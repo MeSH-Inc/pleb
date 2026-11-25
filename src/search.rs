@@ -1,36 +1,214 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use scraper::{Html, Selector};
+use serde::{Deserialize, Serialize};
+use std::str::FromStr;
+use std::time::Duration;
 
-use crate::transport::TransportClient;
+use crate::context::RuntimeContext;
 
-/// A single search result.
-#[derive(Debug, Clone, serde::Serialize)]
+const BRAVE_SEARCH_ENDPOINT: &str = "https://api.search.brave.com/res/v1/web/search";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchProvider {
+    #[default]
+    Auto,
+    Brave,
+    DuckDuckGo,
+}
+
+impl FromStr for SearchProvider {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "brave" => Ok(Self::Brave),
+            "ddg" | "duckduckgo" => Ok(Self::DuckDuckGo),
+            other => bail!(
+                "invalid search provider {:?} (expected auto, brave, or ddg)",
+                other
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SearchResult {
     pub title: String,
     pub url: String,
     pub snippet: String,
 }
 
-/// Search the web via DuckDuckGo's HTML interface.
-/// Returns up to `num_results` results (default 5).
-pub async fn search(client: &TransportClient, query: &str, num_results: usize) -> Result<Vec<SearchResult>> {
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchResponse {
+    pub provider: &'static str,
+    pub results: Vec<SearchResult>,
+}
+
+pub fn brave_api_key_configured() -> bool {
+    load_brave_api_key().is_some()
+}
+
+fn load_brave_api_key() -> Option<String> {
+    std::env::var("BRAVE_API_KEY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+pub async fn search(
+    ctx: &RuntimeContext,
+    query: &str,
+    num_results: usize,
+    provider: SearchProvider,
+) -> Result<SearchResponse> {
+    let count = num_results.clamp(1, 20);
+
+    match provider {
+        SearchProvider::Brave => {
+            let key = load_brave_api_key()
+                .ok_or_else(|| anyhow::anyhow!("BRAVE_API_KEY is not set"))?;
+            let results = search_brave(
+                query,
+                count,
+                &key,
+                ctx.config.proxy.as_deref(),
+                ctx.config.timeout,
+            )
+            .await?;
+            Ok(SearchResponse {
+                provider: "brave",
+                results,
+            })
+        }
+        SearchProvider::DuckDuckGo => {
+            let results = search_ddg(ctx, query, count).await?;
+            Ok(SearchResponse {
+                provider: "duckduckgo",
+                results,
+            })
+        }
+        SearchProvider::Auto => {
+            if let Some(key) = load_brave_api_key() {
+                match search_brave(
+                    query,
+                    count,
+                    &key,
+                    ctx.config.proxy.as_deref(),
+                    ctx.config.timeout,
+                )
+                .await
+                {
+                    Ok(results) => {
+                        return Ok(SearchResponse {
+                            provider: "brave",
+                            results,
+                        });
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Brave Search API request failed ({}); falling back to DuckDuckGo",
+                            err
+                        );
+                    }
+                }
+            }
+            let results = search_ddg(ctx, query, count).await?;
+            Ok(SearchResponse {
+                provider: "duckduckgo",
+                results,
+            })
+        }
+    }
+}
+
+async fn search_brave(
+    query: &str,
+    num_results: usize,
+    api_key: &str,
+    proxy: Option<&str>,
+    timeout: Duration,
+) -> Result<Vec<SearchResult>> {
+    let mut builder = reqwest::Client::builder().timeout(timeout);
+    if let Some(proxy_url) = proxy {
+        let trimmed = proxy_url.trim();
+        if !trimmed.is_empty() {
+            builder = builder.proxy(reqwest::Proxy::all(trimmed)?);
+        }
+    }
+    let client = builder.build()?;
+    let encoded = urlencoding::encode(query);
+    let url = format!("{BRAVE_SEARCH_ENDPOINT}?count={num_results}&q={encoded}");
+
+    let resp = client
+        .get(&url)
+        .header("X-Subscription-Token", api_key)
+        .header("Accept", "application/json")
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let body = resp.text().await?;
+    parse_brave_json(&body, num_results)
+}
+
+async fn search_ddg(
+    ctx: &RuntimeContext,
+    query: &str,
+    num_results: usize,
+) -> Result<Vec<SearchResult>> {
     let encoded = urlencoding::encode(query);
     let search_url = format!("https://html.duckduckgo.com/html/?q={}", encoded);
 
-    let resp = client.get(&search_url).await?;
-
+    let resp = ctx.client.get(&search_url).await?;
     if resp.status >= 400 {
-        anyhow::bail!("Search failed: HTTP {}", resp.status);
+        bail!("DuckDuckGo search failed: HTTP {}", resp.status);
     }
 
-    parse_results(&resp.text(), num_results)
+    parse_ddg_html(&resp.text(), num_results)
 }
 
-/// Parse DuckDuckGo HTML results page.
-fn parse_results(html: &str, max: usize) -> Result<Vec<SearchResult>> {
-    let doc = Html::parse_document(html);
+#[derive(Deserialize)]
+struct BraveApiPayload {
+    web: Option<BraveWebBlock>,
+}
 
-    // DuckDuckGo HTML results are in <div class="result"> or <div class="web-result">
+#[derive(Deserialize)]
+struct BraveWebBlock {
+    #[serde(default)]
+    results: Vec<BraveWebResult>,
+}
+
+#[derive(Deserialize)]
+struct BraveWebResult {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    description: String,
+}
+
+pub fn parse_brave_json(json_str: &str, max: usize) -> Result<Vec<SearchResult>> {
+    let payload: BraveApiPayload = serde_json::from_str(json_str)?;
+    let raw_results = payload.web.map(|w| w.results).unwrap_or_default();
+
+    let results = raw_results
+        .into_iter()
+        .filter(|r| !r.title.trim().is_empty() && !r.url.trim().is_empty())
+        .take(max)
+        .map(|r| SearchResult {
+            title: r.title.trim().to_string(),
+            url: r.url.trim().to_string(),
+            snippet: r.description.trim().to_string(),
+        })
+        .collect();
+
+    Ok(results)
+}
+
+pub fn parse_ddg_html(html: &str, max: usize) -> Result<Vec<SearchResult>> {
+    let doc = Html::parse_document(html);
     let result_sel = Selector::parse(".result__body, .web-result__body").unwrap();
     let title_sel = Selector::parse(".result__a, .result__title a").unwrap();
     let snippet_sel = Selector::parse(".result__snippet").unwrap();
@@ -52,7 +230,7 @@ fn parse_results(html: &str, max: usize) -> Result<Vec<SearchResult>> {
             .select(&title_sel)
             .next()
             .and_then(|el| el.value().attr("href"))
-            .map(|href| clean_ddg_url(href))
+            .map(clean_ddg_url)
             .unwrap_or_default();
 
         let snippet = element
@@ -73,9 +251,7 @@ fn parse_results(html: &str, max: usize) -> Result<Vec<SearchResult>> {
     Ok(results)
 }
 
-/// DuckDuckGo wraps URLs in a redirect. Extract the actual URL.
-fn clean_ddg_url(href: &str) -> String {
-    // DDG HTML links look like: //duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com&rut=...
+pub fn clean_ddg_url(href: &str) -> String {
     if let Some(pos) = href.find("uddg=") {
         let encoded = &href[pos + 5..];
         let end = encoded.find('&').unwrap_or(encoded.len());
@@ -83,18 +259,16 @@ fn clean_ddg_url(href: &str) -> String {
             return decoded.into_owned();
         }
     }
-    // Fallback: return as-is
     href.to_string()
 }
 
-/// Format search results as markdown for the LLM.
-pub fn format_results(results: &[SearchResult]) -> String {
-    if results.is_empty() {
+pub fn format_results(response: &SearchResponse) -> String {
+    if response.results.is_empty() {
         return "No results found.".to_string();
     }
 
     let mut out = String::new();
-    for (i, r) in results.iter().enumerate() {
+    for (i, r) in response.results.iter().enumerate() {
         out.push_str(&format!(
             "{}. [{}]({})\n   {}\n\n",
             i + 1,

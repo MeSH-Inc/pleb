@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::policy::{robots::RobotsCache, SiteCache, SiteRules};
@@ -74,12 +74,21 @@ impl RuntimeContext {
     }
 
     pub fn clear_session(&self) -> Result<()> {
-        let data_dir = self.config.state_dir.join("data");
-        if data_dir.exists() {
-            std::fs::remove_dir_all(&data_dir)?;
-        }
-        std::fs::create_dir_all(&data_dir)?;
+        clear_state_dir(&self.config.state_dir)?;
         self.site_cache.clear()?;
         Ok(())
     }
+}
+
+pub fn clear_state_dir(state_dir: &Path) -> Result<()> {
+    let data_dir = state_dir.join("data");
+    if data_dir.exists() {
+        std::fs::remove_dir_all(&data_dir)?;
+    }
+    std::fs::create_dir_all(&data_dir)?;
+    let cache_file = state_dir.join("site-cache.json");
+    if cache_file.exists() {
+        std::fs::remove_file(&cache_file)?;
+    }
+    Ok(())
 }

@@ -1,18 +1,46 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use mesh_wick::context::{default_state_dir, RuntimeConfig, RuntimeContext};
+use mesh_wick::context::{clear_state_dir, default_state_dir, RuntimeConfig, RuntimeContext};
 use mesh_wick::extract::{ExtractMode, ExtractOptions, OutputFormat};
-use mesh_wick::fetch::{self, FetchOptions};
+use mesh_wick::fetch::{self, FetchError, FetchOptions};
 use mesh_wick::policy::RenderMode;
-use mesh_wick::{crawl, search};
+use mesh_wick::search::{self, SearchProvider};
+use mesh_wick::transport::cef;
+use mesh_wick::crawl;
+use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name = "mesh-wick", version, about = "Local browser-grade web fetch and search CLI for AI agents")]
+#[command(
+    name = "mesh-wick",
+    version,
+    about = "Local browser-grade web fetch and search CLI for AI agents"
+)]
 struct Cli {
-    /// SOCKS5 proxy (e.g., socks5://localhost:1080)
+    /// SOCKS5 proxy (e.g., socks5://localhost:1080). Also reads MESH_WICK_PROXY or WICK_PROXY.
     #[arg(long, global = true, env = "MESH_WICK_PROXY")]
     proxy: Option<String>,
+
+    /// Network request timeout in seconds
+    #[arg(long, global = true, default_value = "30")]
+    timeout: u64,
+
+    /// CEF render timeout in seconds
+    #[arg(long, global = true, default_value = "60")]
+    cef_timeout: u64,
+
+    /// Directory for local cache and session state
+    #[arg(long, global = true, env = "MESH_WICK_HOME")]
+    state_dir: Option<PathBuf>,
+
+    /// Enable verbose diagnostic logging to stderr
+    #[arg(short, long, global = true)]
+    verbose: bool,
+
+    /// Suppress non-error status metadata lines on stderr
+    #[arg(short, long, global = true)]
+    quiet: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -20,147 +48,328 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Fetch a URL and print content to stdout
+    /// Fetch a URL and print extracted content to stdout
     Fetch {
+        /// Target URL (http or https)
         url: String,
+        /// Output format: markdown (default), html, text, or raw
         #[arg(long, default_value = "markdown")]
         format: String,
+        /// Content extraction scope: clean (default), article, or full
+        #[arg(long, default_value = "clean")]
+        extract: String,
+        /// Transport mode: auto (default), cef, or cronet
         #[arg(long, default_value = "auto")]
         render: String,
+        /// CSS selector to wait for when CEF renders
         #[arg(long)]
         wait_for_selector: Option<String>,
+        /// Enforce robots.txt for this fetch (skipped by default)
         #[arg(long)]
         respect_robots: bool,
+        /// Disable bundled/local host rewrite rules (e.g., old.reddit.com)
+        #[arg(long)]
+        no_rewrite: bool,
+        /// Strip image references from markdown output
+        #[arg(long)]
+        no_images: bool,
+        /// Unwrap hyperlink URLs in markdown output
+        #[arg(long)]
+        no_links: bool,
+        /// Truncate extracted content to at most N bytes
+        #[arg(long)]
+        max_bytes: Option<usize>,
+        /// Emit structured JSON output
         #[arg(long)]
         json: bool,
+        /// With --json, omit the content field and emit metadata only
+        #[arg(long)]
+        meta_only: bool,
     },
     /// Search the web and print results
     Search {
+        /// Search query
         query: String,
-        #[arg(short, long, default_value = "5")]
+        /// Maximum number of results (1-20)
+        #[arg(short, long, default_value = "8")]
         num: usize,
+        /// Provider: auto (Brave when BRAVE_API_KEY is set, else DuckDuckGo), brave, or ddg
+        #[arg(long, default_value = "auto")]
+        provider: String,
+        /// Emit structured JSON output
+        #[arg(long)]
+        json: bool,
     },
-    /// Crawl a website and return content from multiple pages
+    /// Crawl a website starting from a URL
     Crawl {
+        /// Starting URL
         url: String,
+        /// Maximum link depth (max 5)
         #[arg(short, long, default_value = "2")]
         depth: u32,
+        /// Maximum pages to fetch (max 50)
         #[arg(short = 'n', long, default_value = "10")]
         max_pages: u32,
+        /// Content extraction scope: clean (default), article, or full
+        #[arg(long, default_value = "clean")]
+        extract: String,
+        /// Only follow URLs whose path starts with this prefix
         #[arg(long)]
         path_filter: Option<String>,
+        /// Ignore robots.txt restrictions during crawl
         #[arg(long)]
         no_robots: bool,
+        /// Emit structured JSON output
+        #[arg(long)]
+        json: bool,
     },
-    /// Discover all URLs on a website
+    /// Discover URLs on a website via sitemap and links
     Map {
+        /// Starting URL
         url: String,
+        /// Maximum URLs to discover (max 5000)
         #[arg(short = 'n', long, default_value = "100")]
         limit: u32,
+        /// Skip sitemap.xml discovery
         #[arg(long)]
         no_sitemap: bool,
+        /// Only include URLs whose path starts with this prefix
         #[arg(long)]
         path_filter: Option<String>,
+        /// Ignore robots.txt restrictions during discovery
         #[arg(long)]
         no_robots: bool,
+        /// Emit structured JSON output
+        #[arg(long)]
+        json: bool,
     },
     /// Manage local browser/network session state
     Session {
         #[command(subcommand)]
         action: SessionAction,
     },
-    /// Show component status
+    /// Show binary, Cronet, CEF, and search configuration status
     Status,
 }
 
 #[derive(Subcommand)]
 enum SessionAction {
-    /// Clear cookies and cached site state
+    /// Clear network storage and cached per-site strategies
     Clear,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    init_tracing(cli.verbose);
+
+    let proxy = cli
+        .proxy
+        .or_else(|| std::env::var("WICK_PROXY").ok().filter(|s| !s.trim().is_empty()));
+    let state_dir = cli.state_dir.unwrap_or_else(default_state_dir);
+
     let config = RuntimeConfig {
-        state_dir: default_state_dir(),
-        proxy: cli.proxy,
-        ..Default::default()
+        state_dir,
+        proxy,
+        timeout: Duration::from_secs(cli.timeout.max(1)),
+        cef_timeout: Duration::from_secs(cli.cef_timeout.max(1)),
+        verbose: cli.verbose,
     };
-    let ctx = RuntimeContext::new(config)?;
 
     match cli.command {
+        Command::Session { action } => match action {
+            SessionAction::Clear => {
+                clear_state_dir(&config.state_dir)?;
+                if !cli.quiet {
+                    eprintln!("Cleared session state at {}", config.state_dir.display());
+                }
+                Ok(())
+            }
+        },
+        Command::Status => {
+            let renderer_path = cef::find_renderer();
+            println!("mesh-wick {}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "Cronet: {}",
+                if cfg!(feature = "cronet") {
+                    "enabled"
+                } else {
+                    "disabled (reqwest fallback)"
+                }
+            );
+            match renderer_path {
+                Some(path) => println!("CEF renderer: installed ({})", path.display()),
+                None => println!("CEF renderer: not installed"),
+            }
+            println!("State dir: {}", config.state_dir.display());
+            println!(
+                "Brave Search API key: {}",
+                if search::brave_api_key_configured() {
+                    "configured"
+                } else {
+                    "unset"
+                }
+            );
+            Ok(())
+        }
         Command::Fetch {
             url,
             format,
+            extract,
             render,
             wait_for_selector,
             respect_robots,
+            no_rewrite,
+            no_images,
+            no_links,
+            max_bytes,
             json,
+            meta_only,
         } => {
+            let ctx = RuntimeContext::new(config)?;
             let parsed_format = OutputFormat::from_str(&format)?;
+            let extract_mode = ExtractMode::from_str(&extract)?;
             let render_mode = RenderMode::from_str(&render)?;
 
             if parsed_format == OutputFormat::Raw {
                 use std::io::{IsTerminal, Write};
                 if std::io::stdout().is_terminal() {
-                    anyhow::bail!("refusing to write raw bytes to a terminal.");
+                    anyhow::bail!(
+                        "refusing to write raw bytes to a terminal; redirect stdout to a file"
+                    );
                 }
-                let result = fetch::fetch_raw(&ctx, &url, respect_robots).await?;
-                std::io::stdout().write_all(&result.bytes)?;
-                return Ok(());
+                match fetch::fetch_raw(&ctx, &url, respect_robots).await {
+                    Ok(res) => {
+                        if !cli.quiet {
+                            eprintln!(
+                                "Status: {} | Time: {}ms | Bytes: {}",
+                                res.status_code,
+                                res.timing_ms,
+                                res.bytes.len()
+                            );
+                        }
+                        std::io::stdout().write_all(&res.bytes)?;
+                        return Ok(());
+                    }
+                    Err(err) => emit_fetch_error_and_exit(&err, json),
+                }
             }
 
             let opts = FetchOptions {
                 extract: ExtractOptions {
                     format: parsed_format,
-                    ..Default::default()
+                    mode: extract_mode,
+                    include_images: !no_images,
+                    include_links: !no_links,
+                    max_bytes,
                 },
                 render: render_mode,
                 wait_for_selector,
                 respect_robots,
-                apply_rewrites: true,
+                apply_rewrites: !no_rewrite,
             };
-            let result = fetch::fetch_document(&ctx, &url, &opts).await?;
 
-            if json {
-                println!("{}", serde_json::to_string(&result)?);
-                return Ok(());
+            match fetch::fetch_document(&ctx, &url, &opts).await {
+                Ok(res) => {
+                    if json {
+                        let out = if meta_only {
+                            serde_json::json!({
+                                "url": res.url,
+                                "final_url": res.final_url,
+                                "status_code": res.status_code,
+                                "content_type": res.content_type,
+                                "title": res.title,
+                                "strategy": res.strategy,
+                                "escalated": res.escalated,
+                                "truncated": res.truncated,
+                                "timing_ms": res.timing_ms,
+                                "content_bytes": res.content.len(),
+                            })
+                        } else {
+                            serde_json::json!({
+                                "url": res.url,
+                                "final_url": res.final_url,
+                                "status_code": res.status_code,
+                                "content_type": res.content_type,
+                                "title": res.title,
+                                "strategy": res.strategy,
+                                "escalated": res.escalated,
+                                "truncated": res.truncated,
+                                "timing_ms": res.timing_ms,
+                                "content_bytes": res.content.len(),
+                                "content": res.content,
+                            })
+                        };
+                        println!("{}", out);
+                    } else {
+                        if !cli.quiet {
+                            if let Some(title) = &res.title {
+                                eprintln!("Title: {}", title);
+                            }
+                            eprintln!(
+                                "Status: {} | Strategy: {} | Time: {}ms\n",
+                                res.status_code, res.strategy, res.timing_ms
+                            );
+                        }
+                        print!("{}", res.content);
+                    }
+                    Ok(())
+                }
+                Err(err) => emit_fetch_error_and_exit(&err, json),
             }
-
-            if let Some(title) = &result.title {
-                eprintln!("Title: {}", title);
-            }
-            eprintln!("Status: {} | Time: {}ms\n", result.status_code, result.timing_ms);
-            print!("{}", result.content);
-            Ok(())
         }
-        Command::Search { query, num } => {
-            let results = search::search(&ctx.client, &query, num).await?;
-            println!("{}", search::format_results(&results));
+        Command::Search {
+            query,
+            num,
+            provider,
+            json,
+        } => {
+            let ctx = RuntimeContext::new(config)?;
+            let parsed_provider = SearchProvider::from_str(&provider)?;
+            let response = search::search(&ctx, &query, num, parsed_provider).await?;
+            if json {
+                println!("{}", serde_json::to_string(&response)?);
+            } else {
+                println!("{}", search::format_results(&response));
+            }
             Ok(())
         }
         Command::Crawl {
             url,
             depth,
             max_pages,
+            extract,
             path_filter,
             no_robots,
+            json,
         } => {
+            let ctx = RuntimeContext::new(config)?;
+            let extract_mode = ExtractMode::from_str(&extract)?;
             let options = crawl::CrawlOptions {
                 max_depth: depth.min(5),
                 max_pages: max_pages.min(50),
                 format: OutputFormat::Markdown,
-                extract_mode: ExtractMode::Clean,
+                extract_mode,
                 respect_robots: !no_robots,
                 path_filter,
             };
             let result = crawl::crawl(&ctx, &url, options).await?;
-            let host = url::Url::parse(&url)
-                .ok()
-                .and_then(|u| u.host_str().map(|s| s.to_string()))
-                .unwrap_or_else(|| url.clone());
-            print!("{}", crawl::format_crawl_output(&result, &host));
+            if json {
+                println!("{}", serde_json::to_string(&result)?);
+            } else {
+                let host = url::Url::parse(&url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| url.clone());
+                if !cli.quiet {
+                    eprintln!(
+                        "Crawled {} pages in {:.1}s\n",
+                        result.pages.len(),
+                        result.timing_ms as f64 / 1000.0
+                    );
+                }
+                print!("{}", crawl::format_crawl_output(&result, &host));
+            }
             Ok(())
         }
         Command::Map {
@@ -169,7 +378,9 @@ async fn main() -> Result<()> {
             no_sitemap,
             path_filter,
             no_robots,
+            json,
         } => {
+            let ctx = RuntimeContext::new(config)?;
             let options = crawl::MapOptions {
                 limit: limit.min(5000),
                 use_sitemap: !no_sitemap,
@@ -177,23 +388,51 @@ async fn main() -> Result<()> {
                 path_filter,
             };
             let result = crawl::map(&ctx, &url, options).await?;
-            let host = url::Url::parse(&url)
-                .ok()
-                .and_then(|u| u.host_str().map(|s| s.to_string()))
-                .unwrap_or_else(|| url.clone());
-            print!("{}", crawl::format_map_output(&result, &host));
-            Ok(())
-        }
-        Command::Session { action } => match action {
-            SessionAction::Clear => ctx.clear_session(),
-        },
-        Command::Status => {
-            println!("mesh-wick {}", env!("CARGO_PKG_VERSION"));
-            println!(
-                "CEF renderer: {}",
-                if ctx.cef.is_available() { "installed" } else { "not installed" }
-            );
+            if json {
+                println!("{}", serde_json::to_string(&result)?);
+            } else {
+                let host = url::Url::parse(&url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| url.clone());
+                if !cli.quiet {
+                    eprintln!(
+                        "Found {} URLs in {:.1}s\n",
+                        result.urls.len(),
+                        result.timing_ms as f64 / 1000.0
+                    );
+                }
+                print!("{}", crawl::format_map_output(&result, &host));
+            }
             Ok(())
         }
     }
+}
+
+fn init_tracing(verbose: bool) {
+    let default_level = if verbose {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::WARN
+    };
+    let filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive(default_level.into());
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .try_init();
+}
+
+fn emit_fetch_error_and_exit(err: &FetchError, json: bool) -> ! {
+    if json {
+        let payload = serde_json::json!({
+            "error": err.to_string(),
+            "exit_code": err.exit_code(),
+        });
+        eprintln!("{}", payload);
+    } else {
+        eprintln!("error: {}", err);
+    }
+    std::process::exit(err.exit_code());
 }
