@@ -159,7 +159,7 @@ if [[ "$NEEDS_BUILD" -eq 1 ]]; then
     # Check for source files — prefer a local checkout, fall back to
     # fetching from the wick repo at WICK_VERSION.
     RENDERER_SRC=""
-    for src_dir in "$WICK_DIR/src" "${BASH_SOURCE[0]:+$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../rust/cef}"; do
+    for src_dir in "$WICK_DIR/src" "${BASH_SOURCE[0]:+$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../cef}"; do
         if [[ -f "$src_dir/renderer.m" ]]; then
             RENDERER_SRC="$src_dir"
             break
@@ -235,12 +235,12 @@ PLIST
         cp -R "$WICK_DIR/$CEF_DIR/Release/Chromium Embedded Framework.framework" "$APP_DIR/Contents/Frameworks/"
     fi
 
-    # Each helper .app needs a Frameworks/ symlink to the CEF framework
+    # Each helper .app needs a relative Frameworks/ symlink to the CEF framework
     # (their @executable_path/../Frameworks/ rpath looks in their own bundle)
-    CEF_FW="$APP_DIR/Contents/Frameworks/Chromium Embedded Framework.framework"
     for helper in "$APP_DIR/Contents/Frameworks"/wick\ Helper*.app; do
         mkdir -p "$helper/Contents/Frameworks"
-        ln -sf "$CEF_FW" "$helper/Contents/Frameworks/Chromium Embedded Framework.framework" 2>/dev/null
+        ln -sf "../../../Chromium Embedded Framework.framework" \
+            "$helper/Contents/Frameworks/Chromium Embedded Framework.framework" 2>/dev/null
     done
 
     echo "  Built wick-renderer.app"
