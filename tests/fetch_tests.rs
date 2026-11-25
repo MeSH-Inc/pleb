@@ -1,0 +1,179 @@
+use mesh_wick::context::{RuntimeConfig, RuntimeContext};
+use mesh_wick::extract::{ExtractOptions, OutputFormat};
+use mesh_wick::fetch::{fetch_document, fetch_raw, FetchError, FetchOptions};
+use mesh_wick::policy::RenderMode;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+fn temp_state_dir(name: &str) -> std::path::PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "mesh-wick-fetch-{}-{}-{}",
+        name,
+        std::process::id(),
+        nanos
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+async fn spawn_mock_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+
+                let response: Vec<u8> = match path {
+                    "/page" => http_response(
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        b"<html><head><title>Mock Page</title></head><body><nav>NavLinks</nav><main><h1>Hello</h1><p>Main body content.</p></main></body></html>",
+                    ),
+                    "/redirect" => {
+                        b"HTTP/1.1 302 Found\r\nLocation: /page\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                    }
+                    "/data.json" => http_response(
+                        "200 OK",
+                        "application/json",
+                        br#"{"ok":true,"count":42}"#,
+                    ),
+                    "/blocked" => http_response("403 Forbidden", "text/html", b"Access denied"),
+                    "/missing" => http_response("404 Not Found", "text/plain", b"Not found"),
+                    "/robots.txt" => http_response(
+                        "200 OK",
+                        "text/plain",
+                        b"User-agent: *\nDisallow: /private\n",
+                    ),
+                    "/private" => http_response(
+                        "200 OK",
+                        "text/html",
+                        b"<html><body><p>Private content</p></body></html>",
+                    ),
+                    "/binary" => http_response(
+                        "200 OK",
+                        "application/octet-stream",
+                        &[0x00, 0xFF, 0xFE, 0x41, 0x42],
+                    ),
+                    _ => http_response("404 Not Found", "text/plain", b"unknown"),
+                };
+
+                let _ = socket.write_all(&response).await;
+            });
+        }
+    });
+
+    format!("http://{}", addr)
+}
+
+fn http_response(status: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
+    let header = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut bytes = header.into_bytes();
+    bytes.extend_from_slice(body);
+    bytes
+}
+
+#[tokio::test]
+async fn fetch_pipeline_end_to_end_against_local_server() {
+    let base = spawn_mock_server().await;
+    let state_dir = temp_state_dir("e2e");
+    let ctx = RuntimeContext::new(RuntimeConfig {
+        state_dir: state_dir.clone(),
+        timeout: Duration::from_secs(5),
+        cef_timeout: Duration::from_secs(5),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let cronet_opts = FetchOptions {
+        render: RenderMode::Cronet,
+        ..Default::default()
+    };
+
+    // 1. HTML fetch strips nav and keeps main content.
+    let page = fetch_document(&ctx, &format!("{base}/page"), &cronet_opts)
+        .await
+        .unwrap();
+    assert_eq!(page.status_code, 200);
+    assert_eq!(page.title.as_deref(), Some("Mock Page"));
+    assert!(page.content.contains("Main body content."));
+    assert!(!page.content.contains("NavLinks"));
+
+    // 2. Redirect captures final_url.
+    let redir = fetch_document(&ctx, &format!("{base}/redirect"), &cronet_opts)
+        .await
+        .unwrap();
+    assert!(redir.final_url.ends_with("/page"));
+    assert!(redir.content.contains("Main body content."));
+
+    // 3. JSON passes through unmodified.
+    let json_doc = fetch_document(&ctx, &format!("{base}/data.json"), &cronet_opts)
+        .await
+        .unwrap();
+    assert_eq!(json_doc.content, r#"{"ok":true,"count":42}"#);
+    assert!(json_doc.title.is_none());
+
+    // 4. 403 returns FetchError::Blocked with exit code 2.
+    let err_403 = fetch_document(&ctx, &format!("{base}/blocked"), &cronet_opts)
+        .await
+        .unwrap_err();
+    assert!(matches!(err_403, FetchError::Blocked { status: 403, .. }));
+    assert_eq!(err_403.exit_code(), 2);
+
+    // 5. 404 returns FetchError::HttpError with exit code 3.
+    let err_404 = fetch_document(&ctx, &format!("{base}/missing"), &cronet_opts)
+        .await
+        .unwrap_err();
+    assert!(matches!(err_404, FetchError::HttpError { status: 404, .. }));
+    assert_eq!(err_404.exit_code(), 3);
+
+    // 6. robots.txt is skipped by default and enforced when respect_robots=true.
+    let allowed = fetch_document(&ctx, &format!("{base}/private"), &cronet_opts)
+        .await
+        .unwrap();
+    assert!(allowed.content.contains("Private content"));
+
+    let robots_opts = FetchOptions {
+        respect_robots: true,
+        extract: ExtractOptions {
+            format: OutputFormat::Markdown,
+            ..Default::default()
+        },
+        ..cronet_opts
+    };
+    let err_robots = fetch_document(&ctx, &format!("{base}/private"), &robots_opts)
+        .await
+        .unwrap_err();
+    assert!(matches!(err_robots, FetchError::RobotsDisallowed { .. }));
+    assert_eq!(err_robots.exit_code(), 2);
+
+    // 7. Raw fetch preserves arbitrary binary bytes cleanly.
+    let raw = fetch_raw(&ctx, &format!("{base}/binary"), false)
+        .await
+        .unwrap();
+    assert_eq!(raw.bytes, vec![0x00, 0xFF, 0xFE, 0x41, 0x42]);
+
+    let _ = std::fs::remove_dir_all(state_dir);
+}

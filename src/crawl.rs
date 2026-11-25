@@ -286,11 +286,11 @@ pub fn format_map_output(result: &MapResult, host: &str) -> String {
 }
 
 async fn fetch_sitemap(ctx: &RuntimeContext, base_url: &Url) -> Vec<String> {
-    let sitemap_url = format!(
-        "{}://{}/sitemap.xml",
-        base_url.scheme(),
-        base_url.host_str().unwrap_or("")
-    );
+    let origin = base_url.origin().ascii_serialization();
+    if origin == "null" {
+        return Vec::new();
+    }
+    let sitemap_url = format!("{}/sitemap.xml", origin);
 
     let resp = match ctx.client.get(&sitemap_url).await {
         Ok(r) if r.status < 400 => r,
@@ -366,12 +366,11 @@ fn normalize_url(url: &str) -> String {
 }
 
 fn get_origin(url: &Url) -> String {
-    format!("{}://{}", url.scheme(), url.host_str().unwrap_or(""))
+    url.origin().ascii_serialization()
 }
 
 fn is_same_origin(url: &Url, origin: &str) -> bool {
-    let url_origin = format!("{}://{}", url.scheme(), url.host_str().unwrap_or(""));
-    url_origin == *origin
+    url.origin().ascii_serialization() == origin
 }
 
 const SKIP_EXTENSIONS: &[&str] = &[

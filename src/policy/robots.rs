@@ -27,7 +27,10 @@ impl RobotsCache {
         let Ok(parsed) = url::Url::parse(url) else {
             return true;
         };
-        let origin = format!("{}://{}", parsed.scheme(), parsed.host_str().unwrap_or(""));
+        let origin = parsed.origin().ascii_serialization();
+        if origin == "null" {
+            return true;
+        }
 
         let Some(robots_body) = self.get_robots(client, &origin).await else {
             return true;
