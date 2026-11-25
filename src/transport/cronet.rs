@@ -1,25 +1,62 @@
-pub mod ffi;
-
 use anyhow::{bail, Result};
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::oneshot;
 
-const READ_BUFFER_SIZE: u64 = 32 * 1024; // 32KB per read
+use super::cronet_ffi as ffi;
 
-/// A Cronet-backed HTTP engine with Chrome-identical TLS/HTTP2/QUIC.
+const READ_BUFFER_SIZE: u64 = 32 * 1024;
+
+#[derive(Clone, Copy)]
+struct RequestHandle(ffi::Cronet_UrlRequestPtr);
+
+unsafe impl Send for RequestHandle {}
+unsafe impl Sync for RequestHandle {}
+
+struct CancelGuard {
+    active_request: Arc<Mutex<Option<RequestHandle>>>,
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        if let Ok(guard) = self.active_request.lock() {
+            if let Some(handle) = *guard {
+                unsafe {
+                    ffi::Cronet_UrlRequest_Cancel(handle.0);
+                }
+            }
+        }
+    }
+}
+
+pub struct CronetResponse {
+    pub status_code: u16,
+    pub final_url: String,
+    pub content_type: Option<String>,
+    pub body: Vec<u8>,
+}
+
+/// Cronet-backed HTTP engine with Chrome-identical TLS/HTTP2/QUIC.
 pub struct Engine {
     engine: ffi::Cronet_EnginePtr,
     executor: ffi::Cronet_ExecutorPtr,
+    timeout: Duration,
 }
 
 unsafe impl Send for Engine {}
 unsafe impl Sync for Engine {}
 
 impl Engine {
-    pub fn new(storage_path: &Path, user_agent: &str, proxy: Option<&str>) -> Result<Self> {
+    pub fn new(
+        storage_path: &Path,
+        user_agent: &str,
+        proxy: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Self> {
         std::fs::create_dir_all(storage_path)?;
 
         let ua = CString::new(user_agent)?;
@@ -36,9 +73,8 @@ impl Engine {
             ffi::Cronet_EngineParams_http_cache_max_size_set(params, 50 * 1024 * 1024);
             ffi::Cronet_EngineParams_enable_check_result_set(params, false);
 
-            // Configure SOCKS proxy if specified
             if let Some(proxy_url) = proxy {
-                let opts = format!(r#"{{"proxy_rules":"{}"}}"#, proxy_url);
+                let opts = serde_json::json!({ "proxy_rules": proxy_url }).to_string();
                 let c_opts = CString::new(opts)?;
                 ffi::Cronet_EngineParams_experimental_options_set(params, c_opts.as_ptr());
             }
@@ -54,38 +90,57 @@ impl Engine {
 
             let executor = ffi::Cronet_Executor_CreateWith(executor_execute);
 
-            Ok(Self { engine, executor })
+            Ok(Self {
+                engine,
+                executor,
+                timeout,
+            })
         }
     }
 
-    /// Make an HTTP GET request. Returns (status_code, body).
-    pub async fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Response> {
+    pub async fn get(&self, url: &str, headers: &[(&str, String)]) -> Result<CronetResponse> {
         let (tx, rx) = oneshot::channel();
+        let active_request = Arc::new(Mutex::new(None));
+        let guard = CancelGuard {
+            active_request: Arc::clone(&active_request),
+        };
 
-        // All raw pointer work happens synchronously before the await.
-        // Cronet callbacks own cleanup of request/callback/state after Start.
-        self.start_request(url, headers, tx)?;
+        self.start_request(url, headers, tx, active_request)?;
 
-        // Only the receiver crosses the await boundary — it's Send.
-        rx.await.map_err(|_| anyhow::anyhow!("request cancelled"))?
+        match tokio::time::timeout(self.timeout, rx).await {
+            Ok(Ok(result)) => {
+                drop(guard);
+                result
+            }
+            Ok(Err(_)) => {
+                drop(guard);
+                bail!("Cronet request cancelled")
+            }
+            Err(_) => {
+                drop(guard);
+                bail!("Cronet request timed out after {:?}", self.timeout)
+            }
+        }
     }
 
     fn start_request(
         &self,
         url: &str,
-        headers: &[(&str, &str)],
-        tx: oneshot::Sender<Result<Response>>,
+        headers: &[(&str, String)],
+        tx: oneshot::Sender<Result<CronetResponse>>,
+        active_request: Arc<Mutex<Option<RequestHandle>>>,
     ) -> Result<()> {
         let state = Box::new(RequestState {
             body: Mutex::new(Vec::new()),
-            status_code: std::sync::atomic::AtomicI32::new(0),
+            status_code: AtomicI32::new(0),
+            final_url: Mutex::new(url.to_string()),
+            content_type: Mutex::new(None),
             sender: Mutex::new(Some(tx)),
-            error: Mutex::new(None),
             request: Mutex::new(std::ptr::null_mut()),
             callback: Mutex::new(std::ptr::null_mut()),
+            active_request,
         });
         let state_ptr = Box::into_raw(state) as *mut c_void;
-
         let c_url = CString::new(url)?;
 
         unsafe {
@@ -106,7 +161,7 @@ impl Engine {
             for (name, value) in headers {
                 let h = ffi::Cronet_HttpHeader_Create();
                 let cn = CString::new(*name)?;
-                let cv = CString::new(*value)?;
+                let cv = CString::new(value.as_str())?;
                 ffi::Cronet_HttpHeader_name_set(h, cn.as_ptr());
                 ffi::Cronet_HttpHeader_value_set(h, cv.as_ptr());
                 ffi::Cronet_UrlRequestParams_request_headers_add(params, h);
@@ -115,7 +170,12 @@ impl Engine {
 
             let request = ffi::Cronet_UrlRequest_Create();
             let result = ffi::Cronet_UrlRequest_InitWithParams(
-                request, self.engine, c_url.as_ptr(), params, callback, self.executor,
+                request,
+                self.engine,
+                c_url.as_ptr(),
+                params,
+                callback,
+                self.executor,
             );
             ffi::Cronet_UrlRequestParams_Destroy(params);
 
@@ -126,13 +186,14 @@ impl Engine {
                 bail!("Cronet request init failed: result={}", result);
             }
 
-            // Store pointers for cleanup in callbacks
             let state_ref = &*(state_ptr as *const RequestState);
             *state_ref.request.lock().unwrap() = request;
             *state_ref.callback.lock().unwrap() = callback;
+            *state_ref.active_request.lock().unwrap() = Some(RequestHandle(request));
 
             let start_result = ffi::Cronet_UrlRequest_Start(request);
             if start_result != ffi::RESULT_SUCCESS {
+                *state_ref.active_request.lock().unwrap() = None;
                 let _ = Box::from_raw(state_ptr as *mut RequestState);
                 ffi::Cronet_UrlRequest_Destroy(request);
                 ffi::Cronet_UrlRequestCallback_Destroy(callback);
@@ -154,26 +215,15 @@ impl Drop for Engine {
     }
 }
 
-pub struct Response {
-    pub status_code: u16,
-    pub body: Vec<u8>,
-}
-
-impl Response {
-    pub fn text(&self) -> String {
-        String::from_utf8_lossy(&self.body).into_owned()
-    }
-}
-
-// ── Internal state ──────────────────────────────────────────────
-
 struct RequestState {
     body: Mutex<Vec<u8>>,
-    status_code: std::sync::atomic::AtomicI32,
-    sender: Mutex<Option<oneshot::Sender<Result<Response>>>>,
-    error: Mutex<Option<String>>,
+    status_code: AtomicI32,
+    final_url: Mutex<String>,
+    content_type: Mutex<Option<String>>,
+    sender: Mutex<Option<oneshot::Sender<Result<CronetResponse>>>>,
     request: Mutex<ffi::Cronet_UrlRequestPtr>,
     callback: Mutex<ffi::Cronet_UrlRequestCallbackPtr>,
+    active_request: Arc<Mutex<Option<RequestHandle>>>,
 }
 
 fn get_state(callback: ffi::Cronet_UrlRequestCallbackPtr) -> &'static RequestState {
@@ -183,24 +233,19 @@ fn get_state(callback: ffi::Cronet_UrlRequestCallbackPtr) -> &'static RequestSta
     }
 }
 
-fn complete(state: &RequestState, result: Result<Response>) {
+fn complete(state: &RequestState, result: Result<CronetResponse>) {
     if let Some(tx) = state.sender.lock().unwrap().take() {
         let _ = tx.send(result);
     }
 }
 
-// ── Executor callback ───────────────────────────────────────────
-
 unsafe extern "C" fn executor_execute(
     _executor: ffi::Cronet_ExecutorPtr,
     command: ffi::Cronet_RunnablePtr,
 ) {
-    // Run the command on the current thread (Cronet's network thread).
     ffi::Cronet_Runnable_Run(command);
     ffi::Cronet_Runnable_Destroy(command);
 }
-
-// ── Request callbacks ───────────────────────────────────────────
 
 unsafe extern "C" fn on_redirect_received(
     _callback: ffi::Cronet_UrlRequestCallbackPtr,
@@ -208,7 +253,6 @@ unsafe extern "C" fn on_redirect_received(
     _info: ffi::Cronet_UrlResponseInfoPtr,
     _new_location: ffi::Cronet_String,
 ) {
-    // Follow all redirects automatically
     ffi::Cronet_UrlRequest_FollowRedirect(request);
 }
 
@@ -219,9 +263,34 @@ unsafe extern "C" fn on_response_started(
 ) {
     let state = get_state(callback);
     let code = ffi::Cronet_UrlResponseInfo_http_status_code_get(info);
-    state.status_code.store(code, std::sync::atomic::Ordering::SeqCst);
+    state.status_code.store(code, Ordering::SeqCst);
 
-    // Start reading the response body
+    let url_ptr = ffi::Cronet_UrlResponseInfo_url_get(info);
+    if !url_ptr.is_null() {
+        let final_url = CStr::from_ptr(url_ptr).to_string_lossy().into_owned();
+        if !final_url.is_empty() {
+            *state.final_url.lock().unwrap() = final_url;
+        }
+    }
+
+    let header_count = ffi::Cronet_UrlResponseInfo_all_headers_list_size(info);
+    for i in 0..header_count {
+        let header = ffi::Cronet_UrlResponseInfo_all_headers_list_at(info, i);
+        if header.is_null() {
+            continue;
+        }
+        let name_ptr = ffi::Cronet_HttpHeader_name_get(header);
+        let value_ptr = ffi::Cronet_HttpHeader_value_get(header);
+        if !name_ptr.is_null() && !value_ptr.is_null() {
+            let name = CStr::from_ptr(name_ptr).to_string_lossy();
+            if name.eq_ignore_ascii_case("content-type") {
+                let value = CStr::from_ptr(value_ptr).to_string_lossy().into_owned();
+                *state.content_type.lock().unwrap() = Some(value);
+                break;
+            }
+        }
+    }
+
     let buffer = ffi::Cronet_Buffer_Create();
     ffi::Cronet_Buffer_InitWithAlloc(buffer, READ_BUFFER_SIZE);
     ffi::Cronet_UrlRequest_Read(request, buffer);
@@ -235,25 +304,25 @@ unsafe extern "C" fn on_read_completed(
     bytes_read: u64,
 ) {
     let state = get_state(callback);
+    if bytes_read > 0 {
+        let data_ptr = ffi::Cronet_Buffer_GetData(buffer) as *const u8;
+        let slice = std::slice::from_raw_parts(data_ptr, bytes_read as usize);
+        state.body.lock().unwrap().extend_from_slice(slice);
+    }
 
-    // Append read data to body
-    let data_ptr = ffi::Cronet_Buffer_GetData(buffer) as *const u8;
-    let slice = std::slice::from_raw_parts(data_ptr, bytes_read as usize);
-    state.body.lock().unwrap().extend_from_slice(slice);
-
-    // Continue reading
-    ffi::Cronet_Buffer_InitWithAlloc(buffer, READ_BUFFER_SIZE);
+    // Reuse the existing allocated buffer directly.
     ffi::Cronet_UrlRequest_Read(request, buffer);
 }
 
-/// Clean up Cronet objects and free the state.
 unsafe fn finish_request(callback: ffi::Cronet_UrlRequestCallbackPtr) -> Box<RequestState> {
     let ctx = ffi::Cronet_UrlRequestCallback_GetClientContext(callback);
     let boxed = Box::from_raw(ctx as *mut RequestState);
+
+    // Clear active handle while holding lock so CancelGuard cannot use a destroyed request.
+    let _ = boxed.active_request.lock().unwrap().take();
+
     let req = *boxed.request.lock().unwrap();
     let cb = *boxed.callback.lock().unwrap();
-    // Note: Cronet buffers are reused across on_read_completed callbacks
-    // and destroyed internally by Cronet when the request completes.
     if !req.is_null() {
         ffi::Cronet_UrlRequest_Destroy(req);
     }
@@ -268,15 +337,18 @@ unsafe extern "C" fn on_succeeded(
     _request: ffi::Cronet_UrlRequestPtr,
     _info: ffi::Cronet_UrlResponseInfoPtr,
 ) {
-    let state = get_state(callback);
-    let code = state.status_code.load(std::sync::atomic::Ordering::SeqCst);
-    let body = state.body.lock().unwrap().clone();
-
     let boxed = finish_request(callback);
+    let code = boxed.status_code.load(Ordering::SeqCst);
+    let body = std::mem::take(&mut *boxed.body.lock().unwrap());
+    let final_url = std::mem::take(&mut *boxed.final_url.lock().unwrap());
+    let content_type = boxed.content_type.lock().unwrap().take();
+
     complete(
         &boxed,
-        Ok(Response {
+        Ok(CronetResponse {
             status_code: code as u16,
+            final_url,
+            content_type,
             body,
         }),
     );
@@ -288,12 +360,6 @@ unsafe extern "C" fn on_failed(
     _info: ffi::Cronet_UrlResponseInfoPtr,
     error: ffi::Cronet_ErrorPtr,
 ) {
-    // Capture the net-error cause BEFORE finish_request tears the request
-    // down — the error object is owned by Cronet and valid only for the
-    // duration of this callback. The cause is embedded (in brackets) so
-    // fetch::classify_transport_error can tell a user disconnect apart from
-    // a site actively blocking us instead of lumping both into one opaque
-    // "transport error".
     let code_name = if error.is_null() {
         "ERROR_OTHER"
     } else {
@@ -306,9 +372,6 @@ unsafe extern "C" fn on_failed(
     );
 }
 
-/// Map a `Cronet_Error_ERROR_CODE` (include/cronet.idl_c.h) to a stable name
-/// embedded in the error message. `fetch::classify_transport_error` (via
-/// `candidate_cause`) matches on these (lowercased) to classify the cause.
 fn net_error_name(code: std::os::raw::c_int) -> &'static str {
     match code {
         0 => "ERROR_CALLBACK",
@@ -332,5 +395,5 @@ unsafe extern "C" fn on_canceled(
     _info: ffi::Cronet_UrlResponseInfoPtr,
 ) {
     let boxed = finish_request(callback);
-    complete(&boxed, Err(anyhow::anyhow!("Cronet request cancelled")));
+    complete(&boxed, Err(anyhow::anyhow!("cronet request canceled")));
 }

@@ -1,4 +1,3 @@
-use anyhow::Result;
 use robotstxt::DefaultMatcher;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -17,7 +16,7 @@ static CACHE: std::sync::LazyLock<Mutex<HashMap<String, CacheEntry>>> =
 
 /// Returns true if the URL is allowed by robots.txt.
 /// Checks both "Wick" and "*" user agents.
-pub async fn check(client: &crate::engine::Client, url: &str) -> bool {
+pub async fn check(client: &crate::transport::TransportClient, url: &str) -> bool {
     let parsed = match url::Url::parse(url) {
         Ok(u) => u,
         Err(_) => return true,
@@ -39,7 +38,7 @@ pub async fn check(client: &crate::engine::Client, url: &str) -> bool {
     matcher.one_agent_allowed_by_robots(&robots_body, "*", url)
 }
 
-async fn get_robots(client: &crate::engine::Client, host: &str) -> Option<String> {
+async fn get_robots(client: &crate::transport::TransportClient, host: &str) -> Option<String> {
     // Check cache
     {
         let cache = CACHE.lock().ok()?;
@@ -53,7 +52,7 @@ async fn get_robots(client: &crate::engine::Client, host: &str) -> Option<String
     let url = format!("{}/robots.txt", host);
     let resp = client.get(&url).await.ok()?;
     let status = resp.status;
-    let body = resp.body;
+    let body = resp.text();
 
     let robots_body = match status {
         200 => body,

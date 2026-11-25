@@ -1,7 +1,7 @@
 use anyhow::Result;
 use scraper::{Html, Selector};
 
-use crate::engine::Client;
+use crate::transport::TransportClient;
 
 /// A single search result.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -13,7 +13,7 @@ pub struct SearchResult {
 
 /// Search the web via DuckDuckGo's HTML interface.
 /// Returns up to `num_results` results (default 5).
-pub async fn search(client: &Client, query: &str, num_results: usize) -> Result<Vec<SearchResult>> {
+pub async fn search(client: &TransportClient, query: &str, num_results: usize) -> Result<Vec<SearchResult>> {
     let encoded = urlencoding::encode(query);
     let search_url = format!("https://html.duckduckgo.com/html/?q={}", encoded);
 
@@ -23,7 +23,7 @@ pub async fn search(client: &Client, query: &str, num_results: usize) -> Result<
         anyhow::bail!("Search failed: HTTP {}", resp.status);
     }
 
-    parse_results(&resp.body, num_results)
+    parse_results(&resp.text(), num_results)
 }
 
 /// Parse DuckDuckGo HTML results page.

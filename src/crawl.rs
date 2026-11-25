@@ -8,9 +8,9 @@ use anyhow::Result;
 use scraper::{Html, Selector};
 use url::Url;
 
-use crate::engine::Client;
 use crate::extract::{self, Format};
 use crate::fetch;
+use crate::transport::{cef::CefRenderer, TransportClient};
 
 // ── Crawl ────────────────────────────────────────────────────
 
@@ -36,7 +36,8 @@ pub struct CrawlResult {
 }
 
 pub async fn crawl(
-    client: &Client,
+    client: &TransportClient,
+    cef: &CefRenderer,
     start_url: &str,
     options: CrawlOptions,
 ) -> Result<CrawlResult> {
@@ -63,7 +64,7 @@ pub async fn crawl(
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
-        let html_result = fetch::fetch_html(client, &url, options.respect_robots).await;
+        let html_result = fetch::fetch_html(client, cef, &url, options.respect_robots).await;
         let html_result = match html_result {
             Ok(r) => r,
             Err(e) => {
@@ -188,7 +189,8 @@ pub struct MapResult {
 }
 
 pub async fn map(
-    client: &Client,
+    client: &TransportClient,
+    cef: &CefRenderer,
     start_url: &str,
     options: MapOptions,
 ) -> Result<MapResult> {
@@ -245,7 +247,7 @@ pub async fn map(
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
 
-        let html_result = fetch::fetch_html(client, &url, options.respect_robots).await;
+        let html_result = fetch::fetch_html(client, cef, &url, options.respect_robots).await;
         let html_result = match html_result {
             Ok(r) if r.status_code < 400 && !r.html.is_empty() => r,
             _ => continue,
@@ -312,7 +314,7 @@ pub fn format_map_output(result: &MapResult, host: &str) -> String {
 
 // ── Sitemap ──────────────────────────────────────────────────
 
-async fn fetch_sitemap(client: &Client, base_url: &Url) -> Vec<String> {
+async fn fetch_sitemap(client: &TransportClient, base_url: &Url) -> Vec<String> {
     let sitemap_url = format!("{}://{}/sitemap.xml", base_url.scheme(), base_url.host_str().unwrap_or(""));
 
     let resp = match client.get(&sitemap_url).await {
@@ -320,7 +322,7 @@ async fn fetch_sitemap(client: &Client, base_url: &Url) -> Vec<String> {
         _ => return Vec::new(),
     };
 
-    parse_sitemap_xml(&resp.body)
+    parse_sitemap_xml(&resp.text())
 }
 
 fn parse_sitemap_xml(xml: &str) -> Vec<String> {

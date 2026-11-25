@@ -1,11 +1,12 @@
 use anyhow::Result;
 use std::time::Instant;
 
-use crate::engine::Client;
 use crate::extract::{self, Format};
 use crate::robots;
 use crate::site_cache;
 use crate::site_rules;
+use crate::transport::cef::{CefRenderOptions, CefRenderer};
+use crate::transport::TransportClient;
 
 pub struct FetchResult {
     pub content: String,
@@ -47,7 +48,8 @@ impl RenderMode {
 }
 
 pub async fn fetch(
-    client: &Client,
+    client: &TransportClient,
+    cef: &CefRenderer,
     url: &str,
     format: Format,
     respect_robots: bool,
@@ -72,6 +74,7 @@ pub async fn fetch(
             .replace("://reddit.com", "://old.reddit.com");
         return Box::pin(fetch(
             client,
+            cef,
             &old_url,
             format,
             respect_robots,
@@ -94,10 +97,9 @@ pub async fn fetch(
         });
     }
 
-    let cef_installed = crate::cef::is_available();
+    let cef_installed = cef.is_available();
     let cached = site_cache::get(host);
     let rule = site_rules::get(host);
-    let use_residential = rule.as_ref().map(|r| r.needs_residential).unwrap_or(false);
     let effective_selector =
         wait_for_selector.or_else(|| rule.as_ref().and_then(|r| r.wait_for_selector.as_deref()));
 
@@ -114,7 +116,7 @@ pub async fn fetch(
             ));
 
     if cef_first {
-        match cef_render_with_retry(url, effective_selector, use_residential).await {
+        match cef_render_with_retry(cef, url, effective_selector).await {
             Ok(html) => {
                 let extracted = extract::extract(&html, &parsed, format)?;
                 let timing_ms = start.elapsed().as_millis() as u64;
@@ -133,7 +135,7 @@ pub async fn fetch(
                 if render == RenderMode::Cef {
                     return Err(anyhow::anyhow!("CEF renderer failed: {}", e));
                 }
-                tracing::warn!("CEF renderer failed: {}. Falling back to Cronet.", e);
+                tracing::warn!("CEF renderer failed: {}. Falling back to transport.", e);
             }
         }
     }
@@ -141,10 +143,10 @@ pub async fn fetch(
     let escalated_from = if cef_first { Some("cef") } else { None };
     let resp = client.get(url).await?;
     let status = resp.status;
-    let body = resp.body;
+    let body = resp.text();
 
     if (status == 403 || status == 503) && escalated_from.is_none() && render != RenderMode::Cronet && cef_installed {
-        if let Ok(html) = cef_render_with_retry(url, effective_selector, use_residential).await {
+        if let Ok(html) = cef_render_with_retry(cef, url, effective_selector).await {
             let extracted = extract::extract(&html, &parsed, format)?;
             let timing_ms = start.elapsed().as_millis() as u64;
             site_cache::record(host, "cef", false, timing_ms);
@@ -171,7 +173,7 @@ pub async fn fetch(
 
     let js_shell = is_js_required_shell(&body);
     if escalated_from.is_none() && js_shell && render != RenderMode::Cronet && cef_installed {
-        if let Ok(html) = cef_render_with_retry(url, effective_selector, use_residential).await {
+        if let Ok(html) = cef_render_with_retry(cef, url, effective_selector).await {
             let extracted = extract::extract(&html, &parsed, format)?;
             let timing_ms = start.elapsed().as_millis() as u64;
             site_cache::record(host, "cef", false, timing_ms);
@@ -191,24 +193,23 @@ pub async fn fetch(
     Ok(FetchResult {
         content: extracted.content,
         title: extracted.title,
-        url: url.to_string(),
+        url: resp.final_url,
         status_code: status,
         timing_ms,
     })
 }
 
 async fn cef_render_with_retry(
+    cef: &CefRenderer,
     url: &str,
     wait_for_selector: Option<&str>,
-    use_residential: bool,
 ) -> Result<String> {
-    let opts = crate::cef::RenderOptions {
-        use_residential,
+    let opts = CefRenderOptions {
         wait_for_selector: wait_for_selector.map(|s| s.to_string()),
     };
-    match crate::cef::render_with(url, opts.clone()).await {
+    match cef.render(url, &opts).await {
         Ok(html) if is_acceptable_render(&html) => Ok(html),
-        _ => crate::cef::render_with(url, opts).await,
+        _ => cef.render(url, &opts).await,
     }
 }
 
@@ -225,7 +226,8 @@ fn looks_like_cloudflare_interstitial(html: &str) -> bool {
 }
 
 pub async fn fetch_html(
-    client: &Client,
+    client: &TransportClient,
+    cef: &CefRenderer,
     url: &str,
     respect_robots: bool,
 ) -> Result<FetchHtmlResult> {
@@ -239,7 +241,7 @@ pub async fn fetch_html(
         let old_url = url
             .replace("://www.reddit.com", "://old.reddit.com")
             .replace("://reddit.com", "://old.reddit.com");
-        return Box::pin(fetch_html(client, &old_url, respect_robots)).await;
+        return Box::pin(fetch_html(client, cef, &old_url, respect_robots)).await;
     }
 
     if respect_robots && !robots::check(client, url).await {
@@ -250,10 +252,9 @@ pub async fn fetch_html(
         });
     }
 
-    let cef_installed = crate::cef::is_available();
+    let cef_installed = cef.is_available();
     let cached = site_cache::get(host);
     let rule = site_rules::get(host);
-    let use_residential = rule.as_ref().map(|r| r.needs_residential).unwrap_or(false);
     let effective_selector = rule.as_ref().and_then(|r| r.wait_for_selector.as_deref());
     let cef_first = should_use_cef_first(
         rule.as_ref().map(|r| r.render.as_str()),
@@ -262,7 +263,7 @@ pub async fn fetch_html(
     );
 
     if cef_first {
-        match cef_render_with_retry(url, effective_selector, use_residential).await {
+        match cef_render_with_retry(cef, url, effective_selector).await {
             Ok(html) => {
                 let timing_ms = start.elapsed().as_millis() as u64;
                 site_cache::record(host, "cef", false, timing_ms);
@@ -284,7 +285,7 @@ pub async fn fetch_html(
     let blocked = matches!(resp.status, 403 | 503);
 
     if blocked && cef_installed && !cef_first {
-        if let Ok(html) = cef_render_with_retry(url, effective_selector, use_residential).await {
+        if let Ok(html) = cef_render_with_retry(cef, url, effective_selector).await {
             let timing_ms = start.elapsed().as_millis() as u64;
             site_cache::record(host, "cef", false, timing_ms);
             return Ok(FetchHtmlResult {
@@ -300,14 +301,14 @@ pub async fn fetch_html(
     }
 
     Ok(FetchHtmlResult {
-        html: resp.body,
-        url: url.to_string(),
+        html: resp.text(),
+        url: resp.final_url,
         status_code: resp.status,
     })
 }
 
 pub async fn fetch_raw(
-    client: &Client,
+    client: &TransportClient,
     url: &str,
     respect_robots: bool,
 ) -> Result<FetchRawResult> {
@@ -332,7 +333,7 @@ pub async fn fetch_raw(
         });
     }
 
-    let resp = client.get_bytes(url).await?;
+    let resp = client.get(url).await?;
     let timing_ms = start.elapsed().as_millis() as u64;
     if resp.status >= 200 && resp.status < 400 {
         site_cache::record(host, "cronet", false, timing_ms);
@@ -340,7 +341,7 @@ pub async fn fetch_raw(
 
     Ok(FetchRawResult {
         bytes: resp.body,
-        url: url.to_string(),
+        url: resp.final_url,
         status_code: resp.status,
         timing_ms,
     })

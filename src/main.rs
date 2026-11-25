@@ -1,6 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use mesh_wick::{cef, crawl, engine, extract, fetch, search, session};
+use mesh_wick::transport::{cef::CefRenderer, TransportClient};
+use mesh_wick::{crawl, extract, fetch, search, session};
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "mesh-wick", version, about = "Local browser-grade web fetch and search CLI for AI agents")]
@@ -78,6 +80,8 @@ enum SessionAction {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let proxy = cli.proxy.as_deref();
+    let timeout = Duration::from_secs(30);
+    let cef_timeout = Duration::from_secs(60);
 
     match cli.command {
         Command::Fetch {
@@ -88,7 +92,8 @@ async fn main() -> Result<()> {
             no_robots,
             json,
         } => {
-            let client = engine::Client::new(proxy)?;
+            let client = TransportClient::new(&session::storage_path()?, proxy, timeout)?;
+            let cef = CefRenderer::new(proxy.map(str::to_string), cef_timeout, false);
             let parsed_format = extract::Format::from_str(&format);
             let render_mode = fetch::RenderMode::from_str(&render);
             let selector = wait_for_selector.as_deref();
@@ -103,9 +108,16 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let result =
-                fetch::fetch(&client, &url, parsed_format, !no_robots, render_mode, selector)
-                    .await?;
+            let result = fetch::fetch(
+                &client,
+                &cef,
+                &url,
+                parsed_format,
+                !no_robots,
+                render_mode,
+                selector,
+            )
+            .await?;
 
             if json {
                 let out = serde_json::json!({
@@ -127,7 +139,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Search { query, num } => {
-            let client = engine::Client::new(proxy)?;
+            let client = TransportClient::new(&session::storage_path()?, proxy, timeout)?;
             let results = search::search(&client, &query, num).await?;
             println!("{}", search::format_results(&results));
             Ok(())
@@ -139,7 +151,8 @@ async fn main() -> Result<()> {
             path_filter,
             no_robots,
         } => {
-            let client = engine::Client::new(proxy)?;
+            let client = TransportClient::new(&session::storage_path()?, proxy, timeout)?;
+            let cef = CefRenderer::new(proxy.map(str::to_string), cef_timeout, false);
             let options = crawl::CrawlOptions {
                 max_depth: depth.min(5),
                 max_pages: max_pages.min(50),
@@ -147,7 +160,7 @@ async fn main() -> Result<()> {
                 respect_robots: !no_robots,
                 path_filter,
             };
-            let result = crawl::crawl(&client, &url, options).await?;
+            let result = crawl::crawl(&client, &cef, &url, options).await?;
             let host = url::Url::parse(&url)
                 .ok()
                 .and_then(|u| u.host_str().map(|s| s.to_string()))
@@ -162,14 +175,15 @@ async fn main() -> Result<()> {
             path_filter,
             no_robots,
         } => {
-            let client = engine::Client::new(proxy)?;
+            let client = TransportClient::new(&session::storage_path()?, proxy, timeout)?;
+            let cef = CefRenderer::new(proxy.map(str::to_string), cef_timeout, false);
             let options = crawl::MapOptions {
                 limit: limit.min(5000),
                 use_sitemap: !no_sitemap,
                 respect_robots: !no_robots,
                 path_filter,
             };
-            let result = crawl::map(&client, &url, options).await?;
+            let result = crawl::map(&client, &cef, &url, options).await?;
             let host = url::Url::parse(&url)
                 .ok()
                 .and_then(|u| u.host_str().map(|s| s.to_string()))
@@ -181,10 +195,11 @@ async fn main() -> Result<()> {
             SessionAction::Clear => session::clear(),
         },
         Command::Status => {
+            let cef = CefRenderer::new(None, cef_timeout, false);
             println!("mesh-wick {}", env!("CARGO_PKG_VERSION"));
             println!(
                 "CEF renderer: {}",
-                if cef::is_available() { "installed" } else { "not installed" }
+                if cef.is_available() { "installed" } else { "not installed" }
             );
             Ok(())
         }
