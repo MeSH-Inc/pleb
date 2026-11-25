@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use mesh_wick::transport::{cef::CefRenderer, TransportClient};
 use mesh_wick::{crawl, extract, fetch, search, session};
+use std::str::FromStr;
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -94,11 +95,11 @@ async fn main() -> Result<()> {
         } => {
             let client = TransportClient::new(&session::storage_path()?, proxy, timeout)?;
             let cef = CefRenderer::new(proxy.map(str::to_string), cef_timeout, false);
-            let parsed_format = extract::Format::from_str(&format);
+            let parsed_format = extract::OutputFormat::from_str(&format)?;
             let render_mode = fetch::RenderMode::from_str(&render);
             let selector = wait_for_selector.as_deref();
 
-            if parsed_format == extract::Format::Raw {
+            if parsed_format == extract::OutputFormat::Raw {
                 use std::io::{IsTerminal, Write};
                 if std::io::stdout().is_terminal() {
                     anyhow::bail!("refusing to write raw bytes to a terminal.");
@@ -156,7 +157,7 @@ async fn main() -> Result<()> {
             let options = crawl::CrawlOptions {
                 max_depth: depth.min(5),
                 max_pages: max_pages.min(50),
-                format: extract::Format::Markdown,
+                format: extract::OutputFormat::Markdown,
                 respect_robots: !no_robots,
                 path_filter,
             };

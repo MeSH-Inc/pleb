@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::time::Instant;
 
-use crate::extract::{self, Format};
+use crate::extract::{self, ExtractOptions, OutputFormat};
 use crate::robots;
 use crate::site_cache;
 use crate::site_rules;
@@ -51,7 +51,7 @@ pub async fn fetch(
     client: &TransportClient,
     cef: &CefRenderer,
     url: &str,
-    format: Format,
+    format: OutputFormat,
     respect_robots: bool,
     render: RenderMode,
     wait_for_selector: Option<&str>,
@@ -115,10 +115,15 @@ pub async fn fetch(
                 cef_installed,
             ));
 
+    let extract_opts = ExtractOptions {
+        format,
+        ..Default::default()
+    };
+
     if cef_first {
         match cef_render_with_retry(cef, url, effective_selector).await {
             Ok(html) => {
-                let extracted = extract::extract(&html, &parsed, format)?;
+                let extracted = extract::extract_document(&html, &parsed, Some("text/html"), &extract_opts)?;
                 let timing_ms = start.elapsed().as_millis() as u64;
                 site_cache::record(host, "cef", false, timing_ms);
                 return Ok(FetchResult {
@@ -143,11 +148,12 @@ pub async fn fetch(
     let escalated_from = if cef_first { Some("cef") } else { None };
     let resp = client.get(url).await?;
     let status = resp.status;
+    let content_type = resp.content_type.clone();
     let body = resp.text();
 
     if (status == 403 || status == 503) && escalated_from.is_none() && render != RenderMode::Cronet && cef_installed {
         if let Ok(html) = cef_render_with_retry(cef, url, effective_selector).await {
-            let extracted = extract::extract(&html, &parsed, format)?;
+            let extracted = extract::extract_document(&html, &parsed, Some("text/html"), &extract_opts)?;
             let timing_ms = start.elapsed().as_millis() as u64;
             site_cache::record(host, "cef", false, timing_ms);
             return Ok(FetchResult {
@@ -174,7 +180,7 @@ pub async fn fetch(
     let js_shell = is_js_required_shell(&body);
     if escalated_from.is_none() && js_shell && render != RenderMode::Cronet && cef_installed {
         if let Ok(html) = cef_render_with_retry(cef, url, effective_selector).await {
-            let extracted = extract::extract(&html, &parsed, format)?;
+            let extracted = extract::extract_document(&html, &parsed, Some("text/html"), &extract_opts)?;
             let timing_ms = start.elapsed().as_millis() as u64;
             site_cache::record(host, "cef", false, timing_ms);
             return Ok(FetchResult {
@@ -187,7 +193,7 @@ pub async fn fetch(
         }
     }
 
-    let extracted = extract::extract(&body, &parsed, format)?;
+    let extracted = extract::extract_document(&body, &parsed, content_type.as_deref(), &extract_opts)?;
     let timing_ms = start.elapsed().as_millis() as u64;
     site_cache::record(host, "cronet", false, timing_ms);
     Ok(FetchResult {

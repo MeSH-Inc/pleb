@@ -8,7 +8,7 @@ use anyhow::Result;
 use scraper::{Html, Selector};
 use url::Url;
 
-use crate::extract::{self, Format};
+use crate::extract::{self, ExtractOptions, ExtractedDocument, OutputFormat};
 use crate::fetch;
 use crate::transport::{cef::CefRenderer, TransportClient};
 
@@ -17,7 +17,7 @@ use crate::transport::{cef::CefRenderer, TransportClient};
 pub struct CrawlOptions {
     pub max_depth: u32,
     pub max_pages: u32,
-    pub format: Format,
+    pub format: OutputFormat,
     pub respect_robots: bool,
     pub path_filter: Option<String>,
 }
@@ -108,25 +108,22 @@ pub async fn crawl(
 
         // Extract content
         let page_url = Url::parse(&url).unwrap_or(parsed.clone());
-        let extracted = extract::extract(&html_result.html, &page_url, options.format)
-            .unwrap_or(extract::Extracted {
+        let opts = ExtractOptions {
+            format: options.format,
+            max_bytes: Some(10_000),
+            ..Default::default()
+        };
+        let extracted = extract::extract_document(&html_result.html, &page_url, Some("text/html"), &opts)
+            .unwrap_or(ExtractedDocument {
                 content: String::new(),
                 title: None,
+                truncated: false,
             });
-
-        // Cap per-page content at 10K chars
-        let content = if extracted.content.len() > 10_000 {
-            let mut truncated = extracted.content[..10_000].to_string();
-            truncated.push_str("\n\n[... truncated]");
-            truncated
-        } else {
-            extracted.content
-        };
 
         pages.push(CrawlPage {
             url: url.clone(),
             title: extracted.title,
-            content,
+            content: extracted.content,
             depth,
         });
     }

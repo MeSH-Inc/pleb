@@ -842,6 +842,7 @@ dependencies = [
  "anyhow",
  "cc",
  "clap",
+ "ego-tree",
  "htmd",
  "reqwest",
  "robotstxt",
