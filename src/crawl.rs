@@ -1,27 +1,25 @@
-//! BFS crawl engine for wick_crawl and wick_map.
-//! Follows same-domain links, respects rate limits, returns markdown per page.
-
-use std::collections::{HashSet, VecDeque};
-use std::time::{Duration, Instant};
-
 use anyhow::Result;
 use scraper::{Html, Selector};
+use serde::Serialize;
+use std::collections::{HashSet, VecDeque};
+use std::time::{Duration, Instant};
 use url::Url;
 
-use crate::extract::{self, ExtractOptions, ExtractedDocument, OutputFormat};
+use crate::context::RuntimeContext;
+use crate::extract::{self, ExtractMode, ExtractOptions, ExtractedDocument, OutputFormat};
 use crate::fetch;
-use crate::transport::{cef::CefRenderer, TransportClient};
 
-// ── Crawl ────────────────────────────────────────────────────
-
+#[derive(Debug, Clone)]
 pub struct CrawlOptions {
     pub max_depth: u32,
     pub max_pages: u32,
     pub format: OutputFormat,
+    pub extract_mode: ExtractMode,
     pub respect_robots: bool,
     pub path_filter: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
 pub struct CrawlPage {
     pub url: String,
     pub title: Option<String>,
@@ -29,6 +27,7 @@ pub struct CrawlPage {
     pub depth: u32,
 }
 
+#[derive(Debug, Clone, Serialize)]
 pub struct CrawlResult {
     pub pages: Vec<CrawlPage>,
     pub urls_discovered: usize,
@@ -36,8 +35,7 @@ pub struct CrawlResult {
 }
 
 pub async fn crawl(
-    client: &TransportClient,
-    cef: &CefRenderer,
+    ctx: &RuntimeContext,
     start_url: &str,
     options: CrawlOptions,
 ) -> Result<CrawlResult> {
@@ -59,13 +57,11 @@ pub async fn crawl(
             break;
         }
 
-        // Rate limit: 500ms between requests
         if !pages.is_empty() {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
-        let html_result = fetch::fetch_html(client, cef, &url, options.respect_robots).await;
-        let html_result = match html_result {
+        let html_result = match fetch::fetch_html(ctx, &url, options.respect_robots).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!("crawl skip {}: {}", url, e);
@@ -77,11 +73,9 @@ pub async fn crawl(
             continue;
         }
 
-        // Extract links for BFS (before depth limit check on children)
         if depth < options.max_depth {
-            let page_url = Url::parse(&url).unwrap_or(parsed.clone());
-            let links = extract_links(&html_result.html, &page_url);
-            for link in links {
+            let page_url = Url::parse(&html_result.url).unwrap_or_else(|_| parsed.clone());
+            for link in extract_links(&html_result.html, &page_url) {
                 let link_str = link.to_string();
                 let norm = normalize_url(&link_str);
 
@@ -93,10 +87,7 @@ pub async fn crawl(
                         continue;
                     }
                 }
-                if !is_crawlable_extension(&link) {
-                    continue;
-                }
-                if visited.contains(&norm) {
+                if !is_crawlable_extension(&link) || visited.contains(&norm) {
                     continue;
                 }
 
@@ -106,10 +97,10 @@ pub async fn crawl(
             }
         }
 
-        // Extract content
-        let page_url = Url::parse(&url).unwrap_or(parsed.clone());
+        let page_url = Url::parse(&html_result.url).unwrap_or_else(|_| parsed.clone());
         let opts = ExtractOptions {
             format: options.format,
+            mode: options.extract_mode,
             max_bytes: Some(10_000),
             ..Default::default()
         };
@@ -121,7 +112,7 @@ pub async fn crawl(
             });
 
         pages.push(CrawlPage {
-            url: url.clone(),
+            url: html_result.url,
             title: extracted.title,
             content: extracted.content,
             depth,
@@ -155,7 +146,6 @@ pub fn format_crawl_output(result: &CrawlResult, host: &str) -> String {
             page.content,
         );
 
-        // Cap total output at 100K chars
         if total_len + section.len() > 100_000 {
             out.push_str(&format!(
                 "\n---\n*Output truncated. {} more pages not shown.*\n",
@@ -170,8 +160,7 @@ pub fn format_crawl_output(result: &CrawlResult, host: &str) -> String {
     out
 }
 
-// ── Map ──────────────────────────────────────────────────────
-
+#[derive(Debug, Clone)]
 pub struct MapOptions {
     pub limit: u32,
     pub use_sitemap: bool,
@@ -179,6 +168,7 @@ pub struct MapOptions {
     pub path_filter: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
 pub struct MapResult {
     pub urls: Vec<String>,
     pub timing_ms: u64,
@@ -186,8 +176,7 @@ pub struct MapResult {
 }
 
 pub async fn map(
-    client: &TransportClient,
-    cef: &CefRenderer,
+    ctx: &RuntimeContext,
     start_url: &str,
     options: MapOptions,
 ) -> Result<MapResult> {
@@ -200,10 +189,8 @@ pub async fn map(
     let mut visited: HashSet<String> = HashSet::new();
     let mut from_sitemap = 0;
 
-    // Try sitemap.xml first
     if options.use_sitemap {
-        let sitemap_urls = fetch_sitemap(client, &parsed).await;
-        for url in sitemap_urls {
+        for url in fetch_sitemap(ctx, &parsed).await {
             let norm = normalize_url(&url);
             if !visited.contains(&norm) {
                 if let Some(ref prefix) = options.path_filter {
@@ -223,7 +210,6 @@ pub async fn map(
         }
     }
 
-    // BFS link crawl for additional discovery
     let mut queue: VecDeque<String> = VecDeque::new();
     let seed_norm = normalize_url(start_url);
     if !visited.contains(&seed_norm) {
@@ -233,7 +219,7 @@ pub async fn map(
     queue.push_back(start_url.to_string());
 
     let mut pages_fetched = 0;
-    let max_fetch = 20.min(limit); // Don't fetch more than 20 pages for map
+    let max_fetch = 20.min(limit);
 
     while let Some(url) = queue.pop_front() {
         if discovered.len() >= limit || pages_fetched >= max_fetch {
@@ -244,17 +230,14 @@ pub async fn map(
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
 
-        let html_result = fetch::fetch_html(client, cef, &url, options.respect_robots).await;
-        let html_result = match html_result {
+        let html_result = match fetch::fetch_html(ctx, &url, options.respect_robots).await {
             Ok(r) if r.status_code < 400 && !r.html.is_empty() => r,
             _ => continue,
         };
         pages_fetched += 1;
 
-        let page_url = Url::parse(&url).unwrap_or(parsed.clone());
-        let links = extract_links(&html_result.html, &page_url);
-
-        for link in links {
+        let page_url = Url::parse(&html_result.url).unwrap_or_else(|_| parsed.clone());
+        for link in extract_links(&html_result.html, &page_url) {
             let link_str = link.to_string();
             let norm = normalize_url(&link_str);
 
@@ -266,10 +249,7 @@ pub async fn map(
                     continue;
                 }
             }
-            if !is_crawlable_extension(&link) {
-                continue;
-            }
-            if visited.contains(&norm) {
+            if !is_crawlable_extension(&link) || visited.contains(&norm) {
                 continue;
             }
 
@@ -293,11 +273,7 @@ pub async fn map(
 }
 
 pub fn format_map_output(result: &MapResult, host: &str) -> String {
-    let mut out = format!(
-        "# Site Map: {}\nFound {} URLs",
-        host,
-        result.urls.len(),
-    );
+    let mut out = format!("# Site Map: {}\nFound {} URLs", host, result.urls.len());
     if result.from_sitemap > 0 {
         out.push_str(&format!(" ({} from sitemap.xml)", result.from_sitemap));
     }
@@ -309,12 +285,14 @@ pub fn format_map_output(result: &MapResult, host: &str) -> String {
     out
 }
 
-// ── Sitemap ──────────────────────────────────────────────────
+async fn fetch_sitemap(ctx: &RuntimeContext, base_url: &Url) -> Vec<String> {
+    let sitemap_url = format!(
+        "{}://{}/sitemap.xml",
+        base_url.scheme(),
+        base_url.host_str().unwrap_or("")
+    );
 
-async fn fetch_sitemap(client: &TransportClient, base_url: &Url) -> Vec<String> {
-    let sitemap_url = format!("{}://{}/sitemap.xml", base_url.scheme(), base_url.host_str().unwrap_or(""));
-
-    let resp = match client.get(&sitemap_url).await {
+    let resp = match ctx.client.get(&sitemap_url).await {
         Ok(r) if r.status < 400 => r,
         _ => return Vec::new(),
     };
@@ -324,22 +302,16 @@ async fn fetch_sitemap(client: &TransportClient, base_url: &Url) -> Vec<String> 
 
 fn parse_sitemap_xml(xml: &str) -> Vec<String> {
     let mut urls = Vec::new();
-
-    // Simple regex-free parsing: find all <loc>...</loc> tags
-    let lower = xml.to_lowercase();
+    let lower = xml.to_ascii_lowercase();
     let mut search_from = 0;
+
     while let Some(start_tag) = lower[search_from..].find("<loc>") {
         let content_start = search_from + start_tag + 5;
         if let Some(end_offset) = lower[content_start..].find("</loc>") {
             let content_end = content_start + end_offset;
             let url = xml[content_start..content_end].trim();
-            if url.starts_with("http") {
-                // Check if this is a nested sitemap (sitemap index)
-                if url.ends_with(".xml") || url.ends_with(".xml.gz") {
-                    // Skip nested sitemaps for now — keep it simple
-                } else {
-                    urls.push(url.to_string());
-                }
+            if url.starts_with("http") && !url.ends_with(".xml") && !url.ends_with(".xml.gz") {
+                urls.push(url.to_string());
             }
             search_from = content_end + 6;
         } else {
@@ -350,8 +322,6 @@ fn parse_sitemap_xml(xml: &str) -> Vec<String> {
     urls
 }
 
-// ── Link extraction ──────────────────────────────────────────
-
 fn extract_links(html: &str, page_url: &Url) -> Vec<Url> {
     let doc = Html::parse_document(html);
     let selector = Selector::parse("a[href]").unwrap();
@@ -361,7 +331,11 @@ fn extract_links(html: &str, page_url: &Url) -> Vec<Url> {
     for element in doc.select(&selector) {
         if let Some(href) = element.value().attr("href") {
             let href = href.trim();
-            if href.is_empty() || href.starts_with('#') || href.starts_with("javascript:") || href.starts_with("mailto:") {
+            if href.is_empty()
+                || href.starts_with('#')
+                || href.starts_with("javascript:")
+                || href.starts_with("mailto:")
+            {
                 continue;
             }
             if let Ok(resolved) = page_url.join(href) {
@@ -377,14 +351,11 @@ fn extract_links(html: &str, page_url: &Url) -> Vec<Url> {
     links
 }
 
-// ── URL utilities ────────────────────────────────────────────
-
 fn normalize_url(url: &str) -> String {
     match Url::parse(url) {
         Ok(mut u) => {
             u.set_fragment(None);
             let mut s = u.to_string();
-            // Remove trailing slash (except for root path)
             if s.ends_with('/') && u.path() != "/" {
                 s.pop();
             }
@@ -404,14 +375,12 @@ fn is_same_origin(url: &Url, origin: &str) -> bool {
 }
 
 const SKIP_EXTENSIONS: &[&str] = &[
-    ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".ico", ".bmp",
-    ".pdf", ".zip", ".tar", ".gz", ".rar",
-    ".css", ".js", ".woff", ".woff2", ".ttf", ".eot",
-    ".mp3", ".mp4", ".avi", ".mov", ".wmv", ".flv",
-    ".xml", ".json", ".rss", ".atom",
+    ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".ico", ".bmp", ".pdf", ".zip", ".tar",
+    ".gz", ".rar", ".css", ".js", ".woff", ".woff2", ".ttf", ".eot", ".mp3", ".mp4", ".avi",
+    ".mov", ".wmv", ".flv", ".xml", ".json", ".rss", ".atom",
 ];
 
 fn is_crawlable_extension(url: &Url) -> bool {
-    let path = url.path().to_lowercase();
+    let path = url.path().to_ascii_lowercase();
     !SKIP_EXTENSIONS.iter().any(|ext| path.ends_with(ext))
 }

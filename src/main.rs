@@ -1,9 +1,11 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use mesh_wick::transport::{cef::CefRenderer, TransportClient};
-use mesh_wick::{crawl, extract, fetch, search, session};
+use mesh_wick::context::{default_state_dir, RuntimeConfig, RuntimeContext};
+use mesh_wick::extract::{ExtractMode, ExtractOptions, OutputFormat};
+use mesh_wick::fetch::{self, FetchOptions};
+use mesh_wick::policy::RenderMode;
+use mesh_wick::{crawl, search};
 use std::str::FromStr;
-use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "mesh-wick", version, about = "Local browser-grade web fetch and search CLI for AI agents")]
@@ -28,7 +30,7 @@ enum Command {
         #[arg(long)]
         wait_for_selector: Option<String>,
         #[arg(long)]
-        no_robots: bool,
+        respect_robots: bool,
         #[arg(long)]
         json: bool,
     },
@@ -80,9 +82,12 @@ enum SessionAction {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let proxy = cli.proxy.as_deref();
-    let timeout = Duration::from_secs(30);
-    let cef_timeout = Duration::from_secs(60);
+    let config = RuntimeConfig {
+        state_dir: default_state_dir(),
+        proxy: cli.proxy,
+        ..Default::default()
+    };
+    let ctx = RuntimeContext::new(config)?;
 
     match cli.command {
         Command::Fetch {
@@ -90,45 +95,36 @@ async fn main() -> Result<()> {
             format,
             render,
             wait_for_selector,
-            no_robots,
+            respect_robots,
             json,
         } => {
-            let client = TransportClient::new(&session::storage_path()?, proxy, timeout)?;
-            let cef = CefRenderer::new(proxy.map(str::to_string), cef_timeout, false);
-            let parsed_format = extract::OutputFormat::from_str(&format)?;
-            let render_mode = fetch::RenderMode::from_str(&render);
-            let selector = wait_for_selector.as_deref();
+            let parsed_format = OutputFormat::from_str(&format)?;
+            let render_mode = RenderMode::from_str(&render)?;
 
-            if parsed_format == extract::OutputFormat::Raw {
+            if parsed_format == OutputFormat::Raw {
                 use std::io::{IsTerminal, Write};
                 if std::io::stdout().is_terminal() {
                     anyhow::bail!("refusing to write raw bytes to a terminal.");
                 }
-                let result = fetch::fetch_raw(&client, &url, !no_robots).await?;
+                let result = fetch::fetch_raw(&ctx, &url, respect_robots).await?;
                 std::io::stdout().write_all(&result.bytes)?;
                 return Ok(());
             }
 
-            let result = fetch::fetch(
-                &client,
-                &cef,
-                &url,
-                parsed_format,
-                !no_robots,
-                render_mode,
-                selector,
-            )
-            .await?;
+            let opts = FetchOptions {
+                extract: ExtractOptions {
+                    format: parsed_format,
+                    ..Default::default()
+                },
+                render: render_mode,
+                wait_for_selector,
+                respect_robots,
+                apply_rewrites: true,
+            };
+            let result = fetch::fetch_document(&ctx, &url, &opts).await?;
 
             if json {
-                let out = serde_json::json!({
-                    "url": result.url,
-                    "status_code": result.status_code,
-                    "timing_ms": result.timing_ms,
-                    "content_bytes": result.content.len(),
-                    "title": result.title,
-                });
-                println!("{}", out);
+                println!("{}", serde_json::to_string(&result)?);
                 return Ok(());
             }
 
@@ -140,8 +136,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Search { query, num } => {
-            let client = TransportClient::new(&session::storage_path()?, proxy, timeout)?;
-            let results = search::search(&client, &query, num).await?;
+            let results = search::search(&ctx.client, &query, num).await?;
             println!("{}", search::format_results(&results));
             Ok(())
         }
@@ -152,16 +147,15 @@ async fn main() -> Result<()> {
             path_filter,
             no_robots,
         } => {
-            let client = TransportClient::new(&session::storage_path()?, proxy, timeout)?;
-            let cef = CefRenderer::new(proxy.map(str::to_string), cef_timeout, false);
             let options = crawl::CrawlOptions {
                 max_depth: depth.min(5),
                 max_pages: max_pages.min(50),
-                format: extract::OutputFormat::Markdown,
+                format: OutputFormat::Markdown,
+                extract_mode: ExtractMode::Clean,
                 respect_robots: !no_robots,
                 path_filter,
             };
-            let result = crawl::crawl(&client, &cef, &url, options).await?;
+            let result = crawl::crawl(&ctx, &url, options).await?;
             let host = url::Url::parse(&url)
                 .ok()
                 .and_then(|u| u.host_str().map(|s| s.to_string()))
@@ -176,15 +170,13 @@ async fn main() -> Result<()> {
             path_filter,
             no_robots,
         } => {
-            let client = TransportClient::new(&session::storage_path()?, proxy, timeout)?;
-            let cef = CefRenderer::new(proxy.map(str::to_string), cef_timeout, false);
             let options = crawl::MapOptions {
                 limit: limit.min(5000),
                 use_sitemap: !no_sitemap,
                 respect_robots: !no_robots,
                 path_filter,
             };
-            let result = crawl::map(&client, &cef, &url, options).await?;
+            let result = crawl::map(&ctx, &url, options).await?;
             let host = url::Url::parse(&url)
                 .ok()
                 .and_then(|u| u.host_str().map(|s| s.to_string()))
@@ -193,14 +185,13 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Session { action } => match action {
-            SessionAction::Clear => session::clear(),
+            SessionAction::Clear => ctx.clear_session(),
         },
         Command::Status => {
-            let cef = CefRenderer::new(None, cef_timeout, false);
             println!("mesh-wick {}", env!("CARGO_PKG_VERSION"));
             println!(
                 "CEF renderer: {}",
-                if cef.is_available() { "installed" } else { "not installed" }
+                if ctx.cef.is_available() { "installed" } else { "not installed" }
             );
             Ok(())
         }

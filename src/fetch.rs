@@ -1,388 +1,470 @@
-use anyhow::Result;
+use serde::Serialize;
 use std::time::Instant;
+use thiserror::Error;
 
+use crate::context::RuntimeContext;
 use crate::extract::{self, ExtractOptions, OutputFormat};
-use crate::robots;
-use crate::site_cache;
-use crate::site_rules;
+use crate::policy::{
+    classify_response, detect_interstitial_challenge, plan_strategy, PrimaryTransport, RenderMode,
+    ResponseClassification,
+};
 use crate::transport::cef::{CefRenderOptions, CefRenderer};
-use crate::transport::TransportClient;
 
-pub struct FetchResult {
-    pub content: String,
-    pub title: Option<String>,
+#[derive(Debug, Error)]
+pub enum FetchError {
+    #[error("invalid URL: {0}")]
+    InvalidUrl(String),
+
+    #[error("blocked by robots.txt on {host}: {url}")]
+    RobotsDisallowed { host: String, url: String },
+
+    #[error("HTTP {status} blocked fetching {url}: {detail}")]
+    Blocked {
+        url: String,
+        status: u16,
+        detail: String,
+    },
+
+    #[error("challenge encountered (HTTP {status}) on {url}: {reason}")]
+    Challenge {
+        url: String,
+        status: u16,
+        reason: String,
+    },
+
+    #[error("HTTP {status} error fetching {url}")]
+    HttpError { url: String, status: u16 },
+
+    #[error("CEF renderer unavailable: {0}")]
+    CefUnavailable(String),
+
+    #[error(transparent)]
+    Transport(#[from] anyhow::Error),
+}
+
+impl FetchError {
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::RobotsDisallowed { .. } | Self::Blocked { .. } | Self::Challenge { .. } => 2,
+            Self::HttpError { .. } => 3,
+            Self::InvalidUrl(_) | Self::CefUnavailable(_) | Self::Transport(_) => 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FetchOptions {
+    pub extract: ExtractOptions,
+    pub render: RenderMode,
+    pub wait_for_selector: Option<String>,
+    pub respect_robots: bool,
+    pub apply_rewrites: bool,
+}
+
+impl Default for FetchOptions {
+    fn default() -> Self {
+        Self {
+            extract: ExtractOptions::default(),
+            render: RenderMode::Auto,
+            wait_for_selector: None,
+            respect_robots: false,
+            apply_rewrites: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FetchOutput {
     pub url: String,
+    pub final_url: String,
     pub status_code: u16,
+    pub content_type: Option<String>,
+    pub title: Option<String>,
+    pub content: String,
+    pub strategy: String,
+    pub escalated: bool,
+    pub truncated: bool,
     pub timing_ms: u64,
 }
 
+#[derive(Debug, Clone)]
 pub struct FetchHtmlResult {
     pub html: String,
     pub url: String,
     pub status_code: u16,
 }
 
+#[derive(Debug, Clone)]
 pub struct FetchRawResult {
     pub bytes: Vec<u8>,
     pub url: String,
+    pub final_url: String,
     pub status_code: u16,
+    pub content_type: Option<String>,
     pub timing_ms: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum RenderMode {
-    #[default]
-    Auto,
-    Cef,
-    Cronet,
+struct AcquiredPage {
+    body: String,
+    final_url: String,
+    status_code: u16,
+    content_type: Option<String>,
+    strategy: String,
+    escalated: bool,
 }
 
-impl RenderMode {
-    pub fn from_str(s: &str) -> RenderMode {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "cef" | "browser" | "render" | "js" => RenderMode::Cef,
-            "cronet" | "network" | "fast" | "no-js" | "nojs" => RenderMode::Cronet,
-            _ => RenderMode::Auto,
-        }
-    }
-}
-
-pub async fn fetch(
-    client: &TransportClient,
-    cef: &CefRenderer,
+pub async fn fetch_document(
+    ctx: &RuntimeContext,
     url: &str,
-    format: OutputFormat,
-    respect_robots: bool,
-    render: RenderMode,
-    wait_for_selector: Option<&str>,
-) -> Result<FetchResult> {
+    options: &FetchOptions,
+) -> std::result::Result<FetchOutput, FetchError> {
     let start = Instant::now();
-
-    let parsed = url::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid URL: {}", e))?;
-    match parsed.scheme() {
-        "http" | "https" => {}
-        s => anyhow::bail!("unsupported scheme {:?} (only http and https)", s),
+    if options.extract.format == OutputFormat::Raw {
+        return Err(FetchError::Transport(anyhow::anyhow!(
+            "use fetch_raw for OutputFormat::Raw"
+        )));
     }
 
-    let host = parsed
+    let parsed = parse_http_url(url)?;
+    let effective = resolve_target_url(ctx, &parsed, options.apply_rewrites);
+    let effective_str = effective.as_str();
+    let host = effective
         .host_str()
-        .ok_or_else(|| anyhow::anyhow!("missing host"))?;
+        .ok_or_else(|| FetchError::InvalidUrl("missing host".to_string()))?;
 
-    if host == "www.reddit.com" || host == "reddit.com" {
-        let old_url = url
-            .replace("://www.reddit.com", "://old.reddit.com")
-            .replace("://reddit.com", "://old.reddit.com");
-        return Box::pin(fetch(
-            client,
-            cef,
-            &old_url,
-            format,
-            respect_robots,
-            render,
-            wait_for_selector,
-        ))
-        .await;
-    }
-
-    if respect_robots && !robots::check(client, url).await {
-        return Ok(FetchResult {
-            content: format!(
-                "Blocked by robots.txt: {} disallows this path for automated agents.",
-                host
-            ),
-            title: None,
-            url: url.to_string(),
-            status_code: 0,
-            timing_ms: start.elapsed().as_millis() as u64,
+    if options.respect_robots && !ctx.robots.is_allowed(&ctx.client, effective_str).await {
+        return Err(FetchError::RobotsDisallowed {
+            host: host.to_string(),
+            url: effective_str.to_string(),
         });
     }
 
-    let cef_installed = cef.is_available();
-    let cached = site_cache::get(host);
-    let rule = site_rules::get(host);
-    let effective_selector =
-        wait_for_selector.or_else(|| rule.as_ref().and_then(|r| r.wait_for_selector.as_deref()));
+    let page = acquire_page(
+        ctx,
+        &effective,
+        options.render,
+        options.wait_for_selector.as_deref(),
+    )
+    .await?;
 
-    if render == RenderMode::Cef && !cef_installed {
-        anyhow::bail!("render=cef requested but the CEF renderer is not installed.");
-    }
+    let extracted = extract::extract_document(
+        &page.body,
+        &effective,
+        page.content_type.as_deref(),
+        &options.extract,
+    )?;
 
-    let cef_first = render == RenderMode::Cef
-        || (render == RenderMode::Auto
-            && should_use_cef_first(
-                rule.as_ref().map(|r| r.render.as_str()),
-                cached.as_ref().map(|s| s.strategy.as_str()),
-                cef_installed,
-            ));
-
-    let extract_opts = ExtractOptions {
-        format,
-        ..Default::default()
-    };
-
-    if cef_first {
-        match cef_render_with_retry(cef, url, effective_selector).await {
-            Ok(html) => {
-                let extracted = extract::extract_document(&html, &parsed, Some("text/html"), &extract_opts)?;
-                let timing_ms = start.elapsed().as_millis() as u64;
-                site_cache::record(host, "cef", false, timing_ms);
-                return Ok(FetchResult {
-                    content: extracted.content,
-                    title: extracted.title,
-                    url: url.to_string(),
-                    status_code: 200,
-                    timing_ms,
-                });
-            }
-            Err(e) => {
-                let timing_ms = start.elapsed().as_millis() as u64;
-                site_cache::record(host, "cef_timeout", false, timing_ms);
-                if render == RenderMode::Cef {
-                    return Err(anyhow::anyhow!("CEF renderer failed: {}", e));
-                }
-                tracing::warn!("CEF renderer failed: {}. Falling back to transport.", e);
-            }
-        }
-    }
-
-    let escalated_from = if cef_first { Some("cef") } else { None };
-    let resp = client.get(url).await?;
-    let status = resp.status;
-    let content_type = resp.content_type.clone();
-    let body = resp.text();
-
-    if (status == 403 || status == 503) && escalated_from.is_none() && render != RenderMode::Cronet && cef_installed {
-        if let Ok(html) = cef_render_with_retry(cef, url, effective_selector).await {
-            let extracted = extract::extract_document(&html, &parsed, Some("text/html"), &extract_opts)?;
-            let timing_ms = start.elapsed().as_millis() as u64;
-            site_cache::record(host, "cef", false, timing_ms);
-            return Ok(FetchResult {
-                content: extracted.content,
-                title: extracted.title,
-                url: url.to_string(),
-                status_code: 200,
-                timing_ms,
-            });
-        }
-    }
-
-    if status >= 400 {
-        let timing_ms = start.elapsed().as_millis() as u64;
-        return Ok(FetchResult {
-            content: format!("HTTP {}: {}", status, body),
-            title: None,
-            url: url.to_string(),
-            status_code: status,
-            timing_ms,
-        });
-    }
-
-    let js_shell = is_js_required_shell(&body);
-    if escalated_from.is_none() && js_shell && render != RenderMode::Cronet && cef_installed {
-        if let Ok(html) = cef_render_with_retry(cef, url, effective_selector).await {
-            let extracted = extract::extract_document(&html, &parsed, Some("text/html"), &extract_opts)?;
-            let timing_ms = start.elapsed().as_millis() as u64;
-            site_cache::record(host, "cef", false, timing_ms);
-            return Ok(FetchResult {
-                content: extracted.content,
-                title: extracted.title,
-                url: url.to_string(),
-                status_code: 200,
-                timing_ms,
-            });
-        }
-    }
-
-    let extracted = extract::extract_document(&body, &parsed, content_type.as_deref(), &extract_opts)?;
-    let timing_ms = start.elapsed().as_millis() as u64;
-    site_cache::record(host, "cronet", false, timing_ms);
-    Ok(FetchResult {
-        content: extracted.content,
+    Ok(FetchOutput {
+        url: url.to_string(),
+        final_url: page.final_url,
+        status_code: page.status_code,
+        content_type: page.content_type,
         title: extracted.title,
-        url: resp.final_url,
-        status_code: status,
-        timing_ms,
+        content: extracted.content,
+        strategy: page.strategy,
+        escalated: page.escalated,
+        truncated: extracted.truncated,
+        timing_ms: start.elapsed().as_millis() as u64,
     })
 }
 
-async fn cef_render_with_retry(
-    cef: &CefRenderer,
-    url: &str,
-    wait_for_selector: Option<&str>,
-) -> Result<String> {
-    let opts = CefRenderOptions {
-        wait_for_selector: wait_for_selector.map(|s| s.to_string()),
-    };
-    match cef.render(url, &opts).await {
-        Ok(html) if is_acceptable_render(&html) => Ok(html),
-        _ => cef.render(url, &opts).await,
-    }
-}
-
-fn is_acceptable_render(html: &str) -> bool {
-    html.len() >= 2000 && !looks_like_cloudflare_interstitial(html)
-}
-
-fn looks_like_cloudflare_interstitial(html: &str) -> bool {
-    let lower = html.to_lowercase();
-    lower.contains("just a moment")
-        && (lower.contains("performing security verification")
-            || lower.contains("checking your browser")
-            || lower.contains("challenge-platform"))
-}
-
 pub async fn fetch_html(
-    client: &TransportClient,
-    cef: &CefRenderer,
+    ctx: &RuntimeContext,
     url: &str,
     respect_robots: bool,
-) -> Result<FetchHtmlResult> {
-    let start = Instant::now();
-    let parsed = url::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid URL: {}", e))?;
-    let host = parsed
+) -> std::result::Result<FetchHtmlResult, FetchError> {
+    let parsed = parse_http_url(url)?;
+    let effective = resolve_target_url(ctx, &parsed, true);
+    let effective_str = effective.as_str();
+    let host = effective
         .host_str()
-        .ok_or_else(|| anyhow::anyhow!("missing host"))?;
+        .ok_or_else(|| FetchError::InvalidUrl("missing host".to_string()))?;
 
-    if host == "www.reddit.com" || host == "reddit.com" {
-        let old_url = url
-            .replace("://www.reddit.com", "://old.reddit.com")
-            .replace("://reddit.com", "://old.reddit.com");
-        return Box::pin(fetch_html(client, cef, &old_url, respect_robots)).await;
-    }
-
-    if respect_robots && !robots::check(client, url).await {
-        return Ok(FetchHtmlResult {
-            html: String::new(),
-            url: url.to_string(),
-            status_code: 0,
+    if respect_robots && !ctx.robots.is_allowed(&ctx.client, effective_str).await {
+        return Err(FetchError::RobotsDisallowed {
+            host: host.to_string(),
+            url: effective_str.to_string(),
         });
     }
 
-    let cef_installed = cef.is_available();
-    let cached = site_cache::get(host);
-    let rule = site_rules::get(host);
-    let effective_selector = rule.as_ref().and_then(|r| r.wait_for_selector.as_deref());
-    let cef_first = should_use_cef_first(
-        rule.as_ref().map(|r| r.render.as_str()),
-        cached.as_ref().map(|s| s.strategy.as_str()),
-        cef_installed,
-    );
-
-    if cef_first {
-        match cef_render_with_retry(cef, url, effective_selector).await {
-            Ok(html) => {
-                let timing_ms = start.elapsed().as_millis() as u64;
-                site_cache::record(host, "cef", false, timing_ms);
-                return Ok(FetchHtmlResult {
-                    html,
-                    url: url.to_string(),
-                    status_code: 200,
-                });
-            }
-            Err(_) => {
-                let timing_ms = start.elapsed().as_millis() as u64;
-                site_cache::record(host, "cef_timeout", false, timing_ms);
-            }
-        }
-    }
-
-    let resp = client.get(url).await?;
-    let timing_ms = start.elapsed().as_millis() as u64;
-    let blocked = matches!(resp.status, 403 | 503);
-
-    if blocked && cef_installed && !cef_first {
-        if let Ok(html) = cef_render_with_retry(cef, url, effective_selector).await {
-            let timing_ms = start.elapsed().as_millis() as u64;
-            site_cache::record(host, "cef", false, timing_ms);
-            return Ok(FetchHtmlResult {
-                html,
-                url: url.to_string(),
-                status_code: 200,
-            });
-        }
-    }
-
-    if !blocked && resp.status < 400 {
-        site_cache::record(host, "cronet", false, timing_ms);
-    }
-
+    let page = acquire_page(ctx, &effective, RenderMode::Auto, None).await?;
     Ok(FetchHtmlResult {
-        html: resp.text(),
-        url: resp.final_url,
-        status_code: resp.status,
+        html: page.body,
+        url: page.final_url,
+        status_code: page.status_code,
     })
 }
 
 pub async fn fetch_raw(
-    client: &TransportClient,
+    ctx: &RuntimeContext,
     url: &str,
     respect_robots: bool,
-) -> Result<FetchRawResult> {
+) -> std::result::Result<FetchRawResult, FetchError> {
     let start = Instant::now();
-    let parsed = url::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid URL: {}", e))?;
-
-    match parsed.scheme() {
-        "http" | "https" => {}
-        s => anyhow::bail!("unsupported scheme {:?} (only http and https)", s),
-    }
-
+    let parsed = parse_http_url(url)?;
     let host = parsed
         .host_str()
-        .ok_or_else(|| anyhow::anyhow!("missing host"))?;
+        .ok_or_else(|| FetchError::InvalidUrl("missing host".to_string()))?;
 
-    if respect_robots && !robots::check(client, url).await {
-        return Ok(FetchRawResult {
-            bytes: Vec::new(),
+    if respect_robots && !ctx.robots.is_allowed(&ctx.client, parsed.as_str()).await {
+        return Err(FetchError::RobotsDisallowed {
+            host: host.to_string(),
             url: url.to_string(),
-            status_code: 0,
-            timing_ms: start.elapsed().as_millis() as u64,
         });
     }
 
-    let resp = client.get(url).await?;
+    let resp = ctx.client.get(parsed.as_str()).await?;
     let timing_ms = start.elapsed().as_millis() as u64;
-    if resp.status >= 200 && resp.status < 400 {
-        site_cache::record(host, "cronet", false, timing_ms);
+
+    if resp.status >= 400 {
+        return Err(FetchError::HttpError {
+            url: resp.final_url,
+            status: resp.status,
+        });
     }
+
+    ctx.site_cache
+        .record(host, ctx.client.transport_name(), timing_ms);
 
     Ok(FetchRawResult {
         bytes: resp.body,
-        url: resp.final_url,
+        url: url.to_string(),
+        final_url: resp.final_url,
         status_code: resp.status,
+        content_type: resp.content_type,
         timing_ms,
     })
 }
 
-fn is_js_required_shell(body: &str) -> bool {
-    if body.len() > 2_000_000 {
-        return false;
+async fn acquire_page(
+    ctx: &RuntimeContext,
+    parsed: &url::Url,
+    render_mode: RenderMode,
+    wait_for_selector: Option<&str>,
+) -> std::result::Result<AcquiredPage, FetchError> {
+    let start = Instant::now();
+    let url_str = parsed.as_str();
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| FetchError::InvalidUrl("missing host".to_string()))?;
+
+    let rule = ctx.rules.get(host);
+    let cached = ctx.site_cache.get(host);
+    let cef_available = ctx.cef.is_available();
+    let effective_selector =
+        wait_for_selector.or_else(|| rule.and_then(|r| r.wait_for_selector.as_deref()));
+
+    if render_mode == RenderMode::Cef && !cef_available {
+        return Err(FetchError::CefUnavailable(
+            "render=cef requested but wick-renderer was not found".to_string(),
+        ));
     }
-    let lower = body.to_lowercase();
-    const SIGNALS: &[&str] = &[
-        "javascript is not available",
-        "we've detected that javascript is disabled",
-        "we’ve detected that javascript is disabled",
-        "you need to enable javascript to run this app",
-        "please enable javascript to continue",
-        "enable javascript and cookies to continue",
-        "this site requires javascript",
-        "enable javascript to see google maps",
-        "when you have eliminated the javascript",
-    ];
-    SIGNALS.iter().any(|s| lower.contains(s))
+
+    let plan = plan_strategy(render_mode, rule, cached.as_ref(), cef_available);
+
+    let mut cef_fallback = false;
+    if plan.primary == PrimaryTransport::Cef {
+        match render_cef_checked(&ctx.cef, url_str, effective_selector).await {
+            Ok(html) => {
+                let timing_ms = start.elapsed().as_millis() as u64;
+                ctx.site_cache.record(host, "cef", timing_ms);
+                return Ok(AcquiredPage {
+                    body: html,
+                    final_url: url_str.to_string(),
+                    status_code: 200,
+                    content_type: Some("text/html".to_string()),
+                    strategy: "cef".to_string(),
+                    escalated: false,
+                });
+            }
+            Err(err) => {
+                let timing_ms = start.elapsed().as_millis() as u64;
+                ctx.site_cache.record(host, "cef_timeout", timing_ms);
+                if !plan.allow_cronet_fallback {
+                    return Err(err);
+                }
+                tracing::warn!("CEF render failed for {}: {}; falling back to network transport", host, err);
+                cef_fallback = true;
+            }
+        }
+    }
+
+    let resp = ctx.client.get(url_str).await?;
+    let status = resp.status;
+    let final_url = resp.final_url.clone();
+    let content_type = resp.content_type.clone();
+    let is_html = resp.is_html();
+    let body = resp.text();
+    let classification = classify_response(status, is_html, &body);
+
+    match classification {
+        ResponseClassification::Ok => {
+            let timing_ms = start.elapsed().as_millis() as u64;
+            let strategy = ctx.client.transport_name().to_string();
+            ctx.site_cache.record(host, &strategy, timing_ms);
+            Ok(AcquiredPage {
+                body,
+                final_url,
+                status_code: status,
+                content_type,
+                strategy,
+                escalated: cef_fallback,
+            })
+        }
+        ResponseClassification::JavaScriptShell { reason } => {
+            if plan.allow_cef_escalation {
+                match render_cef_checked(&ctx.cef, &final_url, effective_selector).await {
+                    Ok(html) => {
+                        let timing_ms = start.elapsed().as_millis() as u64;
+                        ctx.site_cache.record(host, "cef", timing_ms);
+                        return Ok(AcquiredPage {
+                            body: html,
+                            final_url,
+                            status_code: 200,
+                            content_type: Some("text/html".to_string()),
+                            strategy: "cef".to_string(),
+                            escalated: true,
+                        });
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "JS shell detected ({}) on {} and CEF escalation failed: {}",
+                            reason,
+                            host,
+                            err
+                        );
+                    }
+                }
+            }
+            let timing_ms = start.elapsed().as_millis() as u64;
+            let strategy = ctx.client.transport_name().to_string();
+            ctx.site_cache.record(host, &strategy, timing_ms);
+            Ok(AcquiredPage {
+                body,
+                final_url,
+                status_code: status,
+                content_type,
+                strategy,
+                escalated: cef_fallback,
+            })
+        }
+        ResponseClassification::Blocked { status } => {
+            if plan.allow_cef_escalation {
+                match render_cef_checked(&ctx.cef, &final_url, effective_selector).await {
+                    Ok(html) => {
+                        let timing_ms = start.elapsed().as_millis() as u64;
+                        ctx.site_cache.record(host, "cef", timing_ms);
+                        return Ok(AcquiredPage {
+                            body: html,
+                            final_url,
+                            status_code: 200,
+                            content_type: Some("text/html".to_string()),
+                            strategy: "cef".to_string(),
+                            escalated: true,
+                        });
+                    }
+                    Err(err) => {
+                        return Err(FetchError::Blocked {
+                            url: final_url,
+                            status,
+                            detail: format!("network blocked and CEF escalation failed: {}", err),
+                        });
+                    }
+                }
+            }
+            let detail = if !cef_available && render_mode != RenderMode::Cronet {
+                "site blocked the request and CEF renderer is not installed".to_string()
+            } else {
+                "site blocked the request".to_string()
+            };
+            Err(FetchError::Blocked {
+                url: final_url,
+                status,
+                detail,
+            })
+        }
+        ResponseClassification::Challenge { status, reason } => {
+            if plan.allow_cef_escalation {
+                match render_cef_checked(&ctx.cef, &final_url, effective_selector).await {
+                    Ok(html) => {
+                        let timing_ms = start.elapsed().as_millis() as u64;
+                        ctx.site_cache.record(host, "cef", timing_ms);
+                        return Ok(AcquiredPage {
+                            body: html,
+                            final_url,
+                            status_code: 200,
+                            content_type: Some("text/html".to_string()),
+                            strategy: "cef".to_string(),
+                            escalated: true,
+                        });
+                    }
+                    Err(err) => {
+                        return Err(FetchError::Challenge {
+                            url: final_url,
+                            status,
+                            reason: format!("{} (CEF escalation failed: {})", reason, err),
+                        });
+                    }
+                }
+            }
+            Err(FetchError::Challenge {
+                url: final_url,
+                status,
+                reason,
+            })
+        }
+        ResponseClassification::HttpError { status } => Err(FetchError::HttpError {
+            url: final_url,
+            status,
+        }),
+    }
 }
 
-fn should_use_cef_first(
-    rule_render: Option<&str>,
-    cached_strategy: Option<&str>,
-    cef_installed: bool,
-) -> bool {
-    if !cef_installed {
-        return false;
+async fn render_cef_checked(
+    cef: &CefRenderer,
+    url: &str,
+    wait_for_selector: Option<&str>,
+) -> std::result::Result<String, FetchError> {
+    let opts = CefRenderOptions {
+        wait_for_selector: wait_for_selector.map(|s| s.to_string()),
+    };
+
+    let html = match cef.render(url, &opts).await {
+        Ok(first) if is_acceptable_cef_render(&first) => first,
+        _ => cef.render(url, &opts).await.map_err(FetchError::Transport)?,
+    };
+
+    if let Some(reason) = detect_interstitial_challenge(&html) {
+        return Err(FetchError::Challenge {
+            url: url.to_string(),
+            status: 403,
+            reason,
+        });
     }
-    match rule_render {
-        Some("cef") => true,
-        Some("cronet") => false,
-        _ => matches!(cached_strategy, Some("cef")),
+
+    Ok(html)
+}
+
+fn is_acceptable_cef_render(html: &str) -> bool {
+    html.len() >= 2000 && detect_interstitial_challenge(html).is_none()
+}
+
+fn parse_http_url(url: &str) -> std::result::Result<url::Url, FetchError> {
+    let parsed = url::Url::parse(url).map_err(|e| FetchError::InvalidUrl(e.to_string()))?;
+    match parsed.scheme() {
+        "http" | "https" => Ok(parsed),
+        other => Err(FetchError::InvalidUrl(format!(
+            "unsupported scheme {:?} (only http and https)",
+            other
+        ))),
     }
+}
+
+fn resolve_target_url(ctx: &RuntimeContext, parsed: &url::Url, apply_rewrites: bool) -> url::Url {
+    if !apply_rewrites {
+        return parsed.clone();
+    }
+    ctx.rules
+        .rewrite_url(parsed)
+        .unwrap_or_else(|| parsed.clone())
 }
