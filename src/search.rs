@@ -195,16 +195,28 @@ pub fn parse_brave_json(json_str: &str, max: usize) -> Result<Vec<SearchResult>>
 
     let results = raw_results
         .into_iter()
-        .filter(|r| !r.title.trim().is_empty() && !r.url.trim().is_empty())
-        .take(max)
-        .map(|r| SearchResult {
-            title: r.title.trim().to_string(),
-            url: r.url.trim().to_string(),
-            snippet: r.description.trim().to_string(),
+        .filter_map(|r| {
+            let title = clean_html_text(&r.title);
+            let url = r.url.trim().to_string();
+            if title.is_empty() || url.is_empty() {
+                return None;
+            }
+            Some(SearchResult {
+                title,
+                url,
+                snippet: clean_html_text(&r.description),
+            })
         })
+        .take(max)
         .collect();
 
     Ok(results)
+}
+
+fn clean_html_text(input: &str) -> String {
+    let fragment = Html::parse_fragment(input);
+    let raw: String = fragment.root_element().text().collect();
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 pub fn parse_ddg_html(html: &str, max: usize) -> Result<Vec<SearchResult>> {

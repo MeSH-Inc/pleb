@@ -40,8 +40,8 @@ fn parse_brave_json_extracts_and_limits_results() {
     let payload = r#"{
       "web": {
         "results": [
-          { "title": "First", "url": "https://a.example", "description": "Snippet A" },
-          { "title": "", "url": "https://empty-title.example", "description": "skip" },
+          { "title": "<strong>First</strong> &amp; Best", "url": "https://a.example", "description": "<strong>Rust</strong> &amp; <em>&#x27;Cargo&#x27;</em> guide" },
+          { "title": "<b></b>", "url": "https://empty-title.example", "description": "skip" },
           { "title": "Second", "url": "https://b.example", "description": "Snippet B" },
           { "title": "Third", "url": "https://c.example", "description": "Snippet C" }
         ]
@@ -50,9 +50,9 @@ fn parse_brave_json_extracts_and_limits_results() {
 
     let results = parse_brave_json(payload, 2).unwrap();
     assert_eq!(results.len(), 2);
-    assert_eq!(results[0].title, "First");
+    assert_eq!(results[0].title, "First & Best");
     assert_eq!(results[0].url, "https://a.example");
-    assert_eq!(results[0].snippet, "Snippet A");
+    assert_eq!(results[0].snippet, "Rust & 'Cargo' guide");
     assert_eq!(results[1].title, "Second");
 }
 
