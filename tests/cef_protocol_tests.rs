@@ -683,6 +683,11 @@ fn chromium_cronet_cef_version_and_keyring_parity() {
         expected_api
     );
     assert!(
+        cef_linux.contains("CEF_PLATFORM=\"linux64\"")
+            && cef_linux.contains("CEF_PLATFORM=\"linuxarm64\""),
+        "scripts/install-cef-linux.sh must support both linux64 (x86_64) and linuxarm64 (aarch64)"
+    );
+    assert!(
         cef_helpers.contains(&format!("CEF_API_VERSION=\"${{3:-{expected_api}}}\"")),
         "cef/setup-helpers.sh default CEF_API_VERSION must equal {expected_api}"
     );

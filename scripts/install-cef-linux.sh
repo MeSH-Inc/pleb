@@ -83,10 +83,23 @@ fi
 
 CEF_VERSION="154.0.34+g14c5a08+chromium-154.0.8037.98"
 CEF_API_VERSION="15400"
-CEF_PLATFORM="linux64"
+ARCH="$(uname -m)"
+case "$ARCH" in
+    x86_64|amd64)
+        CEF_PLATFORM="linux64"
+        CEF_SHA1="15c91ad767097217b2e82ba8b933fe30b134be69"
+        ;;
+    aarch64|arm64)
+        CEF_PLATFORM="linuxarm64"
+        CEF_SHA1="fa85793519eef199e6b6fa8cc8d6f0eb45c6dac2"
+        ;;
+    *)
+        echo "Error: unsupported Linux architecture: $ARCH" >&2
+        exit 1
+        ;;
+esac
 CEF_DIR="cef_binary_${CEF_VERSION}_${CEF_PLATFORM}_minimal"
 CEF_URL="https://cef-builds.spotifycdn.com/${CEF_DIR}.tar.bz2"
-CEF_SHA1="15c91ad767097217b2e82ba8b933fe30b134be69"
 
 SDK_CACHE_DIR="${HOME}/.cache/mesh-wick/cef-sdk"
 SDK_TARBALL="${SDK_CACHE_DIR}/${CEF_DIR}.tar.bz2"
