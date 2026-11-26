@@ -1,14 +1,18 @@
 use anyhow::{bail, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use ring::signature::Ed25519KeyPair;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Read;
+use std::net::{IpAddr, Ipv6Addr};
 use std::path::Path;
 use std::sync::atomic::{compiler_fence, Ordering};
 
 use crate::context::{acquire_private_lock, ensure_private_dir, write_private_file_atomic};
 
 pub const MAX_SECRET_BYTES: usize = 4096;
+const MAX_WEB_BOT_AUTH_AGENT_BYTES: usize = 512;
 
 #[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "pleb";
@@ -24,6 +28,12 @@ fn zeroize_bytes(bytes: &mut [u8]) {
         unsafe { std::ptr::write_volatile(byte, 0) };
     }
     compiler_fence(Ordering::SeqCst);
+}
+
+fn zeroize_string(s: &mut str) {
+    // SAFETY: Writing 0x00 bytes to a str's buffer keeps it valid UTF-8.
+    let bytes = unsafe { s.as_bytes_mut() };
+    zeroize_bytes(bytes);
 }
 
 struct ZeroizingBytes(Vec<u8>);
@@ -54,9 +64,7 @@ impl fmt::Debug for SecretString {
 
 impl Drop for SecretString {
     fn drop(&mut self) {
-        // SAFETY: Writing 0x00 bytes to a String's buffer keeps it valid UTF-8.
-        let bytes = unsafe { self.0.as_bytes_mut() };
-        zeroize_bytes(bytes);
+        zeroize_string(&mut self.0);
     }
 }
 
@@ -198,11 +206,225 @@ impl fmt::Debug for ResolvedCredential {
     }
 }
 
+pub fn scrub_sensitive_env(cmd: &mut std::process::Command) {
+    for provider in CredentialProvider::ALL {
+        cmd.env_remove(provider.env_var());
+    }
+    cmd.env_remove("PLEB_CDP_URL");
+}
+
 fn trim_secret_edges(raw: &str) -> &str {
     raw.trim_matches([' ', '\r', '\n'])
 }
 
+pub(crate) struct ValidatedEd25519Jwk {
+    pub(crate) canonical_json: SecretString,
+    pub(crate) key_id: String,
+    pub(crate) keypair: Ed25519KeyPair,
+}
+
+#[derive(serde::Deserialize)]
+struct RawEd25519Jwk {
+    kty: String,
+    crv: String,
+    x: String,
+    d: String,
+}
+
+impl Drop for RawEd25519Jwk {
+    fn drop(&mut self) {
+        zeroize_string(&mut self.kty);
+        zeroize_string(&mut self.crv);
+        zeroize_string(&mut self.x);
+        zeroize_string(&mut self.d);
+    }
+}
+
+pub(crate) fn parse_ed25519_jwk(raw: &str) -> Result<ValidatedEd25519Jwk> {
+    let trimmed = raw.trim_matches([' ', '\t', '\r', '\n']);
+    if trimmed.is_empty() {
+        bail!("credential for web-bot-auth-jwk must not be empty");
+    }
+    if trimmed.len() > MAX_SECRET_BYTES {
+        bail!(
+            "credential for web-bot-auth-jwk exceeds maximum length of {} bytes",
+            MAX_SECRET_BYTES
+        );
+    }
+    if trimmed
+        .bytes()
+        .any(|b| !b.is_ascii() || (b.is_ascii_control() && !matches!(b, b'\n' | b'\r' | b'\t')))
+    {
+        bail!("credential for web-bot-auth-jwk contains invalid control or non-ASCII characters");
+    }
+
+    let parsed: RawEd25519Jwk = serde_json::from_str(trimmed).map_err(|_| {
+        anyhow::anyhow!("invalid web-bot-auth-jwk: malformed or incomplete Ed25519 JWK JSON")
+    })?;
+    if parsed.kty != "OKP" || parsed.crv != "Ed25519" {
+        bail!("invalid web-bot-auth-jwk: expected kty=\"OKP\" and crv=\"Ed25519\"");
+    }
+
+    let mut d_bytes = ZeroizingBytes(vec![0u8; 32]);
+    let d_len = URL_SAFE_NO_PAD
+        .decode_slice(parsed.d.as_bytes(), &mut d_bytes.0)
+        .map_err(|_| anyhow::anyhow!("invalid web-bot-auth-jwk: d must be valid base64url"))?;
+    if d_len != 32 {
+        bail!("invalid web-bot-auth-jwk: d must decode to 32 bytes");
+    }
+
+    let mut x_bytes = [0u8; 32];
+    let x_len = URL_SAFE_NO_PAD
+        .decode_slice(parsed.x.as_bytes(), &mut x_bytes)
+        .map_err(|_| anyhow::anyhow!("invalid web-bot-auth-jwk: x must be valid base64url"))?;
+    if x_len != 32 {
+        bail!("invalid web-bot-auth-jwk: x must decode to 32 bytes");
+    }
+
+    let keypair = Ed25519KeyPair::from_seed_and_public_key(&d_bytes.0, &x_bytes).map_err(|_| {
+        anyhow::anyhow!("invalid web-bot-auth-jwk: Ed25519 keypair verification failed")
+    })?;
+
+    let d_canon = SecretString::new(URL_SAFE_NO_PAD.encode(&d_bytes.0));
+    let x_canon = URL_SAFE_NO_PAD.encode(x_bytes);
+    let canonical_json = SecretString::new(format!(
+        r#"{{"crv":"Ed25519","d":"{}","kty":"OKP","x":"{}"}}"#,
+        d_canon.as_str(),
+        x_canon
+    ));
+    let key_id = crate::transport::web_bot_auth::ed25519_jwk_thumbprint(&x_bytes);
+
+    Ok(ValidatedEd25519Jwk {
+        canonical_json,
+        key_id,
+        keypair,
+    })
+}
+
+fn validate_web_bot_auth_agent(trimmed: &str) -> Result<SecretString> {
+    if trimmed.len() > MAX_WEB_BOT_AUTH_AGENT_BYTES {
+        bail!(
+            "credential for web-bot-auth-agent exceeds maximum length of {} bytes",
+            MAX_WEB_BOT_AUTH_AGENT_BYTES
+        );
+    }
+    if trimmed
+        .bytes()
+        .any(|b| b.is_ascii_whitespace() || matches!(b, b'"' | b'\\'))
+    {
+        bail!("invalid web-bot-auth-agent: URL contains disallowed whitespace or quote characters");
+    }
+    let parsed = url::Url::parse(trimmed)
+        .map_err(|_| anyhow::anyhow!("invalid web-bot-auth-agent: must be a valid https URL"))?;
+    if parsed.scheme() != "https" {
+        bail!("invalid web-bot-auth-agent: scheme must be https");
+    }
+    let Some(host) = parsed.host_str().filter(|h| !h.is_empty()) else {
+        bail!("invalid web-bot-auth-agent: URL must include a host");
+    };
+    if crate::policy::is_local_or_private_host(host) {
+        bail!("invalid web-bot-auth-agent: local or private hosts are not allowed");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!("invalid web-bot-auth-agent: embedded userinfo credentials are not allowed");
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        bail!("invalid web-bot-auth-agent: query strings and fragments are not allowed");
+    }
+    Ok(SecretString::new(trimmed.to_string()))
+}
+
+fn parse_nonzero_port(raw: &str) -> Result<u16> {
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        bail!("invalid cdp-access-host: port must be a valid TCP port");
+    }
+    let port: u16 = raw
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid cdp-access-host: port out of range"))?;
+    if port == 0 {
+        bail!("invalid cdp-access-host: port must be non-zero");
+    }
+    Ok(port)
+}
+
+fn validate_cdp_access_host(trimmed: &str) -> Result<SecretString> {
+    if trimmed.bytes().any(|b| {
+        b.is_ascii_whitespace() || matches!(b, b'"' | b'\\' | b'/' | b'?' | b'#' | b'@' | b'*')
+    }) {
+        bail!("invalid cdp-access-host: must be a hostname or host:port without scheme, path, userinfo, or wildcard");
+    }
+
+    let (canonical_host, port) = if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        let host = match ip {
+            IpAddr::V6(v6) => format!("[{v6}]"),
+            IpAddr::V4(v4) => v4.to_string(),
+        };
+        (host, None)
+    } else if let Some(rest_after_open) = trimmed.strip_prefix('[') {
+        let Some((inside, rest)) = rest_after_open.split_once(']') else {
+            bail!("invalid cdp-access-host: malformed IPv6 literal");
+        };
+        let v6: Ipv6Addr = inside
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid cdp-access-host: invalid IPv6 address"))?;
+        let port = if rest.is_empty() {
+            None
+        } else if let Some(p_str) = rest.strip_prefix(':') {
+            Some(parse_nonzero_port(p_str)?)
+        } else {
+            bail!("invalid cdp-access-host: unexpected characters after IPv6 literal");
+        };
+        (format!("[{v6}]"), port)
+    } else {
+        let (host_raw, port) = if let Some((h, p)) = trimmed.split_once(':') {
+            if h.is_empty() || p.contains(':') {
+                bail!("invalid cdp-access-host: malformed host:port");
+            }
+            (h, Some(parse_nonzero_port(p)?))
+        } else {
+            (trimmed, None)
+        };
+        let parsed = url::Url::parse(&format!("https://{host_raw}"))
+            .map_err(|_| anyhow::anyhow!("invalid cdp-access-host: invalid hostname"))?;
+        if parsed.path() != "/"
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || parsed.port().is_some()
+        {
+            bail!("invalid cdp-access-host: invalid hostname");
+        }
+        let host = match parsed.host() {
+            Some(url::Host::Domain(d)) => {
+                if d.is_empty() || d.starts_with('.') || d.ends_with('.') || d.contains("..") {
+                    bail!("invalid cdp-access-host: invalid hostname");
+                }
+                d.to_ascii_lowercase()
+            }
+            Some(url::Host::Ipv4(ip)) => ip.to_string(),
+            Some(url::Host::Ipv6(ip)) => format!("[{ip}]"),
+            None => bail!("invalid cdp-access-host: missing hostname"),
+        };
+        (host, port)
+    };
+
+    if crate::policy::is_local_or_private_host(&canonical_host) {
+        bail!("invalid cdp-access-host: local or private hosts are not allowed");
+    }
+
+    let canonical = match port {
+        Some(p) => format!("{canonical_host}:{p}"),
+        None => canonical_host,
+    };
+    Ok(SecretString::new(canonical))
+}
+
 pub fn validate_credential(provider: CredentialProvider, raw: &str) -> Result<SecretString> {
+    if provider == CredentialProvider::WebBotAuthJwk {
+        return parse_ed25519_jwk(raw).map(|parsed| parsed.canonical_json);
+    }
+
     let trimmed = trim_secret_edges(raw);
     if trimmed.is_empty() {
         bail!("credential for {} must not be empty", provider.as_str());
@@ -223,24 +445,43 @@ pub fn validate_credential(provider: CredentialProvider, raw: &str) -> Result<Se
             provider.as_str()
         );
     }
-    if provider == CredentialProvider::Searxng {
-        let parsed = url::Url::parse(trimmed).map_err(|_| {
-            anyhow::anyhow!("invalid SEARXNG_URL: must be a valid http or https URL")
-        })?;
-        if parsed.scheme() != "http" && parsed.scheme() != "https" {
-            bail!("invalid SEARXNG_URL: scheme must be http or https");
+
+    match provider {
+        CredentialProvider::Searxng => {
+            let parsed = url::Url::parse(trimmed).map_err(|_| {
+                anyhow::anyhow!("invalid SEARXNG_URL: must be a valid http or https URL")
+            })?;
+            if parsed.scheme() != "http" && parsed.scheme() != "https" {
+                bail!("invalid SEARXNG_URL: scheme must be http or https");
+            }
+            if parsed.host_str().is_none() {
+                bail!("invalid SEARXNG_URL: URL must include a host");
+            }
+            if !parsed.username().is_empty() || parsed.password().is_some() {
+                bail!("invalid SEARXNG_URL: embedded userinfo credentials are not allowed");
+            }
+            if parsed.query().is_some() || parsed.fragment().is_some() {
+                bail!("invalid SEARXNG_URL: query strings and fragments are not allowed");
+            }
+            Ok(SecretString::new(trimmed.to_string()))
         }
-        if parsed.host_str().is_none() {
-            bail!("invalid SEARXNG_URL: URL must include a host");
+        CredentialProvider::WebBotAuthAgent => validate_web_bot_auth_agent(trimmed),
+        CredentialProvider::CdpAccessHost => validate_cdp_access_host(trimmed),
+        CredentialProvider::CdpAccessClientId | CredentialProvider::CdpAccessClientSecret => {
+            if trimmed.bytes().any(|b| b.is_ascii_whitespace()) {
+                bail!(
+                    "credential for {} must not contain whitespace",
+                    provider.as_str()
+                );
+            }
+            Ok(SecretString::new(trimmed.to_string()))
         }
-        if !parsed.username().is_empty() || parsed.password().is_some() {
-            bail!("invalid SEARXNG_URL: embedded userinfo credentials are not allowed");
-        }
-        if parsed.query().is_some() || parsed.fragment().is_some() {
-            bail!("invalid SEARXNG_URL: query strings and fragments are not allowed");
-        }
+        CredentialProvider::WebBotAuthJwk => unreachable!("handled above"),
+        CredentialProvider::Brave
+        | CredentialProvider::Tavily
+        | CredentialProvider::Serper
+        | CredentialProvider::Exa => Ok(SecretString::new(trimmed.to_string())),
     }
-    Ok(SecretString::new(trimmed.to_string()))
 }
 
 fn keychain_disabled() -> bool {
@@ -419,9 +660,7 @@ struct ZeroizingCredentialMap(BTreeMap<String, String>);
 impl Drop for ZeroizingCredentialMap {
     fn drop(&mut self) {
         for value in self.0.values_mut() {
-            // SAFETY: Writing 0x00 bytes to a String's buffer keeps it valid UTF-8.
-            let bytes = unsafe { value.as_bytes_mut() };
-            zeroize_bytes(bytes);
+            zeroize_string(value);
         }
     }
 }
@@ -548,7 +787,14 @@ pub fn resolve_credential(
 ) -> Result<Option<ResolvedCredential>> {
     if let Ok(raw) = std::env::var(provider.env_var()) {
         let raw = SecretString::new(raw);
-        if !trim_secret_edges(raw.as_str()).is_empty() {
+        let is_blank = if provider == CredentialProvider::WebBotAuthJwk {
+            raw.as_str()
+                .trim_matches([' ', '\t', '\r', '\n'])
+                .is_empty()
+        } else {
+            trim_secret_edges(raw.as_str()).is_empty()
+        };
+        if !is_blank {
             let value = validate_credential(provider, raw.as_str())?;
             return Ok(Some(ResolvedCredential {
                 provider,
@@ -642,40 +888,46 @@ pub fn remove_credential(
     }
 }
 
+fn resolve_provider_results(
+    state_dir: &Path,
+    providers: &[CredentialProvider],
+) -> Result<Vec<(CredentialProvider, Result<Option<ResolvedCredential>>)>> {
+    if !keychain_enabled() {
+        let mut out = Vec::with_capacity(providers.len());
+        for &provider in providers {
+            out.push((provider, resolve_credential(state_dir, provider)));
+        }
+        return Ok(out);
+    }
+
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = providers
+            .iter()
+            .copied()
+            .map(|provider| {
+                scope.spawn(move || (provider, resolve_credential(state_dir, provider)))
+            })
+            .collect();
+
+        let mut out = Vec::with_capacity(handles.len());
+        for handle in handles {
+            let pair = handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("credential resolution worker panicked"))?;
+            out.push(pair);
+        }
+        Ok(out)
+    })
+}
+
 pub fn resolve_credentials(
     state_dir: &Path,
     providers: &[CredentialProvider],
 ) -> Result<BTreeMap<CredentialProvider, ResolvedCredential>> {
-    let entries = if !keychain_enabled() {
-        let mut out = Vec::with_capacity(providers.len());
-        for &provider in providers {
-            out.push((provider, resolve_credential(state_dir, provider)?));
-        }
-        out
-    } else {
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = providers
-                .iter()
-                .copied()
-                .map(|provider| {
-                    scope.spawn(move || (provider, resolve_credential(state_dir, provider)))
-                })
-                .collect();
-
-            let mut out = Vec::with_capacity(handles.len());
-            for handle in handles {
-                let (provider, res) = handle
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("credential resolution worker panicked"))?;
-                out.push((provider, res?));
-            }
-            Result::<_>::Ok(out)
-        })?
-    };
-
+    let entries = resolve_provider_results(state_dir, providers)?;
     let mut map = BTreeMap::new();
-    for (provider, cred_opt) in entries {
-        if let Some(cred) = cred_opt {
+    for (provider, res) in entries {
+        if let Some(cred) = res? {
             map.insert(provider, cred);
         }
     }
@@ -707,15 +959,127 @@ pub fn all_credential_statuses(state_dir: &Path) -> Result<Vec<CredentialStatus>
 }
 
 pub fn resolve_agent_identity_status(
-    _state_dir: &Path,
+    state_dir: &Path,
     no_web_bot_auth: bool,
 ) -> AgentIdentityStatus {
-    AgentIdentityStatus {
+    let mut status = AgentIdentityStatus {
         web_bot_auth_enabled: !no_web_bot_auth,
         ..Default::default()
+    };
+    let mut errors = Vec::new();
+    let results = match resolve_provider_results(
+        state_dir,
+        &[
+            CredentialProvider::WebBotAuthJwk,
+            CredentialProvider::WebBotAuthAgent,
+        ],
+    ) {
+        Ok(res) => res,
+        Err(err) => {
+            status.status_error = Some(err.to_string());
+            return status;
+        }
+    };
+
+    for (provider, res) in results {
+        match (provider, res) {
+            (CredentialProvider::WebBotAuthJwk, Ok(Some(cred))) => {
+                status.jwk_configured = true;
+                status.jwk_source = Some(cred.source);
+                status.keyid = parse_ed25519_jwk(cred.value.as_str())
+                    .ok()
+                    .map(|jwk| jwk.key_id);
+            }
+            (CredentialProvider::WebBotAuthAgent, Ok(Some(cred))) => {
+                status.agent_configured = true;
+                status.agent_source = Some(cred.source);
+            }
+            (_, Ok(_)) => {}
+            (_, Err(err)) => errors.push(err.to_string()),
+        }
     }
+
+    if !errors.is_empty() {
+        status.status_error = Some(errors.join("; "));
+    } else if status.jwk_configured && !status.agent_configured {
+        status.status_error = Some(
+            "incomplete Web Bot Auth configuration: run `pleb auth set web-bot-auth-agent`"
+                .to_string(),
+        );
+    } else if !status.jwk_configured && status.agent_configured {
+        status.status_error = Some(
+            "incomplete Web Bot Auth configuration: run `pleb auth set web-bot-auth-jwk`"
+                .to_string(),
+        );
+    }
+
+    status
 }
 
-pub fn resolve_cdp_access_status(_state_dir: &Path) -> CdpAccessStatus {
-    CdpAccessStatus::default()
+pub fn resolve_cdp_access_status(state_dir: &Path) -> CdpAccessStatus {
+    let mut status = CdpAccessStatus::default();
+    let mut errors = Vec::new();
+    let results = match resolve_provider_results(
+        state_dir,
+        &[
+            CredentialProvider::CdpAccessClientId,
+            CredentialProvider::CdpAccessClientSecret,
+            CredentialProvider::CdpAccessHost,
+        ],
+    ) {
+        Ok(res) => res,
+        Err(err) => {
+            status.status_error = Some(err.to_string());
+            return status;
+        }
+    };
+
+    for (provider, res) in results {
+        match (provider, res) {
+            (CredentialProvider::CdpAccessClientId, Ok(Some(cred))) => {
+                status.client_id_configured = true;
+                status.client_id_source = Some(cred.source);
+            }
+            (CredentialProvider::CdpAccessClientSecret, Ok(Some(cred))) => {
+                status.client_secret_configured = true;
+                status.client_secret_source = Some(cred.source);
+            }
+            (CredentialProvider::CdpAccessHost, Ok(Some(cred))) => {
+                status.host_configured = true;
+                status.host_source = Some(cred.source);
+                status.access_host = Some(cred.value.as_str().to_string());
+            }
+            (_, Ok(_)) => {}
+            (_, Err(err)) => errors.push(err.to_string()),
+        }
+    }
+
+    if !errors.is_empty() {
+        status.status_error = Some(errors.join("; "));
+    } else if status.client_id_configured
+        && status.client_secret_configured
+        && status.host_configured
+    {
+        status.configured = true;
+    } else if status.client_id_configured
+        || status.client_secret_configured
+        || status.host_configured
+    {
+        let mut missing = Vec::new();
+        if !status.client_id_configured {
+            missing.push(CredentialProvider::CdpAccessClientId.as_str());
+        }
+        if !status.client_secret_configured {
+            missing.push(CredentialProvider::CdpAccessClientSecret.as_str());
+        }
+        if !status.host_configured {
+            missing.push(CredentialProvider::CdpAccessHost.as_str());
+        }
+        status.status_error = Some(format!(
+            "incomplete CDP Access configuration: missing {}",
+            missing.join(", ")
+        ));
+    }
+
+    status
 }

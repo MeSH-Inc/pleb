@@ -1305,3 +1305,96 @@ for raw in sys.stdin:
     assert!(daemon_stop(dir.path()).await.unwrap());
     let _ = handle.await;
 }
+
+#[tokio::test]
+async fn daemon_v4_round_trips_web_bot_auth_and_disable_redirects() {
+    use pleb::transport::{RequestHeaderOptions, TransportClient, WebBotAuthHeaders};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen_sig = Arc::new(std::sync::Mutex::new(None::<String>));
+    let seen_sig_srv = Arc::clone(&seen_sig);
+    let follow_hits = Arc::new(AtomicUsize::new(0));
+    let follow_hits_srv = Arc::clone(&follow_hits);
+
+    let srv = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let seen_sig = Arc::clone(&seen_sig_srv);
+            let follow_hits = Arc::clone(&follow_hits_srv);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let raw = String::from_utf8_lossy(&buf[..n]);
+                let mut lines = raw.lines();
+                let path = lines
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                for line in lines {
+                    if let Some((k, v)) = line.split_once(':') {
+                        if k.eq_ignore_ascii_case("signature") {
+                            *seen_sig.lock().unwrap() = Some(v.trim().to_string());
+                        }
+                    }
+                }
+                let resp = match path {
+                    "/302" => "HTTP/1.1 302 Found\r\nLocation: /target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    "/target" => {
+                        follow_hits.fetch_add(1, Ordering::SeqCst);
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                    }
+                    _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                };
+                let _ = socket.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let dir = TempStateDir::new();
+    let dir_clone = dir.to_path_buf();
+    let handle =
+        tokio::spawn(async move { run_daemon(dir_clone, Duration::from_secs(30), false).await });
+    let status = wait_for_ping(dir.path()).await;
+    assert_eq!(status.protocol_version, 4);
+
+    let client = TransportClient::new_daemon(
+        dir.to_path_buf(),
+        None,
+        Duration::from_secs(5),
+        Duration::from_secs(30),
+        false,
+    );
+    let resp = client
+        .get_with_request_options(
+            &format!("http://{addr}/302"),
+            Duration::from_secs(5),
+            64 * 1024,
+            &RequestHeaderOptions {
+                disable_redirects: true,
+                web_bot_auth: Some(WebBotAuthHeaders {
+                    signature: "sig1=:dGVzdA==:".to_string(),
+                    signature_input: "sig1=(\"@authority\" \"signature-agent\");created=1"
+                        .to_string(),
+                    signature_agent: "\"https://agent.example.com\"".to_string(),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status, 302);
+    assert!(resp
+        .location_header
+        .as_deref()
+        .is_some_and(|l| l.ends_with("/target")));
+    assert_eq!(seen_sig.lock().unwrap().as_deref(), Some("sig1=:dGVzdA==:"));
+    assert_eq!(follow_hits.load(Ordering::SeqCst), 0);
+
+    srv.abort();
+    assert!(daemon_stop(dir.path()).await.unwrap());
+    let _ = handle.await;
+}

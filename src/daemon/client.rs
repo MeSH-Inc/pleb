@@ -362,6 +362,7 @@ fn spawn_detached_daemon(
         .context("failed to open daemon.log")?;
 
     let mut cmd = Command::new(exe);
+    crate::auth::scrub_sensitive_env(&mut cmd);
     cmd.arg("--state-dir")
         .arg(state_dir)
         .arg("--daemon-idle-timeout")

@@ -1,7 +1,7 @@
 use pleb::auth::{
-    all_credential_statuses, remove_credential, resolve_credential, set_credential,
-    CredentialProvider, CredentialSource, CredentialStorage, ResolvedCredential, SecretString,
-    MAX_SECRET_BYTES,
+    all_credential_statuses, remove_credential, resolve_agent_identity_status,
+    resolve_cdp_access_status, resolve_credential, set_credential, CredentialProvider,
+    CredentialSource, CredentialStorage, ResolvedCredential, SecretString, MAX_SECRET_BYTES,
 };
 use pleb::context::{clear_state_dir, ensure_private_dir};
 use std::path::PathBuf;
@@ -434,4 +434,293 @@ fn clear_state_dir_preserves_credentials_and_clears_search_state() {
         .unwrap()
         .expect("credential should still resolve after clear_state_dir");
     assert_eq!(resolved.value.as_str(), "keep-this-secret");
+}
+
+#[test]
+fn web_bot_auth_jwk_canonicalizes_pretty_json_and_never_leaks_secrets_on_error() {
+    let _env = EnvGuard::new(&[
+        ("PLEB_WEB_BOT_AUTH_JWK", None),
+        ("PLEB_WEB_BOT_AUTH_AGENT", None),
+    ]);
+    let dir = TempStateDir::new();
+
+    let d_b64 = "nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A";
+    let x_b64 = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
+    let thumbprint = "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k";
+
+    let pretty_jwk = format!(
+        "\n  {{\n\t\"kty\": \"OKP\",\n\t\"kid\": \"ignored-kid\",\n\t\"x\": \"{x_b64}\",\n\t\"crv\": \"Ed25519\",\n\t\"d\": \"{d_b64}\"\n  }}\r\n"
+    );
+    let stored = set_credential(
+        &dir.path,
+        CredentialProvider::WebBotAuthJwk,
+        &pretty_jwk,
+        CredentialStorage::File,
+    )
+    .unwrap();
+    assert_eq!(stored, CredentialSource::File);
+
+    let expected_canonical =
+        format!(r#"{{"crv":"Ed25519","d":"{d_b64}","kty":"OKP","x":"{x_b64}"}}"#);
+    let resolved = resolve_credential(&dir.path, CredentialProvider::WebBotAuthJwk)
+        .unwrap()
+        .expect("jwk should resolve");
+    assert_eq!(resolved.value.as_str(), expected_canonical);
+
+    // Verify credentials.json persisted canonical single-line JSON (without pretty newlines/kid).
+    let raw_file = std::fs::read_to_string(dir.path.join("credentials.json")).unwrap();
+    let parsed_map: std::collections::BTreeMap<String, String> =
+        serde_json::from_str(&raw_file).unwrap();
+    assert_eq!(
+        parsed_map.get("web-bot-auth-jwk").map(String::as_str),
+        Some(expected_canonical.as_str())
+    );
+    assert!(!raw_file.contains("ignored-kid"));
+
+    // Invalid JWKs (corrupt JSON, wrong kty/crv, public-only, mismatched keypair, NUL byte, non-ASCII).
+    let bad_jwks = [
+        "{not-json-secret-111",
+        "{}",
+        r#"{"kty":"RSA","crv":"Ed25519","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo","d":"nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A"}"#,
+        r#"{"kty":"OKP","crv":"Ed25519","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}"#,
+        // Mismatched d/x pair
+        r#"{"kty":"OKP","crv":"Ed25519","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","d":"nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A"}"#,
+        // Padding '=' rejected by URL_SAFE_NO_PAD
+        r#"{"kty":"OKP","crv":"Ed25519","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo=","d":"nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A="}"#,
+        "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"11qY\",\"d\":\"nWGx\x00nul\"}",
+        "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"é\",\"d\":\"nWGx\"}",
+    ];
+    for bad in bad_jwks {
+        let err = set_credential(
+            &dir.path,
+            CredentialProvider::WebBotAuthJwk,
+            bad,
+            CredentialStorage::File,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.contains(d_b64), "error leaked d: {msg}");
+        assert!(!msg.contains(x_b64), "error leaked x: {msg}");
+        assert!(
+            !msg.contains("secret-111"),
+            "error leaked raw JSON fragment: {msg}"
+        );
+        assert!(
+            !msg.contains("expected value at line"),
+            "error leaked serde_json details: {msg}"
+        );
+    }
+
+    // Status reporting: partial (only JWK), then complete, then disabled flag, then corrupt env.
+    let partial = resolve_agent_identity_status(&dir.path, false);
+    assert!(partial.web_bot_auth_enabled);
+    assert!(partial.jwk_configured);
+    assert_eq!(partial.jwk_source, Some(CredentialSource::File));
+    assert!(!partial.agent_configured);
+    assert_eq!(partial.keyid.as_deref(), Some(thumbprint));
+    assert!(partial.status_error.is_some());
+
+    set_credential(
+        &dir.path,
+        CredentialProvider::WebBotAuthAgent,
+        "https://agent.example.com",
+        CredentialStorage::File,
+    )
+    .unwrap();
+    let ready = resolve_agent_identity_status(&dir.path, false);
+    assert!(ready.web_bot_auth_enabled);
+    assert!(ready.jwk_configured);
+    assert!(ready.agent_configured);
+    assert_eq!(ready.keyid.as_deref(), Some(thumbprint));
+    assert_eq!(ready.status_error, None);
+
+    let disabled = resolve_agent_identity_status(&dir.path, true);
+    assert!(!disabled.web_bot_auth_enabled);
+    assert_eq!(disabled.keyid.as_deref(), Some(thumbprint));
+
+    // Corrupt env JWK overrides and surfaces sanitized status_error without leaking secret.
+    drop(_env);
+    let _corrupt = EnvGuard::new(&[(
+        "PLEB_WEB_BOT_AUTH_JWK",
+        Some(r#"{"kty":"OKP","crv":"Ed25519","d":"secret-leak-guard","x":"bad"}"#),
+    )]);
+    let corrupt_status = resolve_agent_identity_status(&dir.path, false);
+    let err_msg = corrupt_status
+        .status_error
+        .expect("corrupt env JWK must populate status_error");
+    assert!(!err_msg.contains("secret-leak-guard"));
+}
+
+#[test]
+fn validates_web_bot_auth_agent_and_cdp_access_credentials_and_status() {
+    let _env = EnvGuard::new(&[
+        ("PLEB_WEB_BOT_AUTH_AGENT", None),
+        ("PLEB_CDP_ACCESS_CLIENT_ID", None),
+        ("PLEB_CDP_ACCESS_CLIENT_SECRET", None),
+        ("PLEB_CDP_ACCESS_HOST", None),
+    ]);
+    let dir = TempStateDir::new();
+
+    // WebBotAuthAgent rejections.
+    for bad_agent in [
+        "http://agent.example.com",
+        "https://localhost/dir",
+        "https://127.0.0.1/dir",
+        "https://[::1]/dir",
+        "https://169.254.169.254/dir",
+        "https://10.0.0.1/dir",
+        "https://user:secretpass@agent.example.com",
+        "https://agent.example.com?q=1",
+        "https://agent.example.com#frag",
+        "https://agent.example.com/with space",
+        "https://agent.example.com/with\"quote",
+        "https://agent.example.com/with\\slash",
+        "https://agent.example.com/\x07bell",
+        &format!("https://agent.example.com/{}", "a".repeat(500)),
+    ] {
+        let err = set_credential(
+            &dir.path,
+            CredentialProvider::WebBotAuthAgent,
+            bad_agent,
+            CredentialStorage::File,
+        )
+        .unwrap_err();
+        assert!(!err.to_string().contains("secretpass"));
+    }
+
+    assert!(set_credential(
+        &dir.path,
+        CredentialProvider::WebBotAuthAgent,
+        "https://agent.example.com/.well-known/http-message-signatures-directory",
+        CredentialStorage::File,
+    )
+    .is_ok());
+
+    // CdpAccessHost validation + canonicalization.
+    for bad_host in [
+        "https://worker.example.com",
+        "worker.example.com/path",
+        "worker.example.com?a=1",
+        "worker.example.com#frag",
+        "user@worker.example.com",
+        "*.example.com",
+        "worker example.com",
+        "worker\"example.com",
+        "worker\\example.com",
+        "worker.example.com:0",
+        "worker.example.com:99999",
+        "worker.example.com:",
+        "localhost",
+        "127.0.0.1",
+        "::1",
+        "[::1]:8787",
+        "2130706433",
+        "10.0.0.5",
+        "169.254.169.254",
+        "100.64.0.1",
+        "fc00::1",
+    ] {
+        assert!(
+            set_credential(
+                &dir.path,
+                CredentialProvider::CdpAccessHost,
+                bad_host,
+                CredentialStorage::File,
+            )
+            .is_err(),
+            "bad cdp-access-host must be rejected: {bad_host}"
+        );
+    }
+
+    set_credential(
+        &dir.path,
+        CredentialProvider::CdpAccessHost,
+        "Worker.Example.COM:8443",
+        CredentialStorage::File,
+    )
+    .unwrap();
+    assert_eq!(
+        resolve_credential(&dir.path, CredentialProvider::CdpAccessHost)
+            .unwrap()
+            .unwrap()
+            .value
+            .as_str(),
+        "worker.example.com:8443"
+    );
+
+    set_credential(
+        &dir.path,
+        CredentialProvider::CdpAccessHost,
+        "2001:4860:4860::8888",
+        CredentialStorage::File,
+    )
+    .unwrap();
+    assert_eq!(
+        resolve_credential(&dir.path, CredentialProvider::CdpAccessHost)
+            .unwrap()
+            .unwrap()
+            .value
+            .as_str(),
+        "[2001:4860:4860::8888]"
+    );
+
+    // Partial CDP Access tuple surfaces status_error without marking configured.
+    let partial = resolve_cdp_access_status(&dir.path);
+    assert!(!partial.configured);
+    assert!(partial.host_configured);
+    assert_eq!(partial.host_source, Some(CredentialSource::File));
+    assert_eq!(
+        partial.access_host.as_deref(),
+        Some("[2001:4860:4860::8888]")
+    );
+    assert!(partial.status_error.is_some());
+
+    // Internal whitespace rejected on client id & client secret.
+    assert!(set_credential(
+        &dir.path,
+        CredentialProvider::CdpAccessClientId,
+        "bad id",
+        CredentialStorage::File,
+    )
+    .is_err());
+    assert!(set_credential(
+        &dir.path,
+        CredentialProvider::CdpAccessClientSecret,
+        "bad\tsecret",
+        CredentialStorage::File,
+    )
+    .is_err());
+
+    set_credential(
+        &dir.path,
+        CredentialProvider::CdpAccessClientId,
+        "cid-123.access",
+        CredentialStorage::File,
+    )
+    .unwrap();
+    set_credential(
+        &dir.path,
+        CredentialProvider::CdpAccessClientSecret,
+        "csec-456",
+        CredentialStorage::File,
+    )
+    .unwrap();
+    let complete = resolve_cdp_access_status(&dir.path);
+    assert!(complete.configured);
+    assert!(complete.client_id_configured);
+    assert!(complete.client_secret_configured);
+    assert!(complete.host_configured);
+    assert_eq!(complete.status_error, None);
+
+    // Kebab-case serialization & search provider partitioning.
+    assert_eq!(
+        serde_json::to_string(&CredentialProvider::WebBotAuthJwk).unwrap(),
+        "\"web-bot-auth-jwk\""
+    );
+    assert_eq!(
+        serde_json::to_string(&CredentialProvider::CdpAccessHost).unwrap(),
+        "\"cdp-access-host\""
+    );
+    assert!(!CredentialProvider::WebBotAuthJwk.is_search_provider());
+    assert!(CredentialProvider::Brave.is_search_provider());
 }

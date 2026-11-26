@@ -332,6 +332,7 @@ impl CefRenderer {
             .to_path_buf();
 
         let mut cmd = Command::new(&renderer_path);
+        crate::auth::scrub_sensitive_env(&mut cmd);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

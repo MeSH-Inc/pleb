@@ -183,13 +183,32 @@ impl Engine {
         timeout: Duration,
         max_body_bytes: usize,
     ) -> Result<CronetResponse> {
+        self.get_with_redirects(url, headers, timeout, max_body_bytes, false)
+            .await
+    }
+
+    pub async fn get_with_redirects(
+        &self,
+        url: &str,
+        headers: &[(&str, String)],
+        timeout: Duration,
+        max_body_bytes: usize,
+        disable_redirects: bool,
+    ) -> Result<CronetResponse> {
         let (tx, rx) = oneshot::channel();
         let active_request = Arc::new((Mutex::new(ActiveRequestInner::default()), Condvar::new()));
         let guard = CancelGuard {
             active_request: Arc::clone(&active_request),
         };
 
-        self.start_request(url, headers, max_body_bytes, tx, active_request)?;
+        self.start_request(
+            url,
+            headers,
+            max_body_bytes,
+            disable_redirects,
+            tx,
+            active_request,
+        )?;
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => {
@@ -218,6 +237,7 @@ impl Engine {
         url: &str,
         headers: &[(&str, String)],
         max_body_bytes: usize,
+        disable_redirects: bool,
         tx: oneshot::Sender<Result<CronetResponse>>,
         active_request: Arc<(Mutex<ActiveRequestInner>, Condvar)>,
     ) -> Result<()> {
@@ -232,13 +252,16 @@ impl Engine {
         let state = Box::new(RequestState {
             body: Mutex::new(Vec::new()),
             max_body_bytes,
+            disable_redirects,
             overflowed: AtomicBool::new(false),
             blocked_redirect: Mutex::new(None),
+            intercepted_redirect: Mutex::new(None),
             initial_url: url::Url::parse(url).ok(),
             status_code: AtomicI32::new(0),
             final_url: Mutex::new(url.to_string()),
             content_type: Mutex::new(None),
             link_header: Mutex::new(None),
+            location_header: Mutex::new(None),
             sender: Mutex::new(Some(tx)),
             request: Mutex::new(std::ptr::null_mut()),
             callback: Mutex::new(std::ptr::null_mut()),
@@ -342,21 +365,89 @@ impl Drop for Engine {
     }
 }
 
+struct InterceptedRedirect {
+    status_code: u16,
+    final_url: String,
+    content_type: Option<String>,
+    link_header: Option<String>,
+    location_header: Option<String>,
+}
+
 struct RequestState {
     body: Mutex<Vec<u8>>,
     max_body_bytes: usize,
+    disable_redirects: bool,
     overflowed: AtomicBool,
     blocked_redirect: Mutex<Option<String>>,
+    intercepted_redirect: Mutex<Option<InterceptedRedirect>>,
     initial_url: Option<url::Url>,
     status_code: AtomicI32,
     final_url: Mutex<String>,
     content_type: Mutex<Option<String>>,
     link_header: Mutex<Option<String>>,
+    location_header: Mutex<Option<String>>,
     sender: Mutex<Option<oneshot::Sender<Result<CronetResponse>>>>,
     request: Mutex<ffi::Cronet_UrlRequestPtr>,
     callback: Mutex<ffi::Cronet_UrlRequestCallbackPtr>,
     active_request: Arc<(Mutex<ActiveRequestInner>, Condvar)>,
     in_flight: Option<InFlightGuard>,
+}
+
+struct ParsedCronetHeaders {
+    content_type: Option<String>,
+    link_header: Option<String>,
+    location_header: Option<String>,
+}
+
+unsafe fn parse_cronet_response_headers(
+    info: ffi::Cronet_UrlResponseInfoPtr,
+    capture_location: bool,
+) -> ParsedCronetHeaders {
+    let mut content_type: Option<String> = None;
+    let mut link_values: Vec<String> = Vec::new();
+    let mut location_header: Option<String> = None;
+    if info.is_null() {
+        return ParsedCronetHeaders {
+            content_type,
+            link_header: None,
+            location_header,
+        };
+    }
+
+    let header_count = ffi::Cronet_UrlResponseInfo_all_headers_list_size(info);
+    for i in 0..header_count {
+        let header = ffi::Cronet_UrlResponseInfo_all_headers_list_at(info, i);
+        if header.is_null() {
+            continue;
+        }
+        let name_ptr = ffi::Cronet_HttpHeader_name_get(header);
+        let value_ptr = ffi::Cronet_HttpHeader_value_get(header);
+        if !name_ptr.is_null() && !value_ptr.is_null() {
+            let name = CStr::from_ptr(name_ptr).to_string_lossy();
+            if name.eq_ignore_ascii_case("content-type") && content_type.is_none() {
+                content_type = Some(CStr::from_ptr(value_ptr).to_string_lossy().into_owned());
+            } else if name.eq_ignore_ascii_case("link") {
+                let value = CStr::from_ptr(value_ptr).to_string_lossy().into_owned();
+                if !value.is_empty() {
+                    link_values.push(value);
+                }
+            } else if capture_location
+                && name.eq_ignore_ascii_case("location")
+                && location_header.is_none()
+            {
+                let value = CStr::from_ptr(value_ptr).to_string_lossy().into_owned();
+                if !value.is_empty() {
+                    location_header = Some(value);
+                }
+            }
+        }
+    }
+
+    ParsedCronetHeaders {
+        content_type,
+        link_header: (!link_values.is_empty()).then(|| link_values.join(", ")),
+        location_header,
+    }
 }
 
 fn get_state(callback: ffi::Cronet_UrlRequestCallbackPtr) -> &'static RequestState {
@@ -383,7 +474,7 @@ unsafe extern "C" fn executor_execute(
 unsafe extern "C" fn on_redirect_received(
     callback: ffi::Cronet_UrlRequestCallbackPtr,
     request: ffi::Cronet_UrlRequestPtr,
-    _info: ffi::Cronet_UrlResponseInfoPtr,
+    info: ffi::Cronet_UrlResponseInfoPtr,
     new_location: ffi::Cronet_String,
 ) {
     let state = get_state(callback);
@@ -392,6 +483,49 @@ unsafe extern "C" fn on_redirect_received(
     } else {
         CStr::from_ptr(new_location).to_string_lossy().into_owned()
     };
+
+    if state.disable_redirects {
+        let status_code = if info.is_null() {
+            302
+        } else {
+            let code = ffi::Cronet_UrlResponseInfo_http_status_code_get(info);
+            if (300..400).contains(&code) {
+                code as u16
+            } else {
+                302
+            }
+        };
+        let final_url = if !info.is_null() {
+            let url_ptr = ffi::Cronet_UrlResponseInfo_url_get(info);
+            if !url_ptr.is_null() {
+                let s = CStr::from_ptr(url_ptr).to_string_lossy().into_owned();
+                if !s.is_empty() {
+                    s
+                } else {
+                    lock_unpoisoned(&state.final_url).clone()
+                }
+            } else {
+                lock_unpoisoned(&state.final_url).clone()
+            }
+        } else {
+            lock_unpoisoned(&state.final_url).clone()
+        };
+        let headers = parse_cronet_response_headers(info, true);
+        let location_header = (!raw_loc.is_empty())
+            .then_some(raw_loc)
+            .or(headers.location_header);
+        *lock_unpoisoned(&state.intercepted_redirect) = Some(InterceptedRedirect {
+            status_code,
+            final_url,
+            content_type: headers.content_type,
+            link_header: headers.link_header,
+            location_header,
+        });
+        let active = Arc::clone(&state.active_request);
+        cancel_active_request(&active);
+        return;
+    }
+
     let resolved = url::Url::parse(&raw_loc).ok().or_else(|| {
         let current = lock_unpoisoned(&state.final_url).clone();
         url::Url::parse(&current)
@@ -435,34 +569,15 @@ unsafe extern "C" fn on_response_started(
         }
     }
 
-    let header_count = ffi::Cronet_UrlResponseInfo_all_headers_list_size(info);
-    let mut content_type: Option<String> = None;
-    let mut link_values: Vec<String> = Vec::new();
-    for i in 0..header_count {
-        let header = ffi::Cronet_UrlResponseInfo_all_headers_list_at(info, i);
-        if header.is_null() {
-            continue;
-        }
-        let name_ptr = ffi::Cronet_HttpHeader_name_get(header);
-        let value_ptr = ffi::Cronet_HttpHeader_value_get(header);
-        if !name_ptr.is_null() && !value_ptr.is_null() {
-            let name = CStr::from_ptr(name_ptr).to_string_lossy();
-            if name.eq_ignore_ascii_case("content-type") && content_type.is_none() {
-                let value = CStr::from_ptr(value_ptr).to_string_lossy().into_owned();
-                content_type = Some(value);
-            } else if name.eq_ignore_ascii_case("link") {
-                let value = CStr::from_ptr(value_ptr).to_string_lossy().into_owned();
-                if !value.is_empty() {
-                    link_values.push(value);
-                }
-            }
-        }
+    let headers = parse_cronet_response_headers(info, (300..400).contains(&code));
+    if headers.content_type.is_some() {
+        *lock_unpoisoned(&state.content_type) = headers.content_type;
     }
-    if content_type.is_some() {
-        *lock_unpoisoned(&state.content_type) = content_type;
+    if headers.link_header.is_some() {
+        *lock_unpoisoned(&state.link_header) = headers.link_header;
     }
-    if !link_values.is_empty() {
-        *lock_unpoisoned(&state.link_header) = Some(link_values.join(", "));
+    if headers.location_header.is_some() {
+        *lock_unpoisoned(&state.location_header) = headers.location_header;
     }
 
     let buffer = ffi::Cronet_Buffer_Create();
@@ -556,6 +671,7 @@ unsafe extern "C" fn on_succeeded(
     let final_url = std::mem::take(&mut *lock_unpoisoned(&boxed.final_url));
     let content_type = lock_unpoisoned(&boxed.content_type).take();
     let link_header = lock_unpoisoned(&boxed.link_header).take();
+    let location_header = lock_unpoisoned(&boxed.location_header).take();
 
     complete(
         &boxed,
@@ -564,7 +680,7 @@ unsafe extern "C" fn on_succeeded(
             final_url,
             content_type,
             link_header,
-            location_header: None,
+            location_header,
             body,
         }),
     );
@@ -619,22 +735,31 @@ unsafe extern "C" fn on_canceled(
     _info: ffi::Cronet_UrlResponseInfoPtr,
 ) {
     let boxed = finish_request(callback);
-    let err = if let Some(target) = lock_unpoisoned(&boxed.blocked_redirect).take() {
-        anyhow::Error::new(TransportError::new(
+    let result = if let Some(redir) = lock_unpoisoned(&boxed.intercepted_redirect).take() {
+        Ok(CronetResponse {
+            status_code: redir.status_code,
+            final_url: redir.final_url,
+            content_type: redir.content_type,
+            link_header: redir.link_header,
+            location_header: redir.location_header,
+            body: Vec::new(),
+        })
+    } else if let Some(target) = lock_unpoisoned(&boxed.blocked_redirect).take() {
+        Err(anyhow::Error::new(TransportError::new(
             TransportErrorKind::RedirectBlocked,
             format!("blocked unsafe redirect to {target}"),
-        ))
+        )))
     } else if boxed.overflowed.load(Ordering::SeqCst) {
-        anyhow::Error::new(super::ResponseTooLargeError {
+        Err(anyhow::Error::new(super::ResponseTooLargeError {
             limit_bytes: boxed.max_body_bytes,
-        })
+        }))
     } else {
-        anyhow::Error::new(TransportError::new(
+        Err(anyhow::Error::new(TransportError::new(
             TransportErrorKind::Canceled,
             "cronet request canceled",
-        ))
+        )))
     };
-    complete(&boxed, Err(err));
+    complete(&boxed, result);
 }
 
 #[cfg(test)]

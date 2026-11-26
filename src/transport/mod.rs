@@ -125,6 +125,8 @@ enum TransportBackend {
         engine: cronet::Engine,
         #[cfg(not(feature = "cronet"))]
         inner: reqwest::Client,
+        #[cfg(not(feature = "cronet"))]
+        no_redirect_client: reqwest::Client,
     },
     #[cfg(unix)]
     Daemon {
@@ -140,6 +142,25 @@ enum TransportBackend {
 pub struct TransportClient {
     backend: TransportBackend,
     default_timeout: Duration,
+}
+
+#[cfg(not(feature = "cronet"))]
+fn build_reqwest_client(
+    proxy: Option<&str>,
+    redirect_policy: reqwest::redirect::Policy,
+) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(chrome_user_agent())
+        .redirect(redirect_policy)
+        .gzip(true)
+        .brotli(true)
+        .deflate(true);
+
+    if let Some(proxy_url) = proxy {
+        builder = builder.proxy(reqwest::Proxy::all(proxy_url)?);
+    }
+
+    Ok(builder.build()?)
 }
 
 impl TransportClient {
@@ -159,20 +180,14 @@ impl TransportClient {
         #[cfg(not(feature = "cronet"))]
         {
             let _ = storage_path;
-            let mut builder = reqwest::Client::builder()
-                .user_agent(chrome_user_agent())
-                .redirect(reqwest_redirect_policy())
-                .gzip(true)
-                .brotli(true)
-                .deflate(true);
-
-            if let Some(proxy_url) = proxy {
-                builder = builder.proxy(reqwest::Proxy::all(proxy_url)?);
-            }
+            let inner = build_reqwest_client(proxy, reqwest_redirect_policy())?;
+            let no_redirect_client =
+                build_reqwest_client(proxy, reqwest::redirect::Policy::none())?;
 
             Ok(Self {
                 backend: TransportBackend::Direct {
-                    inner: builder.build()?,
+                    inner,
+                    no_redirect_client,
                 },
                 default_timeout: timeout,
             })
@@ -245,6 +260,10 @@ impl TransportClient {
         max_body_bytes: usize,
         opts: &RequestHeaderOptions,
     ) -> Result<HttpResponse> {
+        if let Some(ref wba) = opts.web_bot_auth {
+            validate_web_bot_auth_headers(wba)?;
+        }
+
         match &self.backend {
             #[cfg(unix)]
             TransportBackend::Daemon {
@@ -272,11 +291,22 @@ impl TransportClient {
                 engine,
                 #[cfg(not(feature = "cronet"))]
                 inner,
+                #[cfg(not(feature = "cronet"))]
+                no_redirect_client,
             } => {
                 #[cfg(feature = "cronet")]
                 {
-                    let headers = request_header_pairs(true, url, opts);
-                    let resp = engine.get(url, &headers, timeout, max_body_bytes).await?;
+                    let headers = request_header_pairs(true, url, opts)?;
+                    let disable_redirects = opts.disable_redirects || opts.web_bot_auth.is_some();
+                    let resp = engine
+                        .get_with_redirects(
+                            url,
+                            &headers,
+                            timeout,
+                            max_body_bytes,
+                            disable_redirects,
+                        )
+                        .await?;
                     Ok(HttpResponse {
                         status: resp.status_code,
                         final_url: resp.final_url,
@@ -289,8 +319,14 @@ impl TransportClient {
                 #[cfg(not(feature = "cronet"))]
                 {
                     let headers = request_headers_reqwest(url, opts)?;
+                    let no_redirects = opts.disable_redirects || opts.web_bot_auth.is_some();
+                    let client = if no_redirects {
+                        no_redirect_client
+                    } else {
+                        inner
+                    };
                     let fut = async {
-                        let mut resp = inner
+                        let mut resp = client
                             .get(url)
                             .headers(headers)
                             .timeout(timeout)
@@ -316,6 +352,14 @@ impl TransportClient {
                         } else {
                             Some(link_values.join(", "))
                         };
+                        let location_header = if (300..400).contains(&status) {
+                            resp.headers()
+                                .get(reqwest::header::LOCATION)
+                                .and_then(|v| v.to_str().ok())
+                                .map(|s| s.to_string())
+                        } else {
+                            None
+                        };
                         let mut body = Vec::new();
                         while let Some(chunk) = resp.chunk().await? {
                             if body.len().saturating_add(chunk.len()) > max_body_bytes {
@@ -330,7 +374,7 @@ impl TransportClient {
                             final_url,
                             content_type,
                             link_header,
-                            location_header: None,
+                            location_header,
                             body,
                         })
                     };
@@ -449,11 +493,23 @@ fn compute_sec_fetch_site(referer: Option<&str>, target_url: &str) -> &'static s
     "cross-site"
 }
 
+fn validate_web_bot_auth_headers(wba: &WebBotAuthHeaders) -> Result<()> {
+    for value in [&wba.signature, &wba.signature_input, &wba.signature_agent] {
+        if value.bytes().any(|b| b.is_ascii_control() || !b.is_ascii()) {
+            return Err(anyhow::Error::new(TransportError::new(
+                TransportErrorKind::Network,
+                "Web Bot Auth header contains disallowed control or non-ASCII characters",
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn request_header_pairs(
     include_zstd: bool,
     url: &str,
     opts: &RequestHeaderOptions,
-) -> Vec<(&'static str, String)> {
+) -> Result<Vec<(&'static str, String)>> {
     let accept_encoding = if include_zstd {
         "gzip, deflate, br, zstd"
     } else {
@@ -491,7 +547,13 @@ fn request_header_pairs(
     if let Some(referer) = opts.referer.as_deref().filter(|s| !s.is_empty()) {
         pairs.push(("Referer", referer.to_string()));
     }
-    pairs
+    if let Some(ref wba) = opts.web_bot_auth {
+        validate_web_bot_auth_headers(wba)?;
+        pairs.push(("Signature", wba.signature.clone()));
+        pairs.push(("Signature-Input", wba.signature_input.clone()));
+        pairs.push(("Signature-Agent", wba.signature_agent.clone()));
+    }
+    Ok(pairs)
 }
 
 fn chrome_header_pairs(include_zstd: bool) -> Vec<(&'static str, String)> {
@@ -527,7 +589,7 @@ fn request_headers_reqwest(
 ) -> Result<reqwest::header::HeaderMap> {
     use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
     let mut headers = HeaderMap::new();
-    for (name, value) in request_header_pairs(false, url, opts) {
+    for (name, value) in request_header_pairs(false, url, opts)? {
         headers.insert(
             HeaderName::from_bytes(name.as_bytes())?,
             HeaderValue::from_str(&value)?,
