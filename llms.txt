@@ -1,0 +1,35 @@
+# pleb
+
+> Local, MIT-licensed, zero-telemetry web acquisition and search CLI (`pleb`) and Rust library (`pleb`) by Memory Sync Hub LLC.
+
+`pleb` converts public web pages, Markdown mirrors, syndication feeds, YouTube captions, and transcripts into compact Markdown or plain text in a single `O(N)` DOM pass. Primary HTTP runs over Chromium 154 Cronet (or `reqwest` with `rustls` by default when compiled without `--features cronet`) with redirect-time SSRF protection, optional offscreen Chromium rendering (`pleb-renderer`, protocol `v5-meta`) via a shared Unix-socket daemon (`daemon.sock`), zero-fetch resource indexing with selective staging, and local multi-provider search (`pleb search`, `pleb auth`). Active anti-bot challenges fail fast (exit code `2`) without CAPTCHA solving or evasion scripts.
+
+## Core Documentation
+
+- [README.md](README.md): Overview, verified corpus benchmark summary, tool comparison, installation, and quick start
+- [README-FULL.md](README-FULL.md): Complete CLI reference, five-stage extraction pipeline, environment variables, JSON output schemas, comparison matrix, and packaging notes
+- [llms-full.txt](llms-full.txt): Single-file technical reference and benchmark report formatted for full-context LLM ingestion
+- [skills/pleb/SKILL.md](skills/pleb/SKILL.md): Canonical version-locked agent skill embedded verbatim in `pleb skill print`
+- [examples/corpus_benchmark.rs](examples/corpus_benchmark.rs): Reproducible corpus byte/token reduction and extraction throughput harness
+
+## Architecture Specifications
+
+- [AGENTS.md](AGENTS.md): Build rules, host installation sync, hermetic test boundaries, and non-regression gates
+- [docs/01-transport-daemon-and-batch-fetch.md](docs/01-transport-daemon-and-batch-fetch.md): Unified transport daemon (`daemon.sock`), Cronet/`reqwest`, CEF escalation, and batch fetching
+- [docs/02-swarm-hillclimb-protocol.md](docs/02-swarm-hillclimb-protocol.md): Corpus scorecard evaluation (`ratchet == 1.000`) and quality gates
+- [docs/03-structured-source-negotiation.md](docs/03-structured-source-negotiation.md): GitHub/GitLab/Gist raw source resolution, Markdown mirrors, feeds, and native Markdown
+- [docs/04-resource-indexing-and-staging.md](docs/04-resource-indexing-and-staging.md): Resource salience indexing, SVG/transcript rescue, and artifact staging
+- [docs/05-multi-provider-search-and-auth.md](docs/05-multi-provider-search-and-auth.md): `pleb auth` credential resolution and multi-provider search routing
+
+## Packaging and Distribution
+
+- [Cargo.toml](Cargo.toml): Cargo crate manifest (`pleb`, default `reqwest` TLS or optional `cronet` feature)
+- [packaging/homebrew/pleb.rb](packaging/homebrew/pleb.rb): Homebrew formula template for tap distribution
+- [scripts/install-cef-mac.sh](scripts/install-cef-mac.sh): macOS arm64 offscreen CEF `v5-meta` installer
+- [scripts/install-cef-linux.sh](scripts/install-cef-linux.sh): Linux `x86_64` / `aarch64` native Ozone headless CEF `v5-meta` installer
+
+## Optional
+
+- [LICENSE](LICENSE): MIT license and upstream attribution (`wickproject/wick`)
+- [data/site-rules.json](data/site-rules.json): Bundled host rewrite and mandatory CEF overrides
+- [tests/corpus_evaluation.rs](tests/corpus_evaluation.rs): Corpus non-regression test harness across all `43` fixtures

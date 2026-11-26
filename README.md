@@ -12,6 +12,33 @@ By default, `pleb` makes HTTP requests using Chrome's network stack (Cronet) or 
 - **Multi-provider search and local credentials**: Routes search queries across Brave, Tavily, Serper, Exa, SearXNG, or DuckDuckGo with cooldown tracking, burst pacing, Reciprocal Rank Fusion, and local credential storage (`pleb auth`). See [Search and Credentials](README-FULL.md#search-and-credentials).
 - **Site crawling and mapping**: Crawls links with bounded concurrency and `Crawl-delay` pacing, and discovers site URLs from sitemaps and `robots.txt`. See [Crawl and Map](README-FULL.md#crawl-and-map).
 
+## Benchmarks
+
+Measured with `cargo run --release --example corpus_benchmark` across all `43` sanitized fixtures in [tests/corpus_evaluation.rs](tests/corpus_evaluation.rs) (`39` extractable documents across `50` warm iterations, `4` classification gates; token counts estimated via `ceil(bytes / 4)`):
+
+| Category | Fixtures | Raw Bytes | Output Bytes | Byte Reduction | Est. Tokens (`Raw -> Clean`) | Mean Release Latency |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| HTML pages | 26 | 26,402 | 9,306 | 64.8% | 6,601 -> 2,327 | 51.8 us |
+| Feeds (RSS/Atom/JSON) | 4 | 3,031 | 1,424 | 53.0% | 758 -> 356 | 23.2 us |
+| Transcripts (WebVTT/SRT) | 2 | 520 | 205 | 60.6% | 130 -> 52 | 1.4 us |
+| Native Markdown | 5 | 2,108 | 2,142 | -1.6% | 527 -> 536 | 2.8 us |
+| Plain/JSON passthrough | 2 | 152 | 152 | 0.0% | 38 -> 38 | 0.1 us |
+| **All extractable** | **39** | **32,213** | **13,229** | **58.9%** | **8,054 -> 3,308** | **37.4 us** (`21.08 MiB/s`) |
+
+All `4/4` non-extractable fixtures (`ratchet_challenge_403.html`, `frontier_soft_404_login_wall.html`, `ratchet_js_shell.html`, `frontier_canary_sveltekit_spa.html`) classified accurately for fail-fast blocking or CEF escalation. See [Benchmarks](README-FULL.md#benchmarks) for methodology and native Markdown link-resolution details.
+
+## Comparison
+
+| Tool | Execution & State | HTTP / Browser Stack | Challenge Policy | Built-in Search & Auth |
+| :--- | :--- | :--- | :--- | :--- |
+| **`pleb`** | Single MIT Rust binary (`~/.pleb`); zero telemetry | Cronet (`Chromium 154`) or `reqwest` + optional CEF `v5-meta` daemon | Fail fast (`exit 2`), zero CAPTCHA bypass | `pleb search` (6 providers + RRF) & `pleb auth` |
+| **Firecrawl** | Cloud API, `firecrawl-local` binary, or AGPL-3.0 Docker stack (Redis, Postgres, browser) | Cloud browsers or Playwright/Fire-engine | Managed cloud unblocking | Cloud/v2 `/search` endpoint |
+| **Jina Reader** | Hosted `r.jina.ai` (`20 RPM` no-key / paid tokens) or Apache-2.0 container | Hosted Chromium fleet | Rate-limit tiers (not bypass) | Separate `s.jina.ai` endpoint |
+| **Crawl4AI** | Python + Playwright (Apache-2.0) or Crawl4AI Cloud | Async Playwright browser pool | Community hooks/proxies | Crawl4AI Cloud only |
+| **`curl` + `html2text`** | Local CLI tools; no state | `libcurl` HTTP, no JS rendering | Raw `403` HTML output | None |
+
+See [Comparison with Alternatives](README-FULL.md#comparison-with-alternatives) for feature trade-offs and when to pick another tool.
+
 ## Install
 
 Build and install the `pleb` binary onto `PATH`:
@@ -68,10 +95,13 @@ See [Command Reference](README-FULL.md#command-reference) for all subcommands, f
 
 ## Full Documentation
 
-Complete documentation lives in [README-FULL.md](README-FULL.md):
+Machine-readable agent discovery files live at [llms.txt](llms.txt), [llms-full.txt](llms-full.txt), and [skills/pleb/SKILL.md](skills/pleb/SKILL.md). Complete human and integrator documentation lives in [README-FULL.md](README-FULL.md):
 
 - [Overview and Design Boundaries](README-FULL.md#overview-and-design-boundaries) — scope, differences from upstream `wickproject/wick`, and non-bypass boundary
+- [Benchmarks](README-FULL.md#benchmarks) — reproducible corpus byte/token reduction and release latency across `tests/corpus/`
+- [Comparison with Alternatives](README-FULL.md#comparison-with-alternatives) — trade-offs vs Firecrawl, Jina Reader (`r.jina.ai`), Crawl4AI, and `curl` + `html2text`
 - [Installation and Runtime Setup](README-FULL.md#installation-and-runtime-setup) — Cronet, optional CEF `v5-meta` renderer, and agent skill installation
+- [Distribution and Packaging](README-FULL.md#distribution-and-packaging) — default `reqwest` build (`crates.io`), optional Cronet builds, and Homebrew tap formula template
 - [Architecture](README-FULL.md#architecture) — request pipeline and repository directory layout
 - [Transport and Rendering](README-FULL.md#transport-and-rendering) — Cronet, CEF escalation, response classification, and the `daemon.sock` transport daemon
 - [Extraction and Source Negotiation](README-FULL.md#extraction-and-source-negotiation) — cleanup stages, worked HTML-to-Markdown example, source bypass, and non-HTML formats

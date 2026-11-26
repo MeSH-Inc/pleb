@@ -515,14 +515,21 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
     assert_eq!(val["daemon"]["active_requests"], 0);
     assert_eq!(val["cef_renderer"]["expected_protocol"], "v5-meta");
 
-    // README.md and README-FULL.md must maintain canonical branding, valid relative file links,
-    // valid heading anchors, and CLI/schema contract parity without retired identifiers.
+    // README.md, README-FULL.md, llms.txt, and llms-full.txt must maintain canonical branding,
+    // valid relative file links, valid heading anchors, and CLI/schema contract parity without retired identifiers.
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let readme = std::fs::read_to_string(manifest_dir.join("README.md")).unwrap();
     let readme_full = std::fs::read_to_string(manifest_dir.join("README-FULL.md")).unwrap();
+    let llms_txt = std::fs::read_to_string(manifest_dir.join("llms.txt")).unwrap();
+    let llms_full_txt = std::fs::read_to_string(manifest_dir.join("llms-full.txt")).unwrap();
     let license = std::fs::read_to_string(manifest_dir.join("LICENSE")).unwrap();
 
-    for (doc_name, doc_text) in [("README.md", &readme), ("README-FULL.md", &readme_full)] {
+    for (doc_name, doc_text) in [
+        ("README.md", &readme),
+        ("README-FULL.md", &readme_full),
+        ("llms.txt", &llms_txt),
+        ("llms-full.txt", &llms_full_txt),
+    ] {
         assert!(
             doc_text.contains("pleb"),
             "{doc_name} missing canonical pleb name"
@@ -649,6 +656,8 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
 
     let readme_anchors = extract_markdown_anchors(&readme);
     let full_anchors = extract_markdown_anchors(&readme_full);
+    let llms_anchors = extract_markdown_anchors(&llms_txt);
+    let llms_full_anchors = extract_markdown_anchors(&llms_full_txt);
     let mut readme_full_anchor_links = 0usize;
     let mut full_internal_anchor_links = 0usize;
     let mut relative_file_links = 0usize;
@@ -656,6 +665,8 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
     for (doc_name, doc_text, self_anchors) in [
         ("README.md", &readme, &readme_anchors),
         ("README-FULL.md", &readme_full, &full_anchors),
+        ("llms.txt", &llms_txt, &llms_anchors),
+        ("llms-full.txt", &llms_full_txt, &llms_full_anchors),
     ] {
         for target in extract_markdown_link_targets(doc_text) {
             if target.starts_with("http://")
@@ -689,6 +700,10 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
                     &full_anchors
                 } else if rel_path == "README.md" {
                     &readme_anchors
+                } else if rel_path == "llms.txt" {
+                    &llms_anchors
+                } else if rel_path == "llms-full.txt" {
+                    &llms_full_anchors
                 } else {
                     continue;
                 };
@@ -754,10 +769,34 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "StatusJson",
         "CrawlResult",
         "MapResult",
+        "corpus_benchmark",
+        "Firecrawl",
+        "Jina Reader",
+        "Crawl4AI",
+        "crates.io",
+        "packaging/homebrew/pleb.rb",
     ] {
         assert!(
             readme_full.contains(required),
             "README-FULL.md missing documented capability: {required}"
+        );
+    }
+    for required in [
+        "pleb",
+        "Memory Sync Hub LLC",
+        "v5-meta",
+        "daemon.sock",
+        "corpus_benchmark",
+        "Firecrawl",
+        "Jina Reader",
+        "Crawl4AI",
+        "pleb auth set",
+        "--stage-resources",
+        "FetchOutput",
+    ] {
+        assert!(
+            llms_full_txt.contains(required),
+            "llms-full.txt missing documented capability: {required}"
         );
     }
     let retired_docs_and_skill = [
@@ -781,7 +820,12 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "WICK_BUILD_ID",
         "WICK_RENDERER_PROTOCOL",
     ];
-    for (doc_name, doc_text) in [("README.md", &readme), ("README-FULL.md", &readme_full)] {
+    for (doc_name, doc_text) in [
+        ("README.md", &readme),
+        ("README-FULL.md", &readme_full),
+        ("llms.txt", &llms_txt),
+        ("llms-full.txt", &llms_full_txt),
+    ] {
         for retired in retired_docs_and_skill {
             assert!(
                 !doc_text.contains(retired),

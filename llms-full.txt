@@ -1,0 +1,152 @@
+# pleb — Complete Technical Reference for AI Agents
+
+> Local, MIT-licensed, zero-telemetry web acquisition and search CLI (`pleb`) and Rust library (`pleb`), maintained by Memory Sync Hub LLC and forked from [wickproject/wick](https://github.com/wickproject/wick).
+
+Verify any host installation before relying on `pleb` flags or state guarantees:
+
+```bash
+pleb status --json
+pleb skill print
+```
+
+Healthy Cronet + CEF installations report `"cronet_enabled": true`, `"cef_renderer": { "status": "ready", "expected_protocol": "v5-meta" }`, and `"state_dir": "<home>/.pleb"`. Standard builds without `--features cronet` report `"cronet_enabled": false` and use `reqwest` (`rustls`).
+
+## Behavioral Boundaries
+
+- **Zero telemetry**: All upstream telemetry pings and remote `site-rules.json` fetches from `wickproject/wick` are removed. Bundled rules live in [data/site-rules.json](data/site-rules.json) with an optional local overlay at `<state_dir>/site-rules.json`.
+- **Fail fast on bot challenges**: `pleb` never solves CAPTCHAs, clicks challenge widgets, or runs anti-bot evasion scripts. Active challenges return exit code `2` (`kind: "challenge"`) immediately without duplicate CEF retries.
+- **Redirect SSRF protection**: Both Cronet and `reqwest` validate `3xx` redirects against non-HTTP(S) schemes and private/loopback/IMDS/`.local`/`.internal` targets from public origins (`redirect_blocked` transport error).
+- **Private local state (`0o700` / `0o600`)**: Credentials resolve `environment -> macOS Keychain (service "pleb") -> <state_dir>/credentials.json`, never accept secrets as positional CLI args, zeroize in memory, and never appear in JSON or `-v` logs.
+
+## Installation Modes
+
+1. **macOS Apple Silicon or Linux with Chromium 154 Cronet (recommended from source checkout):**
+   ```bash
+   ./scripts/download-cronet-macos.sh   # or ./scripts/download-cronet-linux.sh
+   cargo install --path . --features cronet --locked
+   ```
+2. **Optional local offscreen CEF renderer (`v5-meta`):**
+   ```bash
+   bash scripts/install-cef-mac.sh --force     # macOS arm64 (~/.pleb/cef/pleb-renderer.app)
+   bash scripts/install-cef-linux.sh --force   # Linux x86_64/aarch64 (Ozone headless when DISPLAY is unset)
+   ```
+3. **Pure-Rust `reqwest` (`rustls`) build (offline-friendly default for package managers):**
+   ```bash
+   cargo build --release
+   ```
+4. **Agent skill symlink installer (`~/.agents`, `~/.gemini`, `~/.claude`, `~/.codex`, `~/.config/opencode`):**
+   ```bash
+   bash scripts/install-skill.sh
+   ```
+
+## Corpus Extraction Benchmarks
+
+Measured with `cargo run --release --example corpus_benchmark` across all `43` sanitized fixtures in [tests/corpus_evaluation.rs](tests/corpus_evaluation.rs) (`ExtractMode::Clean`, `OutputFormat::Markdown`, `50` warm passes per fixture on Apple Silicon). Token counts use the deterministic `ceil(bytes / 4)` heuristic (exact BPE counts vary by tokenizer), and latencies reflect single-host release execution of [examples/corpus_benchmark.rs](examples/corpus_benchmark.rs).
+
+| Category | Fixtures | Raw Bytes | Output Bytes | Reduction | Raw Est. Tokens | Output Est. Tokens | Mean Latency/Doc |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| HTML pages | 26 | 26,402 | 9,306 | 64.8% | 6,601 | 2,327 | 51.8 us |
+| Syndication feeds (RSS/Atom/JSON) | 4 | 3,031 | 1,424 | 53.0% | 758 | 356 | 23.2 us |
+| Transcripts (WebVTT/SRT) | 2 | 520 | 205 | 60.6% | 130 | 52 | 1.4 us |
+| Native Markdown | 5 | 2,108 | 2,142 | -1.6% | 527 | 536 | 2.8 us |
+| Plain/JSON passthrough | 2 | 152 | 152 | 0.0% | 38 | 38 | 0.1 us |
+| **All extractable fixtures** | **39** | **32,213** | **13,229** | **58.9%** | **8,054** | **3,308** | **37.4 us** |
+
+Notes:
+- Combined warm extraction throughput measured `21.08 MiB/s` (`1.457 ms` per full pass across `32,213` bytes).
+- Native Markdown fixtures grew `+1.6%` overall because relative links (for example `./CONTRIBUTING.md`) are resolved against the base URL into full clickable URLs.
+- All `4/4` non-extractable classification gates matched (`ratchet_challenge_403.html` -> `challenge`, `frontier_soft_404_login_wall.html` -> `blocked`, `ratchet_js_shell.html` -> `javascript_shell`, `frontier_canary_sveltekit_spa.html` -> `javascript_shell`).
+- Run `cargo run --release --example corpus_benchmark -- --json` for machine-readable JSON output.
+
+## Comparison with Alternatives
+
+| Capability | `pleb` | Firecrawl | Jina Reader (`r.jina.ai`) | Crawl4AI | `curl` + `html2text` |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **License & telemetry** | MIT; zero telemetry, local-only | AGPL-3.0 OSS / Cloud API | Apache-2.0 OSS / Cloud API | Apache-2.0 OSS / Cloud API | Permissive; local |
+| **Runtime footprint** | Single Rust binary (plus optional CEF) | `firecrawl-local` binary, Cloud API, or Docker Compose (Redis, PostgreSQL, browser) | Hosted `r.jina.ai`/`s.jina.ai` or self-hosted stateless/S3 container | Python runtime + Playwright Chromium | Ubiquitous lightweight CLI |
+| **Network & browser stack** | Cronet (`Chromium 154`) or `reqwest` + optional CEF `v5-meta` daemon | Hosted unblocking/actions or self-hosted Playwright/Fire-engine | Hosted headless browser (no-key 20 RPM / free & paid token tiers) | Async Playwright Chromium pool | Default HTTP client (`libcurl`), no JS |
+| **Bot challenge handling** | Fail fast (exit `2`), no CAPTCHA bypass | Cloud tier offers managed unblocking | Respects tier limits; paid tiers increase RPM, not access bypass | Community stealth / proxy hooks | Raw `403` HTML response |
+| **Structured source bypass** | GitHub/GitLab/Gist raw, RFC 8288/`<link>` Markdown mirrors, RSS/Atom/JSON, VTT/SRT, YouTube captions | HTML/PDF scraping and structured `/extract` schemas | HTML, PDF, MS Office, and VLM image captioning | HTML fit-Markdown, BM25/LLM filters | Raw HTML only |
+| **Search + credentials** | Built-in `pleb search` (6 providers + RRF) and `pleb auth` | Separate `/search` endpoint in Cloud/v2 API | Separate `s.jina.ai` search (`10,000` fixed tokens/search on API) | Search integration in Crawl4AI Cloud | None |
+
+### When to Choose Another Tool
+
+- **Firecrawl**: Prefer Firecrawl when you want managed cloud unblocking with rotating proxies, interactive page actions (`click`/`scroll`), MCP cloud connectors, or LLM-driven JSON schema extraction (`/extract`).
+- **Jina Reader (`r.jina.ai` / `s.jina.ai`)**: Prefer Jina Reader when zero-install URL prefixing over HTTP is sufficient (20 RPM without a key; free token starter pack, ~$0.05 per 1M output tokens thereafter) or when you want built-in PDF parsing and image captioning.
+- **Crawl4AI**: Prefer Crawl4AI when your stack is async Python + Playwright and you want query-aware BM25 or LLM chunk filtering (`PruningContentFilterLXML`, `BM25ContentFilter`, `LLMContentFilter`) inside Python pipelines.
+
+## Command Reference
+
+### Global Flags
+
+- `--proxy <URL>` (`PLEB_PROXY`): SOCKS5 or HTTP proxy URL (partitions daemon cache/profile).
+- `--timeout <SECS>`: Network request timeout (default `30`).
+- `--max-response-bytes <BYTES>`: Body cap (default `16 MiB` document / `128 MiB` raw).
+- `--cef-timeout <SECS>`: CEF render timeout (default `60`).
+- `--state-dir <DIR>` (`PLEB_HOME`): Private (`0o700`) state directory (default `~/.pleb`).
+- `--no-daemon` (`PLEB_NO_DAEMON`): Bypass `daemon.sock` and run in-process.
+- `--daemon-idle-timeout <SECS>` (`PLEB_DAEMON_IDLE_SECONDS`): Daemon idle exit seconds (default `300`).
+- `-v, --verbose` / `-q, --quiet` / `--json`: Debug tracing (`pleb=debug`), quiet stderr, or JSON output + JSON error envelope.
+
+### Subcommands
+
+- `pleb fetch [OPTIONS] <URLS>...` (or `-` to read URLs from `stdin`):
+  - `--format <markdown|html|text|raw>` (aliases: `md`, `txt`)
+  - `--extract <clean|article|full>` (default `clean`)
+  - `--render <auto|cef|cronet>` (aliases: `browser`/`render`/`js` -> `cef`; `network`/`fast`/`no-js`/`nojs` -> `cronet`)
+  - `--source <auto|negotiate|none>` (default `auto`: raw forge URLs + RFC 8288/HTML Markdown mirrors; `negotiate` sends `Accept: text/markdown` and probes `<path>.md`)
+  - `--resources <none|manifest|transcripts|diagrams|all>` (default `none`: zero subresource requests, indexes into JSON/`stderr` cue)
+  - `--stage-resources <r1,r2>` / `--stage` / `--referer <URL>` (content-addressed `0o600` files in `<state_dir>/artifacts/`, magic-byte validated, `256 MiB` LRU eviction)
+  - `--wait-for-selector <CSS>`, `--respect-robots`, `--no-rewrite`, `--no-images`, `--no-links`, `--max-bytes <N>`
+  - Batch options: `--concurrency <1..=16>` (default `4`, host cap `2`), `--jsonl`, `--metadata-only`, `-o <PATH>` (single URL only)
+- `pleb search [OPTIONS] <QUERY>`:
+  - `-n, --limit <1..=20>` (default `8`)
+  - `--provider <auto|brave|tavily|serper|exa|searxng|duckduckgo|federated>` (`ddg` alias; `federated` merges with deterministic RRF `k = 60`)
+  - `--mode <auto|exact|semantic>`
+  - `--freshness <day|week|month|year>`, `--site <DOMAIN>`, `--extra-snippets`, `--urls-only`
+- `pleb auth set <brave|tavily|serper|exa|searxng> [--stdin] [--storage <auto|keychain|file>]`, `pleb auth remove <provider>`, `pleb auth status [--json]` (interactive `set` reads `/dev/tty` with echo off)
+- `pleb crawl <URL> [-d 2] [-n 10] [--extract clean|article|full] [--path-filter PREFIX] [--no-robots]` (respects `robots.txt` + `Crawl-delay` by default; max `--depth 5`, `--max-pages 50`)
+- `pleb map <URL> [-n 100] [--path-filter PREFIX] [--no-sitemap] [--no-robots]` (max `--limit 5000`)
+- `pleb status [--json]`, `pleb daemon <status|stop|run>`, `pleb session clear`, `pleb skill print [--json]`
+
+## Exit Codes and JSON Schemas
+
+| Exit Code | Meaning |
+| :--- | :--- |
+| `0` | Success |
+| `1` | Invalid flags/input, missing/mismatched CEF renderer, size overflow, transport failure, or heterogeneous all-failed batch |
+| `2` | Origin block (`403`/`503`, login/cookie wall), active bot challenge, or `robots.txt` disallow |
+| `3` | Origin HTTP `4xx`/`5xx` error (including low-prose soft-`404`) |
+| `4` | Partial batch failure (mixed success and failure) |
+| `5` | Unsupported binary payload in non-raw mode (use `--stage` or `--format raw -o <path>`) |
+| `130` | Interrupted interactive TTY secret prompt (`SIGINT`/`SIGTERM`) |
+
+Key JSON schemas (`--json` / `--jsonl`):
+- **`FetchOutput`**: `url`, `final_url`, `status_code`, `content_type`, `title`, `content` (omitted with `--metadata-only`), `content_bytes`, `strategy` (`cronet`, `reqwest`, `cef`, `raw_source`, `markdown_mirror`, `markdown_negotiated`), `escalated`, `truncated`, `timing_ms`, optional `resources` (`ResourceDescriptor[]`).
+- **`BatchItemResult`**: untagged union on `ok` (`true` matches `FetchOutput`; `false` has `url`, `ok`, `error`, `kind`, `exit_code`).
+- **`StagedAssetOutput`**: `url`, `final_url`, `status_code`, `content_type`, `byte_count`, `staged_path`, `timing_ms`.
+- **`ResourceDescriptor`**: `identifier` (`r1`, ...), `kind` (`diagram`, `image`, `transcript`, `document`, `dataset`, `schema`), `url`, `salience` (`high`, `medium`), plus optional `mime_hint`, `section_heading`, `label`, `dimensions`, `staged_path`, `byte_count`, `content_type`.
+- **`SearchResponse`**: `provider`, optional `providers_used`, `results` (`[{ title, url, snippet, extra_snippets? }]`).
+- **`StatusJson`**: `version`, `cronet_enabled`, `cef_renderer` (`status`, `path`, `found_protocol`, `expected_protocol`), `daemon` (`supported`, `running`, `pid`, `protocol_version`, `build_id`, `active_requests`, `cronet_slots`, `cef_renderers_alive`), `state_dir`, `search_providers`.
+- **`CrawlResult`** / **`MapResult`**: `pages` (`[{ url, title, content, depth }]`), `urls_discovered`, `timing_ms` / `urls`, `timing_ms`, `from_sitemap`.
+
+## Agent Composition Patterns
+
+```bash
+# Search and stream extracted pages without loading boilerplate
+pleb search --urls-only -n 5 "rustls ech support" | pleb fetch - --jsonl --concurrency 4
+
+# Read clean Markdown first, inspect resource cue, then stage only a needed diagram
+pleb fetch --json --resources none https://example.com/architecture
+pleb fetch --json --stage-resources r1 https://example.com/architecture
+
+# Render a client-side SPA deterministically
+pleb fetch --render cef --wait-for-selector "article[data-ready]" https://app.example.com/post
+
+# Verify full non-regression test suite and corpus scorecard
+cargo fmt --check
+cargo clippy --all-targets --features cronet -- -D warnings
+cargo test --features cronet --locked
+```
+
+For full details on all flags, extraction rules, and packaging files, see [README.md](README.md) and [README-FULL.md](README-FULL.md).

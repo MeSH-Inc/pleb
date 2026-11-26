@@ -5,7 +5,10 @@
 ## Contents
 
 - [Overview and Design Boundaries](#overview-and-design-boundaries)
+- [Benchmarks](#benchmarks)
+- [Comparison with Alternatives](#comparison-with-alternatives)
 - [Installation and Runtime Setup](#installation-and-runtime-setup)
+- [Distribution and Packaging](#distribution-and-packaging)
 - [Architecture](#architecture)
 - [Transport and Rendering](#transport-and-rendering)
 - [Extraction and Source Negotiation](#extraction-and-source-negotiation)
@@ -37,6 +40,52 @@ Key capabilities beyond upstream `wickproject/wick`:
 ### Behavioral Boundaries
 
 `pleb` does not solve CAPTCHAs, click challenge widgets, or inject anti-bot evasion scripts. When an origin returns an active bot challenge, `pleb` classifies it immediately into a challenge error (exit code `2`) without issuing duplicate CEF retries.
+
+---
+
+## Benchmarks
+
+Reproducible offline benchmark across all `43` sanitized fixtures in [tests/corpus_evaluation.rs](tests/corpus_evaluation.rs) (`39` extractable documents in `ExtractMode::Clean` -> `OutputFormat::Markdown`, `50` warm release passes per fixture on Apple Silicon, plus `4` non-extractable gate fixtures):
+
+```bash
+cargo run --release --example corpus_benchmark
+cargo run --release --example corpus_benchmark -- --json
+```
+
+| Category | Fixtures | Raw Bytes | Output Bytes | Byte Reduction | Est. Tokens (`Raw -> Clean`) | Mean Release Latency |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| HTML pages | 26 | 26,402 | 9,306 | 64.8% | 6,601 -> 2,327 | 51.8 us |
+| Syndication feeds (RSS/Atom/JSON) | 4 | 3,031 | 1,424 | 53.0% | 758 -> 356 | 23.2 us |
+| Transcripts (WebVTT/SRT) | 2 | 520 | 205 | 60.6% | 130 -> 52 | 1.4 us |
+| Native Markdown | 5 | 2,108 | 2,142 | -1.6% | 527 -> 536 | 2.8 us |
+| Plain/JSON passthrough | 2 | 152 | 152 | 0.0% | 38 -> 38 | 0.1 us |
+| **All extractable** | **39** | **32,213** | **13,229** | **58.9%** | **8,054 -> 3,308** | **37.4 us** (`21.08 MiB/s`) |
+
+Methodology notes:
+- **Token estimation**: Uses the deterministic `ceil(bytes / 4)` heuristic (exact BPE counts vary by tokenizer; raw UTF-8 bytes are exact).
+- **Native Markdown expansion (`-1.6%`)**: Relative paths inside Markdown fixtures (such as `./CONTRIBUTING.md`) are resolved against the base URL into full URLs so agents receive valid links.
+- **Classification gates (`4/4` matched)**: `ratchet_challenge_403.html` (`challenge`), `frontier_soft_404_login_wall.html` (`blocked`), `ratchet_js_shell.html` (`javascript_shell`), and `frontier_canary_sveltekit_spa.html` (`javascript_shell`) all classify accurately before extraction.
+- **Hardware caveat**: Latency (`us`) and combined throughput (`21.08 MiB/s`, `1.457 ms` per full pass) depend on host CPU and reflect release builds (`target/release/examples/corpus_benchmark`).
+
+---
+
+## Comparison with Alternatives
+
+| Dimension | `pleb` | Firecrawl | Jina Reader (`r.jina.ai`) | Crawl4AI | `curl` + `html2text` |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **License & telemetry** | MIT; zero telemetry, local-only | AGPL-3.0 OSS / Cloud API | Apache-2.0 OSS / Cloud API | Apache-2.0 OSS / Cloud API | Permissive; local CLI |
+| **Runtime & dependencies** | Single Rust binary (plus optional CEF bundle) | Cloud API, `firecrawl-local` binary, or Docker Compose (Redis, PostgreSQL, browser) | Hosted `r.jina.ai`/`s.jina.ai` (`20 RPM` no-key / paid tokens) or stateless/S3 Docker image | Python + async Playwright Chromium or Crawl4AI Cloud | POSIX CLI tools |
+| **Network & JS stack** | Cronet (`Chromium 154`) or `reqwest` (`rustls`) + optional warm CEF `v5-meta` daemon | Hosted unblocking/actions or Playwright/Fire-engine | Hosted headless browser fleet | Playwright Chromium browser pool | `libcurl` HTTP, no JS execution |
+| **Challenge policy** | Fail fast (exit `2`), no CAPTCHA bypass | Cloud tier provides managed unblocking | Tiered rate limits (paid keys do not bypass access controls) | Community stealth / proxy hooks | Raw `403` HTML response |
+| **Structured source bypass** | GitHub/GitLab/Gist raw, RFC 8288/`<link>` Markdown mirrors, RSS/Atom/JSON, VTT/SRT, YouTube captions | HTML/PDF scraping and LLM `/extract` schemas | HTML, PDF, MS Office, and VLM image captioning | `PruningContentFilterLXML`, BM25/LLM filters | Generic HTML stripping only |
+| **Search & credential store** | Built-in `pleb search` (6 providers + RRF) & `pleb auth` (`env` / Keychain / `0o600` file) | Separate `/search` endpoint in Cloud/v2 API | Separate `s.jina.ai` search (`10,000` fixed tokens per API search) | Search in Crawl4AI Cloud | None |
+
+### When to Choose Another Tool
+
+- Choose **Firecrawl** when you need managed cloud anti-bot unblocking, interactive browser actions (`click`, `scroll`), hosted MCP integrations, or LLM-generated structured JSON schemas (`/extract`).
+- Choose **Jina Reader** when zero-install HTTP prefixing (`https://r.jina.ai/<url>`) fits your workload or you need hosted PDF parsing and image captioning built into the reader endpoint.
+- Choose **Crawl4AI** when you are building async Python + Playwright pipelines with built-in BM25 or LLM content-filtering stages.
+- Choose **`pleb`** when you want a fast, single-binary MIT CLI with zero external cloud dependencies, zero telemetry, browser-grade Cronet TLS, deterministic single-pass DOM extraction, structured source bypass, and unified local search + credential storage.
 
 ---
 
@@ -104,6 +153,16 @@ Healthy local installations report `"cronet_enabled": true`, `"cef_renderer": { 
 
 ---
 
+## Distribution and Packaging
+
+`Cargo.toml` sets pure-Rust `reqwest` (`rustls`) as the default feature set so `cargo install pleb` and offline package-manager sandboxes (such as Homebrew) build cleanly without external prebuilt binary downloads:
+
+- **Cargo / `crates.io` (`pleb`)**: `Cargo.toml` excludes `research/` and `.gitignore` / `Cargo.toml` keep prebuilt `lib/*/libcronet.*` static/shared libraries out of published `.crate` tarballs while packaging all sources (`src/`, `cef/`, `data/`, `scripts/`, `skills/pleb/SKILL.md`, `packaging/`, and `README*`). Build with Cronet TLS from a repository checkout using `./scripts/download-cronet-macos.sh` or `./scripts/download-cronet-linux.sh` followed by `cargo install --path . --features cronet --locked`.
+- **Homebrew tap template**: [packaging/homebrew/pleb.rb](packaging/homebrew/pleb.rb) installs the pure-Rust `pleb` binary alongside helper setup scripts (`pkgshare/scripts/`) and [skills/pleb/SKILL.md](skills/pleb/SKILL.md) (`pkgshare/skills/pleb`), printing Cronet and CEF source-build instructions in `caveats`.
+- **Verification**: Check crate packaging contents before publishing with `cargo package --list`.
+
+---
+
 ## Architecture
 
 ### Request Pipeline
@@ -153,6 +212,9 @@ CLI / Library Call
 | `src/auth.rs` | 3-tier credential resolution (`env` -> macOS Keychain -> `credentials.json`), secret zeroization, and status reporting |
 | `cef/` | C/Objective-C sources for the `v5-meta` offscreen CEF renderer and helper (`protocol.h`, `browser_environment.h`, `renderer_core.h`, `helper_core.h`, macOS `.m` and Linux `.c` entrypoints) |
 | `data/site-rules.json` | Bundled structural host rewrite and mandatory CEF overrides |
+| `examples/corpus_benchmark.rs` | Offline corpus byte/token reduction and warm release extraction benchmark |
+| `llms.txt`, `llms-full.txt` | Machine-readable LLM discovery index and single-file technical reference |
+| `packaging/homebrew/pleb.rb` | Homebrew tap formula template (`reqwest` default build + setup caveats) |
 | `scripts/` | Cronet downloaders, CEF build/install scripts, and agent skill symlink installer |
 | `skills/pleb/SKILL.md` | Canonical version-locked skill embedded in `pleb skill print` |
 | `docs/` | Milestone architecture specifications (`01` through `05`) |
