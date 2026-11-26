@@ -450,7 +450,7 @@ fn prune_dom(doc: &mut Html, mode: ExtractMode) -> HashMap<NodeId, NodeMetrics> 
             if matches!(name, "html" | "body") {
                 continue;
             }
-            if !contains_tex_annotation(*el) {
+            if find_tex_annotation(*el).is_none() {
                 to_detach.push(el.id());
             }
         }
@@ -818,21 +818,18 @@ fn is_void_element(tag: &str) -> bool {
 }
 
 fn push_escaped_text(text: &str, out: &mut String) {
-    for ch in text.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            _ => out.push(ch),
-        }
-    }
+    push_escaped(text, false, out);
 }
 
 fn push_escaped_attr(val: &str, out: &mut String) {
+    push_escaped(val, true, out);
+}
+
+fn push_escaped(val: &str, escape_quote: bool, out: &mut String) {
     for ch in val.chars() {
         match ch {
             '&' => out.push_str("&amp;"),
-            '"' => out.push_str("&quot;"),
+            '"' if escape_quote => out.push_str("&quot;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             _ => out.push(ch),
@@ -844,21 +841,22 @@ fn emit_img_tag(src: &str, alt: Option<&str>, title: Option<&str>, out: &mut Str
     out.push_str("<img src=\"");
     push_escaped_attr(src, out);
     out.push('"');
-    if let Some(alt) = alt {
-        out.push_str(" alt=\"");
-        push_escaped_attr(alt, out);
-        out.push('"');
-    }
-    if let Some(title) = title {
-        out.push_str(" title=\"");
-        push_escaped_attr(title, out);
-        out.push('"');
+    for (name, val) in [("alt", alt), ("title", title)] {
+        if let Some(v) = val {
+            out.push(' ');
+            out.push_str(name);
+            out.push_str("=\"");
+            push_escaped_attr(v, out);
+            out.push('"');
+        }
     }
     out.push('>');
 }
 
 fn is_data_uri(url: &str) -> bool {
-    url.trim_start().to_ascii_lowercase().starts_with("data:")
+    url.trim_start()
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
 }
 
 fn resolve_img_src(el: &scraper::node::Element) -> Option<String> {
@@ -995,10 +993,6 @@ fn parse_srcset_descriptor(desc: &str) -> Option<f64> {
     None
 }
 
-fn contains_tex_annotation(node: NodeRef<'_, Node>) -> bool {
-    find_tex_annotation(node).is_some()
-}
-
 fn find_tex_annotation(node: NodeRef<'_, Node>) -> Option<String> {
     for desc in node.descendants() {
         if let Node::Element(el) = desc.value() {
@@ -1110,21 +1104,14 @@ fn try_extract_code_gutter_table(table: NodeRef<'_, Node>) -> Option<(Option<Str
     }
 
     let lang = detect_code_language(table, &rows);
-    let code = if rows.len() == 1 {
+    let mut lines = Vec::with_capacity(rows.len());
+    for (_, col1) in &rows {
         let mut buf = String::new();
-        collect_raw_text(rows[0].1, &mut buf);
-        buf.trim_end_matches(['\r', '\n']).to_string()
-    } else {
-        let mut lines = Vec::with_capacity(rows.len());
-        for (_, col1) in &rows {
-            let mut buf = String::new();
-            collect_raw_text(*col1, &mut buf);
-            lines.push(buf.trim_end_matches(['\r', '\n']).to_string());
-        }
-        lines.join("\n")
-    };
+        collect_raw_text(*col1, &mut buf);
+        lines.push(buf.trim_end_matches(['\r', '\n']).to_string());
+    }
 
-    Some((lang, code))
+    Some((lang, lines.join("\n")))
 }
 
 fn collect_table_rows<'a>(
@@ -1181,28 +1168,15 @@ fn detect_code_language(
     table: NodeRef<'_, Node>,
     rows: &[(NodeRef<'_, Node>, NodeRef<'_, Node>)],
 ) -> Option<String> {
-    if let Some((_, first_col1)) = rows.first() {
-        for desc in first_col1.descendants() {
-            if let Node::Element(el) = desc.value() {
-                if let Some(lang) = extract_lang_from_element(el) {
-                    return Some(lang);
-                }
-            }
-        }
-    }
-    if let Node::Element(el) = table.value() {
-        if let Some(lang) = extract_lang_from_element(el) {
-            return Some(lang);
-        }
-    }
-    for anc in table.ancestors().take(3) {
-        if let Node::Element(el) = anc.value() {
-            if let Some(lang) = extract_lang_from_element(el) {
-                return Some(lang);
-            }
-        }
-    }
-    None
+    rows.first()
+        .into_iter()
+        .flat_map(|(_, col1)| col1.descendants())
+        .chain(std::iter::once(table))
+        .chain(table.ancestors().take(3))
+        .find_map(|node| match node.value() {
+            Node::Element(el) => extract_lang_from_element(el),
+            _ => None,
+        })
 }
 
 fn extract_lang_from_element(el: &scraper::node::Element) -> Option<String> {

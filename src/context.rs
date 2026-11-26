@@ -97,6 +97,7 @@ impl RuntimeContext {
                 config.daemon_idle_timeout,
                 config.verbose,
             )
+            .with_daemon_executable(config.daemon_executable.clone())
         } else {
             TransportClient::new_direct(
                 &config.state_dir.join("data"),
@@ -118,7 +119,9 @@ impl RuntimeContext {
             config.daemon_idle_timeout,
             config.use_daemon,
             config.verbose,
-        );
+        )
+        .with_daemon_executable(config.daemon_executable.clone())
+        .with_renderer_executable(config.cef_renderer_executable.clone());
         let rules = SiteRules::load(&config.state_dir);
         let site_cache = SiteCache::load(config.state_dir.join("site-cache.json"));
         let robots = RobotsCache::new();

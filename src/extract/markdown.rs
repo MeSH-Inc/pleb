@@ -390,12 +390,7 @@ pub fn compact_markdown(md: &str) -> String {
         }
         blank_run = 0;
 
-        let line = if let Some(compacted_row) = compact_table_row(trimmed_end) {
-            compacted_row
-        } else {
-            trimmed_end.to_string()
-        };
-        out_lines.push(line);
+        out_lines.push(compact_table_row(trimmed_end).unwrap_or_else(|| trimmed_end.to_string()));
     }
 
     while out_lines.last().is_some_and(String::is_empty) {
@@ -425,7 +420,7 @@ fn compact_table_row(line: &str) -> Option<String> {
         let cell_trimmed = cell.trim();
         out.push(' ');
         if is_sep {
-            out.push_str(&compact_separator_cell(cell_trimmed));
+            out.push_str(compact_separator_cell(cell_trimmed));
         } else {
             out.push_str(&collapse_spaces(cell_trimmed));
         }
@@ -484,14 +479,12 @@ fn is_separator_cell(cell: &str) -> bool {
     !core.is_empty() && core.chars().all(|c| c == '-')
 }
 
-fn compact_separator_cell(cell: &str) -> String {
-    let left = cell.starts_with(':');
-    let right = cell.ends_with(':');
-    match (left, right) {
-        (true, true) => ":---:".to_string(),
-        (true, false) => ":---".to_string(),
-        (false, true) => "---:".to_string(),
-        (false, false) => "---".to_string(),
+fn compact_separator_cell(cell: &str) -> &'static str {
+    match (cell.starts_with(':'), cell.ends_with(':')) {
+        (true, true) => ":---:",
+        (true, false) => ":---",
+        (false, true) => "---:",
+        (false, false) => "---",
     }
 }
 

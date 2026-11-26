@@ -99,9 +99,9 @@ fn is_auth_path(raw_url: &str) -> bool {
     ["/login", "/signin", "/sign-in", "/sso", "/auth", "/oauth"]
         .iter()
         .any(|seg| {
-            path == *seg
-                || path.starts_with(&format!("{seg}/"))
-                || path.contains(&format!("{seg}?"))
+            path.strip_prefix(seg).is_some_and(|rest| {
+                rest.is_empty() || rest.starts_with('/') || rest.starts_with('?')
+            })
         })
 }
 
