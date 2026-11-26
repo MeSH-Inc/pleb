@@ -10,13 +10,17 @@ pub mod url;
 pub mod webmcp;
 pub mod youtube;
 
+pub use axtree::format_axtree_from_cdp_json;
 pub use charset::decode_text_bytes;
 pub use dom::ParsedHtml;
 pub use markdown::truncate_markdown;
 pub use resources::{
     format_resource_manifest_markdown, ResourceDescriptor, ResourceKind, ResourceSalience,
 };
-pub use webmcp::{WebMcpToolAnnotations, WebMcpToolDescriptor, WebMcpToolSource};
+pub use webmcp::{
+    format_webmcp_cue, format_webmcp_manifest_markdown, merge_webmcp_tools, sanitize_webmcp_tool,
+    WebMcpToolAnnotations, WebMcpToolDescriptor, WebMcpToolSource,
+};
 
 use anyhow::{bail, Result};
 

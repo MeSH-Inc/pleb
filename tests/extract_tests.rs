@@ -1667,3 +1667,624 @@ fn adversarial_canary_inverse_false_positives_preserve_valid_content() {
         .content
         .contains("Issue #123 and Skip to section inline."));
 }
+
+#[test]
+fn webmcp_declarative_forms_extract_schemas_prune_chrome_and_preserve_normal_forms() {
+    use pleb::extract::{format_webmcp_cue, format_webmcp_manifest_markdown, WebMcpToolSource};
+    use serde_json::json;
+
+    let html = r#"<!doctype html>
+<html>
+<head>
+  <title>Catalog &amp; Tools</title>
+  <base href="https://hijack.example.org/wrong/">
+</head>
+<body>
+  <nav>
+    <form toolname="nav_search" tooldescription="Search documentation" tooltitle="Docs Search" action="/search#ignored" method="post" toolautosubmit>
+      <label for="nav.q[0]:id">Query string</label>
+      <input id="nav.q[0]:id" name="q" required>
+      <button type="submit">Go</button>
+    </form>
+  </nav>
+  <main>
+    <h1>Catalog</h1>
+    <p>Browse our public hardware catalog and run read-only queries.</p>
+
+    <form toolname="filter_items" tooldescription="Filter   catalog   items">
+      <input type="text" name="keyword" toolparamdescription="Primary keyword">
+      <input type="email" name="contact" toolparamdescription="Reply email" required>
+      <input type="checkbox" name="in_stock" toolparamdescription="Only in stock">
+      <input type="number" name="min_price" min="10" max="999.5" toolparamdescription="Price floor">
+      <input type="range" name="rating" min="1" max="5">
+      <textarea name="notes" toolparamdescription="Extra filter notes"></textarea>
+
+      <input type="radio" name="plan">
+      <input type="radio" name="plan" value="" toolparamdescription="Billing tier" required>
+      <input type="radio" name="plan" value="pro" toolparamdescription="Should not overwrite">
+      <input type="radio" name="plan" value="on">
+      <input type="radio" name="plan" value="disabled_opt" disabled>
+
+      <select name="region" required>
+        <option value="us">United States</option>
+        <option>EU</option>
+        <option value="us">Duplicate US</option>
+        <option value="dis" disabled>Disabled Opt</option>
+        <optgroup label="Blocked" disabled>
+          <option value="blocked">Blocked Opt</option>
+        </optgroup>
+      </select>
+
+      <select name="tags" multiple toolparamdescription="Item tags">
+        <option value="">Any tag</option>
+        <option>rust</option>
+        <option>wasm</option>
+      </select>
+
+      <select name="empty_sel">
+        <option value="nope" disabled>Only disabled</option>
+      </select>
+
+      <input type="hidden" name="csrf" value="secret">
+      <input type="password" name="pw">
+      <input type="file" name="upload">
+      <input type="button" name="btn" value="Click">
+      <input type="submit" name="sub" value="Submit">
+      <input type="reset" name="rst" value="Reset">
+      <input type="image" name="img_sub" src="/go.png">
+      <input type="text" name="disabled_direct" disabled>
+      <fieldset disabled>
+        <input type="text" name="inside_disabled_fieldset">
+      </fieldset>
+      <input type="text">
+      <span>WebMCP Chrome Noise Should Disappear</span>
+    </form>
+
+    <form toolname="empty_tool" tooldescription="Empty form tool" method="dialog">
+      <button type="submit">Close</button>
+    </form>
+
+    <form action="/login" method="post">
+      <label for="ordinary_user">Ordinary form prose stays</label>
+      <input id="ordinary_user" name="user" type="text">
+    </form>
+  </main>
+</body>
+</html>"#;
+
+    let page_url = Url::parse("https://user:pass@docs.example.com/catalog?v=1#frag").unwrap();
+    let doc = extract_document(
+        html,
+        &page_url,
+        Some("text/html"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+
+    // Clean Markdown detaches WebMCP form chrome while preserving surrounding prose & normal forms.
+    assert!(doc
+        .content
+        .contains("Browse our public hardware catalog and run read-only queries."));
+    assert!(doc.content.contains("Ordinary form prose stays"));
+    assert!(!doc.content.contains("WebMCP Chrome Noise Should Disappear"));
+    assert!(!doc.content.contains("Query string"));
+
+    // Full mode retains all DOM content.
+    let full_doc = extract_document(
+        html,
+        &page_url,
+        Some("text/html"),
+        &ExtractOptions {
+            mode: ExtractMode::Full,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(full_doc
+        .content
+        .contains("WebMCP Chrome Noise Should Disappear"));
+
+    assert_eq!(doc.tools.len(), 3);
+
+    // 1. nav_search (inside <nav>, resolved against <base href> because non-empty action, POST, autosubmit, label[for] with CSS metacharacters)
+    let nav = &doc.tools[0];
+    assert_eq!(nav.name, "nav_search");
+    assert_eq!(nav.description, "Search documentation");
+    assert_eq!(nav.title.as_deref(), Some("Docs Search"));
+    assert_eq!(nav.source, WebMcpToolSource::Declarative);
+    assert_eq!(
+        nav.action_url.as_deref(),
+        Some("https://hijack.example.org/search")
+    );
+    assert_eq!(nav.method.as_deref(), Some("POST"));
+    assert_eq!(
+        nav.annotations.as_ref().and_then(|a| a.autosubmit),
+        Some(true)
+    );
+    assert_eq!(
+        nav.annotations.as_ref().and_then(|a| a.untrusted_content),
+        Some(true)
+    );
+    assert_eq!(
+        nav.input_schema,
+        Some(json!({
+            "type": "object",
+            "properties": {
+                "q": { "type": "string", "description": "Query string" }
+            },
+            "required": ["q"]
+        }))
+    );
+
+    // 2. filter_items (absent action defaults to page_url ignoring <base href>, strips credentials/fragment)
+    let filter = &doc.tools[1];
+    assert_eq!(filter.name, "filter_items");
+    assert_eq!(filter.description, "Filter catalog items");
+    assert_eq!(
+        filter.action_url.as_deref(),
+        Some("https://docs.example.com/catalog?v=1")
+    );
+    assert_eq!(filter.method.as_deref(), Some("GET"));
+    assert_eq!(
+        filter.input_schema,
+        Some(json!({
+            "type": "object",
+            "properties": {
+                "keyword": { "type": "string", "description": "Primary keyword" },
+                "contact": { "type": "string", "format": "email", "description": "Reply email" },
+                "in_stock": { "type": "boolean", "description": "Only in stock" },
+                "min_price": { "type": "number", "minimum": 10, "maximum": 999.5, "description": "Price floor" },
+                "rating": { "type": "number", "minimum": 1, "maximum": 5 },
+                "notes": { "type": "string", "description": "Extra filter notes" },
+                "plan": { "type": "string", "enum": ["on", "", "pro"], "description": "Billing tier" },
+                "region": { "type": "string", "enum": ["us", "EU"] },
+                "tags": {
+                    "type": "array",
+                    "items": { "type": "string", "enum": ["", "rust", "wasm"] },
+                    "description": "Item tags"
+                },
+                "empty_sel": { "type": "string" }
+            },
+            "required": ["contact", "plan", "region"]
+        }))
+    );
+
+    // 3. empty_tool (empty properties without "required"; method="dialog" omitted -> None)
+    let empty = &doc.tools[2];
+    assert_eq!(empty.name, "empty_tool");
+    assert_eq!(empty.method, None);
+    assert_eq!(
+        empty.input_schema,
+        Some(json!({ "type": "object", "properties": {} }))
+    );
+
+    // Manifest and cue formatters
+    let manifest = format_webmcp_manifest_markdown(&doc.tools);
+    assert!(manifest.starts_with("## Page Tools (WebMCP)\n\n"));
+    assert!(manifest.contains("| nav_search | declarative | POST | https://hijack.example.org/search | Docs Search | Search documentation |"));
+    assert!(manifest.contains("```json\n"));
+    assert_eq!(format_webmcp_manifest_markdown(&[]), "");
+
+    let cue = format_webmcp_cue(&doc.tools).unwrap();
+    assert_eq!(
+        cue,
+        "Tools: 3 WebMCP tools (nav_search, filter_items, empty_tool) — pass --tools manifest or --json"
+    );
+    assert_eq!(
+        format_webmcp_cue(&doc.tools[..1]).as_deref(),
+        Some("Tools: 1 WebMCP tool (nav_search) — pass --tools manifest or --json")
+    );
+    assert_eq!(format_webmcp_cue(&[]), None);
+}
+
+#[test]
+fn webmcp_adversarial_filtering_caps_sanitization_and_injection_guards() {
+    use pleb::extract::{
+        format_webmcp_manifest_markdown, merge_webmcp_tools, sanitize_webmcp_tool,
+        webmcp::MAX_WEBMCP_TOOLS, WebMcpToolAnnotations, WebMcpToolDescriptor, WebMcpToolSource,
+    };
+    use serde_json::json;
+
+    let overlong_name = "a".repeat(129);
+    let overlong_param_name = "p".repeat(129);
+    let mut forms_40 = String::new();
+    for i in 1..=40 {
+        forms_40.push_str(&format!(
+            r#"<form toolname="bulk_{i}" tooldescription="Bulk tool {i}"></form>"#
+        ));
+    }
+
+    let html = format!(
+        r#"<!doctype html><html><body>
+        <form toolname=" bad_ws " tooldescription="Should reject"></form>
+        <form toolname="bad/slash" tooldescription="Should reject"></form>
+        <form toolname="{overlong_name}" tooldescription="Should reject"></form>
+        <form toolname="empty_desc" tooldescription="   &#x1b;  "></form>
+
+        <template><form toolname="in_template" tooldescription="Hidden"></form></template>
+        <noscript><form toolname="in_noscript" tooldescription="Hidden"></form></noscript>
+        <div hidden><form toolname="in_hidden_anc" tooldescription="Hidden"></form></div>
+        <form toolname="self_hidden" tooldescription="Hidden" hidden></form>
+        <div aria-hidden="TRUE"><form toolname="in_aria_hidden" tooldescription="Hidden"></form></div>
+        <div style="display: none"><form toolname="in_display_none" tooldescription="Hidden"></form></div>
+        <div style="visibility: hidden"><form toolname="in_vis_hidden" tooldescription="Hidden"></form></div>
+
+        <form toolname="dup_tool" tooldescription="First wins" action="javascript:alert(1)">
+          <div style="display:none"><input name="secret_hidden_field" type="text"></div>
+          <template><input name="tpl_field" type="text"></template>
+          <input name="{overlong_param_name}" type="text">
+        </form>
+        <form toolname="dup_tool" tooldescription="Second ignored"></form>
+
+        <form toolname="ssrf_ip" tooldescription="Private IP" action="http://169.254.169.254/latest/meta-data"></form>
+        <form toolname="downgrade" tooldescription="Downgrade" action="http://docs.example.com/submit"></form>
+        <form toolname="ansi_tool" tooldescription="Search&#x1b;[31m docs&#x07;&#x7f;&#x202E; now" tooltitle="Title | pipe&#x1b;[1m">
+          <label for="hidden_lbl" hidden>Hidden label</label>
+          <label for="vis_lbl">Visible label</label>
+          <input id="hidden_lbl" name="h">
+          <input id="vis_lbl" name="v" toolparamdescription="   ">
+        </form>
+        {forms_40}
+    </body></html>"#
+    );
+
+    let page_url = Url::parse("https://docs.example.com/start").unwrap();
+    let doc = extract_document(
+        &html,
+        &page_url,
+        Some("text/html"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(doc.tools.len(), MAX_WEBMCP_TOOLS);
+    let names: Vec<&str> = doc.tools.iter().map(|t| t.name.as_str()).collect();
+    for forbidden in [
+        " bad_ws ",
+        "bad_ws",
+        "bad/slash",
+        overlong_name.as_str(),
+        "empty_desc",
+        "in_template",
+        "in_noscript",
+        "in_hidden_anc",
+        "self_hidden",
+        "in_aria_hidden",
+        "in_display_none",
+        "in_vis_hidden",
+        "bulk_30",
+    ] {
+        assert!(!names.contains(&forbidden), "unexpected tool {forbidden}");
+    }
+
+    let dup = doc.tools.iter().find(|t| t.name == "dup_tool").unwrap();
+    assert_eq!(dup.description, "First wins");
+    assert_eq!(dup.action_url, None);
+    assert_eq!(
+        dup.input_schema,
+        Some(json!({ "type": "object", "properties": {} }))
+    );
+
+    let ssrf = doc.tools.iter().find(|t| t.name == "ssrf_ip").unwrap();
+    assert_eq!(ssrf.action_url, None);
+    let downgrade = doc.tools.iter().find(|t| t.name == "downgrade").unwrap();
+    assert_eq!(downgrade.action_url, None);
+
+    let ansi = doc.tools.iter().find(|t| t.name == "ansi_tool").unwrap();
+    assert_eq!(ansi.description, "Search[31m docs now");
+    assert_eq!(ansi.title.as_deref(), Some("Title | pipe[1m"));
+    assert_eq!(
+        ansi.input_schema,
+        Some(json!({
+            "type": "object",
+            "properties": {
+                "h": { "type": "string" },
+                "v": { "type": "string", "description": "Visible label" }
+            }
+        }))
+    );
+
+    // `sanitize_webmcp_tool` overrides untrusted_content: Some(false) and drops oversized/deep schemas.
+    let mut too_many_props = serde_json::Map::new();
+    for i in 0..65 {
+        too_many_props.insert(format!("p{i}"), json!({ "type": "string" }));
+    }
+    let bad_props_tool = sanitize_webmcp_tool(WebMcpToolDescriptor {
+        name: "imp_tool".to_string(),
+        description: "Imperative\n\x1b[31m\u{202E} tool".to_string(),
+        title: Some("Title\x07\u{2066}".to_string()),
+        source: WebMcpToolSource::Imperative,
+        input_schema: Some(json!({ "type": "object", "properties": too_many_props })),
+        annotations: Some(WebMcpToolAnnotations {
+            read_only: Some(true),
+            autosubmit: None,
+            untrusted_content: Some(false),
+        }),
+        action_url: Some("https://user:pw@example.com/run#frag".to_string()),
+        method: Some("put".to_string()),
+    })
+    .unwrap();
+    assert_eq!(bad_props_tool.description, "Imperative [31m tool");
+    assert_eq!(bad_props_tool.title.as_deref(), Some("Title"));
+    assert_eq!(bad_props_tool.input_schema, None);
+    assert_eq!(
+        bad_props_tool
+            .annotations
+            .as_ref()
+            .and_then(|a| a.untrusted_content),
+        Some(true)
+    );
+    assert_eq!(
+        bad_props_tool.action_url.as_deref(),
+        Some("https://example.com/run")
+    );
+    assert_eq!(bad_props_tool.method, None);
+
+    // Deep schema (> 8) & oversized enum (> 64 or > 256 bytes) & oversized bytes (> 16 KiB) drop to None.
+    let mut deep = json!({ "type": "string" });
+    for _ in 0..9 {
+        deep = json!({ "nested": deep });
+    }
+    let deep_sanitized = sanitize_webmcp_tool(WebMcpToolDescriptor {
+        name: "deep".to_string(),
+        description: "Deep".to_string(),
+        title: None,
+        source: WebMcpToolSource::Imperative,
+        input_schema: Some(deep),
+        annotations: None,
+        action_url: None,
+        method: None,
+    })
+    .unwrap();
+    assert_eq!(deep_sanitized.input_schema, None);
+
+    let enum_65: Vec<String> = (0..65).map(|i| format!("v{i}")).collect();
+    let enum_sanitized = sanitize_webmcp_tool(WebMcpToolDescriptor {
+        name: "enum_cap".to_string(),
+        description: "Enum cap".to_string(),
+        title: None,
+        source: WebMcpToolSource::Imperative,
+        input_schema: Some(json!({ "type": "object", "properties": { "k": { "type": "string", "enum": enum_65 } } })),
+        annotations: None,
+        action_url: None,
+        method: None,
+    })
+    .unwrap();
+    assert_eq!(enum_sanitized.input_schema, None);
+
+    // Oversized enum item (> 256 bytes) and oversized schema (> 16 KiB) drop to None.
+    let long_enum_sanitized = sanitize_webmcp_tool(WebMcpToolDescriptor {
+        name: "long_enum".to_string(),
+        description: "Long enum".to_string(),
+        title: None,
+        source: WebMcpToolSource::Imperative,
+        input_schema: Some(
+            json!({ "type": "object", "properties": { "k": { "type": "string", "enum": ["x".repeat(257)] } } }),
+        ),
+        annotations: None,
+        action_url: None,
+        method: None,
+    })
+    .unwrap();
+    assert_eq!(long_enum_sanitized.input_schema, None);
+
+    let big_schema_sanitized = sanitize_webmcp_tool(WebMcpToolDescriptor {
+        name: "big_schema".to_string(),
+        description: "Big schema".to_string(),
+        title: None,
+        source: WebMcpToolSource::Imperative,
+        input_schema: Some(
+            json!({ "type": "object", "properties": { "k": { "type": "string", "description": "d".repeat(17 * 1024) } } }),
+        ),
+        annotations: None,
+        action_url: None,
+        method: None,
+    })
+    .unwrap();
+    assert_eq!(big_schema_sanitized.input_schema, None);
+
+    // Imperative overrides declarative by name even when declarative already fills the 32-tool cap.
+    let mut decl_32 = Vec::new();
+    for i in 0..MAX_WEBMCP_TOOLS {
+        decl_32.push(WebMcpToolDescriptor {
+            name: format!("tool_{i}"),
+            description: format!("Decl {i}"),
+            title: None,
+            source: WebMcpToolSource::Declarative,
+            input_schema: None,
+            annotations: None,
+            action_url: None,
+            method: None,
+        });
+    }
+    let imp = vec![
+        WebMcpToolDescriptor {
+            name: "tool_5".to_string(),
+            description: "Imperative override".to_string(),
+            title: None,
+            source: WebMcpToolSource::Imperative,
+            input_schema: Some(
+                json!({ "type": "object", "properties": { "code": { "type": "string", "description": "```rust\nfn x(){}\n```" } } }),
+            ),
+            annotations: Some(WebMcpToolAnnotations {
+                read_only: Some(true),
+                autosubmit: None,
+                untrusted_content: Some(false),
+            }),
+            action_url: None,
+            method: None,
+        },
+        WebMcpToolDescriptor {
+            name: "tool_33".to_string(),
+            description: "Should be capped".to_string(),
+            title: None,
+            source: WebMcpToolSource::Imperative,
+            input_schema: None,
+            annotations: None,
+            action_url: None,
+            method: None,
+        },
+    ];
+    let merged = merge_webmcp_tools(decl_32, imp);
+    assert_eq!(merged.len(), MAX_WEBMCP_TOOLS);
+    let overridden = merged.iter().find(|t| t.name == "tool_5").unwrap();
+    assert_eq!(overridden.source, WebMcpToolSource::Imperative);
+    assert_eq!(overridden.description, "Imperative override");
+    assert_eq!(
+        overridden
+            .annotations
+            .as_ref()
+            .and_then(|a| a.untrusted_content),
+        Some(true)
+    );
+    assert!(!merged.iter().any(|t| t.name == "tool_33"));
+
+    // Markdown injection escaping: pipe escaping in table + 4-backtick dynamic fence for ``` in schema.
+    let manifest = format_webmcp_manifest_markdown(&[ansi.clone(), overridden.clone()]);
+    assert!(manifest.contains("Title \\| pipe[1m"));
+    assert!(manifest.contains("````json\n"));
+    assert!(manifest.contains("\n````"));
+    assert!(open_fence_at(&manifest, manifest.len()).is_none());
+}
+
+#[test]
+fn axtree_formatter_promotes_containers_formats_values_and_escapes_injections() {
+    use pleb::extract::format_axtree_from_cdp_json;
+
+    let raw_cdp = r#"{
+      "nodes": [
+        {
+          "nodeId": "root",
+          "ignored": false,
+          "role": { "type": "internalRole", "value": "RootWebArea" },
+          "name": { "type": "computedString", "value": "Page \"Title\"\nLine2\\path\u001b[31m\u007f" },
+          "childIds": ["gen", "ign", "list"]
+        },
+        {
+          "nodeId": "gen",
+          "ignored": false,
+          "role": { "type": "role", "value": "generic" },
+          "childIds": ["gc"]
+        },
+        {
+          "nodeId": "gc",
+          "ignored": false,
+          "role": { "type": "role", "value": "GenericContainer" },
+          "childIds": ["h1", "chk", "btn", "txt"]
+        },
+        {
+          "nodeId": "h1",
+          "ignored": false,
+          "role": { "type": "role", "value": "heading" },
+          "name": { "type": "computedString", "value": "Docs" },
+          "properties": [
+            { "name": "level", "value": { "type": "integer", "value": 2 } }
+          ],
+          "childIds": ["inline"]
+        },
+        {
+          "nodeId": "inline",
+          "ignored": false,
+          "role": { "type": "internalRole", "value": "InlineTextBox" },
+          "name": { "type": "computedString", "value": "Docs" }
+        },
+        {
+          "nodeId": "chk",
+          "ignored": false,
+          "role": { "type": "role", "value": "checkbox" },
+          "name": { "type": "computedString", "value": "Agree\r\nTerms" },
+          "properties": [
+            { "name": "checked", "value": { "type": "tristate", "value": "mixed" } },
+            { "name": "required", "value": { "type": "boolean", "value": true } }
+          ]
+        },
+        {
+          "nodeId": "btn",
+          "ignored": false,
+          "role": { "type": "role", "value": "button" },
+          "name": { "type": "computedString", "value": "Menu" },
+          "properties": [
+            { "name": "disabled", "value": { "type": "boolean", "value": true } },
+            { "name": "expanded", "value": { "type": "boolean", "value": false } },
+            { "name": "pressed", "value": { "type": "tristate", "value": "false" } },
+            { "name": "selected", "value": { "type": "boolean", "value": true } },
+            { "name": "focused", "value": { "type": "boolean", "value": true } }
+          ]
+        },
+        {
+          "nodeId": "txt",
+          "ignored": false,
+          "role": { "type": "role", "value": "textbox" },
+          "name": { "type": "computedString", "value": "Email" },
+          "value": { "type": "string", "value": "a@b.com\u001b[0m" }
+        },
+        {
+          "nodeId": "ign",
+          "ignored": true,
+          "role": { "type": "internalRole", "value": "none" },
+          "childIds": ["ign_child"]
+        },
+        {
+          "nodeId": "ign_child",
+          "ignored": true,
+          "role": { "type": "internalRole", "value": "StaticText" },
+          "name": { "type": "computedString", "value": "Secret hidden" }
+        },
+        {
+          "nodeId": "list",
+          "ignored": false,
+          "role": { "type": "role", "value": "Ignored" },
+          "childIds": ["none_node"]
+        },
+        {
+          "nodeId": "none_node",
+          "ignored": false,
+          "role": { "type": "role", "value": "none" },
+          "childIds": ["link"]
+        },
+        {
+          "nodeId": "link",
+          "ignored": false,
+          "role": { "type": "role", "value": "link" },
+          "name": { "type": "computedString", "value": "Home" },
+          "properties": [
+            { "name": "url", "value": { "type": "string", "value": "https://example.com/?q=\"1\"\n" } }
+          ]
+        }
+      ]
+    }"#;
+
+    let formatted = format_axtree_from_cdp_json(raw_cdp).unwrap();
+    let expected = concat!(
+        "RootWebArea \"Page \\\"Title\\\"\\nLine2\\\\path[31m\"\n",
+        "  heading \"Docs\" level=2\n",
+        "  checkbox \"Agree\\r\\nTerms\" checked=mixed required=true\n",
+        "  button \"Menu\" disabled=true expanded=false pressed=false selected=true focused=true\n",
+        "  textbox \"Email\" value=\"a@b.com[0m\"\n",
+        "  link \"Home\" url=\"https://example.com/?q=\\\"1\\\"\\n\""
+    );
+    assert_eq!(formatted, expected);
+    assert!(!formatted.contains("Secret hidden"));
+    assert!(!formatted.contains('\x1b'));
+    assert!(!formatted.contains('\x7f'));
+
+    // Parent-id-only & cyclic CDP envelopes terminate safely and promote skipped containers.
+    let parent_cycle_cdp = r#"{
+      "result": {
+        "nodes": [
+          { "nodeId": "r", "role": { "value": "RootWebArea" }, "childIds": ["a"] },
+          { "nodeId": "a", "parentId": "r", "role": { "value": "generic" }, "childIds": ["b", "r"] },
+          { "nodeId": "b", "parentId": "a", "role": { "value": "button" }, "name": { "value": "Click" } }
+        ]
+      }
+    }"#;
+    assert_eq!(
+        format_axtree_from_cdp_json(parent_cycle_cdp).unwrap(),
+        "RootWebArea\n  button \"Click\""
+    );
+
+    // Empty tree and invalid payloads
+    assert_eq!(format_axtree_from_cdp_json(r#"{"nodes":[]}"#).unwrap(), "");
+    assert!(format_axtree_from_cdp_json(r#"{"bad":1}"#).is_err());
+    assert!(format_axtree_from_cdp_json("not json").is_err());
+}

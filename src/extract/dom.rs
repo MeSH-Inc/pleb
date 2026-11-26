@@ -106,6 +106,8 @@ static IMG_DIM_SEL: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("img[width], img[height]").unwrap());
 static CHECKBOX_POPUP_SEL: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("input[type=\"checkbox\"][aria-haspopup=\"true\"]").unwrap());
+pub(crate) static WEBMCP_FORM_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("form[toolname][tooldescription]").unwrap());
 
 /// HTML document parsed once via `scraper` (`atomic` tendrils) for metrics,
 /// link discovery, and pruned extraction.
@@ -204,11 +206,9 @@ impl ParsedHtml {
             .unwrap_or_else(|| page_url.clone())
     }
 
-    pub fn extract_webmcp_tools(
-        &self,
-        _page_url: &Url,
-    ) -> Vec<super::webmcp::WebMcpToolDescriptor> {
-        Vec::new()
+    pub fn extract_webmcp_tools(&self, page_url: &Url) -> Vec<super::webmcp::WebMcpToolDescriptor> {
+        let effective_base = self.effective_base_url(page_url);
+        super::webmcp::extract_declarative_tools(&self.doc, page_url, &effective_base)
     }
 
     /// Compute bottom-up `NodeMetrics` in a single `O(N)` post-order pass over the DOM,
@@ -503,6 +503,7 @@ fn prune_dom(doc: &mut Html, mode: ExtractMode) -> HashMap<NodeId, NodeMetrics> 
 
     if matches!(mode, ExtractMode::Clean | ExtractMode::Article) {
         collect_selector_ids(doc, &BOILERPLATE_TAG_SEL, &mut to_detach);
+        collect_selector_ids(doc, &WEBMCP_FORM_SEL, &mut to_detach);
 
         for el in doc.select(&ARIA_BOILERPLATE_SEL) {
             let name = el.value().name();
@@ -659,6 +660,21 @@ fn collect_link_density_prune_ids(
     for child in node.children() {
         collect_link_density_prune_ids(child, now_protected, now_header, metrics, out);
     }
+}
+
+pub(crate) fn is_element_hidden_or_inert(el: &scraper::node::Element) -> bool {
+    matches!(el.name(), "template" | "noscript" | "script" | "style")
+        || el.attr("hidden").is_some()
+        || el
+            .attr("aria-hidden")
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
+        || el.attr("style").is_some_and(is_inline_hidden_style)
+}
+
+pub(crate) fn is_hidden_or_inert(node: NodeRef<'_, Node>) -> bool {
+    std::iter::once(node)
+        .chain(node.ancestors())
+        .any(|n| matches!(n.value(), Node::Element(el) if is_element_hidden_or_inert(el)))
 }
 
 pub(crate) fn is_inline_hidden_style(style: &str) -> bool {
