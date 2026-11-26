@@ -5,8 +5,7 @@ class Pleb < Formula
   desc "Local, zero-telemetry web acquisition and search CLI for AI agents"
   homepage "https://github.com/MeSH-Inc/pleb"
   url "https://github.com/MeSH-Inc/pleb/archive/refs/tags/v0.1.0.tar.gz"
-  # Replace with: shasum -a 256 v0.1.0.tar.gz
-  sha256 "REPLACE_WITH_TAG_TARBALL_SHA256"
+  sha256 "f99e271ed7a49ee2fe66f891abd7d55dc50dd4d7005d05145a03d02ffaa79e79"
   license "MIT"
   head "https://github.com/MeSH-Inc/pleb.git", branch: "main"
 
