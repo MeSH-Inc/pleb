@@ -1,91 +1,106 @@
-# Swarm Hillclimb Protocol: Efficacy and Elegance Convergence
+# Swarm Convergence Protocol: Efficacy and Elegance Specification
 
 ## 1. Purpose and Baseline
 
-`mesh-wick` (`wick`) is a local, zero-telemetry web acquisition and search CLI for AI agents. Its objective is to acquire public web documents over browser-grade network and offscreen-rendering transports and emit compact, structurally faithful Markdown (or exact raw bytes) with deterministic machine-readable metadata and exit codes (`0..=5`).
+`mesh-wick` (`wick`) is a local, zero-telemetry web acquisition and search CLI for AI agents. Its purpose is to acquire public web documents over browser-grade network (`Cronet` / `reqwest`) and offscreen-rendering (`CEF`) transports and emit compact, structurally faithful Markdown, plain text, HTML, or exact raw bytes with deterministic metadata and exit codes (`0..=5`).
 
-Current repository baseline on `main`:
+Prerequisite baseline: `docs/01-transport-daemon-and-batch-fetch.md` (Milestone 1 and Milestone 2). Because repository line and test counts evolve continuously on `main`, baseline counts are recorded dynamically at wave start via command rather than hardcoded in prose:
 
-- `src/`: `6,233` lines of Rust across `context`, `crawl`, `extract`, `fetch`, `policy`, `search`, and `transport`.
-- `cef/`: `1,510` lines of C and Objective-C implementing the `v4-meta` offscreen Chromium renderer.
-- `tests/`: `1,580` lines across `28` crate-level and unit tests.
-- Prerequisite specification: `docs/01-transport-daemon-and-batch-fetch.md` (Milestone 1 landed; Milestone 2 pending).
+```bash
+find src -name '*.rs' | xargs wc -l | tail -n 1
+find cef \( -name '*.c' -o -name '*.h' -o -name '*.m' \) | xargs wc -l | tail -n 1
+rg -n '#\[(tokio::)?test\]' src tests | wc -l
+```
 
-Multi-agent hillclimbing on a compact systems codebase fails when optimization lacks a deterministic offline objective, when parallel efficacy patches accrete special-case branches without structural compression, or when concurrent workers collide on `main`, build locks, or Unix domain sockets. This specification defines the evaluation harness, Pareto acceptance rules, seam-partitioned swarm topology, generation ratchet, and dependency-ordered waves used to climb `mesh-wick` simultaneously toward higher efficacy and stricter elegance.
+Multi-agent optimization on a compact Rust + C systems repository fails under three predictable conditions:
+1. **Metric Goodharting**: optimizing output byte count alone deletes unannotated body prose or Markdown syntax; optimizing raw recall alone retains navigation menus, cookie modals, and hydration scripts; gating commits on wall-clock throughput under parallel compiler load introduces non-deterministic rejections.
+2. **Complexity Accretion**: parallel efficacy patches accumulate special-case branches, multi-pass DOM scans, and untyped error string matching without a paired structural subtraction step.
+3. **Seam and Resource Contention**: uncoordinated edits to shared types (`RuntimeContext`, `FetchError`, `src/lib.rs`), shared `~/.mesh-wick` sockets/caches, global `~/.mesh-wick/cef` binaries, or in-tree `target*` directories break compilation and corrupt host state.
+
+This specification defines the single-file corpus harness, Goodhart-resistant Pareto acceptance gate, five-member seam-partitioned swarm topology, git worktree verification flow, and three dependency-ordered waves used to converge `mesh-wick` toward peak acquisition/extraction efficacy and minimal structural complexity.
 
 ---
 
 ## 2. Deterministic Evaluation Architecture
 
-All hillclimbing decisions are governed by deterministic, zero-network local commands. Live internet origins are never queried inside the optimization loop; live runs occur only in an out-of-loop canary harvest to capture new static fixtures.
+All commit-gate decisions execute deterministically offline with zero live internet requests. Live origins are queried only in an out-of-loop canary harvest (Wave 2) to capture static fixtures.
 
-### 2.1 Offline Corpus Layout (`tests/corpus/`)
+### 2.1 Single-File Two-Tier Corpus (`tests/corpus/`)
 
-Each fixture under `tests/corpus/<fixture_identifier>/` consists of:
+To avoid multi-file fixture sprawl, each HTML or text fixture is stored as a single file `tests/corpus/<fixture_id>.html` whose first line is a JSON frontmatter comment:
 
-1. `input.html` (or `input.bin` for binary payload guards): raw response bytes as received from an origin or `wick-renderer`.
-2. `metadata.json`:
-   - `url`: requested URL string.
-   - `final_url`: post-redirect URL string.
-   - `status_code`: HTTP status (`u16`).
-   - `content_type`: optional `Content-Type` header string.
-   - `extract_mode`: `"clean"` | `"article"` | `"full"`.
-3. `annotations.json`:
-   - `expected_classification`: `"ok"` | `"javascript_shell"` | `"blocked"` | `"challenge"` | `"http_error"` | `"unsupported_content_type"`.
-   - `must_keep_substrings`: ordered non-trivial prose, table cell, and heading substrings that must appear in extracted output.
-   - `must_keep_code_blocks`: expected `{ "language": Option<String>, "snippet": String }` entries verifying fence preservation and gutter cleanup.
-   - `must_keep_links`: expected resolved destination URLs verifying `<base href>`, relative path resolution, and tracking-parameter removal.
-   - `must_drop_substrings`: navigation chrome, cookie-consent copy, copy-code button labels, heading permalink glyphs, and hydration JSON strings that must not appear in extracted output.
+```html
+<!-- wick-fixture: {"tier":"ratchet","url":"https://docs.example.com/guide","final_url":"https://docs.example.com/guide","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"Guide","variants":[...]} -->
+```
 
-The corpus spans representative technical documentation (Rustdoc, MDN, GitHub, Nextra, Mintlify, Docusaurus, ReadTheDocs), content aggregators (`old.reddit.com`, Hacker News), encyclopedic and academic HTML (Wikipedia, ArXiv HTML), client-rendered shells, Cloudflare/DataDome challenge interstitials, HTTP-200 soft-404 and login walls, malformed pipe tables, and ISO-8859-1 / Windows-1252 documents.
+Raw binary payload guards (`%PDF-`, PNG, ZIP, NUL-byte streams) and non-UTF-8 (`ISO-8859-1`, `Windows-1252`) byte fixtures are stored either in a compact byte-slice table inside `tests/corpus_evaluation.rs` or as `tests/corpus/<fixture_id>.bin` paired with a single manifest table.
+
+#### Two-Tier Progression (`tier`)
+- `"ratchet"`: solved baseline fixtures. Every `"ratchet"` fixture enforces strict `1.0` non-regression across all assertions.
+- `"frontier"`: newly seeded adversarial or live-canary fixtures exposing current gaps. `"frontier"` fixtures are scored separately so seeding new failure cases at wave start never blocks unrelated seams; once an author commit brings a `"frontier"` fixture to `1.0`, `corpus-verifier` promotes its `tier` to `"ratchet"`.
+
+#### Fixture Contract Fields
+- **Top-level acquisition and policy fields** (separating transport/binary guards from `ResponseClassification`):
+  - `expected_exit_code`: `0..=5` (`5` for `FetchError::UnsupportedContentType` binary detection prior to HTML classification).
+  - `expected_error_kind`: optional string matching `FetchError::kind()` when `expected_exit_code != 0`.
+  - `expected_response_classification`: optional `"ok"` | `"javascript_shell"` | `"blocked"` | `"challenge"` | `"http_error"` (asserted whenever execution reaches `classify_response_with_parsed`).
+  - `expected_title`: `Option<String>`.
+  - `exact_passthrough`: `bool` (asserting byte-exact output for `application/json`, `text/plain`, `image/svg+xml`, `+json`, `+xml`).
+- **Per-variant extraction fields** (`variants`: testing `Clean`, `Article`, `Full`, `Markdown`, `Text`, `include_images`, `include_links`, and `max_bytes` on the same document):
+  - `expected_substrings`: prose, heading, and table-cell strings matched as an **ordered subsequence** (`match_start[k] >= match_end[k - 1]`) on whitespace-normalized body output *after* stripping any synthesized `# <title>` line (preventing `<title>` injection or surviving `<nav>` tokens from masking dropped `<main>` prose).
+  - `expected_code_blocks`: `{ "language": Option<String>, "snippet": String }` entries matched against parsed fenced blocks (` ``` ` / ` ~~~ `), verifying exact info-string language and gutter-free body content.
+  - `expected_links` and `expected_images`: exact parsed Markdown link/image destinations (`[...](destination)` / `![...](destination)`), catching unstripped `?utm_*` parameters and broken parenthesis escaping.
+  - `forbidden_substrings`: navigation labels, cookie-banner text, copy-button labels, heading permalink glyphs, and hydration JSON matched case-insensitively on whitespace-normalized output.
+  - `minimum_output_bytes` and `maximum_output_bytes`: explicit byte bounds preventing unannotated body deletion or unbounded boilerplate retention.
+  - `expected_structure`: `{ minimum_headings, minimum_code_blocks, minimum_tables, minimum_list_items, minimum_links }` preventing `output_bytes` gaming via Markdown syntax stripping.
 
 ### 2.2 Four-Axis Scorecard (`CorpusScorecard`)
 
-Every candidate commit produces a deterministic JSON scorecard across four axes:
+`cargo test --test corpus_evaluation -- --nocapture` evaluates the corpus and prints a single deterministic machine-parseable summary line alongside human-readable diagnostics:
 
-1. **Gate 0 — Soundness Invariants (`soundness_gate: bool`)**
-   - `cargo test` and `cargo test --features cronet` pass completely.
+1. **Gate 0 — Soundness Invariants (`passes_soundness_gate: bool`)**
+   - `cargo test` and `cargo test --features cronet` pass with zero failures.
    - `cargo clippy --all-targets --features cronet -- -D warnings` emits zero warnings.
-   - Native C/Objective-C headers in `cef/` compile with `-Wall -Wextra -Werror`.
-   - Structural invariants hold over boundary inputs:
-     - `truncate_markdown(input, max_bytes)` satisfies `output.len() <= max_bytes`, valid UTF-8, and zero unclosed fenced code blocks across all byte budgets `0..=input.len()`.
-     - `strip_tracking_parameters` leaves non-tracking query strings (including signed S3/CloudFront URLs) byte-for-byte unchanged.
-     - Two-part binary wire framing (`JSON header\n + raw bytes`) rejects malformed headers, oversized payloads, and truncated streams cleanly without panic or unbounded allocation.
+   - `cargo fmt --check` and `clang-format --dry-run --Werror cef/*.c cef/*.h cef/*.m` pass (preventing horizontal line-packing).
+   - Native C/Objective-C compilation of `cef/protocol.h` and `cef/renderer_core.h` succeeds under `-Wall -Wextra -Werror`.
+   - Boundary property tests in `extract_tests.rs` and `cef_protocol_tests.rs` hold:
+     - `truncate_markdown(input, max_bytes)` satisfies `output.len() <= max_bytes`, valid UTF-8, and zero unclosed fences across **all** `max_bytes` in `0..=input.len()` (including `0 < max_bytes <= TRUNCATED_SUFFIX.len()`).
+     - `strip_tracking_parameters` leaves non-tracking signed URLs byte-for-byte identical.
+     - Two-part binary wire framing (`JSON header\n + payload_bytes`) handles malformed JSON, oversized `payload_bytes`, and mid-payload `EOF` cleanly.
 
-2. **Axis 1 — Extraction Efficacy (`ExtractionScorecard`)**
-   - `classification_exactness`: exact match fraction across all corpus fixtures (`1.0` required on existing fixtures).
-   - `must_keep_recall`: fraction of all `must_keep_substrings`, `must_keep_code_blocks`, and `must_keep_links` present in extracted Markdown.
-   - `noise_suppression`: fraction of all `must_drop_substrings` absent from extracted Markdown.
-   - `signal_density`:
-     $$\text{signal\_density} = \frac{\sum \text{matched\_must\_keep\_bytes}}{\max(1,\ \sum \text{output\_bytes})}$$
-     Pairing `signal_density` with `must_keep_recall` prevents gaming compactness by deleting body prose.
-   - `extraction_throughput_mib_per_sec`: aggregate corpus input bytes divided by extraction wall time (tracked for regression screening, gated at `<= 10%` variance).
+2. **Axis 1 — Extraction Efficacy**
+   - `ratchet_pass_rate`: fraction of `"ratchet"` fixtures passing 100% of classification, structure, byte-bound, keep, and drop assertions (hard requirement: `1.000`).
+   - `frontier_classification_exactness`, `frontier_expected_recall`, and `frontier_forbidden_suppression`: macro-averaged across `"frontier"` fixtures.
+   - `signal_density`: unweighted **macro-mean** across HTML Markdown fixtures, bounded below by `minimum_output_bytes` so deleting unannotated prose cannot inflate density:
+     $$\text{fixture\_density}_i = \frac{\sum_{m \in \text{matched}(i)} \text{byte\_length}(m)}{\max(\text{output\_bytes}_i,\ \text{minimum\_output\_bytes}_i)}, \qquad \text{signal\_density} = \frac{1}{|F|} \sum_{i \in F} \text{fixture\_density}_i$$
 
-3. **Axis 2 — Transport and Pipeline Efficacy (`TransportScorecard`)**
-   - Evaluated against deterministic `127.0.0.1:0` loopback HTTP servers and deterministic `wick-renderer` protocol harnesses:
-   - `warm_http_p95_ms` and `batch_16_wall_ms`: latency through `daemon.sock` with pooled `TransportClient`.
-   - `cef_settle_overhead_ms`: elapsed delay between DOM readiness (or `wait_for_selector` match) and response frame emission in `cef/protocol.h` + `cef/renderer_core.h`.
-   - `resource_hygiene`: zero leaked child processes, zero orphaned socket locks, and zero lost `SiteCache` entries under 8-process concurrent writes.
+3. **Axis 2 — Transport and Readiness Determinism**
+   - Evaluated via deterministic `127.0.0.1:0` loopback servers and deterministic `wick-renderer` harnesses (wall-clock throughput and batch latency benchmarks live in `#[ignore]` `--release` benches run on idle `main`, never as flaky parallel commit gates):
+   - `cef_settle_ticks`: deterministic poller/observer settle delay after DOM + subresource readiness on short (`<= 500` byte) and selector-matched documents.
+   - `leaked_resource_count`: orphaned `wick-renderer` child processes, unclosed lock descriptors, or lost `SiteCache` entries across an 8-subprocess contention test (hard requirement: `0`).
 
-4. **Axis 3 — Architectural Elegance (`EleganceScorecard`)**
-   - `source_line_count`: total lines across `src/**/*.rs` and `cef/*.{c,h,m}` formatted via `rustfmt` / standard C formatting (preventing horizontal line-golfing).
+4. **Axis 3 — Structural Elegance**
+   - Measured by shell/test inspection without adding AST-parser dependencies:
+   - `logical_code_lines`: non-blank, non-comment lines across `src/**/*.rs` and `cef/*.{c,h,m}` after standard formatting (deleting `///` doc comments or `debug_assert!` invariants yields zero credit and is rejected in review).
    - `unsafe_block_count`: count of `unsafe` blocks across `src/`.
-   - `dom_traversal_complexity`: verified upper bound on tree walks per HTML extraction (`1` `scraper` parse + `1` `O(N)` bottom-up metric pass + `1` `htmd` conversion).
-   - `untyped_error_matches`: count of cross-module string-prefix/substring error classifications (target: `0`).
+   - `dom_node_visits_ratio`: deterministic `#[cfg(test)]` visit counter in `src/extract/dom.rs` verifying `visits(10_000 nodes) / visits(1_000 nodes) <= 12.0` and `visits(N) <= 4 * N` (`O(N)` scaling).
+   - `untyped_error_matches`: count of non-test `.contains(` / `.starts_with(` / `.ends_with(` calls classifying error strings in `src/` (target: `0`).
 
 ### 2.3 Lexicographic Pareto Acceptance Gate
 
-A candidate commit is compared against the current `main` baseline scorecard:
+Every candidate commit is compared against `main`:
 
-- **Efficacy Commit Acceptance**:
-  1. `soundness_gate == true`.
-  2. `classification_exactness >= baseline.classification_exactness` and `must_keep_recall >= baseline.must_keep_recall`.
-  3. At least one primary efficacy metric (`must_keep_recall`, `noise_suppression`, `signal_density`, `cef_settle_overhead_ms`, or `batch_16_wall_ms`) strictly improves without regressing any sibling metric.
-  4. **Complexity Tax**: net growth in `source_line_count` must remain proportional to efficacy gain; any heuristic adding `> 120` net lines for a single-fixture improvement is rejected in favor of a structural abstraction.
-- **Subtraction Commit Acceptance (Elegance Ratchet)**:
-  1. `soundness_gate == true`.
-  2. Every `ExtractionScorecard` and `TransportScorecard` metric is `>=` baseline (zero efficacy loss).
-  3. At least one `EleganceScorecard` cost (`source_line_count`, `unsafe_block_count`, `untyped_error_matches`, or asymptotic pass count) strictly decreases while `rustfmt` formatting remains standard.
+- **Efficacy Commit**:
+  1. `passes_soundness_gate == true` and `ratchet_pass_rate == 1.000` (zero regressions on any `"ratchet"` fixture).
+  2. Strictly improves at least one target metric in lexicographic priority order:
+     `frontier_classification_exactness` > `frontier_expected_recall` > `frontier_forbidden_suppression` (for extraction/policy seams) or `cef_settle_ticks` / `leaked_resource_count` / Milestone 2 transport invariants (for transport/pipeline seams).
+  3. A higher-priority recall or classification gain tolerates `signal_density` delta `>= -0.02` provided `"ratchet"` `output_bytes <= 1.05 * baseline` and `expected_structure` holds.
+  4. **Net Line Ceiling**:
+     $$\Delta \text{logical\_code\_lines} \le \min\left(120,\ 60 \times \max(1,\ \text{newly\_solved\_frontier\_fixtures})\right)$$
+     for single-seam heuristic commits (excluding Wave Header or Milestone 2 subsystem commits), rejecting sprawling special-case patches.
+- **Subtraction Commit (Elegance Ratchet)**:
+  1. `passes_soundness_gate == true`, `ratchet_pass_rate == 1.000`, and zero regression on any `"frontier"` or transport metric (`signal_density` delta `>= 0.000`).
+  2. Strictly reduces `logical_code_lines`, `unsafe_block_count`, `dom_node_visits_ratio`, or `untyped_error_matches` without removing `///` doc comments, `debug_assert!` checks, or `pub` symbols required by `tests/*.rs`.
 
 ---
 
@@ -93,144 +108,137 @@ A candidate commit is compared against the current `main` baseline scorecard:
 
 ### 3.1 Five-Member Roster
 
-For a ~7.7k-line Rust + C repository on linear `main`, five roles prevent rebase gridlock while preserving adversarial separation:
-
 | Roster Name | Workspace | Owned Paths | Forbidden Paths | Primary Responsibility |
 | :--- | :--- | :--- | :--- | :--- |
-| `coordinator` | `inherit` | `main` branch, `docs/` | Mid-wave edits in `src/`, `cef/` | Schedules waves, arbitrates cross-seam signatures, rebases approved commits linearly onto `main`, pushes `main`. |
-| `corpus-verifier` | `share` | `tests/corpus/`, `tests/` | `src/`, `cef/` | Curates corpus snapshots and ground-truth annotations, authors adversarial counterexample tests, audits candidate commits against the Pareto gate. |
-| `transport-author` | `share` | `src/transport/`, `src/daemon/`, `cef/`, `build.rs` | `tests/corpus/` annotations | Implements unified `daemon.sock` transport RPC, Cronet/CEF slot lifecycle, CEF readiness poller precision, and typed wire error codes. |
-| `extraction-author` | `share` | `src/extract/`, `src/policy/` | `tests/corpus/` annotations | Implements `O(N)` DOM content-root scoring, code/table/image fidelity, boilerplate pruning, response classification, and `flock`-serialized `SiteCache`. |
-| `elegance-reducer` | `share` | `src/main.rs`, `src/fetch.rs`, `src/crawl.rs`, `src/search.rs`, `src/context.rs` (wave); whole repo (subtraction pass) | `tests/corpus/` annotations | Implements CLI/batch/search/crawl composition during feature waves; executes mandatory whole-repo Subtraction Passes closing every wave. |
+| `coordinator` | `inherit` | `main`, `docs/`, `Cargo.toml`, `Cargo.lock`, `src/lib.rs`, `.gitignore`, `.clang-format` | Feature edits mid-wave | Lands pre-wave Header Commits, enforces wave barriers, rebases approved commits linearly onto `main`, runs Wave 2 live canary, pushes `main`. |
+| `corpus-verifier` | `share` | `tests/corpus/`, `tests/` | `src/`, `cef/`, `scripts/` | Builds `tests/corpus_evaluation.rs`, curates `"ratchet"`/`"frontier"` fixtures, writes adversarial counterexample tests on candidate commits, gates all merges (including Subtraction Passes). |
+| `transport-author` | `share` | `src/transport/`, `src/daemon/`, `cef/`, `build.rs`, `scripts/` | `tests/corpus/` | Hardens `daemon.sock`, Cronet/CEF lifecycle, CEF `v5-meta` readiness and hermetic builds, and structured wire `error_kind` codes. |
+| `extraction-author` | `share` | `src/extract/`, `src/policy/`, `data/site-rules.json` | `tests/corpus/` | Implements charset decoding, `O(N)` `NodeMetrics`, landmark-safe pruning, `<header>` surgery, code/table/image/math fidelity, and `NodeMetrics`-gated soft-block classification. |
+| `pipeline-reducer` | `share` | `src/main.rs`, `src/fetch.rs`, `src/crawl.rs`, `src/search.rs`, `src/context.rs` (wave); whole repo behind Wave Barrier (subtraction) | `tests/corpus/` | Completes batch/search/crawl/sitemap pipeline integration and `FetchError` wiring during feature waves; executes whole-repo Subtraction Passes behind wave barriers. |
 
-- **Rationale for Generator–Verifier Separation**: forbidding authors from modifying `tests/corpus/` annotations makes benchmark tampering structurally impossible; forbidding `corpus-verifier` from editing `src/` keeps red-team incentives aligned with uncovering edge cases.
+### 3.2 Mandatory Pre-Wave Header Commit (`coordinator`)
 
-### 3.2 Shared Seam Protocol
+Cross-seam signature changes (`RuntimeConfig` in `src/context.rs`, `FetchError` in `src/fetch.rs`, `TransportErrorKind` in `src/transport/mod.rs`, `EXPECTED_PROTOCOL` in `src/transport/cef.rs` + `cef/protocol.h`, `pub mod daemon;` in `src/lib.rs`) **never** happen asynchronously inside parallel worker branches.
 
-Cross-seam struct or signature changes (`RuntimeContext` in `src/context.rs`, `FetchError` in `src/fetch.rs`, `HttpResponse` in `src/transport/mod.rs`) follow a strict header-first rule:
+Before opening a parallel wave:
+1. `coordinator` verifies `git status` on `main` is completely clean (landing or resolving any pre-existing working-tree edits first).
+2. `coordinator` lands one **Wave Header Commit** on `main` defining shared struct fields, enum variants, stub module exports, and call-site adaptations across `src/` and `tests/` that passes `cargo check --all-targets --features cronet`.
+3. Every `share` worker resets its branch (`git checkout -B swarm/<role> main`) onto that Wave Header Commit before writing code.
 
-1. At the start of a wave, if an interface signature must change, `coordinator` (or one designated lead author before parallel fan-out) lands the minimal type/trait signature commit on `main` first.
-2. Parallel workers then fork/rebase onto that signature commit so their implementations compile without conflicting edits in `src/context.rs` or `src/fetch.rs`.
+### 3.3 Hermetic Build, Socket, Renderer, and Challenge Invariants
 
-### 3.3 Hermetic Build, Socket, and Challenge Rules
-
-1. **Per-Worker Build Isolation**: each `share` workspace sets `CARGO_TARGET_DIR=<workspace_root>/target` (or a worker-specific path) so parallel `cargo test --features cronet` invocations never block on a single Cargo build-directory file lock.
-2. **Short-Path Hermetic `state_dir`**: macOS `std::env::temp_dir()` paths (`/var/folders/...`) can exceed 60 bytes, approaching the 104-byte Unix domain socket `sun_path` limit enforced in `cef_daemon.rs`. All daemon and session tests must allocate short state directories under `/tmp/wick-test-<pid>-<seq>` (`0o700`) and remove them on teardown, never touching `~/.mesh-wick`.
-3. **Explicit Daemon Binary Resolution in Tests**: integration test binaries must resolve `env!("CARGO_BIN_EXE_wick")` (with an explicit override on `RuntimeConfig` or `WICK_DAEMON_EXE`) rather than `std::env::current_exe()` when auto-spawning `wick daemon run`, because `current_exe()` inside a test harness points to the test runner binary rather than `wick`.
-4. **Strict Anti-Bot and Challenge Boundary**: workers never implement CAPTCHA solving, synthetic challenge clicking, or anti-bot evasion scripts. When an origin returns an active bot challenge (`403`/`503` or HTTP-200 interstitial), correct behavior is immediate, deterministic classification into `FetchError::Challenge` (exit code `2`) without burning retry timeouts.
+1. **External Per-Worker `CARGO_TARGET_DIR`**: `libcronet.a` (`41 MiB`) static-links into `wick` and every test binary (~1–2.5 GiB per target dir). Workers must **never** place `target-*` inside `$PWD`. Set `CARGO_TARGET_DIR` on external build storage when available (`/Volumes/rabbitx10/build/mesh-wick-workers/<role>`, matching root `target` symlink) or `${TMPDIR:-/tmp}/mesh-wick-workers/<role>`, and include `/target*` in `.gitignore`.
+2. **Short-Path Hermetic `state_dir`**: macOS `std::env::temp_dir()` (`/var/folders/...`) yields `daemon.sock` paths exceeding the 100-byte / 104-byte Unix `sun_path` limit. Every test in `tests/*.rs` (`cli_tests.rs`, `fetch_tests.rs`, `cef_protocol_tests.rs`, `daemon_tests.rs`) must allocate `/tmp/wick-t-<pid>-<seq>` (`0o700`) and clean up on drop, never touching `~/.mesh-wick`.
+3. **Hermetic Daemon & CEF Binary Resolution**:
+   - `env!("CARGO_BIN_EXE_wick")` is defined by Cargo only when compiling `tests/*.rs`, never inside `src/`. `RuntimeConfig` carries `pub daemon_executable: Option<PathBuf>` (with `WICK_DAEMON_EXECUTABLE` env fallback), populated by integration tests from `env!("CARGO_BIN_EXE_wick")`; `src/daemon/` fails loud if `daemon_executable` is `None` and `current_exe()` resides under `deps/`.
+   - `RuntimeConfig` carries `pub cef_renderer_executable: Option<PathBuf>` (with `WICK_CEF_RENDERER` env override and `WICK_NO_HOME_CEF=1` in tests so `find_renderer_in` never falls back to the host's `~/.mesh-wick/cef`). `scripts/install-cef-{mac,linux}.sh` accepts `--prefix <dir>`, caches the upstream CEF SDK tarball under a `flock`-guarded shared cache, and parses `WICK_RENDERER_PROTOCOL_VERSION` directly from `cef/protocol.h`.
+4. **Minimum Supported Rust Version**: declare `rust-version = "1.89"` in `Cargo.toml` (stabilizing `std::fs::File::lock` and `File::try_lock` via `flock(2)` with `O_CLOEXEC`).
+5. **Strict Anti-Bot and Challenge Boundary**: workers never implement CAPTCHA solvers, synthetic challenge clicking, or anti-bot evasion scripts. Active bot challenges must classify immediately into `FetchError::Challenge` (exit code `2`) with **zero** duplicate CEF retries in `render_cef_checked`.
 
 ---
 
-## 4. Generation Ratchet Protocol
-
-Each dependency wave executes a six-step ratchet cycle:
+## 4. Generation Ratchet and Git Worktree Protocol
 
 ```mermaid
 flowchart LR
-    S1["1. Corpus Seed & Baseline<br/>(corpus-verifier)"] --> S2["2. Parallel Seam Climbs<br/>(authors in share workspaces)"]
-    S2 --> S3["3. Board Submission<br/>(6-field structured post)"]
-    S3 --> S4["4. Adversarial Audit<br/>(corpus-verifier)"]
-    S4 -->|Approved| S5["5. Linear Rebase onto main<br/>(coordinator)"]
-    S4 -->|Rejected + Counterexample| S2
-    S5 --> S6["6. Whole-Repo Subtraction Pass<br/>(elegance-reducer)"]
+    H["0. Clean Check & Wave Header Commit<br/>(coordinator on main)"] --> P["1. Parallel Seam Climbs<br/>(corpus / transport / extraction / pipeline)"]
+    P --> B["2. Commit on swarm/role & Post Handoff<br/>(authors)"]
+    B --> V["3. Detached Checkout + Counterexample Commit<br/>(corpus-verifier)"]
+    V -->|Approved + Test SHA| M["4. Linear Rebase onto main<br/>(coordinator)"]
+    V -->|Rejected + Repro Test SHA| P
+    M --> W["5. Wave Barrier<br/>(all worker branches landed or parked)"]
+    W --> S["6. Whole-Repo Subtraction Pass<br/>(pipeline-reducer -> corpus-verifier -> main)"]
 ```
 
-### 4.1 Inner Author Loop and Two-Strike Reset
+### 4.1 Author Branch Discipline and Two-Attempt Reset
 
-Inside its `share` workspace, each author runs tight single-hypothesis iterations:
+1. Each author works exclusively on named branch `swarm/<role>` forked from `main` inside its `share` workspace (which shares the underlying `.git` object store with `coordinator` and `corpus-verifier`).
+2. **Two-Attempt Reset Rule**: if a hypothesis fails Gate 0 or breaks `"ratchet"` fixtures twice, run `git reset --hard main` and redesign rather than stacking corrective patches.
+3. Authors **must `git commit`** (`git status --porcelain` empty) before posting to the board so `<head_sha>` exists in the shared git object store.
 
-1. Formulate one falsifiable hypothesis targeting a measured gap on the scorecard.
-2. Implement the minimal change and run `rustfmt`, `clippy`, `cargo test --features cronet`, and the corpus scorecard.
-3. **Two-Strike Reset Rule**: if a hypothesis fails verification or breaks sibling fixtures twice, run `git reset --hard main` and reformulate from scratch rather than stacking corrective patches onto a flawed mechanism.
-
-### 4.2 Swarm Board Message Contract
-
-To keep shared board context compact, every candidate handoff uses an exact six-field record:
+### 4.2 Swarm Board Handoff Record
 
 ```text
-WAVE_SEAM: W2 / cef-readiness
-COMMIT: <commit-sha> (<workspace-name>)
+WAVE: 1 | SEAM: cef-readiness
+BRANCH: swarm/transport-author | BASE_SHA: <base_sha> | HEAD_SHA: <head_sha>
 HYPOTHESIS: <single sentence>
-SCORECARD_DELTA: recall +0.000 | noise +0.000 | density +0.000 | cef_overhead 8050ms -> 140ms | sloc -12
-VERIFICATION: cargo test --features cronet (<N> passed); clippy clean
-TOUCHED_FILES: cef/protocol.h, src/transport/cef.rs, tests/cef_protocol_tests.rs
+SCORECARD: ratchet 1.000 | frontier_recall +0.000 | density +0.000 | cef_settle_ticks 31 -> 4 | logical_code_lines -8
+VERIFICATION: cargo test --features cronet (<N> passed); clippy & fmt clean
+TOUCHED_FILES: cef/protocol.h, cef/renderer_core.h, src/transport/cef.rs
 ```
 
-### 4.3 Adversarial Audit and Linear Landing
+### 4.3 `corpus-verifier` Audit and Linear Rebase Mechanics
 
-1. `corpus-verifier` inspects `COMMIT`, verifies `TOUCHED_FILES` respects seam ownership and leaves `tests/corpus/` annotations untouched, writes at least one adversarial edge-case assertion probing false-positive risk, and replies `APPROVE <sha>` or `REJECT <sha>: <counterexample>`.
-2. `coordinator` fetches approved commits in dependency order, rebases each linearly onto `main` (`git rebase`, zero merge commits), re-runs Gate 0 + scorecard, and fast-forwards `main`.
-3. Once all wave authors land, `elegance-reducer` rebases onto `main` and executes a **Subtraction Pass**, deleting redundant helpers, collapsing multi-pass loops, tightening module visibility (`pub` -> `pub(crate)` -> private), and landing a pure complexity-reduction commit before the next wave opens.
+1. `corpus-verifier` runs `git checkout --detach <head_sha>` in its clean `share` workspace and verifies `git diff --name-only <base_sha>..<head_sha>` stays strictly within the author's owned paths and leaves `tests/corpus/` untouched.
+2. `corpus-verifier` runs Gate 0 + `corpus_evaluation`, writes at least one adversarial edge-case test in `tests/` targeting false-positive risk, commits that test on top of `<head_sha>` as `<verified_sha>` (plus any `"frontier"` -> `"ratchet"` promotion), posts `APPROVE <head_sha> | VERIFIED_SHA: <verified_sha>` (or `REJECT <head_sha>: <reason> | REPRO_SHA: <repro_sha>`), and resets its worktree (`git checkout --detach main && git clean -fd`).
+3. `coordinator` lands `<verified_sha>` linearly onto `main`:
+   `git rebase --onto main <base_sha> <verified_sha> && git checkout -B main <rebased_sha>`, re-running `cargo test --features cronet` and `corpus_evaluation` before advancing `main`.
+4. **Wave Barrier & Subtraction Pass**: once every active branch in the wave has landed or been parked, `pipeline-reducer` branches `swarm/subtraction` from `main`, executes a whole-repo Subtraction Pass (preserving all `pub` symbols referenced by `tests/*.rs`), submits `<head_sha>` to `corpus-verifier` under the Subtraction Commit gate, and `coordinator` fast-forwards `main`.
 
 ---
 
-## 5. Dependency-Ordered Hillclimb Waves
+## 5. Dependency-Ordered Convergence Waves
 
-### Wave 0 — Deterministic Corpus and Scorecard Harness
-- **Owners**: `corpus-verifier` (corpus + harness), `elegance-reducer` (scorecard CLI/test runner integration).
-- **Deliverables**:
-  - `tests/corpus/` seeded with initial HTML/binary fixtures and `annotations.json` ground truth across documentation, aggregator, SPA-shell, challenge-interstitial, soft-404, table/code, and Latin-1 categories.
-  - `tests/corpus_evaluation.rs` computing `CorpusScorecard` deterministically and asserting Gate 0 property invariants (`truncate_markdown` fuzz sweeps, signed URL preservation, binary frame boundary tests).
-  - Baseline `CorpusScorecard` recorded on `main`.
+### Pre-Flight Gate (`coordinator`)
+- Confirm Milestone 2 in-progress edits on `main` (`src/daemon/`, `build.rs`, `SiteCache` lock, per-request limits) are cleanly committed and green.
+- Land **Wave 0 Header Commit**: set `rust-version = "1.89"` in `Cargo.toml`, add `/target*` to `.gitignore`, add `.clang-format`, and add `daemon_executable` / `cef_renderer_executable` fields on `RuntimeConfig` (`src/context.rs`).
 
-### Wave 1 — Unified Warm Transport Daemon and Composable Pipelines
-- **Owners**: `transport-author` (`src/daemon/`, `src/transport/`, `build.rs`), `extraction-author` (`SiteCache` `flock`), `elegance-reducer` (`fetch` batching, `search` flags, `crawl`/`map` concurrency).
-- **Deliverables**:
-  - Complete `docs/01-transport-daemon-and-batch-fetch.md` Milestone 2:
-    - Concurrent `src/daemon/` (`Ping`, `Shutdown`, `HttpGet`, `CefRender`) over two-part frames (`daemon.sock`), proxy-partitioned `(TransportClient, CefRenderer)` slots (LRU cap 4), client-disconnect cancellation, `WICK_BUILD_ID` mismatch auto-restart, and `CARGO_BIN_EXE_wick`-safe daemon spawning.
-    - Advisory `flock` around read-merge-write in `src/policy/cache.rs` (`site-cache.lock`).
-    - Pooled Brave `reqwest::Client` on `RuntimeContext`; `wick search` `--urls-only`, `--freshness`, `--site`, and `--extra-snippets`.
-    - Multi-URL and stdin (`-`) batch `wick fetch` with `--concurrency`, per-host `Semaphore(2)`, `--jsonl`, and exit code `4` on partial failure.
-    - Bounded concurrent `crawl` (replacing sequential `500ms` sleeps in `src/crawl.rs`) and recursive `<sitemapindex>` resolution in `map`.
+### Wave 0 — Hermetic Harness, Charset Decoding, and Pipeline Baseline (All 4 Workers Parallel)
+- **`corpus-verifier`**: implement `tests/corpus_evaluation.rs` (single-file `<!-- wick-fixture: ... -->` loader, ordered subsequence matcher, fence/link destination matchers, macro-mean `signal_density`, `dom_node_visits` scaling check) and seed `tests/corpus/` with `"ratchet"` and `"frontier"` snapshots across technical docs, code gutter tables, `<header>` with `<h1>`, link-heavy indexes (HN/`old.reddit`/Rustdoc), SPA shells, challenge interstitials, HTTP-200 soft-404/login walls, signed URLs, KaTeX, `srcset` CDN commas, binary magic bytes, and `ISO-8859-1` / `Windows-1252`.
+- **`transport-author`**: migrate all existing test `temp_dir` helpers to `/tmp/wick-t-<pid>-<seq>`; wire `daemon_executable`, `cef_renderer_executable`, and `WICK_NO_HOME_CEF=1` in `src/daemon/` and `src/transport/cef.rs`; add `--prefix <dir>`, `flock`-cached SDK extraction, and `cef/protocol.h` version parsing to `scripts/install-cef-{mac,linux}.sh`.
+- **`extraction-author`**: fix the `0 < max_bytes <= TRUNCATED_SUFFIX.len()` unclosed-fence slice edge case in `src/extract/markdown.rs`; upgrade `HttpResponse` / HTML byte decoding from lossy UTF-8 (`U+FFFD`) to charset-aware decoding (`Content-Type` `charset=` + `<meta charset>` fallback for `ISO-8859-1` / `Windows-1252`).
+- **`pipeline-reducer`**: complete any remaining Milestone 2 pipeline items (`wick fetch` batch/stdin `--jsonl`, `wick search` `--urls-only`/`--freshness`/`--site`/`--extra-snippets`, and `src/crawl.rs` concurrent `crawl` + recursive `<sitemapindex>` with `visited_sitemaps`, `depth <= 3`, `max_sitemaps <= 64`, bounded `<= 32 MiB` `.xml.gz` decompression, `robots.txt` `Sitemap:` discovery, `RobotsCache` in-flight request coalescing, post-redirect seed origin update, and `(depth, discovery_sequence)` deterministic ordering).
+- **Wave 0 Barrier**: `pipeline-reducer` runs Wave 0 Subtraction Pass -> audited by `corpus-verifier` -> landed on `main`.
 
-### Wave 2 — CEF Readiness Precision and Typed Wire Errors
-- **Owners**: `transport-author` (`cef/`, `src/transport/`), `corpus-verifier` (mock/OSR timing and error-code harnesses), `elegance-reducer` (subtraction pass).
-- **Deliverables**:
-  - **Fix `len > 500` timeout trap in `cef/protocol.h`**: currently `var stableHit=!isCF&&len>500&&stable>=1000&&hit;` forces any page with `<= 500` characters of `innerText` (concise posts, short documentation pages, minimal SPAs) to stall until `js_cap` (`8000ms`, or `20000ms` with selector) expires, and imposes a `1300ms` floor on all pages. Replace with:
-    - Immediate completion as soon as explicit `wait_for_selector` matches on a non-challenge document.
-    - `MutationObserver` + `requestAnimationFrame` quiet-window settle (`~150–250ms` of zero DOM subtree mutations after `load` when `body` is non-empty and non-challenge) for selector-less renders, regardless of whether `innerText.length` is above or below `500`.
-  - **Structured Error Codes across Native/IPC Seams**: add explicit machine-readable `error_code` fields (`"timeout"`, `"load_error"`, `"invalid_selector"`, `"response_too_large"`, `"canceled"`, `"protocol_mismatch"`) to `wick-renderer` `v4-meta` headers, `daemon.sock` responses, and `TransportClient` errors, deleting string-prefix matching in `src/transport/cef.rs` and `src/transport/cronet.rs`.
+### Wave 1 — Parallel Core Efficacy Hillclimb (CEF `v5-meta`, `O(N)` DOM Engine, Error Ontology)
+- **Wave 1 Header Commit (`coordinator`)**: bump `WICK_RENDERER_PROTOCOL_VERSION` / `EXPECTED_PROTOCOL` to `"v5-meta"`, define structured `TransportErrorKind` (`Timeout`, `LoadError`, `InvalidSelector`, `ResponseTooLarge`, `Canceled`, `ProtocolMismatch`, `Network`) in `src/transport/mod.rs`, add `(requested_url, final_url)` context to `classify_response_with_parsed`, and update cross-seam signatures in `src/fetch.rs` and `tests/{cef_protocol,cli}_tests.rs`.
+- **`transport-author` (`cef/`, `src/transport/`, `src/daemon/`)**:
+  - **Fix `cef/protocol.h` `len > 500` stall and `1500ms` floor**: replace `setInterval(300)` + `len > 500` with C-level atomic in-flight subresource tracking (`RT_XHR`, `RT_SCRIPT`, `RT_SUB_RESOURCE` in `cef/renderer_core.h`) + `window.__wickPollerActive`-guarded `MutationObserver` + `requestAnimationFrame` quiet window (`150–250ms`). Gate quiet-window completion on `!isChallenge && !hasEmptySpaRoot && inflightSubresources == 0` (where `hasEmptySpaRoot` matches `#root, #app, #__next, #__nuxt, app-root, [data-reactroot]` with `innerText.trim().length < 50`, allowing short static/hydrated pages to finish in `< 250ms` while waiting for CSR hydration; on `js_cap` expiry with `g_committed_main_frame == 1`, force-dump `outerHTML` cleanly without error). For `wait_for_selector`, resolve after selector match + non-empty subtree (or brief hydration grace) + 1 `rAF`.
+  - **Emit structured `error_kind` in `v5-meta`**, `daemon.sock`, and `cronet.rs`, deleting all string-prefix error matching in `src/transport/`.
+  - **Harden lock and cache I/O**: route `clear_state_dir` through `site-cache.lock` (never unlinking the lockfile inode), distinguish `NotFound` from read/parse errors in `SiteCache` so transient errors never wipe `site-cache.json`, offload blocking `flock` writes via `spawn_blocking`, and have `daemon run` probe `daemon.sock` on `WouldBlock` instead of blind 2s spinning.
+- **`extraction-author` (`src/extract/`, `src/policy/`)**:
+  - **Single-pass `O(N)` post-order `NodeMetrics` (`src/extract/dom.rs`)**: compute `(prose_bytes, link_text_bytes, link_count, code_bytes, heading_count, form_count)` in one bottom-up `ego_tree` traversal tracking `in_link: bool` (eliminating `O(N^2)` subtree re-walks and nested-`<a>` double counting).
+  - **Landmark-safe boilerplate pruning & `<header>` surgery**: never link-density-prune inside `main`, `[role="main"]`, `article`, or content `<table>`s (preserving HN, `old.reddit.com`, Rustdoc indexes, and GitHub file trees); outside landmarks, prune only corroborated navigation chrome (`link_density > 0.65`, mean link text `<= 32` bytes, `heading_count == 0`, `code_bytes == 0`). Inside `<header>` elements containing `<h1>`, detach `<nav>` and link-cluster siblings while keeping the `<h1>` subtree.
+  - **Code, table, permalink, image, and math fidelity**:
+    - Unwrap 2-column code-gutter `<table>`s **only** when `<thead>`/`<th>` are absent and either explicit gutter classes/attributes (`hljs-ln-numbers`, `blob-num`, `linenos`, `gutter`, `highlighttable`, `rouge-table`, `data-line-number`) match (both multi-row and single-row `<pre>` layouts) or `>= 3` rows have `1..=N` integers paired exclusively with `<pre>`/`<code>`, hoisting `language-*` / `highlight-source-*` from wrapper elements.
+    - Inside `<pre>`, strip only `<button>`, `[role="button"]`, and `.line-numbers-rows` (never syntax `<span>` literals).
+    - Strip permalink `<a>` only inside `h1..=h6` (or `.headerlink`/`.anchor`) with `href^="#"` whose text (minus zero-width codepoints) is in `{"", "#", "§", "¶", "🔗"}`.
+    - Resolve `<picture><source srcset>` and `img[data-src]`/`srcset` **before** detaching `img[src^="data:"]` placeholders, parsing `srcset` per WHATWG descriptor boundaries so commas inside CDN transform URLs (`/cdn-cgi/image/width=800,quality=80/...`) stay intact.
+    - Extract KaTeX/MathJax `<annotation encoding="application/x-tex">` before detaching `[aria-hidden="true"]`, add `<details>`/`<summary>` to `is_block`, preserve labeled `<svg>` diagrams (`[Diagram: <label>]`) outside interactive controls, ignore `|` inside inline backtick code spans in `split_table_cells`, and suppress `# <title>` duplication when `<h1>` matches the site-stripped `<title>` prefix.
+  - **`NodeMetrics`-gated HTTP-200 classification (`src/policy/classify.rs`)**: never classify HTTP-200 documents with post-strip `prose_bytes >= 600` (excluding `<noscript>`, `<pre>`, `<code>`, `<script>`) as `JavaScriptShell`, `Challenge`, `Blocked`, or Soft-404—preventing false positives on documentation articles quoting challenge or OAuth text. Classify cookie walls, redirect/form login walls, and low-prose 404 titles strictly from visible DOM and `(requested_url, final_url)`.
+- **`pipeline-reducer` (`src/fetch.rs`, `src/main.rs`)**:
+  - Map `TransportErrorKind` directly into `FetchError`; remove the duplicate CEF retry on detected static challenges in `render_cef_checked` (`src/fetch.rs`) so challenges exit immediately with code `2`; enforce `crawl` per-host `Semaphore(2)` + `Crawl-delay` spacing.
+- **Wave 1 Barrier**: `pipeline-reducer` runs Wave 1 Subtraction Pass -> audited by `corpus-verifier` -> landed on `main`.
 
-### Wave 3 — `O(N)` DOM Content Scoring and Technical Documentation Fidelity
-- **Owners**: `extraction-author` (`src/extract/`, `src/policy/`), `corpus-verifier` (adversarial HTML counterexamples), `elegance-reducer` (subtraction pass).
-- **Deliverables**:
-  - **Single-Pass `O(N)` Bottom-Up DOM Metrics (`src/extract/dom.rs`)**: replace repeated `O(N^2)` subtree walks in `select_root_id` and `text_metrics` with one post-order traversal over `ego_tree` computing `NodeMetrics { prose_bytes, link_text_bytes, code_bytes, heading_count, form_count }` per node. Use these metrics both for `Article` root selection and to strip high-link-density navigation chrome in `Clean` mode.
-  - **`<header>` Navigation Chrome Surgery**: instead of retaining an entire site-wide `<header>` whenever it contains `<h1>` (`src/extract/dom.rs`), detach `<nav>` / link-cluster siblings inside `<header>` while preserving the `<h1>` heading subtree.
-  - **Technical Documentation Fidelity (`src/extract/dom.rs`, `src/extract/markdown.rs`)**:
-    - Detect 2-column line-number gutter `<table>` layouts (`td.hljs-ln-numbers` / `td.blob-num` / monotonic integer-only first column paired with `<pre>`/`<code>` second column) and unwrap them into clean fenced code blocks with preserved `language-*` info strings, verified against counterexample numeric data tables.
-    - Strip injected `Copy` / `Copied` button elements inside `<pre>` blocks and self-referential heading anchor permalinks (`<a href="#...">` containing only `#`, `§`, or zero-width/icon glyphs).
-    - Resolve `<picture><source srcset>` and `img[data-src]` / `srcset` primary candidates when `img[src]` is missing or a `data:` placeholder.
-  - **HTTP-200 Soft-Block and Interstitial Classification (`src/policy/classify.rs`)**: expand `ResponseClassification` accuracy on HTTP-200 login walls, cookie walls, and noscript/hydration shells without false positives on short technical pages.
-
-### Wave 4 — Out-of-Loop Canary Harvest and Final Compression
-- **Owners**: `coordinator` (live canary execution), `corpus-verifier` (snapshot anonymization and annotation), `elegance-reducer` (final whole-repo subtraction pass).
-- **Deliverables**:
-  - Execute a one-shot live canary (`wick search` + `wick fetch`) across 20 representative developer documentation, repository, forum, and SPA URLs strictly to harvest any unhandled DOM patterns into static `tests/corpus/` fixtures.
-  - Climb any newly exposed fixture gaps via one Wave 3 iteration.
-  - Run a final whole-repo Subtraction Pass auditing dead symbols, public API surface (`src/lib.rs`), memory allocations on the hot extraction path, and documentation parity in `README.md`, then push linear `main`.
+### Wave 2 — Out-of-Loop Live Canary Harvest and Final Subtraction
+- **`coordinator`**: build release `wick` + local `--prefix` `v5-meta` `wick-renderer`, run a one-shot 20-URL live canary across representative documentation, repository, aggregator, and CSR SPA origins, and hand raw responses that exhibit any defect to `corpus-verifier`.
+- **`corpus-verifier`**: sanitize and commit captured defects as `"frontier"` fixtures in `tests/corpus/`.
+- **`transport-author` / `extraction-author`**: climb all Wave 2 `"frontier"` fixtures to `"ratchet"` (`1.000`).
+- **`pipeline-reducer`**: execute final whole-repo Subtraction Pass (auditing `untyped_error_matches == 0`, minimal `pub` surface, hot-path allocations, and `README.md` parity with `daemon.sock`, `v5-meta`, batch/search flags, and exit codes `0..=5`) -> audited by `corpus-verifier` -> `coordinator` pushes linear `main`.
 
 ---
 
 ## 6. Ready-to-Use `/swarm` Worker Briefs
 
-When launching `/swarm`, `coordinator` spawns the four workers below using `workspace: "share"`.
+Set `EXT_BUILD=/Volumes/rabbitx10/build/mesh-wick-workers` if `/Volumes/rabbitx10/build` exists, otherwise `${TMPDIR:-/tmp}/mesh-wick-workers`. Spawn all four workers with `workspace: "share"` after landing the Wave 0 Header Commit on `main`.
 
 ### 6.1 `corpus-verifier` Brief
-> You own `tests/corpus/` and adversarial test verification in `tests/`. You are forbidden from editing `src/` or `cef/`. Read `docs/02-swarm-hillclimb-protocol.md` and `docs/01-transport-daemon-and-batch-fetch.md`.
-> 1. In Wave 0, build `tests/corpus_evaluation.rs` and seed `tests/corpus/` with deterministic HTML/binary fixtures + `annotations.json` covering technical docs, code gutter tables, `<header>` with `<h1>`, SPA shells, challenge interstitials, soft-404s, signed URLs, and Latin-1 HTML, plus Gate 0 property tests (`truncate_markdown` byte ceiling + fence closure, two-part frame truncation).
-> 2. In Waves 1–4, audit every candidate commit posted by authors: verify seam boundaries and untouched corpus annotations, add at least one adversarial counterexample test targeting false-positive edge cases, run `CARGO_TARGET_DIR=$PWD/target-verifier cargo test --features cronet`, and post `APPROVE <sha>` or `REJECT <sha>: <counterexample>`.
+> You own `tests/corpus/` and `tests/`. You are forbidden from editing `src/`, `cef/`, or `scripts/`. Read `docs/02-swarm-hillclimb-protocol.md` and `docs/01-transport-daemon-and-batch-fetch.md`. Always run Cargo with `CARGO_TARGET_DIR=${EXT_BUILD}/verifier` and `WICK_NO_HOME_CEF=1`, and use `/tmp/wick-t-<pid>-<seq>` in tests.
+> 1. Wave 0: work on branch `swarm/corpus-verifier`. Build `tests/corpus_evaluation.rs` (single-file `<!-- wick-fixture: {...} -->` loader, `"ratchet"` vs `"frontier"` tiers, ordered subsequence `expected_substrings`, fenced `expected_code_blocks`, exact `expected_links`/`expected_images`, bounded macro-mean `signal_density`, `dom_node_visits` scaling check, and 8-subprocess `SiteCache` contention test) and seed `tests/corpus/` across all specified categories. Commit and post your handoff.
+> 2. Waves 0–2 Gatekeeping: for every author or subtraction handoff, `git checkout --detach <head_sha>`, verify `git diff --name-only <base_sha>..<head_sha>` stays inside the author's owned paths and leaves `tests/corpus/` untouched (except promoting solved `"frontier"` -> `"ratchet"` in your verification commit), add at least one adversarial counterexample test in `tests/`, verify Gate 0 + Pareto rules, commit your test as `<verified_sha>`, post `APPROVE <head_sha> | VERIFIED_SHA: <verified_sha>` (or `REJECT`), and reset to `main`.
 
 ### 6.2 `transport-author` Brief
-> You own `src/transport/`, `src/daemon/`, `cef/`, and `build.rs` (`workspace: "share"`). Never edit `tests/corpus/` annotations and never touch `~/.mesh-wick` (always use `/tmp/wick-test-<pid>-<seq>` in tests and `CARGO_TARGET_DIR=$PWD/target-transport`). Read `docs/01-transport-daemon-and-batch-fetch.md` and `docs/02-swarm-hillclimb-protocol.md`.
-> 1. Wave 1: replace `src/transport/cef_daemon.rs` with concurrent `src/daemon/` (`Ping`, `Shutdown`, `HttpGet`, `CefRender` over two-part binary frames), proxy-partitioned `(TransportClient, CefRenderer)` slots, client-disconnect cancellation, `WICK_BUILD_ID` mismatch restart, and explicit daemon binary path resolution safe under `cargo test`.
-> 2. Wave 2: fix the `len > 500` timeout trap in `cef/protocol.h` using immediate `wait_for_selector` completion and `MutationObserver` quiet-window settle; replace untyped error strings across `cef/protocol.h`, `src/transport/cef.rs`, and `src/transport/cronet.rs` with structured error codes. Post 6-field board handoffs per commit.
+> You own `src/transport/`, `src/daemon/`, `cef/`, `build.rs`, and `scripts/` on branch `swarm/transport-author` (`workspace: "share"`). Never edit `tests/corpus/`, never write `target*` inside `$PWD` (`CARGO_TARGET_DIR=${EXT_BUILD}/transport`), and never touch `~/.mesh-wick` (`WICK_NO_HOME_CEF=1`, `/tmp/wick-t-<pid>-<seq>`). Read `docs/02-swarm-hillclimb-protocol.md` and `docs/01-transport-daemon-and-batch-fetch.md`.
+> 1. Wave 0: migrate test temp paths to `/tmp/wick-t-<pid>-<seq>`; wire `RuntimeConfig::{daemon_executable, cef_renderer_executable}` and `WICK_NO_HOME_CEF=1`; add `--prefix <dir>`, `flock` SDK caching, and `cef/protocol.h` version extraction to `scripts/install-cef-{mac,linux}.sh`.
+> 2. Wave 1 (after Wave 1 Header Commit): upgrade `cef/protocol.h` and `cef/renderer_core.h` to `v5-meta` with C-level in-flight subresource tracking + `MutationObserver` quiet-window settle + unhydrated-SPA-root guard (eliminating the `len > 500` timeout stall and `1500ms` floor while preserving `g_committed_main_frame` force-dump on `js_cap`); emit structured `error_kind` across `v5-meta`, `daemon.sock`, and `cronet.rs` (zero string-prefix error matching); harden `SiteCache` error handling, `clear_state_dir` locking, `spawn_blocking` writes, and `daemon run` `WouldBlock` socket probing. Commit before every board handoff; reset after 2 failed attempts on a hypothesis.
 
 ### 6.3 `extraction-author` Brief
-> You own `src/extract/` and `src/policy/` (`workspace: "share"`). Never edit `tests/corpus/` annotations; use `CARGO_TARGET_DIR=$PWD/target-extract`. Read `docs/01-transport-daemon-and-batch-fetch.md` and `docs/02-swarm-hillclimb-protocol.md`.
-> 1. Wave 1: add advisory `flock` (`site-cache.lock`) around read-merge-write in `src/policy/cache.rs` with multi-process contention tests.
-> 2. Wave 3: replace `O(N^2)` subtree walks in `src/extract/dom.rs` with a single-pass `O(N)` bottom-up `NodeMetrics` computation; prune `<header>` nav siblings without dropping nested `<h1>`; unwrap 2-column line-number code tables into fenced code blocks with `language-*` tags; strip `<pre>` copy buttons and heading `#`/`§` permalink anchors; resolve `<picture>`/`srcset`/`data-src` images; tighten HTTP-200 soft-block classification in `src/policy/classify.rs`. Post 6-field board handoffs with `CorpusScorecard` deltas.
+> You own `src/extract/`, `src/policy/`, and `data/site-rules.json` on branch `swarm/extraction-author` (`workspace: "share"`, `CARGO_TARGET_DIR=${EXT_BUILD}/extraction`, `WICK_NO_HOME_CEF=1`). Never edit `tests/corpus/`. Read `docs/02-swarm-hillclimb-protocol.md`.
+> 1. Wave 0: fix the `0 < max_bytes <= TRUNCATED_SUFFIX.len()` opening-fence slice bug in `src/extract/markdown.rs`; add charset-aware HTML byte decoding (`Content-Type` `charset=` and `<meta charset>` for `ISO-8859-1` / `Windows-1252`) prior to `ParsedHtml::parse`.
+> 2. Wave 1 (after Wave 1 Header Commit): implement single-pass `O(N)` post-order `NodeMetrics` (with `in_link` tracking and `#[cfg(test)]` visit counter); apply landmark-protected link-density pruning and `<header>` sibling nav surgery; unwrap headerless 2-column code-gutter `<table>`s (multi-row and single-row `<pre>`, hoisting `language-*`); strip `<pre>` `<button>`/`.line-numbers-rows` and heading `#`/`§`/`¶`/`🔗` permalinks; resolve `<picture>`/`srcset` (WHATWG comma-safe)/`data-src` before `data:` image detachment; extract KaTeX `<annotation>`, handle `<details>`/`<summary>`, labeled `<svg>` diagrams, code-span pipes in `split_table_cells`, and `<title>`/`<h1>` prefix dedup; gate HTTP-200 soft-block/shell/challenge classification in `src/policy/classify.rs` on `prose_bytes < 600` and visible DOM + redirect signals. Commit before every board handoff.
 
-### 6.4 `elegance-reducer` Brief
-> You own `src/main.rs`, `src/fetch.rs`, `src/crawl.rs`, `src/search.rs`, and `src/context.rs` during feature waves, and whole-repo Subtraction Passes at the close of every wave (`workspace: "share"`, `CARGO_TARGET_DIR=$PWD/target-elegance`). Never edit `tests/corpus/` annotations. Read `docs/01-transport-daemon-and-batch-fetch.md` and `docs/02-swarm-hillclimb-protocol.md`.
-> 1. Wave 1: pool the Brave `reqwest::Client` on `RuntimeContext`; implement `wick search` `--urls-only`, `--freshness`, `--site`, `--extra-snippets`; implement multi-URL and stdin (`-`) batch `wick fetch` (`--concurrency`, per-host `Semaphore(2)`, `--jsonl`, exit code `4`); upgrade `src/crawl.rs` to bounded concurrency and recursive `<sitemapindex>` discovery.
-> 2. End of every wave: rebase onto `main` and land a pure Subtraction Commit (`soundness_gate == true`, zero regression on any `ExtractionScorecard` or `TransportScorecard` metric, strict reduction in `source_line_count`, `unsafe_block_count`, duplicate helpers, or visibility surface).
+### 6.4 `pipeline-reducer` Brief
+> You own `src/main.rs`, `src/fetch.rs`, `src/crawl.rs`, `src/search.rs`, and `src/context.rs` during feature waves, and whole-repo Subtraction Passes behind each Wave Barrier (`workspace: "share"`, `CARGO_TARGET_DIR=${EXT_BUILD}/pipeline`, `WICK_NO_HOME_CEF=1`). Never edit `tests/corpus/`. Read `docs/02-swarm-hillclimb-protocol.md` and `docs/01-transport-daemon-and-batch-fetch.md`.
+> 1. Wave 0: complete any unlanded Milestone 2 batch `fetch`, `search` flags/pooling, and `src/crawl.rs` concurrency + safe `<sitemapindex>` / `.xml.gz` / `RobotsCache` coalescing / post-redirect seed origin updates.
+> 2. Wave 1: wire `TransportErrorKind` into `FetchError`; remove the duplicate CEF retry on static challenges in `render_cef_checked`; enforce `crawl` per-host `Semaphore(2)` + `Crawl-delay` spacing.
+> 3. Wave Barriers (end of Waves 0, 1, 2): branch `swarm/subtraction` from `main` after all wave branches have landed, reduce `logical_code_lines`, `unsafe_block_count`, duplicate helpers, and `untyped_error_matches` with zero efficacy loss (keeping `///` docs, `debug_assert!`, and `tests/*.rs` `pub` items intact), and submit to `corpus-verifier`.
