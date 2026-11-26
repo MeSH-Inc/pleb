@@ -587,3 +587,54 @@ fn wave1_extraction_preserves_data_tables_prose_links_svg_diagrams_code_pipes_an
     assert!(txt.content.contains("More info\nHidden detail text."));
     assert!(txt.content.contains("[Diagram: Request Pipeline]"));
 }
+
+#[test]
+fn adversarial_wave1_heading_link_code_span_and_thead_table_false_positives() {
+    let html = r##"<!DOCTYPE html>
+<html>
+<head><title>Adversarial False Positives</title></head>
+<body>
+  <main>
+    <h1>Adversarial False Positives</h1>
+    <h2 id="csharp">Using <a href="#csharp">C#</a> Interop <a class="headerlink" href="#csharp">#</a></h2>
+    <p>Syntax spans containing the word Copy inside code blocks must survive:</p>
+    <pre><button type="button">Copy</button><code class="language-rust">let action = <span class="tok-str">"Copy"</span>;</code></pre>
+    <table>
+      <thead><tr><th>Step</th><th>Snippet</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><code>cargo check</code></td></tr>
+        <tr><td>2</td><td><code>cargo test</code></td></tr>
+        <tr><td>3</td><td><code>cargo clippy</code></td></tr>
+        <tr><td>4</td><td><code>cargo fmt --check</code></td></tr>
+      </tbody>
+    </table>
+  </main>
+</body>
+</html>"##;
+
+    let url = Url::parse("https://docs.example.com/adversarial").unwrap();
+    let doc = extract_document(html, &url, Some("text/html"), &ExtractOptions::default()).unwrap();
+
+    // Meaningful `[C#](#csharp)` link inside `<h2>` survives while trailing `#` permalink is stripped.
+    assert!(
+        doc.content.contains("[C#](#csharp)"),
+        "meaningful C# link inside heading must survive: {}",
+        doc.content
+    );
+    assert!(
+        !doc.content.contains("[#](#csharp)"),
+        "trailing permalink # should be stripped: {}",
+        doc.content
+    );
+
+    // Syntax `<span>` literal `"Copy"` survives inside `<pre><code>` while `<button>Copy</button>` is stripped.
+    assert!(
+        doc.content.contains("let action = \"Copy\";"),
+        "syntax span inside <pre><code> must survive: {}",
+        doc.content
+    );
+
+    // 4-row 2-column table with `<thead>`/`<th>` stays a Markdown table.
+    assert!(doc.content.contains("| Step | Snippet |"));
+    assert!(doc.content.contains("| 4 | `cargo fmt --check` |"));
+}
