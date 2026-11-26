@@ -210,7 +210,7 @@ impl ParsedHtml {
         let mut map = HashMap::new();
         let mut visits = 0usize;
         if let Some(root) = self.doc.tree.get(root_id) {
-            walk_node_metrics(root, false, false, &mut map, &mut visits);
+            walk_node_metrics(root, false, false, &mut map, &mut visits, None);
         }
         (map, visits)
     }
@@ -224,28 +224,17 @@ impl ParsedHtml {
             .map(|el| el.id())
             .unwrap_or(root_id);
 
-        let mut script_count = 0usize;
-        let mut has_password_input = false;
-        let mut spa_root_ids = Vec::new();
+        let mut scan = TextMetricsScan::default();
         let mut map = HashMap::new();
         let mut visits = 0usize;
 
         if let Some(root) = self.doc.tree.get(root_id) {
-            walk_dom_text_metrics(
-                root,
-                false,
-                false,
-                &mut map,
-                &mut visits,
-                &mut script_count,
-                &mut has_password_input,
-                &mut spa_root_ids,
-            );
+            walk_node_metrics(root, false, false, &mut map, &mut visits, Some(&mut scan));
         }
 
         let body_metrics = map.get(&body_id).copied().unwrap_or_default();
         let visible_text_len = body_metrics.prose_bytes + body_metrics.code_bytes;
-        let has_empty_spa_root = spa_root_ids.into_iter().any(|id| {
+        let has_empty_spa_root = scan.spa_root_ids.into_iter().any(|id| {
             let m = map.get(&id).copied().unwrap_or_default();
             m.prose_bytes + m.code_bytes < 50
         });
@@ -253,9 +242,9 @@ impl ParsedHtml {
         DomTextMetrics {
             visible_text_len,
             prose_bytes: body_metrics.prose_bytes,
-            script_count,
+            script_count: scan.script_count,
             has_empty_spa_root,
-            has_password_input,
+            has_password_input: scan.has_password_input,
         }
     }
 
@@ -394,87 +383,32 @@ fn is_protected_container(el: &scraper::node::Element) -> bool {
     is_landmark_element(el) || el.name() == "table"
 }
 
+#[derive(Default)]
+struct TextMetricsScan {
+    script_count: usize,
+    has_password_input: bool,
+    spa_root_ids: Vec<NodeId>,
+}
+
+impl NodeMetrics {
+    fn accumulate(&mut self, child: Self) {
+        self.prose_bytes += child.prose_bytes;
+        self.link_text_bytes += child.link_text_bytes;
+        self.link_count += child.link_count;
+        self.code_bytes += child.code_bytes;
+        self.heading_count += child.heading_count;
+        self.form_count += child.form_count;
+        self.has_landmark |= child.has_landmark;
+    }
+}
+
 fn walk_node_metrics(
     node: NodeRef<'_, Node>,
     in_link: bool,
     in_code: bool,
     map: &mut HashMap<NodeId, NodeMetrics>,
     visits: &mut usize,
-) -> NodeMetrics {
-    *visits += 1;
-    match node.value() {
-        Node::Text(text) => {
-            let bytes: usize = text.split_whitespace().map(str::len).sum();
-            let mut m = NodeMetrics::default();
-            if in_code {
-                m.code_bytes = bytes;
-            } else {
-                m.prose_bytes = bytes;
-                if in_link {
-                    m.link_text_bytes = bytes;
-                }
-            }
-            m
-        }
-        Node::Element(el) => {
-            let tag = el.name();
-            if matches!(tag, "script" | "style" | "noscript" | "template" | "svg") {
-                return NodeMetrics::default();
-            }
-
-            let entering_link = tag == "a" && !in_link;
-            let child_in_link = in_link || tag == "a";
-            let child_in_code = in_code || matches!(tag, "pre" | "code");
-
-            let mut acc = NodeMetrics {
-                link_count: usize::from(entering_link),
-                heading_count: usize::from(matches!(tag, "h1" | "h2" | "h3" | "h4" | "h5" | "h6")),
-                form_count: usize::from(tag == "form"),
-                has_landmark: is_protected_container(el),
-                ..Default::default()
-            };
-
-            for child in node.children() {
-                let cm = walk_node_metrics(child, child_in_link, child_in_code, map, visits);
-                acc.prose_bytes += cm.prose_bytes;
-                acc.link_text_bytes += cm.link_text_bytes;
-                acc.link_count += cm.link_count;
-                acc.code_bytes += cm.code_bytes;
-                acc.heading_count += cm.heading_count;
-                acc.form_count += cm.form_count;
-                acc.has_landmark |= cm.has_landmark;
-            }
-
-            map.insert(node.id(), acc);
-            acc
-        }
-        _ => {
-            let mut acc = NodeMetrics::default();
-            for child in node.children() {
-                let cm = walk_node_metrics(child, in_link, in_code, map, visits);
-                acc.prose_bytes += cm.prose_bytes;
-                acc.link_text_bytes += cm.link_text_bytes;
-                acc.link_count += cm.link_count;
-                acc.code_bytes += cm.code_bytes;
-                acc.heading_count += cm.heading_count;
-                acc.form_count += cm.form_count;
-                acc.has_landmark |= cm.has_landmark;
-            }
-            acc
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn walk_dom_text_metrics(
-    node: NodeRef<'_, Node>,
-    in_link: bool,
-    in_code: bool,
-    map: &mut HashMap<NodeId, NodeMetrics>,
-    visits: &mut usize,
-    script_count: &mut usize,
-    has_password_input: &mut bool,
-    spa_root_ids: &mut Vec<NodeId>,
+    mut scan: Option<&mut TextMetricsScan>,
 ) -> NodeMetrics {
     *visits += 1;
     match node.value() {
@@ -494,21 +428,25 @@ fn walk_dom_text_metrics(
         Node::Element(el) => {
             let tag = el.name();
             if tag == "script" {
-                *script_count += 1;
+                if let Some(s) = scan.as_deref_mut() {
+                    s.script_count += 1;
+                }
                 return NodeMetrics::default();
             }
             if matches!(tag, "style" | "noscript" | "template" | "svg") {
                 return NodeMetrics::default();
             }
-            if tag == "input"
-                && el
-                    .attr("type")
-                    .is_some_and(|t| t.trim().eq_ignore_ascii_case("password"))
-            {
-                *has_password_input = true;
-            }
-            if is_spa_root(el) {
-                spa_root_ids.push(node.id());
+            if let Some(s) = scan.as_deref_mut() {
+                if tag == "input"
+                    && el
+                        .attr("type")
+                        .is_some_and(|t| t.trim().eq_ignore_ascii_case("password"))
+                {
+                    s.has_password_input = true;
+                }
+                if is_spa_root(el) {
+                    s.spa_root_ids.push(node.id());
+                }
             }
 
             let entering_link = tag == "a" && !in_link;
@@ -524,23 +462,15 @@ fn walk_dom_text_metrics(
             };
 
             for child in node.children() {
-                let cm = walk_dom_text_metrics(
+                let cm = walk_node_metrics(
                     child,
                     child_in_link,
                     child_in_code,
                     map,
                     visits,
-                    script_count,
-                    has_password_input,
-                    spa_root_ids,
+                    scan.as_deref_mut(),
                 );
-                acc.prose_bytes += cm.prose_bytes;
-                acc.link_text_bytes += cm.link_text_bytes;
-                acc.link_count += cm.link_count;
-                acc.code_bytes += cm.code_bytes;
-                acc.heading_count += cm.heading_count;
-                acc.form_count += cm.form_count;
-                acc.has_landmark |= cm.has_landmark;
+                acc.accumulate(cm);
             }
 
             map.insert(node.id(), acc);
@@ -549,23 +479,9 @@ fn walk_dom_text_metrics(
         _ => {
             let mut acc = NodeMetrics::default();
             for child in node.children() {
-                let cm = walk_dom_text_metrics(
-                    child,
-                    in_link,
-                    in_code,
-                    map,
-                    visits,
-                    script_count,
-                    has_password_input,
-                    spa_root_ids,
-                );
-                acc.prose_bytes += cm.prose_bytes;
-                acc.link_text_bytes += cm.link_text_bytes;
-                acc.link_count += cm.link_count;
-                acc.code_bytes += cm.code_bytes;
-                acc.heading_count += cm.heading_count;
-                acc.form_count += cm.form_count;
-                acc.has_landmark |= cm.has_landmark;
+                let cm =
+                    walk_node_metrics(child, in_link, in_code, map, visits, scan.as_deref_mut());
+                acc.accumulate(cm);
             }
             acc
         }
@@ -658,7 +574,7 @@ fn prune_dom(doc: &mut Html, mode: ExtractMode) -> HashMap<NodeId, NodeMetrics> 
     let mut metrics = HashMap::new();
     let mut visits = 0usize;
     if let Some(root) = doc.tree.get(root_id) {
-        walk_node_metrics(root, false, false, &mut metrics, &mut visits);
+        walk_node_metrics(root, false, false, &mut metrics, &mut visits, None);
     }
 
     if matches!(mode, ExtractMode::Clean | ExtractMode::Article) {
@@ -671,7 +587,7 @@ fn prune_dom(doc: &mut Html, mode: ExtractMode) -> HashMap<NodeId, NodeMetrics> 
             metrics.clear();
             visits = 0;
             if let Some(root) = doc.tree.get(root_id) {
-                walk_node_metrics(root, false, false, &mut metrics, &mut visits);
+                walk_node_metrics(root, false, false, &mut metrics, &mut visits, None);
             }
         }
     }
