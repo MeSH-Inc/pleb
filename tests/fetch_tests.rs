@@ -863,3 +863,85 @@ async fn map_resolves_recursive_sitemapindex_guards_and_gzip_sitemaps() {
     assert!(!res.urls.iter().any(|u| u.contains("too-deep-page")));
     assert_eq!(res.from_sitemap, 3);
 }
+
+#[tokio::test]
+async fn adversarial_corrupt_gzip_sitemap_is_skipped_without_breaking_valid_sitemap() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let base_srv = base.clone();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let origin = base_srv.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let resp = match path {
+                    "/robots.txt" => http_response(
+                        "200 OK",
+                        "text/plain",
+                        format!("User-agent: *\nSitemap: {origin}/corrupt.xml.gz\n").as_bytes(),
+                    ),
+                    // Valid gzip magic bytes followed by corrupted deflate stream.
+                    "/corrupt.xml.gz" => http_response(
+                        "200 OK",
+                        "application/gzip",
+                        b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xffCORRUPT_DEFLATE_PAYLOAD",
+                    ),
+                    "/sitemap.xml" => http_response(
+                        "200 OK",
+                        "application/xml",
+                        format!(
+                            r#"<urlset><url><loc>{origin}/survived-corrupt-gz</loc></url></urlset>"#
+                        )
+                        .as_bytes(),
+                    ),
+                    "/" => http_response(
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        b"<html><body><main><p>Home</p></main></body></html>",
+                    ),
+                    _ => http_response("404 Not Found", "text/plain", b"missing"),
+                };
+                let _ = socket.write_all(&resp).await;
+            });
+        }
+    });
+
+    let state_dir = temp_state_dir();
+    let ctx = RuntimeContext::new(RuntimeConfig {
+        state_dir: state_dir.path().to_path_buf(),
+        timeout: Duration::from_secs(5),
+        cef_timeout: Duration::from_secs(5),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let res = map(
+        &ctx,
+        &format!("{base}/"),
+        MapOptions {
+            limit: 10,
+            use_sitemap: true,
+            respect_robots: true,
+            path_filter: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(res.urls.contains(&format!("{base}/survived-corrupt-gz")));
+    assert_eq!(res.from_sitemap, 1);
+}
