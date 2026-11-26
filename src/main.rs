@@ -282,7 +282,7 @@ struct RendererStatusJson {
     expected_protocol: &'static str,
 }
 
-#[derive(Serialize)]
+#[derive(Default, Serialize)]
 struct DaemonStatusJson {
     supported: bool,
     running: bool,
@@ -308,9 +308,7 @@ fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(err) => {
-            if err.use_stderr()
-                && std::env::args_os().any(|a| a == "--json" || a == "--jsonl")
-            {
+            if err.use_stderr() && std::env::args_os().any(|a| a == "--json" || a == "--jsonl") {
                 let cli_err = CliError::invalid_input(err.to_string().trim_end());
                 emit_cli_error(&cli_err, true);
                 return ExitCode::from(cli_err.exit_code);
@@ -320,8 +318,7 @@ fn main() -> ExitCode {
     };
 
     init_tracing(cli.verbose);
-    let json_error_mode =
-        cli.json || matches!(&cli.command, Command::Fetch { jsonl: true, .. });
+    let json_error_mode = cli.json || matches!(&cli.command, Command::Fetch { jsonl: true, .. });
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -368,9 +365,13 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             DaemonAction::Run => {
                 #[cfg(unix)]
                 {
-                    daemon::run_daemon(config.state_dir, config.daemon_idle_timeout, config.verbose)
-                        .await
-                        .map_err(|e| CliError::runtime("daemon_error", e))?;
+                    daemon::run_daemon(
+                        config.state_dir,
+                        config.daemon_idle_timeout,
+                        config.verbose,
+                    )
+                    .await
+                    .map_err(|e| CliError::runtime("daemon_error", e))?;
                     Ok(ExitCode::SUCCESS)
                 }
                 #[cfg(not(unix))]
@@ -383,11 +384,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             DaemonAction::Status => {
                 let status = daemon_status_json(&config.state_dir).await;
                 if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string(&status)
-                            .map_err(|e| CliError::runtime("serialization_error", e))?
-                    );
+                    print_json(&status)?;
                 } else {
                     print_daemon_status(&status);
                 }
@@ -485,11 +482,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     state_dir: config.state_dir.display().to_string(),
                     brave_api_key_configured: search::brave_api_key_configured(),
                 };
-                println!(
-                    "{}",
-                    serde_json::to_string(&payload)
-                        .map_err(|e| CliError::runtime("serialization_error", e))?
-                );
+                print_json(&payload)?;
             } else {
                 println!("wick {} (mesh-wick)", env!("CARGO_PKG_VERSION"));
                 println!(
@@ -592,8 +585,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 urls
             };
 
-            let ctx = RuntimeContext::new(config)
-                .map_err(|e| CliError::runtime("context_error", e))?;
+            let ctx =
+                RuntimeContext::new(config).map_err(|e| CliError::runtime("context_error", e))?;
 
             if format == OutputFormat::Raw {
                 let url = &target_urls[0];
@@ -684,20 +677,20 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 concurrency,
                 metadata_only,
             };
-            let mut results = fetch::fetch_batch(Arc::new(ctx), target_urls, batch_opts, |_, item| {
-                if jsonl {
-                    if let Ok(line) = serde_json::to_string(item) {
-                        let mut stdout = std::io::stdout().lock();
-                        let _ = writeln!(stdout, "{line}");
-                        let _ = stdout.flush();
+            let mut results =
+                fetch::fetch_batch(Arc::new(ctx), target_urls, batch_opts, |_, item| {
+                    if jsonl {
+                        if let Ok(line) = serde_json::to_string(item) {
+                            let mut stdout = std::io::stdout().lock();
+                            let _ = writeln!(stdout, "{line}");
+                            let _ = stdout.flush();
+                        }
                     }
-                }
-            })
-            .await;
+                })
+                .await;
 
             results.sort_by_key(|(idx, _)| *idx);
-            let ordered: Vec<BatchItemResult> =
-                results.into_iter().map(|(_, item)| item).collect();
+            let ordered: Vec<BatchItemResult> = results.into_iter().map(|(_, item)| item).collect();
             let exit_code = fetch::batch_exit_code(&ordered);
 
             if json {
@@ -743,8 +736,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             site,
             extra_snippets,
         } => {
-            let ctx = RuntimeContext::new(config)
-                .map_err(|e| CliError::runtime("context_error", e))?;
+            let ctx =
+                RuntimeContext::new(config).map_err(|e| CliError::runtime("context_error", e))?;
             let opts = SearchOptions {
                 limit,
                 provider,
@@ -760,11 +753,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     println!("{}", search::format_urls_only(&response));
                 }
             } else if json {
-                println!(
-                    "{}",
-                    serde_json::to_string(&response)
-                        .map_err(|e| CliError::runtime("serialization_error", e))?
-                );
+                print_json(&response)?;
             } else {
                 println!("{}", search::format_results(&response));
             }
@@ -778,8 +767,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             path_filter,
             no_robots,
         } => {
-            let ctx = RuntimeContext::new(config)
-                .map_err(|e| CliError::runtime("context_error", e))?;
+            let ctx =
+                RuntimeContext::new(config).map_err(|e| CliError::runtime("context_error", e))?;
             let options = crawl::CrawlOptions {
                 max_depth: depth.min(5),
                 max_pages: max_pages.min(50),
@@ -792,16 +781,9 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 .await
                 .map_err(|e| CliError::runtime("crawl_error", e))?;
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string(&result)
-                        .map_err(|e| CliError::runtime("serialization_error", e))?
-                );
+                print_json(&result)?;
             } else {
-                let host = url::Url::parse(&url)
-                    .ok()
-                    .and_then(|u| u.host_str().map(|s| s.to_string()))
-                    .unwrap_or_else(|| url.clone());
+                let host = url_host(&url);
                 if !quiet {
                     eprintln!(
                         "Crawled {} pages in {:.1}s\n",
@@ -820,8 +802,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             path_filter,
             no_robots,
         } => {
-            let ctx = RuntimeContext::new(config)
-                .map_err(|e| CliError::runtime("context_error", e))?;
+            let ctx =
+                RuntimeContext::new(config).map_err(|e| CliError::runtime("context_error", e))?;
             let options = crawl::MapOptions {
                 limit: limit.min(5000),
                 use_sitemap: !no_sitemap,
@@ -832,16 +814,9 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 .await
                 .map_err(|e| CliError::runtime("map_error", e))?;
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string(&result)
-                        .map_err(|e| CliError::runtime("serialization_error", e))?
-                );
+                print_json(&result)?;
             } else {
-                let host = url::Url::parse(&url)
-                    .ok()
-                    .and_then(|u| u.host_str().map(|s| s.to_string()))
-                    .unwrap_or_else(|| url.clone());
+                let host = url_host(&url);
                 if !quiet {
                     eprintln!(
                         "Found {} URLs in {:.1}s\n",
@@ -854,6 +829,20 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+fn print_json<T: Serialize>(value: &T) -> Result<(), CliError> {
+    let encoded =
+        serde_json::to_string(value).map_err(|e| CliError::runtime("serialization_error", e))?;
+    println!("{encoded}");
+    Ok(())
+}
+
+fn url_host(raw: &str) -> String {
+    url::Url::parse(raw)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_else(|| raw.to_string())
 }
 
 fn print_daemon_status(status: &DaemonStatusJson) {
@@ -888,29 +877,14 @@ async fn daemon_status_json(state_dir: &std::path::Path) -> DaemonStatusJson {
             },
             None => DaemonStatusJson {
                 supported: true,
-                running: false,
-                pid: None,
-                protocol_version: None,
-                build_id: None,
-                active_requests: 0,
-                cronet_slots: 0,
-                cef_renderers_alive: 0,
+                ..Default::default()
             },
         }
     }
     #[cfg(not(unix))]
     {
         let _ = state_dir;
-        DaemonStatusJson {
-            supported: false,
-            running: false,
-            pid: None,
-            protocol_version: None,
-            build_id: None,
-            active_requests: 0,
-            cronet_slots: 0,
-            cef_renderers_alive: 0,
-        }
+        DaemonStatusJson::default()
     }
 }
 
@@ -920,8 +894,8 @@ fn init_tracing(verbose: bool) {
     } else {
         tracing::Level::WARN
     };
-    let filter = tracing_subscriber::EnvFilter::from_default_env()
-        .add_directive(default_level.into());
+    let filter =
+        tracing_subscriber::EnvFilter::from_default_env().add_directive(default_level.into());
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)

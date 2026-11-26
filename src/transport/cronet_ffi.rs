@@ -136,7 +136,8 @@ extern "C" {
         executor: Cronet_ExecutorPtr,
     ) -> c_int;
     pub fn Cronet_UrlRequest_Start(request: Cronet_UrlRequestPtr) -> c_int;
-    pub fn Cronet_UrlRequest_Read(request: Cronet_UrlRequestPtr, buffer: Cronet_BufferPtr) -> c_int;
+    pub fn Cronet_UrlRequest_Read(request: Cronet_UrlRequestPtr, buffer: Cronet_BufferPtr)
+        -> c_int;
     pub fn Cronet_UrlRequest_FollowRedirect(request: Cronet_UrlRequestPtr) -> c_int;
     pub fn Cronet_UrlRequest_Cancel(request: Cronet_UrlRequestPtr);
 

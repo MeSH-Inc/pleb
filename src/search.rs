@@ -136,8 +136,8 @@ pub async fn search(
 
     match options.provider {
         SearchProvider::Brave => {
-            let key = load_brave_api_key()
-                .ok_or_else(|| anyhow::anyhow!("BRAVE_API_KEY is not set"))?;
+            let key =
+                load_brave_api_key().ok_or_else(|| anyhow::anyhow!("BRAVE_API_KEY is not set"))?;
             let results = search_brave(ctx, &effective_query, count, &key, options).await?;
             Ok(SearchResponse {
                 provider: "brave",
@@ -185,7 +185,12 @@ async fn search_brave(
     options: &SearchOptions,
 ) -> Result<Vec<SearchResult>> {
     let client = ctx.brave_client()?;
-    let url = build_brave_search_url(query, num_results, options.freshness, options.extra_snippets);
+    let url = build_brave_search_url(
+        query,
+        num_results,
+        options.freshness,
+        options.extra_snippets,
+    );
 
     let resp = client
         .get(&url)

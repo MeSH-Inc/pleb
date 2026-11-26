@@ -1,15 +1,7 @@
 use url::Url;
 
 const TRACKING_PARAMETERS: &[&str] = &[
-    "fbclid",
-    "gclid",
-    "dclid",
-    "msclkid",
-    "mc_cid",
-    "mc_eid",
-    "igshid",
-    "_hsenc",
-    "_hsmi",
+    "fbclid", "gclid", "dclid", "msclkid", "mc_cid", "mc_eid", "igshid", "_hsenc", "_hsmi",
     "ref_src",
 ];
 

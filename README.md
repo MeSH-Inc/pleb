@@ -2,7 +2,7 @@
 
 Local, zero-telemetry web fetch and search CLI (`wick`) for AI agents, forked from [wickproject/wick](https://github.com/wickproject/wick).
 
-Uses Chrome's network stack (Cronet) for browser-identical TLS/HTTP2/QUIC fingerprinting, an optional embedded Chromium (CEF `v4-meta`) renderer for JS-heavy pages, single-parse DOM-pruned compact markdown extraction, and Brave Search API / DuckDuckGo search.
+Uses Chrome's network stack (Cronet) for browser-identical TLS/HTTP2/QUIC fingerprinting, an optional embedded Chromium (CEF `v5-meta`) renderer for JS-heavy pages, single-parse `O(N)` DOM-pruned compact markdown extraction with charset-aware decoding, and Brave Search API / DuckDuckGo search.
 
 ## Build & Install
 
@@ -30,9 +30,9 @@ This builds the `mesh-wick` crate and installs the canonical `wick` binary onto 
 
 ## CEF Renderer (Optional)
 
-When installed at `~/.mesh-wick/cef/wick-renderer.app` (or `$MESH_WICK_HOME/cef`) with protocol `v4-meta`, `wick` automatically escalates blocked responses (`403`/`503`) and JS-only shells to CEF in `--render auto` mode. The renderer runs offscreen with minimal OSR viewport/screen/language defaults (no synthetic challenge clicking).
+When installed at `~/.mesh-wick/cef/wick-renderer.app` (or `$MESH_WICK_HOME/cef` / `$WICK_CEF_RENDERER`) with protocol `v5-meta`, `wick` automatically escalates blocked responses (`403`/`503`) and JS-only shells to CEF in `--render auto` mode. The renderer runs offscreen with subresource + `MutationObserver` quiet-window readiness and minimal OSR viewport/screen/language defaults (no synthetic challenge clicking).
 
-To build and install (or upgrade to `v4-meta`) on macOS from this checkout:
+To build and install (or upgrade to `v5-meta`) on macOS from this checkout (pass `--prefix <dir>` to install into an isolated directory):
 
 ```bash
 bash scripts/install-cef-mac.sh --force
@@ -94,7 +94,7 @@ Key `search` flags:
 
 ### Crawl and Map
 
-Both `crawl` and `map` respect `robots.txt` by default (pass `--no-robots` to override):
+Both `crawl` (bounded concurrent wave frontier with polite per-origin spacing / `Crawl-delay` and deterministic ordering) and `map` (recursive `<sitemapindex>` + `.xml.gz` + `robots.txt` `Sitemap:` discovery) respect `robots.txt` by default (pass `--no-robots` to override):
 
 ```bash
 wick crawl https://docs.example.com --depth 2 --max-pages 10
@@ -122,6 +122,8 @@ wick session clear
 - `--cef-timeout <SECS>`: CEF render timeout (default: `60`)
 - `--daemon-idle-timeout <SECS>` / `MESH_WICK_DAEMON_IDLE_SECONDS`: auto-exit timeout for the warm Unix-socket daemon (also honored by `wick daemon run`; default: `300`)
 - `--no-daemon` / `MESH_WICK_NO_DAEMON`: bypass the shared background daemon and run in-process
+- `WICK_CEF_RENDERER`: explicit path to a `v5-meta` `wick-renderer` binary (overrides `state_dir/cef` discovery; set `WICK_NO_HOME_CEF=1` in tests to disable `~/.mesh-wick/cef` fallback)
+- `WICK_DAEMON_EXECUTABLE`: explicit path to the `wick` executable spawned for background daemon mode
 
 ## Exit Codes
 
