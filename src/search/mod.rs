@@ -1,19 +1,46 @@
+pub mod state;
+
 use anyhow::{bail, Result};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::LazyLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::auth::{self, CredentialProvider, CredentialSource};
 use crate::context::RuntimeContext;
 
+pub use state::{
+    clear_provider_cooldown, clear_search_state, provider_health_summary, ProviderHealthEntry,
+};
+
 const BRAVE_SEARCH_ENDPOINT: &str = "https://api.search.brave.com/res/v1/web/search";
+const TAVILY_SEARCH_ENDPOINT: &str = "https://api.tavily.com/search";
+const SERPER_SEARCH_ENDPOINT: &str = "https://google.serper.dev/search";
+const EXA_SEARCH_ENDPOINT: &str = "https://api.exa.ai/search";
+const DDG_SEARCH_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum SearchProvider {
     #[default]
     Auto,
     Brave,
+    Tavily,
+    Serper,
+    Exa,
+    Searxng,
     #[value(name = "duckduckgo", alias = "ddg")]
     DuckDuckGo,
+    Federated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum SearchMode {
+    #[default]
+    Auto,
+    Exact,
+    Semantic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -48,6 +75,7 @@ impl Freshness {
 pub struct SearchOptions {
     pub limit: usize,
     pub provider: SearchProvider,
+    pub mode: SearchMode,
     pub freshness: Option<Freshness>,
     pub site: Option<String>,
     pub extra_snippets: bool,
@@ -65,18 +93,70 @@ pub struct SearchResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchResponse {
     pub provider: &'static str,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers_used: Vec<&'static str>,
     pub results: Vec<SearchResult>,
 }
 
-pub fn brave_api_key_configured() -> bool {
-    load_brave_api_key().is_some()
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchProviderStatus {
+    pub configured: bool,
+    pub source: Option<CredentialSource>,
+    pub cooldown_remaining_secs: u64,
+    pub month_requests: u32,
+    pub last_error_status: Option<u16>,
 }
 
-fn load_brave_api_key() -> Option<String> {
-    std::env::var("BRAVE_API_KEY")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+#[derive(Debug, Clone)]
+pub struct ProviderEndpoints {
+    pub brave_url: String,
+    pub tavily_url: String,
+    pub serper_url: String,
+    pub exa_url: String,
+    pub ddg_url: String,
+}
+
+impl Default for ProviderEndpoints {
+    fn default() -> Self {
+        Self {
+            brave_url: BRAVE_SEARCH_ENDPOINT.to_string(),
+            tavily_url: TAVILY_SEARCH_ENDPOINT.to_string(),
+            serper_url: SERPER_SEARCH_ENDPOINT.to_string(),
+            exa_url: EXA_SEARCH_ENDPOINT.to_string(),
+            ddg_url: DDG_SEARCH_ENDPOINT.to_string(),
+        }
+    }
+}
+
+pub fn search_provider_statuses(
+    state_dir: &Path,
+) -> Result<BTreeMap<String, SearchProviderStatus>> {
+    let credentials = auth::all_credential_statuses(state_dir)?;
+    let health = provider_health_summary(state_dir)?;
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let mut statuses = BTreeMap::new();
+    for cred in credentials {
+        let name = cred.provider.as_str();
+        let entry = health.get(name);
+        let cooldown_remaining_secs = entry
+            .map(|e| e.cooldown_until_epoch_secs.saturating_sub(now_secs))
+            .unwrap_or(0);
+        statuses.insert(
+            name.to_string(),
+            SearchProviderStatus {
+                configured: cred.configured,
+                source: cred.source,
+                cooldown_remaining_secs,
+                month_requests: entry.map(|e| e.month_requests).unwrap_or(0),
+                last_error_status: entry.and_then(|e| e.last_error_status),
+            },
+        );
+    }
+    Ok(statuses)
 }
 
 pub fn normalize_site(raw: &str) -> Option<String> {
@@ -131,32 +211,70 @@ pub async fn search(
     query: &str,
     options: &SearchOptions,
 ) -> Result<SearchResponse> {
+    search_with_endpoints(ctx, query, options, &ProviderEndpoints::default()).await
+}
+
+pub async fn search_with_endpoints(
+    ctx: &RuntimeContext,
+    query: &str,
+    options: &SearchOptions,
+    endpoints: &ProviderEndpoints,
+) -> Result<SearchResponse> {
     let count = options.limit.clamp(1, 20);
     let effective_query = build_effective_query(query, options.site.as_deref());
 
     match options.provider {
         SearchProvider::Brave => {
-            let key =
-                load_brave_api_key().ok_or_else(|| anyhow::anyhow!("BRAVE_API_KEY is not set"))?;
-            let results = search_brave(ctx, &effective_query, count, &key, options).await?;
+            let cred = auth::resolve_credential(&ctx.config.state_dir, CredentialProvider::Brave)?
+                .ok_or_else(|| anyhow::anyhow!("BRAVE_API_KEY is not set"))?;
+            let results = search_brave(
+                ctx,
+                &endpoints.brave_url,
+                &effective_query,
+                count,
+                cred.value.as_str(),
+                options,
+            )
+            .await?;
             Ok(SearchResponse {
                 provider: "brave",
+                providers_used: vec![],
                 results,
             })
         }
         SearchProvider::DuckDuckGo => {
-            let results = search_ddg(ctx, &effective_query, count, options.freshness).await?;
+            let results = search_ddg(
+                ctx,
+                &endpoints.ddg_url,
+                &effective_query,
+                count,
+                options.freshness,
+            )
+            .await?;
             Ok(SearchResponse {
                 provider: "duckduckgo",
+                providers_used: vec![],
                 results,
             })
         }
         SearchProvider::Auto => {
-            if let Some(key) = load_brave_api_key() {
-                match search_brave(ctx, &effective_query, count, &key, options).await {
+            if let Some(cred) =
+                auth::resolve_credential(&ctx.config.state_dir, CredentialProvider::Brave)?
+            {
+                match search_brave(
+                    ctx,
+                    &endpoints.brave_url,
+                    &effective_query,
+                    count,
+                    cred.value.as_str(),
+                    options,
+                )
+                .await
+                {
                     Ok(results) => {
                         return Ok(SearchResponse {
                             provider: "brave",
+                            providers_used: vec![],
                             results,
                         });
                     }
@@ -168,29 +286,42 @@ pub async fn search(
                     }
                 }
             }
-            let results = search_ddg(ctx, &effective_query, count, options.freshness).await?;
+            let results = search_ddg(
+                ctx,
+                &endpoints.ddg_url,
+                &effective_query,
+                count,
+                options.freshness,
+            )
+            .await?;
             Ok(SearchResponse {
                 provider: "duckduckgo",
+                providers_used: vec![],
                 results,
             })
         }
+        other => bail!("search provider {:?} is not yet implemented", other),
     }
 }
 
 async fn search_brave(
     ctx: &RuntimeContext,
+    endpoint: &str,
     query: &str,
     num_results: usize,
     api_key: &str,
     options: &SearchOptions,
 ) -> Result<Vec<SearchResult>> {
-    let client = ctx.brave_client()?;
-    let url = build_brave_search_url(
-        query,
-        num_results,
-        options.freshness,
-        options.extra_snippets,
-    );
+    let client = ctx.http_client()?;
+    let encoded = urlencoding::encode(query);
+    let mut url = format!("{endpoint}?count={num_results}&q={encoded}");
+    if let Some(f) = options.freshness {
+        url.push_str("&freshness=");
+        url.push_str(f.brave_param());
+    }
+    if options.extra_snippets {
+        url.push_str("&extra_snippets=true");
+    }
 
     let resp = client
         .get(&url)
@@ -198,20 +329,34 @@ async fn search_brave(
         .header("X-Subscription-Token", api_key)
         .header("Accept", "application/json")
         .send()
-        .await?
-        .error_for_status()?;
+        .await
+        .map_err(|e| anyhow::anyhow!("Brave search request failed: {}", e.without_url()))?;
 
-    let body = resp.text().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        bail!("Brave search failed: HTTP {}", status.as_u16());
+    }
+
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| anyhow::anyhow!("Brave search body read failed: {}", e.without_url()))?;
     parse_brave_json(&body, num_results)
 }
 
 async fn search_ddg(
     ctx: &RuntimeContext,
+    endpoint: &str,
     query: &str,
     num_results: usize,
     freshness: Option<Freshness>,
 ) -> Result<Vec<SearchResult>> {
-    let search_url = build_ddg_search_url(query, freshness);
+    let encoded = urlencoding::encode(query);
+    let mut search_url = format!("{endpoint}?q={encoded}");
+    if let Some(f) = freshness {
+        search_url.push_str("&df=");
+        search_url.push_str(f.ddg_param());
+    }
     let resp = ctx.client.get(&search_url).await?;
     if resp.status >= 400 {
         bail!("DuckDuckGo search failed: HTTP {}", resp.status);

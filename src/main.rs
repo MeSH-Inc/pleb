@@ -8,9 +8,12 @@ use mesh_wick::fetch::{
     self, BatchFetchOptions, BatchItemResult, FetchError, FetchOptions, FetchOutput,
 };
 use mesh_wick::policy::{RenderMode, ResourcePolicy, SourceMode};
-use mesh_wick::search::{self, Freshness, SearchOptions, SearchProvider};
+use mesh_wick::search::{
+    self, Freshness, SearchMode, SearchOptions, SearchProvider, SearchProviderStatus,
+};
 use mesh_wick::transport::cef::{self, RendererProbe};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -332,7 +335,7 @@ struct StatusJson {
     cef_renderer: RendererStatusJson,
     daemon: DaemonStatusJson,
     state_dir: String,
-    brave_api_key_configured: bool,
+    search_providers: BTreeMap<String, SearchProviderStatus>,
 }
 
 fn main() -> ExitCode {
@@ -503,6 +506,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 },
             };
             let daemon_json = daemon_status_json(&config.state_dir).await;
+            let search_providers = search::search_provider_statuses(&config.state_dir)
+                .map_err(|e| CliError::runtime("status_error", e))?;
 
             if json {
                 let payload = StatusJson {
@@ -511,7 +516,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     cef_renderer: renderer_json,
                     daemon: daemon_json,
                     state_dir: config.state_dir.display().to_string(),
-                    brave_api_key_configured: search::brave_api_key_configured(),
+                    search_providers,
                 };
                 print_json(&payload)?;
             } else {
@@ -545,12 +550,17 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 }
                 print_daemon_status(&daemon_json);
                 println!("State dir: {}", config.state_dir.display());
+                let configured: Vec<&str> = search_providers
+                    .iter()
+                    .filter(|(_, st)| st.configured)
+                    .map(|(name, _)| name.as_str())
+                    .collect();
                 println!(
-                    "Brave Search API key: {}",
-                    if search::brave_api_key_configured() {
-                        "configured"
+                    "Search providers: {}",
+                    if configured.is_empty() {
+                        "none configured (duckduckgo fallback)".to_string()
                     } else {
-                        "unset"
+                        configured.join(", ")
                     }
                 );
             }
@@ -836,6 +846,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             let opts = SearchOptions {
                 limit,
                 provider,
+                mode: SearchMode::Auto,
                 freshness,
                 site,
                 extra_snippets,

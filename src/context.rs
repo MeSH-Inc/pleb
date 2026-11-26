@@ -66,6 +66,23 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn acquire_private_lock(lock_path: &Path) -> std::io::Result<std::fs::File> {
+    let mut lock_opts = std::fs::OpenOptions::new();
+    lock_opts
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        lock_opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let lock_file = lock_opts.open(lock_path)?;
+    lock_file.lock()?;
+    Ok(lock_file)
+}
+
 pub struct RuntimeContext {
     pub config: RuntimeConfig,
     pub client: TransportClient,
@@ -73,7 +90,7 @@ pub struct RuntimeContext {
     pub rules: SiteRules,
     pub site_cache: SiteCache,
     pub robots: RobotsCache,
-    brave_client: std::sync::Mutex<Option<reqwest::Client>>,
+    http_client: std::sync::Mutex<Option<reqwest::Client>>,
 }
 
 impl RuntimeContext {
@@ -133,19 +150,21 @@ impl RuntimeContext {
             rules,
             site_cache,
             robots,
-            brave_client: std::sync::Mutex::new(None),
+            http_client: std::sync::Mutex::new(None),
         })
     }
 
-    pub fn brave_client(&self) -> Result<reqwest::Client> {
+    pub fn http_client(&self) -> Result<reqwest::Client> {
         let mut guard = self
-            .brave_client
+            .http_client
             .lock()
-            .map_err(|_| anyhow::anyhow!("Brave HTTP client lock poisoned"))?;
+            .map_err(|_| anyhow::anyhow!("HTTP client lock poisoned"))?;
         if let Some(ref client) = *guard {
             return Ok(client.clone());
         }
-        let mut builder = reqwest::Client::builder();
+        let mut builder = reqwest::Client::builder()
+            .user_agent(concat!("mesh-wick/", env!("CARGO_PKG_VERSION")))
+            .timeout(self.config.timeout);
         if let Some(proxy_url) = self.config.proxy.as_deref() {
             let trimmed = proxy_url.trim();
             if !trimmed.is_empty() {
@@ -173,20 +192,7 @@ pub fn clear_state_dir(state_dir: &Path) -> Result<()> {
     if artifacts_dir.exists() {
         std::fs::remove_dir_all(&artifacts_dir)?;
     }
-    let lock_path = state_dir.join("site-cache.lock");
-    let mut lock_opts = std::fs::OpenOptions::new();
-    lock_opts
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        lock_opts.mode(0o600);
-    }
-    let lock_file = lock_opts.open(&lock_path)?;
-    lock_file.lock()?;
+    let lock_file = acquire_private_lock(&state_dir.join("site-cache.lock"))?;
 
     let cache_file = state_dir.join("site-cache.json");
     match std::fs::remove_file(&cache_file) {

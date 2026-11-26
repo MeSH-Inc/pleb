@@ -121,6 +121,7 @@ fn search_query_normalization_freshness_urls_and_formatting() {
 
     let empty = SearchResponse {
         provider: "brave",
+        providers_used: vec![],
         results: vec![],
     };
     assert_eq!(format_results(&empty), "No results found.");
@@ -128,6 +129,7 @@ fn search_query_normalization_freshness_urls_and_formatting() {
 
     let populated = SearchResponse {
         provider: "brave",
+        providers_used: vec![],
         results: vec![
             SearchResult {
                 title: "Example".to_string(),

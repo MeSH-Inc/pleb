@@ -109,6 +109,7 @@ async fn cli_supports_value_enums_output_file_and_uniform_json_errors() {
 
     // 1. status --json emits structured JSON.
     let status_out = Command::new(wick_bin)
+        .env("WICK_NO_KEYCHAIN", "1")
         .args(["--state-dir"])
         .arg(&state_dir)
         .args(["--json", "status"])
@@ -278,6 +279,7 @@ async fn cli_supports_value_enums_output_file_and_uniform_json_errors() {
 
     // 7. search error without BRAVE_API_KEY respects global --json envelope.
     let fail_search = Command::new(wick_bin)
+        .env("WICK_NO_KEYCHAIN", "1")
         .env_remove("BRAVE_API_KEY")
         .args(["--state-dir"])
         .arg(&state_dir)
@@ -503,6 +505,7 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         .arg(state_dir.path())
         .args(["status", "--json"])
         .env("WICK_NO_HOME_CEF", "1")
+        .env("WICK_NO_KEYCHAIN", "1")
         .output()
         .await
         .unwrap();
