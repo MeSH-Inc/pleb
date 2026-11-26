@@ -72,6 +72,9 @@ static ARIA_BOILERPLATE_SEL: LazyLock<Selector> = LazyLock::new(|| {
         "[role=\"banner\"],",
         "[role=\"contentinfo\"],",
         "[role=\"complementary\"],",
+        "[role=\"menu\"],",
+        "[role=\"menubar\"],",
+        "[role=\"tooltip\"],",
         "[aria-hidden=\"true\"],",
         "[hidden]"
     ))

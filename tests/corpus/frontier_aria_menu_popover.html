@@ -1,0 +1,26 @@
+<!-- wick-fixture: {"tier":"ratchet","url":"https://qa.example.org/questions/42/copy-and-clone","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"How to implement Copy and Clone for a struct with String","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["A type containing a String cannot implement Copy","Implement Clone instead to duplicate heap-allocated data","derive(Clone)"],"forbidden_substrings":["Collectives on Example QA","Find centralized, trusted content","Keyboard shortcut tooltip","Top menubar quick switch"],"minimum_output_bytes":160,"maximum_output_bytes":1500,"expected_structure":{"minimum_code_blocks":1}}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>How to implement Copy and Clone for a struct with String</title>
+</head>
+<body>
+  <div role="menubar"><span>Top menubar quick switch</span></div>
+  <div class="s-popover" id="popover-discover-collectives" role="menu">
+    <h5>Collectives on Example QA</h5>
+    <p>Find centralized, trusted content and collaborate around the technologies you use most.</p>
+    <a href="/collectives">Learn more about Collectives</a>
+  </div>
+  <div role="tooltip">Keyboard shortcut tooltip</div>
+  <main id="content">
+    <h1>How to implement Copy and Clone for a struct with String</h1>
+    <p>A type containing a String cannot implement Copy because String owns heap memory and requires Drop.</p>
+    <p>Implement Clone instead to duplicate heap-allocated data explicitly when needed.</p>
+    <pre><code class="language-rust">#[derive(Clone)]
+struct Record {
+    label: String,
+}</code></pre>
+  </main>
+</body>
+</html>
