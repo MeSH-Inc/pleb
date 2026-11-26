@@ -2288,3 +2288,211 @@ fn axtree_formatter_promotes_containers_formats_values_and_escapes_injections() 
     assert!(format_axtree_from_cdp_json(r#"{"bad":1}"#).is_err());
     assert!(format_axtree_from_cdp_json("not json").is_err());
 }
+
+#[test]
+fn webmcp_and_axtree_boundary_and_counterexample_guards() {
+    use pleb::extract::webmcp::{MAX_ENUM_VALUES, MAX_SCHEMA_PROPERTIES, MAX_WEBMCP_TOOLS};
+    use pleb::extract::{
+        format_axtree_from_cdp_json, format_webmcp_cue, merge_webmcp_tools, sanitize_webmcp_tool,
+        WebMcpToolDescriptor, WebMcpToolSource,
+    };
+    use serde_json::json;
+
+    // 1. Explicit empty/whitespace `action` attributes target `page_url` (never `<base href>`),
+    //    nested hidden spans inside `<label for>` are omitted, non-finite `min`/`max` are ignored,
+    //    and radio fallback skips whitespace-only `toolparamdescription` without overwriting valid ones.
+    let html = r#"<!doctype html><html><head>
+      <title>Boundary</title>
+      <base href="https://hijack.example.org/wrong/">
+    </head><body><main>
+      <form toolname="empty_action_tool" tooldescription="Empty action" action="">
+        <label for="lbl_hid">Visible <span style="display:none">Hidden</span> Label</label>
+        <input id="lbl_hid" name="q">
+        <input type="number" name="n" min="NaN" max="Infinity">
+        <input type="range" name="r" min="abc" max="5">
+        <input type="radio" name="mode" toolparamdescription="   ">
+        <input type="radio" name="mode" value="fast" toolparamdescription="Fast mode">
+        <input type="radio" name="mode" value="slow" toolparamdescription="Should not overwrite">
+      </form>
+      <form toolname="ws_action_tool" tooldescription="Whitespace action" action="   "></form>
+    </main></body></html>"#;
+    let page_url = Url::parse("https://portal.example.com/app/tools?a=1#frag").unwrap();
+    let doc = extract_document(
+        html,
+        &page_url,
+        Some("text/html"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(doc.tools.len(), 2);
+    assert_eq!(
+        doc.tools[0].action_url.as_deref(),
+        Some("https://portal.example.com/app/tools?a=1")
+    );
+    assert_eq!(
+        doc.tools[1].action_url.as_deref(),
+        Some("https://portal.example.com/app/tools?a=1")
+    );
+    assert_eq!(
+        doc.tools[0].input_schema,
+        Some(json!({
+            "type": "object",
+            "properties": {
+                "q": { "type": "string", "description": "Visible Label" },
+                "n": { "type": "number" },
+                "r": { "type": "number", "maximum": 5 },
+                "mode": { "type": "string", "enum": ["on", "fast", "slow"], "description": "Fast mode" }
+            }
+        }))
+    );
+
+    // 2. Verify adversarial fixture caps directly (input_schema dropped for `en`/`pr`/`by`,
+    //    `dp` keeps first duplicate, `w1..w6` action URLs sanitized, `ds` <= 1024).
+    let adv_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/corpus/frontier_m6_webmcp_adversarial_forms.html");
+    let adv_raw = std::fs::read_to_string(&adv_path).unwrap();
+    let adv_body = adv_raw.split_once('\n').unwrap().1;
+    let adv_url = Url::parse("https://portal.example.com/app/tools").unwrap();
+    let adv_doc = extract_document(
+        adv_body,
+        &adv_url,
+        Some("text/html"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(adv_doc.tools.len(), MAX_WEBMCP_TOOLS);
+    for (name, want_action) in [
+        ("w1", Some("https://portal.example.com/app/tools")),
+        ("w2", Some("https://portal.example.com/app/tools")),
+        ("w3", None),
+        ("w4", None),
+        ("w5", None),
+        ("w6", None),
+    ] {
+        let tool = adv_doc.tools.iter().find(|t| t.name == name).unwrap();
+        assert_eq!(
+            tool.action_url.as_deref(),
+            want_action,
+            "unexpected action_url for {name}"
+        );
+    }
+    let dup = adv_doc.tools.iter().find(|t| t.name == "dp").unwrap();
+    assert_eq!(dup.description, "1st");
+    assert_eq!(dup.action_url.as_deref(), Some("https://e.org/1"));
+    assert_eq!(
+        dup.input_schema,
+        Some(json!({ "type": "object", "properties": {} }))
+    );
+    for capped in ["en", "pr", "by"] {
+        let tool = adv_doc.tools.iter().find(|t| t.name == capped).unwrap();
+        assert_eq!(
+            tool.input_schema, None,
+            "{capped} schema should drop to None"
+        );
+    }
+    let desc_tool = adv_doc.tools.iter().find(|t| t.name == "ds").unwrap();
+    assert!(desc_tool.description.len() <= 1024);
+
+    // 3. Exact boundary passes (64 props, 64 enum values, 256-byte item, depth 8) and multi-byte UTF-8 truncation.
+    let mut props_64 = serde_json::Map::new();
+    for i in 0..MAX_SCHEMA_PROPERTIES {
+        props_64.insert(format!("p{i}"), json!({ "type": "string" }));
+    }
+    let enum_64: Vec<String> = (0..MAX_ENUM_VALUES).map(|i| format!("v{i}")).collect();
+    props_64.insert(
+        "p0".to_string(),
+        json!({ "type": "string", "enum": enum_64 }),
+    );
+    let mut depth_8 = json!({ "type": "string" });
+    for _ in 0..3 {
+        depth_8 = json!({ "nested": depth_8 });
+    }
+    props_64.insert("p1".to_string(), depth_8);
+
+    let boundary_tool = sanitize_webmcp_tool(WebMcpToolDescriptor {
+        name: "boundary_ok".to_string(),
+        description: "🦀".repeat(300),
+        title: Some("🦀".repeat(100)),
+        source: WebMcpToolSource::Imperative,
+        input_schema: Some(json!({ "type": "object", "properties": props_64 })),
+        annotations: None,
+        action_url: None,
+        method: None,
+    })
+    .unwrap();
+    assert!(boundary_tool.description.len() <= 1024);
+    assert!(boundary_tool.title.as_deref().unwrap().len() <= 256);
+    assert!(boundary_tool.input_schema.is_some());
+
+    // 4. `merge_webmcp_tools`: invalid imperative tool of same name does NOT clobber valid declarative tool,
+    //    and `format_webmcp_cue` truncates at 8 names with `+N more`.
+    let merged = merge_webmcp_tools(
+        vec![WebMcpToolDescriptor {
+            name: "keep_decl".to_string(),
+            description: "Valid declarative".to_string(),
+            title: None,
+            source: WebMcpToolSource::Declarative,
+            input_schema: None,
+            annotations: None,
+            action_url: None,
+            method: None,
+        }],
+        vec![WebMcpToolDescriptor {
+            name: "keep_decl".to_string(),
+            description: "   \x1b  ".to_string(),
+            title: None,
+            source: WebMcpToolSource::Imperative,
+            input_schema: None,
+            annotations: None,
+            action_url: None,
+            method: None,
+        }],
+    );
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[0].source, WebMcpToolSource::Declarative);
+    assert_eq!(merged[0].description, "Valid declarative");
+
+    let cue = format_webmcp_cue(&adv_doc.tools).unwrap();
+    assert!(cue.contains("+24 more"), "unexpected cue: {cue}");
+
+    // 5. `format_axtree_from_cdp_json`: deep tree (> 512 depth) terminates cleanly, bidi controls stripped,
+    //    `description` and numeric/array values escaped, non-tristate `checked` quoted.
+    let mut deep_nodes = Vec::with_capacity(520);
+    for i in 0..520 {
+        let child = if i + 1 < 520 {
+            vec![format!("n{}", i + 1)]
+        } else {
+            Vec::new()
+        };
+        deep_nodes.push(json!({
+            "nodeId": format!("n{i}"),
+            "role": { "value": if i == 0 { "RootWebArea" } else { "group" } },
+            "name": { "value": if i == 0 { "Deep\u{202E}" } else { "" } },
+            "childIds": child
+        }));
+    }
+    let deep_out =
+        format_axtree_from_cdp_json(&json!({ "nodes": deep_nodes }).to_string()).unwrap();
+    assert!(deep_out.starts_with("RootWebArea \"Deep\"\n"));
+    assert!(!deep_out.contains('\u{202E}'));
+    assert_eq!(deep_out.lines().count(), 513);
+
+    let prop_edge = json!({
+        "nodes": [{
+            "nodeId": "r",
+            "role": { "value": "checkbox" },
+            "name": { "value": "Accept\u{202E}" },
+            "description": { "value": "Line1\nLine2" },
+            "value": { "value": 42 },
+            "properties": [
+                { "name": "checked", "value": { "value": "invalid_state" } },
+                { "name": "extra\u{202E}", "value": { "value": [1, "a"] } }
+            ]
+        }]
+    });
+    let prop_out = format_axtree_from_cdp_json(&prop_edge.to_string()).unwrap();
+    assert_eq!(
+        prop_out,
+        "checkbox \"Accept\" value=42 description=\"Line1\\nLine2\" checked=\"invalid_state\" extra=\"[1,\\\"a\\\"]\""
+    );
+}
