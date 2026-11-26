@@ -1597,3 +1597,108 @@ async fn adversarial_source_mirror_404_binary_fallback_ssrf_and_forge_binary_ski
         .content
         .contains("Original HTML survives binary mirror."));
 }
+
+#[tokio::test]
+async fn fetch_staged_asset_and_session_clear_artifact_lifecycle() {
+    use mesh_wick::artifacts::{evict_artifacts_over_budget, stage_artifact};
+    use mesh_wick::context::clear_state_dir;
+    use mesh_wick::fetch::fetch_staged_asset;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let resp = match path {
+                    "/chart.png" => http_response(
+                        "200 OK",
+                        "image/png",
+                        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR",
+                    ),
+                    "/soft404.png" => http_response(
+                        "200 OK",
+                        "image/png",
+                        b"<html><body>Not found</body></html>",
+                    ),
+                    _ => http_response("404 Not Found", "text/plain", b"missing"),
+                };
+                let _ = socket.write_all(&resp).await;
+            });
+        }
+    });
+
+    let state_dir = temp_state_dir();
+    let ctx = RuntimeContext::new(RuntimeConfig {
+        state_dir: state_dir.path().to_path_buf(),
+        timeout: Duration::from_secs(5),
+        cef_timeout: Duration::from_secs(5),
+        use_daemon: false,
+        ..Default::default()
+    })
+    .unwrap();
+
+    // 1. Valid PNG stages cleanly.
+    let staged = fetch_staged_asset(
+        &ctx,
+        &format!("{base}/chart.png"),
+        Some(&format!("{base}/article")),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(staged.status_code, 200);
+    assert_eq!(staged.byte_count, 16);
+    assert_eq!(staged.content_type.as_deref(), Some("image/png"));
+    let staged_path = PathBuf::from(&staged.staged_path);
+    assert!(staged_path.exists());
+    assert!(staged_path.starts_with(state_dir.path().join("artifacts")));
+
+    // 2. Disguised HTML-as-PNG soft-404 fails cleanly.
+    let err = fetch_staged_asset(&ctx, &format!("{base}/soft404.png"), None, false)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("disguised HTML"));
+
+    // 3. 404 returns HttpError (exit 3).
+    let err_404 = fetch_staged_asset(&ctx, &format!("{base}/nope.png"), None, false)
+        .await
+        .unwrap_err();
+    assert!(matches!(err_404, FetchError::HttpError { status: 404, .. }));
+
+    // 4. LRU eviction keeps protected file and removes older ones.
+    let u2 = url::Url::parse(&format!("{base}/second.png")).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    let staged2 = stage_artifact(
+        state_dir.path(),
+        &u2,
+        Some("image/png"),
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR2",
+        None,
+    )
+    .unwrap();
+    let evicted =
+        evict_artifacts_over_budget(&state_dir.path().join("artifacts"), 20, Some(&staged2.path))
+            .unwrap();
+    assert_eq!(evicted, 1);
+    assert!(!staged_path.exists());
+    assert!(staged2.path.exists());
+
+    // 5. clear_state_dir removes artifacts/.
+    clear_state_dir(state_dir.path()).unwrap();
+    assert!(!state_dir.path().join("artifacts").exists());
+}

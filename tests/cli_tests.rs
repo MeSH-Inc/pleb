@@ -75,6 +75,16 @@ async fn spawn_cli_test_server() -> String {
                     "/blocked" => ("403 Forbidden", "text/html", b"Forbidden"),
                     "/missing" => ("404 Not Found", "text/plain", b"Not Found"),
                     "/file.pdf" => ("200 OK", "application/pdf", b"%PDF-1.7\nbinary"),
+                    "/diagram.png" => (
+                        "200 OK",
+                        "image/png",
+                        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR",
+                    ),
+                    "/fake.png" => (
+                        "200 OK",
+                        "image/png",
+                        b"<!DOCTYPE html><html><body>soft 404</body></html>",
+                    ),
                     _ => ("404 Not Found", "text/plain", b"unknown"),
                 };
                 let hdr = format!(
@@ -518,6 +528,14 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "markdown_mirror",
         "markdown_negotiated",
         "RSS 2.0",
+        "--resources",
+        "--stage-resources",
+        "--referer",
+        "--stage",
+        "artifacts/",
+        "<svg>",
+        ".vtt",
+        ".srt",
     ] {
         assert!(
             readme.contains(required),
@@ -528,4 +546,157 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         !readme.contains("v4-meta"),
         "README.md contains stale v4-meta reference"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_direct_stage_rejects_disguised_html_conflicts_and_clears_artifacts() {
+    let base = spawn_cli_test_server().await;
+    let state_dir = temp_dir();
+    let wick_bin = env!("CARGO_BIN_EXE_wick");
+
+    // 1. Direct --stage with --referer stages PNG and prints local path on stdout.
+    let stage_plain = Command::new(wick_bin)
+        .env("WICK_NO_HOME_CEF", "1")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args([
+            "--no-daemon",
+            "fetch",
+            "--stage",
+            "--referer",
+            &format!("{base}/ok"),
+            &format!("{base}/diagram.png"),
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(
+        stage_plain.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&stage_plain.stderr)
+    );
+    let staged_path_str = String::from_utf8_lossy(&stage_plain.stdout)
+        .trim()
+        .to_string();
+    let staged_path = PathBuf::from(&staged_path_str);
+    assert!(
+        staged_path.exists(),
+        "expected staged file at {staged_path_str}"
+    );
+    assert!(staged_path.starts_with(state_dir.path().join("artifacts")));
+    assert_eq!(
+        fs::read(&staged_path).unwrap(),
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+    );
+    let stderr_str = String::from_utf8_lossy(&stage_plain.stderr);
+    assert!(stderr_str.contains("Status: 200 | Bytes: 16 | Staged:"));
+
+    // 2. Direct --stage --json emits structured JSON.
+    let stage_json = Command::new(wick_bin)
+        .env("WICK_NO_HOME_CEF", "1")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args([
+            "--no-daemon",
+            "--json",
+            "fetch",
+            "--stage",
+            &format!("{base}/file.pdf"),
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(stage_json.status.code(), Some(0));
+    let val: serde_json::Value = serde_json::from_slice(&stage_json.stdout).unwrap();
+    assert_eq!(val["status_code"], 200);
+    assert_eq!(val["content_type"], "application/pdf");
+    assert_eq!(val["byte_count"], 15);
+    assert!(Path::new(val["staged_path"].as_str().unwrap()).exists());
+
+    // 3. Disguised HTML-as-PNG soft-404 is rejected with exit 1.
+    let stage_fake = Command::new(wick_bin)
+        .env("WICK_NO_HOME_CEF", "1")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args([
+            "--no-daemon",
+            "--json",
+            "fetch",
+            "--stage",
+            &format!("{base}/fake.png"),
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(stage_fake.status.code(), Some(1));
+
+    // 4. Flag conflicts with --stage fail cleanly (exit 1 with --json/--jsonl/runtime checks, exit 2 from clap).
+    for (args, expected_code) in [
+        (
+            vec![
+                "fetch",
+                "--stage",
+                "--output",
+                "/tmp/unused.png",
+                &format!("{base}/diagram.png"),
+            ],
+            2,
+        ),
+        (
+            vec![
+                "fetch",
+                "--stage",
+                "--metadata-only",
+                "--json",
+                &format!("{base}/diagram.png"),
+            ],
+            1,
+        ),
+        (
+            vec![
+                "fetch",
+                "--stage",
+                "--jsonl",
+                &format!("{base}/diagram.png"),
+            ],
+            1,
+        ),
+        (
+            vec![
+                "fetch",
+                "--stage",
+                &format!("{base}/diagram.png"),
+                &format!("{base}/file.pdf"),
+            ],
+            1,
+        ),
+    ] {
+        let out = Command::new(wick_bin)
+            .env("WICK_NO_HOME_CEF", "1")
+            .args(["--state-dir"])
+            .arg(&state_dir)
+            .args(&args)
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(expected_code),
+            "expected exit {expected_code} for {args:?}"
+        );
+    }
+
+    // 5. `wick session clear` removes `<state_dir>/artifacts`.
+    assert!(state_dir.path().join("artifacts").exists());
+    let clear_out = Command::new(wick_bin)
+        .env("WICK_NO_HOME_CEF", "1")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args(["session", "clear"])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(clear_out.status.code(), Some(0));
+    assert!(!state_dir.path().join("artifacts").exists());
 }

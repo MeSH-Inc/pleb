@@ -6,21 +6,30 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
+use crate::artifacts::stage_artifact;
 use crate::context::RuntimeContext;
-use crate::extract::{self, ExtractOptions, OutputFormat, ParsedHtml};
+use crate::extract::{
+    self, ExtractMode, ExtractOptions, OutputFormat, ParsedHtml, ResourceDescriptor, ResourceKind,
+    ResourceSalience,
+};
 use crate::policy::{
-    classify_response_with_context, detect_interstitial_challenge, is_markdown_content_type,
-    is_mirror_acceptable_content_type, parse_markdown_link_header, plan_strategy,
-    resolve_raw_source_candidate, PrimaryTransport, RawSourceCandidate, RawSourceKind, RenderMode,
-    ResourcePolicy, ResponseClassification, SourceMode,
+    classify_response_with_context, compute_safe_referer, detect_interstitial_challenge,
+    is_markdown_content_type, is_mirror_acceptable_content_type, is_safe_subresource_url,
+    parse_markdown_link_header, plan_strategy, resolve_raw_source_candidate, PrimaryTransport,
+    RawSourceCandidate, RawSourceKind, RenderMode, ResourcePolicy, ResponseClassification,
+    SourceMode,
 };
 use crate::transport::cef::{
     CefProtocolError, CefRenderOptions, CefRenderResult, CefRenderer, CefTimeoutError,
 };
 use crate::transport::{
-    ResponseTooLargeError, TransportError, TransportErrorKind, DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES,
-    DEFAULT_RAW_MAX_RESPONSE_BYTES,
+    RequestHeaderOptions, ResponseTooLargeError, SubresourceDest, TransportError,
+    TransportErrorKind, DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES, DEFAULT_RAW_MAX_RESPONSE_BYTES,
 };
+
+const MAX_TRANSCRIPT_FETCHES: usize = 4;
+const MAX_STAGED_ARTIFACTS: usize = 8;
+const MAX_SUBRESOURCE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum FetchError {
@@ -164,6 +173,17 @@ pub struct FetchRawResult {
     pub timing_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct StagedAssetOutput {
+    pub url: String,
+    pub final_url: String,
+    pub status_code: u16,
+    pub content_type: Option<String>,
+    pub byte_count: usize,
+    pub staged_path: String,
+    pub timing_ms: u64,
+}
+
 struct AcquiredPage {
     body: String,
     final_url: String,
@@ -224,13 +244,40 @@ pub async fn fetch_document(
 
     let final_url_parsed = url::Url::parse(&page.final_url).unwrap_or_else(|_| effective.clone());
     let extract_url = page.extract_base_url.as_ref().unwrap_or(&final_url_parsed);
-    let extracted = extract::extract_document_parsed(
+    let needs_enrichment =
+        options.resources != ResourcePolicy::None || !options.stage_resources.is_empty();
+    let initial_extract_opts = if needs_enrichment && options.extract.max_bytes.is_some() {
+        ExtractOptions {
+            max_bytes: None,
+            ..options.extract.clone()
+        }
+    } else {
+        options.extract.clone()
+    };
+    let mut extracted = extract::extract_document_parsed(
         &page.body,
         page.parsed,
         extract_url,
         page.content_type.as_deref(),
-        &options.extract,
+        &initial_extract_opts,
     )?;
+
+    if needs_enrichment {
+        enrich_document_resources(
+            ctx,
+            &final_url_parsed,
+            &mut extracted.content,
+            &mut extracted.resources,
+            options,
+        )
+        .await;
+        if let Some(max_bytes) = options.extract.max_bytes {
+            let (truncated_content, did_truncate) =
+                truncate_for_format(&extracted.content, options.extract.format, max_bytes);
+            extracted.content = truncated_content;
+            extracted.truncated |= did_truncate;
+        }
+    }
 
     let content_bytes = extracted.content.len();
     Ok(FetchOutput {
@@ -310,6 +357,446 @@ pub async fn fetch_raw(
         content_type: resp.content_type,
         timing_ms,
     })
+}
+
+pub async fn fetch_staged_asset(
+    ctx: &RuntimeContext,
+    url: &str,
+    referer: Option<&str>,
+    respect_robots: bool,
+) -> std::result::Result<StagedAssetOutput, FetchError> {
+    let start = Instant::now();
+    let (parsed, host) = resolve_and_check_robots(ctx, url, false, respect_robots).await?;
+
+    let safe_referer = match referer {
+        Some(raw) if !raw.trim().is_empty() => {
+            let parent = parse_http_url(raw.trim())?;
+            compute_safe_referer(&parent, &parsed)
+        }
+        _ => None,
+    };
+    let req_opts = RequestHeaderOptions {
+        accept_markdown: false,
+        referer: safe_referer,
+        subresource_dest: Some(infer_subresource_dest(&parsed)),
+    };
+
+    let max_bytes = ctx
+        .config
+        .max_response_bytes
+        .unwrap_or(DEFAULT_RAW_MAX_RESPONSE_BYTES);
+    let resp = ctx
+        .client
+        .get_with_request_options(parsed.as_str(), ctx.config.timeout, max_bytes, &req_opts)
+        .await
+        .map_err(|e| map_transport_error(parsed.as_str(), e, max_bytes))?;
+    let timing_ms = start.elapsed().as_millis() as u64;
+
+    if resp.status >= 400 {
+        return Err(FetchError::HttpError {
+            url: resp.final_url,
+            status: resp.status,
+        });
+    }
+
+    let final_url_parsed = url::Url::parse(&resp.final_url).unwrap_or(parsed);
+    let staged = stage_artifact(
+        &ctx.config.state_dir,
+        &final_url_parsed,
+        resp.content_type.as_deref(),
+        &resp.body,
+        None,
+    )
+    .map_err(FetchError::Transport)?;
+
+    ctx.site_cache
+        .record(&host, ctx.client.transport_name(), timing_ms);
+
+    Ok(StagedAssetOutput {
+        url: url.to_string(),
+        final_url: resp.final_url,
+        status_code: resp.status,
+        content_type: staged.content_type,
+        byte_count: staged.byte_count,
+        staged_path: staged.path.display().to_string(),
+        timing_ms,
+    })
+}
+
+pub fn format_resource_cue(resources: &[ResourceDescriptor]) -> Option<String> {
+    let kind_order = [
+        (ResourceKind::Diagram, "diagram", "diagrams"),
+        (ResourceKind::Transcript, "transcript", "transcripts"),
+        (ResourceKind::Document, "document", "documents"),
+        (ResourceKind::Dataset, "dataset", "datasets"),
+        (ResourceKind::Schema, "schema", "schemas"),
+        (ResourceKind::Image, "image", "images"),
+    ];
+
+    let mut parts = Vec::new();
+    for (kind, singular, plural) in kind_order {
+        let ids: Vec<&str> = resources
+            .iter()
+            .filter(|r| r.salience == ResourceSalience::High && r.kind == kind)
+            .map(|r| r.identifier.as_str())
+            .collect();
+        if !ids.is_empty() {
+            let word = if ids.len() == 1 { singular } else { plural };
+            parts.push(format!("{} {} ({})", ids.len(), word, ids.join(", ")));
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Resources: {} — pass --resources manifest or --stage-resources <ids>",
+            parts.join(", ")
+        ))
+    }
+}
+
+fn infer_subresource_dest(url: &url::Url) -> SubresourceDest {
+    let lower = url.path().to_ascii_lowercase();
+    if [
+        ".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".avif", ".bmp", ".ico",
+    ]
+    .iter()
+    .any(|ext| lower.ends_with(ext))
+    {
+        SubresourceDest::Image
+    } else {
+        SubresourceDest::Asset
+    }
+}
+
+fn resource_kind_label(kind: ResourceKind) -> &'static str {
+    match kind {
+        ResourceKind::Diagram => "diagram",
+        ResourceKind::Image => "image",
+        ResourceKind::Transcript => "transcript",
+        ResourceKind::Document => "document",
+        ResourceKind::Dataset => "dataset",
+        ResourceKind::Schema => "schema",
+    }
+}
+
+fn truncate_for_format(content: &str, format: OutputFormat, max_bytes: usize) -> (String, bool) {
+    if content.len() <= max_bytes {
+        return (content.to_string(), false);
+    }
+    if format == OutputFormat::Markdown {
+        return extract::truncate_markdown(content, max_bytes);
+    }
+    let suffix = "\n\n[... truncated]";
+    let budget = max_bytes.saturating_sub(suffix.len());
+    let mut end = budget.min(content.len());
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = content[..end].trim_end().to_string();
+    out.push_str(suffix);
+    (out, true)
+}
+
+async fn join_all_futures<T, F>(futs: Vec<F>) -> Vec<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    let mut pinned: Vec<std::pin::Pin<Box<F>>> = futs.into_iter().map(Box::pin).collect();
+    let mut results: Vec<Option<T>> = (0..pinned.len()).map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut pending = false;
+        for (i, fut) in pinned.iter_mut().enumerate() {
+            if results[i].is_none() {
+                match fut.as_mut().poll(cx) {
+                    std::task::Poll::Ready(val) => results[i] = Some(val),
+                    std::task::Poll::Pending => pending = true,
+                }
+            }
+        }
+        if pending {
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(())
+        }
+    })
+    .await;
+    results.into_iter().flatten().collect()
+}
+
+struct SelectedSubresource {
+    index: usize,
+    url: url::Url,
+    kind: ResourceKind,
+    explicit: bool,
+}
+
+async fn enrich_document_resources(
+    ctx: &RuntimeContext,
+    final_url: &url::Url,
+    content: &mut String,
+    resources: &mut [ResourceDescriptor],
+    options: &FetchOptions,
+) {
+    if options.resources == ResourcePolicy::Manifest && !resources.is_empty() {
+        let manifest = extract::format_resource_manifest_markdown(resources);
+        if !manifest.trim().is_empty() {
+            content.push_str("\n\n");
+            content.push_str(manifest.trim());
+        }
+    }
+
+    let explicit_ids: HashSet<&str> = options
+        .stage_resources
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if matches!(
+        options.resources,
+        ResourcePolicy::None | ResourcePolicy::Manifest
+    ) && explicit_ids.is_empty()
+    {
+        return;
+    }
+
+    let mut selected = Vec::new();
+    let mut transcript_count = 0usize;
+    let mut staged_count = 0usize;
+
+    for (index, res) in resources.iter().enumerate() {
+        let explicit = explicit_ids.contains(res.identifier.as_str());
+        let policy_match = match options.resources {
+            ResourcePolicy::Transcripts => res.kind == ResourceKind::Transcript,
+            ResourcePolicy::Diagrams => {
+                res.kind == ResourceKind::Diagram && res.salience == ResourceSalience::High
+            }
+            ResourcePolicy::All => {
+                res.kind == ResourceKind::Transcript
+                    || (res.salience == ResourceSalience::High
+                        && matches!(
+                            res.kind,
+                            ResourceKind::Diagram
+                                | ResourceKind::Document
+                                | ResourceKind::Dataset
+                                | ResourceKind::Schema
+                        ))
+            }
+            ResourcePolicy::None | ResourcePolicy::Manifest => false,
+        };
+
+        if !(explicit || policy_match) {
+            continue;
+        }
+        let Ok(res_url) = url::Url::parse(&res.url) else {
+            continue;
+        };
+        if !is_safe_subresource_url(final_url, &res_url) {
+            continue;
+        }
+
+        if res.kind == ResourceKind::Transcript {
+            if transcript_count >= MAX_TRANSCRIPT_FETCHES {
+                continue;
+            }
+            if explicit && staged_count >= MAX_STAGED_ARTIFACTS {
+                continue;
+            }
+            transcript_count += 1;
+            if explicit {
+                staged_count += 1;
+            }
+        } else {
+            if staged_count >= MAX_STAGED_ARTIFACTS {
+                continue;
+            }
+            staged_count += 1;
+        }
+
+        selected.push(SelectedSubresource {
+            index,
+            url: res_url,
+            kind: res.kind,
+            explicit,
+        });
+    }
+
+    if selected.is_empty() {
+        return;
+    }
+
+    let max_sub_bytes = ctx
+        .config
+        .max_response_bytes
+        .map(|limit| limit.min(MAX_SUBRESOURCE_BYTES))
+        .unwrap_or(MAX_SUBRESOURCE_BYTES);
+    let host_sems: Mutex<HashMap<String, Arc<Semaphore>>> = Mutex::new(HashMap::new());
+    let respect_robots = options.respect_robots;
+
+    let futs = selected
+        .into_iter()
+        .map(|item| {
+            let host_key = item
+                .url
+                .host_str()
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+            let sem = {
+                let mut map = host_sems
+                    .lock()
+                    .expect("subresource semaphore map poisoned");
+                Arc::clone(
+                    map.entry(host_key)
+                        .or_insert_with(|| Arc::new(Semaphore::new(2))),
+                )
+            };
+            async move {
+                let _permit = sem.acquire_owned().await.ok()?;
+                if respect_robots && !ctx.robots.is_allowed(&ctx.client, item.url.as_str()).await {
+                    return None;
+                }
+                let req_opts = RequestHeaderOptions {
+                    accept_markdown: false,
+                    referer: compute_safe_referer(final_url, &item.url),
+                    subresource_dest: Some(match item.kind {
+                        ResourceKind::Diagram | ResourceKind::Image => SubresourceDest::Image,
+                        _ => SubresourceDest::Asset,
+                    }),
+                };
+                match ctx
+                    .client
+                    .get_with_request_options(
+                        item.url.as_str(),
+                        ctx.config.timeout,
+                        max_sub_bytes,
+                        &req_opts,
+                    )
+                    .await
+                {
+                    Ok(resp) if resp.status < 400 => Some((item, resp)),
+                    Ok(resp) => {
+                        tracing::debug!(
+                            "Skipping subresource {} with HTTP {}",
+                            item.url,
+                            resp.status
+                        );
+                        None
+                    }
+                    Err(err) => {
+                        tracing::debug!("Skipping subresource {} on error: {}", item.url, err);
+                        None
+                    }
+                }
+            }
+        })
+        .collect();
+
+    let fetched = join_all_futures(futs).await;
+    let mut staged_lines: Vec<String> = Vec::new();
+    let transcript_opts = ExtractOptions {
+        format: if options.extract.format == OutputFormat::Text {
+            OutputFormat::Text
+        } else {
+            OutputFormat::Markdown
+        },
+        mode: ExtractMode::Clean,
+        include_images: false,
+        include_links: false,
+        max_bytes: None,
+    };
+
+    for entry in fetched.into_iter().flatten() {
+        let (item, resp) = entry;
+        let res_final_url = url::Url::parse(&resp.final_url).unwrap_or_else(|_| item.url.clone());
+
+        if item.kind == ResourceKind::Transcript {
+            let ct = match resp.content_type.as_deref() {
+                Some(raw)
+                    if raw.to_ascii_lowercase().contains("vtt")
+                        || raw.to_ascii_lowercase().contains("subrip")
+                        || raw.to_ascii_lowercase().contains("srt") =>
+                {
+                    Some(raw)
+                }
+                _ => Some("text/vtt"),
+            };
+            if let Ok(doc) =
+                extract::extract_document_bytes(&resp.body, &res_final_url, ct, &transcript_opts)
+            {
+                let text = doc.content.trim();
+                if !text.is_empty() {
+                    let label = resources[item.index]
+                        .label
+                        .as_deref()
+                        .unwrap_or(&resources[item.index].identifier);
+                    content.push_str(&format!("\n\n## Media Transcript: {label}\n\n{text}"));
+                }
+            }
+            if item.explicit {
+                if let Ok(staged) = stage_artifact(
+                    &ctx.config.state_dir,
+                    &res_final_url,
+                    ct,
+                    &resp.body,
+                    Some(ResourceKind::Transcript),
+                ) {
+                    let staged_path = staged.path.display().to_string();
+                    let res = &mut resources[item.index];
+                    res.staged_path = Some(staged_path.clone());
+                    res.byte_count = Some(staged.byte_count);
+                    res.content_type = staged.content_type;
+                    staged_lines.push(format!(
+                        "- **{}** ({}, {} bytes): `{}`",
+                        res.identifier,
+                        resource_kind_label(res.kind),
+                        staged.byte_count,
+                        staged_path
+                    ));
+                }
+            }
+            continue;
+        }
+
+        match stage_artifact(
+            &ctx.config.state_dir,
+            &res_final_url,
+            resp.content_type.as_deref(),
+            &resp.body,
+            Some(item.kind),
+        ) {
+            Ok(staged) => {
+                let staged_path = staged.path.display().to_string();
+                let res = &mut resources[item.index];
+                if options.extract.format == OutputFormat::Markdown {
+                    let needle = format!("({})", res.url);
+                    let replacement = format!("({staged_path})");
+                    if content.contains(&needle) {
+                        *content = content.replace(&needle, &replacement);
+                    }
+                }
+                res.staged_path = Some(staged_path.clone());
+                res.byte_count = Some(staged.byte_count);
+                res.content_type = staged.content_type;
+                staged_lines.push(format!(
+                    "- **{}** ({}, {} bytes): `{}`",
+                    res.identifier,
+                    resource_kind_label(res.kind),
+                    staged.byte_count,
+                    staged_path
+                ));
+            }
+            Err(err) => {
+                tracing::debug!("Skipping staging for {}: {}", item.url, err);
+            }
+        }
+    }
+
+    if !staged_lines.is_empty() {
+        content.push_str("\n\n## Staged Resources\n\n");
+        content.push_str(&staged_lines.join("\n"));
+    }
 }
 
 async fn resolve_and_check_robots(
@@ -1350,6 +1837,196 @@ mod tests {
         )
         .await
         .is_none());
+
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn format_resource_cue_summarizes_high_salience_only() {
+        let resources = vec![
+            ResourceDescriptor {
+                identifier: "r1".to_string(),
+                kind: ResourceKind::Diagram,
+                url: "https://example.com/arch.png".to_string(),
+                mime_hint: Some("image/png".to_string()),
+                section_heading: None,
+                label: Some("Arch".to_string()),
+                dimensions: Some((800, 400)),
+                salience: ResourceSalience::High,
+                staged_path: None,
+                byte_count: None,
+                content_type: None,
+            },
+            ResourceDescriptor {
+                identifier: "r2".to_string(),
+                kind: ResourceKind::Image,
+                url: "https://example.com/photo.jpg".to_string(),
+                mime_hint: None,
+                section_heading: None,
+                label: Some("Photo".to_string()),
+                dimensions: None,
+                salience: ResourceSalience::Medium,
+                staged_path: None,
+                byte_count: None,
+                content_type: None,
+            },
+            ResourceDescriptor {
+                identifier: "r3".to_string(),
+                kind: ResourceKind::Transcript,
+                url: "https://example.com/captions.vtt".to_string(),
+                mime_hint: Some("text/vtt".to_string()),
+                section_heading: None,
+                label: Some("English".to_string()),
+                dimensions: None,
+                salience: ResourceSalience::High,
+                staged_path: None,
+                byte_count: None,
+                content_type: None,
+            },
+        ];
+        let cue = format_resource_cue(&resources).unwrap();
+        assert_eq!(
+            cue,
+            "Resources: 1 diagram (r1), 1 transcript (r3) — pass --resources manifest or --stage-resources <ids>"
+        );
+        assert!(format_resource_cue(&resources[1..2]).is_none());
+    }
+
+    #[tokio::test]
+    async fn enrich_document_resources_stages_diagrams_rewrites_markdown_and_inlines_transcripts() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let (status, ct, body): (&str, &str, &[u8]) = match path {
+                        "/arch.png" => (
+                            "200 OK",
+                            "image/png",
+                            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR",
+                        ),
+                        "/talk.vtt" => (
+                            "200 OK",
+                            "text/vtt; charset=utf-8",
+                            b"WEBVTT\n\n00:00:01.000 --> 00:00:03.000\n<v Alice>Welcome to the architecture talk.\n",
+                        ),
+                        "/bad.png" => (
+                            "200 OK",
+                            "text/html",
+                            b"<!DOCTYPE html><html><body>soft 404</body></html>",
+                        ),
+                        _ => ("404 Not Found", "text/plain", b"not found"),
+                    };
+                    let hdr = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(hdr.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                });
+            }
+        });
+
+        let state_dir =
+            std::path::PathBuf::from(format!("/tmp/wick-t-{}-enrich", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let ctx = RuntimeContext::new(crate::context::RuntimeConfig {
+            state_dir: state_dir.clone(),
+            timeout: Duration::from_secs(5),
+            cef_timeout: Duration::from_secs(5),
+            use_daemon: false,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let page_url = url::Url::parse(&format!("{base}/post")).unwrap();
+        let png_url = format!("{base}/arch.png");
+        let vtt_url = format!("{base}/talk.vtt");
+        let bad_url = format!("{base}/bad.png");
+        let mut content = format!("# Architecture\n\n![System Diagram]({png_url})\n");
+        let mut resources = vec![
+            ResourceDescriptor {
+                identifier: "r1".to_string(),
+                kind: ResourceKind::Diagram,
+                url: png_url.clone(),
+                mime_hint: Some("image/png".to_string()),
+                section_heading: Some("Architecture".to_string()),
+                label: Some("System Diagram".to_string()),
+                dimensions: Some((800, 400)),
+                salience: ResourceSalience::High,
+                staged_path: None,
+                byte_count: None,
+                content_type: None,
+            },
+            ResourceDescriptor {
+                identifier: "r2".to_string(),
+                kind: ResourceKind::Transcript,
+                url: vtt_url,
+                mime_hint: Some("text/vtt".to_string()),
+                section_heading: Some("Architecture".to_string()),
+                label: Some("English Captions".to_string()),
+                dimensions: None,
+                salience: ResourceSalience::High,
+                staged_path: None,
+                byte_count: None,
+                content_type: None,
+            },
+            ResourceDescriptor {
+                identifier: "r3".to_string(),
+                kind: ResourceKind::Diagram,
+                url: bad_url,
+                mime_hint: Some("image/png".to_string()),
+                section_heading: None,
+                label: Some("Broken Soft 404".to_string()),
+                dimensions: Some((500, 300)),
+                salience: ResourceSalience::High,
+                staged_path: None,
+                byte_count: None,
+                content_type: None,
+            },
+        ];
+
+        let opts = FetchOptions {
+            resources: ResourcePolicy::All,
+            stage_resources: vec!["r2".to_string()],
+            ..Default::default()
+        };
+
+        enrich_document_resources(&ctx, &page_url, &mut content, &mut resources, &opts).await;
+
+        let staged_png = resources[0].staged_path.as_deref().unwrap();
+        assert!(std::path::Path::new(staged_png).exists());
+        assert_eq!(resources[0].byte_count, Some(16));
+        assert!(content.contains(&format!("![System Diagram]({staged_png})")));
+        assert!(content.contains("## Staged Resources"));
+        assert!(content.contains("- **r1** (diagram, 16 bytes):"));
+
+        // Transcript was inlined and also staged because r2 was explicitly in --stage-resources.
+        assert!(content.contains("## Media Transcript: English Captions"));
+        assert!(content.contains("Welcome to the architecture talk."));
+        assert!(resources[1].staged_path.is_some());
+
+        // Disguised HTML-as-PNG was safely rejected without failing enrichment.
+        assert!(resources[2].staged_path.is_none());
 
         let _ = std::fs::remove_dir_all(&state_dir);
     }

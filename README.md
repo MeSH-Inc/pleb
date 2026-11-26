@@ -69,6 +69,15 @@ Key `fetch` flags:
   - `negotiate`: sends `Accept: text/markdown` on the primary HTTP GET (`strategy: "markdown_negotiated"`) and probes `<path>.md` on documentation paths when HTML lacks an alternate link
   - `none`: disables raw-source rewrites, Markdown mirror discovery, and `Accept: text/markdown` negotiation (also bypassed automatically for `--format html`, `--format raw`, and `--render cef`)
 - `--wait-for-selector <css>`
+- `--resources <none|manifest|transcripts|diagrams|all>` (default: `none`):
+  - `none`: zero subresource network requests; populates `resources` in `--json`/`--jsonl`/`--metadata-only` and prints a concise `stderr` cue line when high-salience diagrams, transcripts, documents, datasets, or schemas are detected
+  - `manifest`: appends a `## Linked Resources` Markdown table
+  - `transcripts`: fetches up to 4 `.vtt`/`.srt` media transcripts with safe `Referer` headers and appends clean speaker prose
+  - `diagrams`: stages up to 8 high-salience diagrams (`<= 16 MiB` each) into `<state_dir>/artifacts/` and rewrites Markdown image paths
+  - `all`: runs `transcripts` plus stages high-salience diagrams, documents, datasets, and schemas
+- `--stage-resources <IDS>` (comma-separated resource IDs, e.g. `r1,r3`): selectively stage or inline named resources from the fetched document
+- `--referer <URL>`: optional parent page URL supplying `strict-origin-when-cross-origin` `Referer` and `Sec-Fetch-*` headers on direct asset fetches
+- `--stage`: directly fetch and stage a single binary/document asset into `<state_dir>/artifacts/` (validating magic bytes and rejecting disguised HTML), printing its local path (or JSON metadata with `--json`); conflicts with `--output`, `--metadata-only`, `--jsonl`, and batch mode
 - `--respect-robots` (disabled by default for interactive single-URL fetches)
 - `--no-rewrite` (disable host rewrites such as `reddit.com` -> `old.reddit.com` and forge raw-source rewrites)
 - `--no-images`, `--no-links`, `--max-bytes <N>`
@@ -76,7 +85,7 @@ Key `fetch` flags:
 - `--output <path>` (`-o`): write output to a file instead of stdout (single-URL only; created only after fetch succeeds)
 - `--json` (global flag), `--jsonl` (streaming per-URL JSON lines), `--metadata-only`
 
-Native `text/markdown` responses extract/strip YAML frontmatter in `clean`/`article` modes, resolve relative links outside code fences, and apply fence-safe `--max-bytes` truncation. Syndication feeds (RSS 2.0, Atom 1.0, and JSON Feed 1.1) are automatically converted into compact Markdown digests in `clean`/`article` modes (pass `--extract full` or `--format raw` for verbatim XML/JSON).
+Native `text/markdown` responses extract/strip YAML frontmatter in `clean`/`article` modes, resolve relative links outside code fences, and apply fence-safe `--max-bytes` truncation. Syndication feeds (RSS 2.0, Atom 1.0, and JSON Feed 1.1) are automatically converted into compact Markdown digests in `clean`/`article` modes (pass `--extract full` or `--format raw` for verbatim XML/JSON). Inline content `<svg>` diagrams rescue readable `<text>` labels (`[Diagram: ...]`) while filtering icon sprites, and WebVTT (`.vtt`) / SubRip (`.srt`) transcripts strip timing cues and rolling-caption duplicates while preserving speaker turns.
 
 ### Search
 
@@ -119,7 +128,7 @@ wick session clear
 
 ## Configuration
 
-- `MESH_WICK_HOME` / `--state-dir`: private (`0o700`) state directory for proxy-partitioned HTTP cache/cookies (`data/`), CEF `cef-cache/`, unified transport daemon socket (`daemon.sock`), daemon logs (`daemon.log`), `site-cache.json` (`0o600`), and optional local `site-rules.json` overlay over bundled structural rules (`reddit.com` -> `old.reddit.com`, `x.com`/`twitter.com`) (default: `~/.mesh-wick`; `wick session clear` stops any running daemon and clears `data/`, `cef-cache/`, and `site-cache.json`)
+- `MESH_WICK_HOME` / `--state-dir`: private (`0o700`) state directory for proxy-partitioned HTTP cache/cookies (`data/`), CEF `cef-cache/`, content-addressed staged artifacts (`artifacts/`, `256 MiB` LRU cap), unified transport daemon socket (`daemon.sock`), daemon logs (`daemon.log`), `site-cache.json` (`0o600`), and optional local `site-rules.json` overlay over bundled structural rules (`reddit.com` -> `old.reddit.com`, `x.com`/`twitter.com`) (default: `~/.mesh-wick`; `wick session clear` stops any running daemon and clears `data/`, `cef-cache/`, `artifacts/`, and `site-cache.json`)
 - `MESH_WICK_PROXY` / `--proxy`: SOCKS5/HTTP proxy URL
 - `MESH_WICK_TIMEZONE`: optional IANA timezone override injected into CEF `Intl.DateTimeFormat`
 - `BRAVE_API_KEY`: enables Brave Search API in `search`

@@ -169,6 +169,10 @@ pub fn clear_state_dir(state_dir: &Path) -> Result<()> {
     if cef_cache_dir.exists() {
         std::fs::remove_dir_all(&cef_cache_dir)?;
     }
+    let artifacts_dir = state_dir.join("artifacts");
+    if artifacts_dir.exists() {
+        std::fs::remove_dir_all(&artifacts_dir)?;
+    }
     let lock_path = state_dir.join("site-cache.lock");
     let mut lock_opts = std::fs::OpenOptions::new();
     lock_opts

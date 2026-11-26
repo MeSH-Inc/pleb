@@ -7,7 +7,7 @@ use mesh_wick::extract::{format_page_section, ExtractMode, OutputFormat};
 use mesh_wick::fetch::{
     self, BatchFetchOptions, BatchItemResult, FetchError, FetchOptions, FetchOutput,
 };
-use mesh_wick::policy::{RenderMode, SourceMode};
+use mesh_wick::policy::{RenderMode, ResourcePolicy, SourceMode};
 use mesh_wick::search::{self, Freshness, SearchOptions, SearchProvider};
 use mesh_wick::transport::cef::{self, RendererProbe};
 use serde::Serialize;
@@ -92,6 +92,18 @@ enum Command {
         /// Structured source negotiation mode
         #[arg(long, value_enum, default_value_t = SourceMode::Auto, ignore_case = true)]
         source: SourceMode,
+        /// Linked resource indexing and staging policy
+        #[arg(long, value_enum, default_value_t = ResourcePolicy::None, ignore_case = true)]
+        resources: ResourcePolicy,
+        /// Selectively stage or inline specific resource IDs (comma-separated, e.g. r1,r3)
+        #[arg(long, value_delimiter = ',')]
+        stage_resources: Vec<String>,
+        /// Optional parent page URL used to compute Referer and Sec-Fetch-* headers
+        #[arg(long)]
+        referer: Option<String>,
+        /// Stage a single fetched asset into <state_dir>/artifacts/ and print its local path
+        #[arg(long, conflicts_with_all = ["output", "metadata_only", "jsonl"])]
+        stage: bool,
         /// CSS selector to wait for when CEF renders
         #[arg(long)]
         wait_for_selector: Option<String>,
@@ -537,6 +549,10 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             extract,
             render,
             source,
+            resources,
+            stage_resources,
+            referer,
+            stage,
             wait_for_selector,
             respect_robots,
             no_rewrite,
@@ -561,6 +577,16 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             }
             let batch_mode = is_stdin || urls.len() > 1;
 
+            if stage && batch_mode {
+                return Err(CliError::invalid_input(
+                    "--stage cannot be combined with batch mode",
+                ));
+            }
+            if stage && format == OutputFormat::Raw {
+                return Err(CliError::invalid_input(
+                    "--stage cannot be combined with --format raw",
+                ));
+            }
             if format == OutputFormat::Raw && (json || jsonl || metadata_only || batch_mode) {
                 return Err(CliError::invalid_input(
                     "--format raw cannot be combined with batch mode, --json, --jsonl, or --metadata-only",
@@ -595,6 +621,25 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             let ctx =
                 RuntimeContext::new(config).map_err(|e| CliError::runtime("context_error", e))?;
 
+            if stage {
+                let url = &target_urls[0];
+                let res = fetch::fetch_staged_asset(&ctx, url, referer.as_deref(), respect_robots)
+                    .await
+                    .map_err(CliError::from_fetch)?;
+                if json {
+                    print_json(&res)?;
+                } else {
+                    if !quiet {
+                        eprintln!(
+                            "Status: {} | Bytes: {} | Staged: {}",
+                            res.status_code, res.byte_count, res.staged_path
+                        );
+                    }
+                    println!("{}", res.staged_path);
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+
             if format == OutputFormat::Raw {
                 let url = &target_urls[0];
                 let res = fetch::fetch_raw(&ctx, url, respect_robots)
@@ -620,6 +665,12 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 return Ok(ExitCode::SUCCESS);
             }
 
+            let stage_resources: Vec<String> = stage_resources
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
             let opts = FetchOptions {
                 extract: mesh_wick::extract::ExtractOptions {
                     format,
@@ -630,10 +681,12 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 },
                 render,
                 source,
+                resources,
+                stage_resources,
+                referer,
                 wait_for_selector,
                 respect_robots,
                 apply_rewrites: !no_rewrite,
-                ..Default::default()
             };
 
             if !batch_mode {
@@ -665,6 +718,12 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     if !quiet {
                         if let Some(title) = &res.title {
                             eprintln!("Title: {}", title);
+                        }
+                        if opts.resources == ResourcePolicy::None && opts.stage_resources.is_empty()
+                        {
+                            if let Some(cue) = fetch::format_resource_cue(&res.resources) {
+                                eprintln!("{cue}");
+                            }
                         }
                         eprintln!(
                             "Status: {} | Strategy: {} | Time: {}ms\n",
