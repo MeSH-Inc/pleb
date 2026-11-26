@@ -47,11 +47,13 @@ CEF_VERSION="144.0.18+gc5b2ec2+chromium-144.0.7559.246"
 CEF_PLATFORM="macosarm64"
 CEF_DIR="cef_binary_${CEF_VERSION}_${CEF_PLATFORM}_minimal"
 CEF_URL="https://cef-builds.spotifycdn.com/${CEF_DIR}.tar.bz2"
+CEF_SHA1="d0e87e125ddfd147ae0e6605445ffe9537c123e3"
 APP_DIR="$INSTALL_DIR/wick-renderer.app"
 RENDERER_BIN="$APP_DIR/Contents/MacOS/wick-renderer"
 RENDERER_PROTOCOL="v4-meta"
 
 mkdir -p "$INSTALL_DIR"
+chmod 700 "$STATE_HOME" "$INSTALL_DIR" 2>/dev/null || true
 
 if [[ "$FORCE" -eq 0 && -f "$RENDERER_BIN" ]] && \
    grep -q "WICK_RENDERER_PROTOCOL=${RENDERER_PROTOCOL}" "$RENDERER_BIN" 2>/dev/null; then
@@ -59,12 +61,11 @@ if [[ "$FORCE" -eq 0 && -f "$RENDERER_BIN" ]] && \
     exit 0
 fi
 
-TMP_BUILD_BIN="/tmp/mesh-wick-renderer-$$"
-TMP_SDK_LINK="$RENDERER_SRC/$CEF_DIR"
-TMP_TAR="$INSTALL_DIR/cef.tar.bz2"
+TMP_BUILD_BIN="$(mktemp "${TMPDIR:-/tmp}/mesh-wick-renderer.XXXXXX")"
+TMP_TAR="$(mktemp "$INSTALL_DIR/cef.tar.bz2.XXXXXX")"
 
 cleanup() {
-    rm -f "$TMP_BUILD_BIN" "$TMP_SDK_LINK" "$TMP_TAR"
+    rm -f "$TMP_BUILD_BIN" "$TMP_TAR"
 }
 trap cleanup EXIT
 
@@ -73,6 +74,13 @@ cd "$INSTALL_DIR"
 if [[ ! -d "$INSTALL_DIR/$CEF_DIR" ]]; then
     echo "Downloading CEF SDK (${CEF_VERSION})..."
     curl -fL --progress-bar -o "$TMP_TAR" "$CEF_URL"
+    echo "Verifying CEF SDK SHA-1 checksum..."
+    if ! echo "$CEF_SHA1  $TMP_TAR" | shasum -a 1 -c --status 2>/dev/null; then
+        echo "Error: CEF SDK SHA-1 verification failed!" >&2
+        echo "Expected: $CEF_SHA1" >&2
+        echo "Got:      $(shasum -a 1 "$TMP_TAR" | cut -d' ' -f1)" >&2
+        exit 1
+    fi
     tar xjf "$TMP_TAR" -C "$INSTALL_DIR"
     rm -f "$TMP_TAR"
 fi
@@ -119,15 +127,14 @@ PLIST
 
 echo -n "APPL????" > "$APP_DIR/Contents/PkgInfo"
 mv "$TMP_BUILD_BIN" "$RENDERER_BIN"
+chmod +x "$RENDERER_BIN"
 
 echo "Copying Chromium Embedded Framework.framework..."
 cp -R "$INSTALL_DIR/$CEF_DIR/Release/Chromium Embedded Framework.framework" \
     "$APP_DIR/Contents/Frameworks/"
 
 echo "Building CEF helper bundles..."
-ln -sfn "$INSTALL_DIR/$CEF_DIR" "$TMP_SDK_LINK"
-bash "$RENDERER_SRC/setup-helpers.sh" "$APP_DIR/Contents/Frameworks"
-rm -f "$TMP_SDK_LINK"
+bash "$RENDERER_SRC/setup-helpers.sh" "$APP_DIR/Contents/Frameworks" "$INSTALL_DIR/$CEF_DIR"
 
 # Each helper .app looks in its own Contents/Frameworks via @executable_path/../Frameworks.
 for helper in "$APP_DIR/Contents/Frameworks"/wick\ Helper*.app; do

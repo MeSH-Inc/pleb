@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "stealth.h"
+#include "browser_environment.h"
 
 #define WICK_RENDERER_PROTOCOL_VERSION "v4-meta"
 #define WICK_MAX_REQUEST_LINE_BYTES (64 * 1024)

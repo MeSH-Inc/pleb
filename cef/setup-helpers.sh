@@ -5,21 +5,26 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CEF_DIR="$(ls -d "$SCRIPT_DIR"/cef_binary_144* 2>/dev/null | head -1)"
+DEST="${1:-$SCRIPT_DIR/Frameworks}"
+CEF_DIR="${2:-$(ls -d "$SCRIPT_DIR"/cef_binary_144* 2>/dev/null | head -1 || true)}"
 
-if [ -z "$CEF_DIR" ]; then
-    echo "Error: CEF distribution not found in $SCRIPT_DIR"
+if [ -z "$CEF_DIR" ] || [ ! -d "$CEF_DIR" ]; then
+    echo "Error: CEF distribution not found (checked '$CEF_DIR')" >&2
     exit 1
 fi
 
-DEST="${1:-$SCRIPT_DIR/Frameworks}"
+TMP_HELPER="$(mktemp "${TMPDIR:-/tmp}/mesh-wick-helper.XXXXXX")"
+cleanup() {
+    rm -f "$TMP_HELPER"
+}
+trap cleanup EXIT
 
 echo "Setting up CEF helper bundles in $DEST..."
 
 # Compile helper binary
 echo "Compiling wick Helper..."
 clang -DCEF_API_VERSION=14400 \
-    -o "$SCRIPT_DIR/wick_helper" \
+    -o "$TMP_HELPER" \
     "$SCRIPT_DIR/helper.m" \
     -I"$SCRIPT_DIR" \
     -I"$CEF_DIR" \
@@ -28,7 +33,7 @@ clang -DCEF_API_VERSION=14400 \
     -framework Cocoa \
     -fobjc-arc
 
-# Create Frameworks directory and link the CEF framework if not already copied
+# Create Frameworks directory and copy the CEF framework if not already copied
 mkdir -p "$DEST"
 if [ ! -e "$DEST/Chromium Embedded Framework.framework" ]; then
     cp -R "$CEF_DIR/Release/Chromium Embedded Framework.framework" "$DEST/"
@@ -54,10 +59,11 @@ for entry in "${HELPERS[@]}"; do
 
     # Use the same binary for all helpers (copy for first, hardlink for rest)
     if [ -z "$suffix" ]; then
-        cp "$SCRIPT_DIR/wick_helper" "$bundle_dir/MacOS/$name"
+        cp "$TMP_HELPER" "$bundle_dir/MacOS/$name"
+        chmod +x "$bundle_dir/MacOS/$name"
     else
         ln -f "$DEST/wick Helper.app/Contents/MacOS/wick Helper" "$bundle_dir/MacOS/$name" 2>/dev/null \
-            || cp "$SCRIPT_DIR/wick_helper" "$bundle_dir/MacOS/$name"
+            || { cp "$TMP_HELPER" "$bundle_dir/MacOS/$name" && chmod +x "$bundle_dir/MacOS/$name"; }
     fi
 
     # Info.plist
@@ -90,9 +96,6 @@ PLIST
     # PkgInfo
     echo -n "APPL????" > "$bundle_dir/PkgInfo"
 done
-
-# Clean up intermediate
-rm -f "$SCRIPT_DIR/wick_helper"
 
 echo "Done. Helper bundles created in $DEST"
 echo ""
