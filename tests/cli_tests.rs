@@ -515,53 +515,192 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
     assert_eq!(val["daemon"]["active_requests"], 0);
     assert_eq!(val["cef_renderer"]["expected_protocol"], "v5-meta");
 
-    // README.md must link cleanly to README-FULL.md anchors and avoid stale protocol references.
+    // README.md and README-FULL.md must maintain canonical branding, valid relative file links,
+    // valid heading anchors, and CLI/schema contract parity without retired identifiers.
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let readme = std::fs::read_to_string(manifest_dir.join("README.md")).unwrap();
     let readme_full = std::fs::read_to_string(manifest_dir.join("README-FULL.md")).unwrap();
+    let license = std::fs::read_to_string(manifest_dir.join("LICENSE")).unwrap();
 
-    assert!(
-        readme.contains("README-FULL.md"),
-        "README.md must link to README-FULL.md"
-    );
-    let full_anchors: std::collections::HashSet<String> = readme_full
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim_start();
-            let heading = trimmed.strip_prefix("## ")?;
-            let slug: String = heading
-                .to_ascii_lowercase()
-                .chars()
-                .filter_map(|c| match c {
-                    'a'..='z' | '0'..='9' | '-' => Some(c),
-                    ' ' => Some('-'),
-                    _ => None,
-                })
-                .collect();
-            Some(slug)
-        })
-        .collect();
-    let mut anchor_links_checked = 0usize;
-    let mut scan = readme.as_str();
-    while let Some(pos) = scan.find("README-FULL.md#") {
-        let rest = &scan[pos + "README-FULL.md#".len()..];
-        let end = rest
-            .find(|c: char| c == ')' || c.is_whitespace())
-            .unwrap_or(rest.len());
-        let anchor = &rest[..end];
+    for (doc_name, doc_text) in [("README.md", &readme), ("README-FULL.md", &readme_full)] {
         assert!(
-            full_anchors.contains(anchor),
-            "README.md links to missing README-FULL.md anchor: #{anchor}"
+            doc_text.contains("MeSH-wick"),
+            "{doc_name} missing canonical MeSH-wick stylization"
         );
-        anchor_links_checked += 1;
-        scan = &rest[end..];
+        assert!(
+            doc_text.contains("Memory Sync Hub LLC"),
+            "{doc_name} missing Memory Sync Hub LLC attribution"
+        );
     }
     assert!(
-        anchor_links_checked >= 5,
-        "README.md should link to README-FULL.md sections (found {anchor_links_checked})"
+        license.contains("Memory Sync Hub LLC"),
+        "LICENSE missing Memory Sync Hub LLC copyright line"
     );
 
-    // README-FULL.md must stay in sync with v5-meta, env overrides, and batch/search flags.
+    fn extract_markdown_anchors(md: &str) -> std::collections::HashSet<String> {
+        let mut anchors = std::collections::HashSet::new();
+        let mut fence_len: Option<usize> = None;
+        for line in md.lines() {
+            let trimmed = line.trim_start();
+            let ticks = trimmed.bytes().take_while(|&b| b == b'`').count();
+            if ticks >= 3 {
+                match fence_len {
+                    None => {
+                        fence_len = Some(ticks);
+                        continue;
+                    }
+                    Some(open) if ticks >= open && trimmed[ticks..].trim().is_empty() => {
+                        fence_len = None;
+                        continue;
+                    }
+                    Some(_) => continue,
+                }
+            }
+            if fence_len.is_some() {
+                continue;
+            }
+            let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
+            if (1..=6).contains(&hashes) && trimmed.as_bytes().get(hashes) == Some(&b' ') {
+                let heading = trimmed[hashes + 1..].trim();
+                let slug: String = heading
+                    .to_ascii_lowercase()
+                    .chars()
+                    .filter_map(|c| match c {
+                        'a'..='z' | '0'..='9' | '-' | '_' => Some(c),
+                        ' ' => Some('-'),
+                        _ => None,
+                    })
+                    .collect();
+                anchors.insert(slug);
+            }
+        }
+        anchors
+    }
+
+    fn extract_markdown_link_targets(md: &str) -> Vec<String> {
+        let mut targets = Vec::new();
+        let mut fence_len: Option<usize> = None;
+        for line in md.lines() {
+            let trimmed = line.trim_start();
+            let ticks = trimmed.bytes().take_while(|&b| b == b'`').count();
+            if ticks >= 3 {
+                match fence_len {
+                    None => {
+                        fence_len = Some(ticks);
+                        continue;
+                    }
+                    Some(open) if ticks >= open && trimmed[ticks..].trim().is_empty() => {
+                        fence_len = None;
+                        continue;
+                    }
+                    Some(_) => continue,
+                }
+            }
+            if fence_len.is_some() {
+                continue;
+            }
+            let bytes = line.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b']' && bytes.get(i + 1) == Some(&b'(') {
+                    let start = i + 2;
+                    let mut depth = 1usize;
+                    let mut j = start;
+                    while j < bytes.len() && depth > 0 {
+                        match bytes[j] {
+                            b'(' => depth += 1,
+                            b')' => depth -= 1,
+                            _ => {}
+                        }
+                        if depth > 0 {
+                            j += 1;
+                        }
+                    }
+                    if depth == 0 && j > start {
+                        let target = line[start..j]
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("")
+                            .trim_matches(|c| c == '<' || c == '>');
+                        if !target.is_empty() {
+                            targets.push(target.to_string());
+                        }
+                    }
+                    i = j + 1;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        targets
+    }
+
+    let readme_anchors = extract_markdown_anchors(&readme);
+    let full_anchors = extract_markdown_anchors(&readme_full);
+    let mut readme_full_anchor_links = 0usize;
+    let mut full_internal_anchor_links = 0usize;
+    let mut relative_file_links = 0usize;
+
+    for (doc_name, doc_text, self_anchors) in [
+        ("README.md", &readme, &readme_anchors),
+        ("README-FULL.md", &readme_full, &full_anchors),
+    ] {
+        for target in extract_markdown_link_targets(doc_text) {
+            if target.starts_with("http://")
+                || target.starts_with("https://")
+                || target.starts_with("mailto:")
+            {
+                continue;
+            }
+            if let Some(anchor) = target.strip_prefix('#') {
+                assert!(
+                    self_anchors.contains(anchor),
+                    "{doc_name} links to missing internal anchor: #{anchor}"
+                );
+                if doc_name == "README-FULL.md" {
+                    full_internal_anchor_links += 1;
+                }
+                continue;
+            }
+            let (rel_path, opt_anchor) = match target.split_once('#') {
+                Some((path, anchor)) => (path, Some(anchor)),
+                None => (target.as_str(), None),
+            };
+            assert!(
+                manifest_dir.join(rel_path).exists(),
+                "{doc_name} links to missing relative path: {rel_path}"
+            );
+            relative_file_links += 1;
+            if let Some(anchor) = opt_anchor {
+                let target_anchors = if rel_path == "README-FULL.md" {
+                    readme_full_anchor_links += 1;
+                    &full_anchors
+                } else if rel_path == "README.md" {
+                    &readme_anchors
+                } else {
+                    continue;
+                };
+                assert!(
+                    target_anchors.contains(anchor),
+                    "{doc_name} links to missing anchor {rel_path}#{anchor}"
+                );
+            }
+        }
+    }
+    assert!(
+        readme_full_anchor_links >= 10,
+        "README.md should link to README-FULL.md sections (found {readme_full_anchor_links})"
+    );
+    assert!(
+        full_internal_anchor_links >= 10,
+        "README-FULL.md Contents should link to internal sections (found {full_internal_anchor_links})"
+    );
+    assert!(
+        relative_file_links >= 8,
+        "README docs should contain verified relative file links (found {relative_file_links})"
+    );
+
+    // README-FULL.md must stay in sync with v5-meta, env overrides, batch/search flags, and JSON schemas.
     for required in [
         "v5-meta",
         "WICK_CEF_RENDERER",
@@ -595,6 +734,14 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "--mode",
         "exact",
         "semantic",
+        "FetchOutput",
+        "BatchItemResult",
+        "StagedAssetOutput",
+        "ResourceDescriptor",
+        "SearchResponse",
+        "StatusJson",
+        "CrawlResult",
+        "MapResult",
     ] {
         assert!(
             readme_full.contains(required),

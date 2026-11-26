@@ -7,9 +7,9 @@ metadata:
   scope: user
 ---
 
-# `mesh-wick` (`wick`)
+# MeSH-wick (`wick`)
 
-Local, MIT-licensed, zero-telemetry web acquisition and search CLI built from `~/apps/mesh-wick`.
+Local, MIT-licensed, zero-telemetry web acquisition and search CLI by Memory Sync Hub LLC, built from `~/apps/mesh-wick`.
 
 ## Identity and Version Contract
 

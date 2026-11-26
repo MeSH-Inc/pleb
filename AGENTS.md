@@ -1,6 +1,6 @@
-# Repository Agent Rules (`mesh-wick`)
+# Repository Agent Rules (MeSH-wick)
 
-`mesh-wick` (`wick`) is a solo-owned, greenfield Rust + C/Objective-C CLI providing local, zero-telemetry web acquisition and search for AI agents.
+MeSH-wick (Cargo crate `mesh-wick`, binary `wick`, by Memory Sync Hub LLC) is a solo-owned, greenfield Rust + C/Objective-C CLI providing local, zero-telemetry web acquisition and search for AI agents.
 
 ## Git Flow and Host Binary Sync
 

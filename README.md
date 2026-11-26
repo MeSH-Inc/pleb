@@ -1,6 +1,6 @@
-# mesh-wick
+# MeSH-wick
 
-`mesh-wick` provides the `wick` command-line tool for local web fetching, web search, site crawling, and URL mapping. It is a zero-telemetry fork of [wickproject/wick](https://github.com/wickproject/wick) intended for AI agents and scripts that need clean, compact page text instead of raw HTML.
+MeSH-wick, developed by Memory Sync Hub LLC, provides the `wick` command-line tool for local web fetching, web search, site crawling, and URL mapping. It is a zero-telemetry fork of [wickproject/wick](https://github.com/wickproject/wick) intended for AI agents and scripts that need clean, compact page text instead of raw HTML.
 
 By default, `wick` makes HTTP requests using Chrome's network stack (Cronet) or a `reqwest` fallback, strips page chrome into compact Markdown or plain text in a single DOM pass, and optionally escalates JavaScript-heavy or blocked pages to a local offscreen Chromium (CEF) renderer.
 
@@ -78,11 +78,12 @@ Complete documentation lives in [README-FULL.md](README-FULL.md):
 - [Resource Indexing and Staging](README-FULL.md#resource-indexing-and-staging) — zero-fetch resource cues, `--resources`, `--stage`, and local artifact validation
 - [Search and Credentials](README-FULL.md#search-and-credentials) — provider routing, federation, cooldowns, and `wick auth`
 - [Crawl and Map](README-FULL.md#crawl-and-map) — bounded wave crawling and sitemap discovery
-- [Command Reference](README-FULL.md#command-reference) — global flags, subcommand options, and output schemas
+- [Command Reference](README-FULL.md#command-reference) — global flags, subcommand options, and output formats
 - [Configuration and State Layout](README-FULL.md#configuration-and-state-layout) — environment variables, state files, and `site-rules.json`
-- [Exit Codes and Error Envelopes](README-FULL.md#exit-codes-and-error-envelopes) — exit codes `0` through `5` and JSON error format
+- [Exit Codes and Error Envelopes](README-FULL.md#exit-codes-and-error-envelopes) — exit codes `0` through `5`, `130`, and JSON error format
+- [JSON Output Schemas](README-FULL.md#json-output-schemas) — exact field contracts for `--json` and `--jsonl` outputs
 - [Testing and Design Documents](README-FULL.md#testing-and-design-documents) — test commands, corpus evaluation, hermetic isolation, and specs in `docs/`
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — Copyright (c) 2026 Memory Sync Hub LLC (forked from [wickproject/wick](https://github.com/wickproject/wick)). See [LICENSE](LICENSE).

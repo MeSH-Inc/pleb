@@ -1,6 +1,6 @@
-# mesh-wick — Full Documentation
+# MeSH-wick — Full Documentation
 
-`mesh-wick` is a local, zero-telemetry web acquisition and search CLI (`wick`) and Rust library (`mesh_wick`) for AI agents, forked from [wickproject/wick](https://github.com/wickproject/wick). For a short overview and quick start, see [README.md](README.md).
+MeSH-wick, maintained by Memory Sync Hub LLC, is a local, zero-telemetry web acquisition and search CLI (`wick`) and Rust library (`mesh_wick`, Cargo package `mesh-wick`) for AI agents, forked from [wickproject/wick](https://github.com/wickproject/wick). For a short overview and quick start, see [README.md](README.md).
 
 ## Contents
 
@@ -15,6 +15,7 @@
 - [Command Reference](#command-reference)
 - [Configuration and State Layout](#configuration-and-state-layout)
 - [Exit Codes and Error Envelopes](#exit-codes-and-error-envelopes)
+- [JSON Output Schemas](#json-output-schemas)
 - [Testing and Design Documents](#testing-and-design-documents)
 - [License](#license)
 
@@ -22,7 +23,7 @@
 
 ## Overview and Design Boundaries
 
-`mesh-wick` acquires public web documents over browser-grade network and offscreen-rendering transports and emits compact, structurally faithful Markdown, plain text, HTML, or raw bytes with deterministic metadata and exit codes.
+MeSH-wick acquires public web documents over browser-grade network and offscreen-rendering transports and emits compact, structurally faithful Markdown, plain text, HTML, or raw bytes with deterministic metadata and exit codes.
 
 Key capabilities beyond upstream `wickproject/wick`:
 
@@ -35,7 +36,7 @@ Key capabilities beyond upstream `wickproject/wick`:
 
 ### Behavioral Boundaries
 
-`mesh-wick` does not solve CAPTCHAs, click challenge widgets, or inject anti-bot evasion scripts. When an origin returns an active bot challenge, `wick` classifies it immediately into a challenge error (exit code `2`) without issuing duplicate CEF retries.
+MeSH-wick does not solve CAPTCHAs, click challenge widgets, or inject anti-bot evasion scripts. When an origin returns an active bot challenge, `wick` classifies it immediately into a challenge error (exit code `2`) without issuing duplicate CEF retries.
 
 ---
 
@@ -568,6 +569,82 @@ When `--json` or `--jsonl` is passed, CLI errors are emitted on `stderr` as a si
 
 ---
 
+## JSON Output Schemas
+
+All `--json` and `--jsonl` payloads serialize directly from MeSH-wick's Rust output structs (`src/fetch.rs`, `src/extract/resources.rs`, `src/search/mod.rs`, `src/crawl.rs`, and `src/main.rs`).
+
+### `FetchOutput` and `FetchMetadataOutput` (`wick fetch --json`)
+
+| Field | Type | Notes |
+| :--- | :--- | :--- |
+| `url` | `string` | Requested URL |
+| `final_url` | `string` | Post-rewrite / post-redirect final URL |
+| `status_code` | `number` | HTTP status code (`u16`) |
+| `content_type` | `string \| null` | Response `Content-Type` header if present |
+| `title` | `string \| null` | Extracted document title if present |
+| `content` | `string` | Extracted Markdown, text, or HTML (**omitted** with `--metadata-only`) |
+| `content_bytes` | `number` | Byte length of `content` (still populated with `--metadata-only`) |
+| `strategy` | `string` | Acquisition strategy (`cronet`, `reqwest`, `cef`, `raw_source`, `markdown_mirror`, `markdown_negotiated`) |
+| `escalated` | `boolean` | `true` when transport escalated from primary HTTP to CEF |
+| `truncated` | `boolean` | `true` when `--max-bytes` truncated output |
+| `timing_ms` | `number` | End-to-end fetch duration in milliseconds |
+| `resources` | `ResourceDescriptor[]` | Indexed linked resources (**omitted** when empty) |
+
+### `BatchItemResult` (`wick fetch --jsonl` and multi-URL `wick fetch --json`)
+
+Multi-URL and `stdin` (`-`) fetches emit an array (`--json`) or newline-delimited stream (`--jsonl`) of untagged `BatchItemResult` objects discriminated by `ok`:
+
+- **Success (`ok: true`)**: `url`, `ok`, `final_url`, `status_code`, `content_type`, `title`, `strategy`, `escalated`, `truncated`, `timing_ms`, `content_bytes`, plus `content` (omitted with `--metadata-only`) and `resources` (omitted when empty).
+- **Failure (`ok: false`)**: `url`, `ok`, `error`, `kind`, `exit_code`.
+
+### `StagedAssetOutput` (`wick fetch --stage --json`)
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `url`, `final_url` | `string` | Requested and final asset URLs |
+| `status_code` | `number` | HTTP status code |
+| `content_type` | `string \| null` | Resolved MIME type (magic-byte verified) |
+| `byte_count` | `number` | Staged file size in bytes |
+| `staged_path` | `string` | Absolute path under `<state_dir>/artifacts/` |
+| `timing_ms` | `number` | Fetch and stage duration in milliseconds |
+
+### `ResourceDescriptor` (entries in `resources`)
+
+| Field | Type | Notes |
+| :--- | :--- | :--- |
+| `identifier` | `string` | Stable per-page resource ID (e.g., `r1`, `r2`) |
+| `kind` | `string` | `diagram`, `image`, `transcript`, `document`, `dataset`, or `schema` |
+| `url` | `string` | Resolved resource URL |
+| `salience` | `string` | `high` or `medium` |
+| `mime_hint`, `section_heading`, `label` | `string` | Optional context metadata (omitted when absent) |
+| `dimensions` | `[number, number]` | Optional `[width, height]` pixels (omitted when absent) |
+| `staged_path`, `byte_count`, `content_type` | `string` / `number` | Populated after staging (omitted when not staged) |
+
+### `SearchResponse` and `SearchResult` (`wick search --json`)
+
+- **`SearchResponse`**: `provider` (`string`), `providers_used` (`string[]`, omitted when empty), `results` (`SearchResult[]`).
+- **`SearchResult`**: `title` (`string`), `url` (`string`), `snippet` (`string`), `extra_snippets` (`string[]`, omitted when empty).
+
+### `StatusJson`, `DaemonStatusJson`, and `SearchProviderStatus`
+
+- **`wick status --json`** (`StatusJson`): `version` (`string`), `cronet_enabled` (`boolean`), `cef_renderer` (`{ status, path, found_protocol, expected_protocol }`), `daemon` (`DaemonStatusJson`), `state_dir` (`string`), `search_providers` (map of provider name to `SearchProviderStatus`).
+- **`wick daemon status --json`** (`DaemonStatusJson`): `supported` (`boolean`), `running` (`boolean`), `pid` (`number | null`), `protocol_version` (`number | null`), `build_id` (`string | null`), `active_requests` (`number`), `cronet_slots` (`number`), `cef_renderers_alive` (`number`).
+- **`wick auth status --json`** (map of provider name to `SearchProviderStatus`): `configured` (`boolean`), `source` (`"environment" | "keychain" | "file" | null`), `cooldown_remaining_secs` (`number`), `month_requests` (`number`), `last_error_status` (`number | null`).
+
+### `CrawlResult`, `MapResult`, and Control Commands
+
+| Command (`--json`) | Schema Fields |
+| :--- | :--- |
+| `wick crawl` (`CrawlResult`) | `pages` (`[{ url, title, content, depth }]`), `urls_discovered`, `timing_ms` |
+| `wick map` (`MapResult`) | `urls` (`string[]`), `timing_ms`, `from_sitemap` |
+| `wick auth set` | `provider`, `stored`, `source` |
+| `wick auth remove` | `provider`, `removed`, `removed_from`, `env_var_still_set` |
+| `wick daemon stop` | `stopped` |
+| `wick session clear` | `cleared`, `state_dir` |
+| `wick skill print` | `name`, `version`, `content` |
+
+---
+
 ## Testing and Design Documents
 
 ### Verification Commands
@@ -598,4 +675,4 @@ cargo test --test cef_protocol_tests -- --ignored  # opt-in live v5-meta CEF smo
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — Copyright (c) 2026 Memory Sync Hub LLC (forked from [wickproject/wick](https://github.com/wickproject/wick)). See [LICENSE](LICENSE).
