@@ -1,10 +1,8 @@
 pub mod robots;
 
-use anyhow::bail;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,28 +12,14 @@ const BUNDLED_RULES: &str = include_str!("../../data/site-rules.json");
 const STRATEGY_TTL_SECS: u64 = 7 * 24 * 3600;
 const TIMEOUT_TTL_SECS: u64 = 24 * 3600;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum RenderMode {
     #[default]
     Auto,
+    #[value(aliases = ["browser", "render", "js"])]
     Cef,
+    #[value(aliases = ["network", "fast", "no-js", "nojs"])]
     Cronet,
-}
-
-impl FromStr for RenderMode {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> anyhow::Result<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "auto" => Ok(Self::Auto),
-            "cef" | "browser" | "render" | "js" => Ok(Self::Cef),
-            "cronet" | "network" | "fast" | "no-js" | "nojs" => Ok(Self::Cronet),
-            other => bail!(
-                "invalid render mode {:?} (expected auto, cef, or cronet)",
-                other
-            ),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

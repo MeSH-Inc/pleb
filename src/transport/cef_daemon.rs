@@ -376,7 +376,7 @@ fn spawn_detached_daemon(state_dir: &Path, idle_timeout: Duration, verbose: bool
         .arg(state_dir)
         .arg("daemon")
         .arg("run")
-        .arg("--idle-secs")
+        .arg("--idle-timeout")
         .arg(&idle_secs)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

@@ -1,7 +1,6 @@
 use anyhow::{bail, Result};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
-use std::str::FromStr;
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -9,28 +8,21 @@ use crate::context::RuntimeContext;
 
 const BRAVE_SEARCH_ENDPOINT: &str = "https://api.search.brave.com/res/v1/web/search";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum SearchProvider {
     #[default]
     Auto,
     Brave,
+    #[value(name = "duckduckgo", alias = "ddg")]
     DuckDuckGo,
 }
 
-impl FromStr for SearchProvider {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "auto" => Ok(Self::Auto),
-            "brave" => Ok(Self::Brave),
-            "ddg" | "duckduckgo" => Ok(Self::DuckDuckGo),
-            other => bail!(
-                "invalid search provider {:?} (expected auto, brave, or ddg)",
-                other
-            ),
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Freshness {
+    Day,
+    Week,
+    Month,
+    Year,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

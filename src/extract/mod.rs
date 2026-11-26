@@ -6,58 +6,26 @@ pub use dom::ParsedHtml;
 pub use markdown::truncate_markdown;
 
 use anyhow::{bail, Result};
-use std::str::FromStr;
 
 pub(crate) const TRUNCATED_SUFFIX: &str = "\n\n[... truncated]";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum OutputFormat {
     #[default]
+    #[value(alias = "md")]
     Markdown,
     Html,
+    #[value(alias = "txt")]
     Text,
     Raw,
 }
 
-impl FromStr for OutputFormat {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "markdown" | "md" => Ok(Self::Markdown),
-            "html" => Ok(Self::Html),
-            "text" | "txt" => Ok(Self::Text),
-            "raw" => Ok(Self::Raw),
-            other => bail!(
-                "invalid output format {:?} (expected markdown, html, text, or raw)",
-                other
-            ),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum ExtractMode {
     #[default]
     Clean,
     Article,
     Full,
-}
-
-impl FromStr for ExtractMode {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "clean" => Ok(Self::Clean),
-            "article" => Ok(Self::Article),
-            "full" => Ok(Self::Full),
-            other => bail!(
-                "invalid extract mode {:?} (expected clean, article, or full)",
-                other
-            ),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

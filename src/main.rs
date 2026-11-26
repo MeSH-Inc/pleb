@@ -1,16 +1,17 @@
-use anyhow::Result;
 use clap::{Parser, Subcommand};
 use mesh_wick::context::{clear_state_dir, default_state_dir, RuntimeConfig, RuntimeContext};
-use mesh_wick::extract::{ExtractMode, ExtractOptions, OutputFormat};
-use mesh_wick::fetch::{self, FetchError, FetchOptions};
+use mesh_wick::crawl;
+use mesh_wick::extract::{ExtractMode, OutputFormat};
+use mesh_wick::fetch::{self, FetchError, FetchOptions, FetchOutput};
 use mesh_wick::policy::RenderMode;
 use mesh_wick::search::{self, SearchProvider};
-use mesh_wick::transport::cef;
+use mesh_wick::transport::cef::{self, RendererProbe};
 #[cfg(unix)]
 use mesh_wick::transport::cef_daemon;
-use mesh_wick::crawl;
+use serde::Serialize;
+use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::str::FromStr;
+use std::process::ExitCode;
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -20,7 +21,7 @@ use std::time::Duration;
     about = "Local browser-grade web fetch and search CLI for AI agents"
 )]
 struct Cli {
-    /// SOCKS5 proxy (e.g., socks5://localhost:1080). Also reads MESH_WICK_PROXY or WICK_PROXY.
+    /// SOCKS5/HTTP proxy URL (e.g., socks5://localhost:1080)
     #[arg(long, global = true, env = "MESH_WICK_PROXY")]
     proxy: Option<String>,
 
@@ -36,13 +37,18 @@ struct Cli {
     #[arg(long, global = true, env = "MESH_WICK_HOME")]
     state_dir: Option<PathBuf>,
 
-    /// Disable persistent background CEF daemon sharing for this command
-    #[arg(long, global = true, env = "MESH_WICK_NO_CEF_DAEMON")]
-    no_cef_daemon: bool,
+    /// Disable persistent background daemon sharing for this command
+    #[arg(long, global = true, env = "MESH_WICK_NO_DAEMON")]
+    no_daemon: bool,
 
-    /// Idle timeout in seconds for the auto-spawned CEF daemon
-    #[arg(long, global = true, env = "MESH_WICK_CEF_IDLE_SECS", default_value = "300")]
-    cef_idle_timeout: u64,
+    /// Idle timeout in seconds for the auto-spawned background daemon
+    #[arg(
+        long,
+        global = true,
+        env = "MESH_WICK_DAEMON_IDLE_SECONDS",
+        default_value = "300"
+    )]
+    daemon_idle_timeout: u64,
 
     /// Enable verbose diagnostic logging to stderr
     #[arg(short, long, global = true)]
@@ -51,6 +57,10 @@ struct Cli {
     /// Suppress non-error status metadata lines on stderr
     #[arg(short, long, global = true)]
     quiet: bool,
+
+    /// Emit structured JSON output on stdout and JSON error envelopes on stderr
+    #[arg(long, global = true)]
+    json: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -62,15 +72,15 @@ enum Command {
     Fetch {
         /// Target URL (http or https)
         url: String,
-        /// Output format: markdown (default), html, text, or raw
-        #[arg(long, default_value = "markdown")]
-        format: String,
-        /// Content extraction scope: clean (default), article, or full
-        #[arg(long, default_value = "clean")]
-        extract: String,
-        /// Transport mode: auto (default), cef, or cronet
-        #[arg(long, default_value = "auto")]
-        render: String,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = OutputFormat::Markdown, ignore_case = true)]
+        format: OutputFormat,
+        /// Content extraction scope
+        #[arg(long, value_enum, default_value_t = ExtractMode::Clean, ignore_case = true)]
+        extract: ExtractMode,
+        /// Transport mode
+        #[arg(long, value_enum, default_value_t = RenderMode::Auto, ignore_case = true)]
+        render: RenderMode,
         /// CSS selector to wait for when CEF renders
         #[arg(long)]
         wait_for_selector: Option<String>,
@@ -89,26 +99,23 @@ enum Command {
         /// Truncate extracted content to at most N bytes
         #[arg(long)]
         max_bytes: Option<usize>,
-        /// Emit structured JSON output
-        #[arg(long)]
-        json: bool,
         /// With --json, omit the content field and emit metadata only
-        #[arg(long)]
-        meta_only: bool,
+        #[arg(long, requires = "json")]
+        metadata_only: bool,
+        /// Write output to file path instead of stdout (created only after fetch succeeds)
+        #[arg(short = 'o', long, conflicts_with = "metadata_only")]
+        output: Option<PathBuf>,
     },
     /// Search the web and print results
     Search {
         /// Search query
         query: String,
         /// Maximum number of results (1-20)
-        #[arg(short, long, default_value = "8")]
-        num: usize,
-        /// Provider: auto (Brave when BRAVE_API_KEY is set, else DuckDuckGo), brave, or ddg
-        #[arg(long, default_value = "auto")]
-        provider: String,
-        /// Emit structured JSON output
-        #[arg(long)]
-        json: bool,
+        #[arg(short = 'n', long = "limit", default_value = "8")]
+        limit: usize,
+        /// Search provider
+        #[arg(long, value_enum, default_value_t = SearchProvider::Auto, ignore_case = true)]
+        provider: SearchProvider,
     },
     /// Crawl a website starting from a URL
     Crawl {
@@ -120,18 +127,15 @@ enum Command {
         /// Maximum pages to fetch (max 50)
         #[arg(short = 'n', long, default_value = "10")]
         max_pages: u32,
-        /// Content extraction scope: clean (default), article, or full
-        #[arg(long, default_value = "clean")]
-        extract: String,
+        /// Content extraction scope
+        #[arg(long, value_enum, default_value_t = ExtractMode::Clean, ignore_case = true)]
+        extract: ExtractMode,
         /// Only follow URLs whose path starts with this prefix
         #[arg(long)]
         path_filter: Option<String>,
         /// Ignore robots.txt restrictions during crawl
         #[arg(long)]
         no_robots: bool,
-        /// Emit structured JSON output
-        #[arg(long)]
-        json: bool,
     },
     /// Discover URLs on a website via sitemap and links
     Map {
@@ -149,9 +153,6 @@ enum Command {
         /// Ignore robots.txt restrictions during discovery
         #[arg(long)]
         no_robots: bool,
-        /// Emit structured JSON output
-        #[arg(long)]
-        json: bool,
     },
     /// Manage persistent background CEF renderer daemon
     Daemon {
@@ -173,7 +174,7 @@ enum DaemonAction {
     Run {
         /// Exit after this many seconds with no render requests
         #[arg(long, default_value = "300")]
-        idle_secs: u64,
+        idle_timeout: u64,
     },
     /// Show background CEF daemon status
     Status,
@@ -187,64 +188,198 @@ enum SessionAction {
     Clear,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
-    init_tracing(cli.verbose);
+#[derive(Debug)]
+struct CliError {
+    message: String,
+    kind: &'static str,
+    exit_code: u8,
+}
 
-    let proxy = cli
-        .proxy
-        .or_else(|| std::env::var("WICK_PROXY").ok().filter(|s| !s.trim().is_empty()));
+impl CliError {
+    fn invalid_input(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: "invalid_input",
+            exit_code: 1,
+        }
+    }
+
+    fn from_fetch(err: FetchError) -> Self {
+        Self {
+            kind: err.kind(),
+            exit_code: err.exit_code().clamp(1, 255) as u8,
+            message: err.to_string(),
+        }
+    }
+
+    fn runtime(kind: &'static str, err: impl std::fmt::Display) -> Self {
+        Self {
+            message: err.to_string(),
+            kind,
+            exit_code: 1,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct FetchMetadataOutput<'a> {
+    url: &'a str,
+    final_url: &'a str,
+    status_code: u16,
+    content_type: Option<&'a str>,
+    title: Option<&'a str>,
+    strategy: &'a str,
+    escalated: bool,
+    truncated: bool,
+    timing_ms: u64,
+    content_bytes: usize,
+}
+
+impl<'a> From<&'a FetchOutput> for FetchMetadataOutput<'a> {
+    fn from(res: &'a FetchOutput) -> Self {
+        Self {
+            url: &res.url,
+            final_url: &res.final_url,
+            status_code: res.status_code,
+            content_type: res.content_type.as_deref(),
+            title: res.title.as_deref(),
+            strategy: &res.strategy,
+            escalated: res.escalated,
+            truncated: res.truncated,
+            timing_ms: res.timing_ms,
+            content_bytes: res.content_bytes,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct RendererStatusJson {
+    status: &'static str,
+    path: Option<String>,
+    found_protocol: Option<String>,
+    expected_protocol: &'static str,
+}
+
+#[derive(Serialize)]
+struct DaemonStatusJson {
+    supported: bool,
+    running: bool,
+    pid: Option<u32>,
+    renderer_alive: bool,
+}
+
+#[derive(Serialize)]
+struct StatusJson {
+    version: &'static str,
+    cronet_enabled: bool,
+    cef_renderer: RendererStatusJson,
+    cef_daemon: DaemonStatusJson,
+    state_dir: String,
+    brave_api_key_configured: bool,
+}
+
+fn main() -> ExitCode {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            if err.use_stderr() && std::env::args_os().any(|a| a == "--json") {
+                let cli_err = CliError::invalid_input(err.to_string().trim_end());
+                emit_cli_error(&cli_err, true);
+                return ExitCode::from(cli_err.exit_code);
+            }
+            err.exit();
+        }
+    };
+
+    init_tracing(cli.verbose);
+    let json_mode = cli.json;
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(err) => {
+            let cli_err = CliError::runtime("runtime_error", err);
+            emit_cli_error(&cli_err, json_mode);
+            return ExitCode::from(cli_err.exit_code);
+        }
+    };
+
+    match runtime.block_on(run(cli)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            drop(runtime);
+            emit_cli_error(&err, json_mode);
+            ExitCode::from(err.exit_code)
+        }
+    }
+}
+
+async fn run(cli: Cli) -> Result<(), CliError> {
     let state_dir = cli.state_dir.unwrap_or_else(default_state_dir);
+    let json = cli.json;
+    let quiet = cli.quiet;
 
     let config = RuntimeConfig {
-        state_dir,
-        proxy,
+        state_dir: state_dir.clone(),
+        proxy: cli.proxy.filter(|s| !s.trim().is_empty()),
         timeout: Duration::from_secs(cli.timeout.max(1)),
         cef_timeout: Duration::from_secs(cli.cef_timeout.max(1)),
-        cef_idle_timeout: Duration::from_secs(cli.cef_idle_timeout.max(1)),
-        cef_daemon: !cli.no_cef_daemon,
+        cef_idle_timeout: Duration::from_secs(cli.daemon_idle_timeout.max(1)),
+        cef_daemon: !cli.no_daemon,
         verbose: cli.verbose,
     };
 
     match cli.command {
         Command::Daemon { action } => match action {
-            DaemonAction::Run { idle_secs } => {
+            DaemonAction::Run { idle_timeout } => {
                 #[cfg(unix)]
                 {
-                    let idle = Duration::from_secs(idle_secs.max(1));
-                    cef_daemon::run_daemon(config.state_dir, idle, cli.verbose).await
+                    let idle = Duration::from_secs(idle_timeout.max(1));
+                    cef_daemon::run_daemon(config.state_dir, idle, config.verbose)
+                        .await
+                        .map_err(|e| CliError::runtime("daemon_error", e))?;
+                    Ok(())
                 }
                 #[cfg(not(unix))]
                 {
-                    let _ = idle_secs;
-                    anyhow::bail!("CEF daemon mode is only supported on Unix systems")
+                    let _ = idle_timeout;
+                    Err(CliError::invalid_input(
+                        "CEF daemon mode is only supported on Unix systems",
+                    ))
                 }
             }
             DaemonAction::Status => {
-                #[cfg(unix)]
-                {
-                    match cef_daemon::daemon_ping(&config.state_dir).await {
-                        Some(st) => println!(
-                            "CEF daemon: running (pid {}, renderer {})",
-                            st.pid,
-                            if st.renderer_alive { "warm" } else { "idle" }
-                        ),
-                        None => println!("CEF daemon: stopped"),
-                    }
-                    Ok(())
-                }
-                #[cfg(not(unix))]
-                {
+                let status = daemon_status_json(&config.state_dir).await;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&status)
+                            .map_err(|e| CliError::runtime("serialization_error", e))?
+                    );
+                } else if !status.supported {
                     println!("CEF daemon: unsupported on this OS");
-                    Ok(())
+                } else if status.running {
+                    println!(
+                        "CEF daemon: running (pid {}, renderer {})",
+                        status.pid.unwrap_or(0),
+                        if status.renderer_alive { "warm" } else { "idle" }
+                    );
+                } else {
+                    println!("CEF daemon: stopped");
                 }
+                Ok(())
             }
             DaemonAction::Stop => {
                 #[cfg(unix)]
                 {
-                    let stopped = cef_daemon::daemon_stop(&config.state_dir).await?;
-                    if !cli.quiet {
+                    let stopped = cef_daemon::daemon_stop(&config.state_dir)
+                        .await
+                        .map_err(|e| CliError::runtime("daemon_error", e))?;
+                    if json {
+                        println!("{}", serde_json::json!({ "stopped": stopped }));
+                    } else if !quiet {
                         if stopped {
                             println!("Stopped CEF daemon");
                         } else {
@@ -255,7 +390,9 @@ async fn main() -> Result<()> {
                 }
                 #[cfg(not(unix))]
                 {
-                    anyhow::bail!("CEF daemon mode is only supported on Unix systems")
+                    Err(CliError::invalid_input(
+                        "CEF daemon mode is only supported on Unix systems",
+                    ))
                 }
             }
         },
@@ -263,60 +400,118 @@ async fn main() -> Result<()> {
             SessionAction::Clear => {
                 #[cfg(unix)]
                 let _ = cef_daemon::daemon_stop(&config.state_dir).await;
-                clear_state_dir(&config.state_dir)?;
-                if !cli.quiet {
+                clear_state_dir(&config.state_dir)
+                    .map_err(|e| CliError::runtime("session_error", e))?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "cleared": true,
+                            "state_dir": config.state_dir.display().to_string(),
+                        })
+                    );
+                } else if !quiet {
                     eprintln!("Cleared session state at {}", config.state_dir.display());
                 }
                 Ok(())
             }
         },
         Command::Status => {
-            println!("wick {} (mesh-wick)", env!("CARGO_PKG_VERSION"));
-            println!(
-                "Cronet: {}",
-                if cfg!(feature = "cronet") {
-                    "enabled"
-                } else {
-                    "disabled (reqwest fallback)"
-                }
-            );
-            match cef::probe_renderer_in(&config.state_dir) {
-                cef::RendererProbe::Ready(path) => println!(
-                    "CEF renderer: installed ({}, protocol {})",
-                    path.display(),
-                    cef::EXPECTED_PROTOCOL
-                ),
-                cef::RendererProbe::ProtocolMismatch {
+            let probe = cef::probe_renderer_in(&config.state_dir);
+            let renderer_json = match &probe {
+                RendererProbe::Ready(path) => RendererStatusJson {
+                    status: "ready",
+                    path: Some(path.display().to_string()),
+                    found_protocol: Some(cef::EXPECTED_PROTOCOL.to_string()),
+                    expected_protocol: cef::EXPECTED_PROTOCOL,
+                },
+                RendererProbe::ProtocolMismatch {
                     path,
                     found,
                     expected,
-                } => println!(
-                    "CEF renderer: protocol mismatch at {} (found {}, expected {}; rebuild with: {})",
-                    path.display(),
-                    found.as_deref().unwrap_or("none"),
-                    expected,
-                    cef::rebuild_command_hint()
-                ),
-                cef::RendererProbe::NotInstalled => println!("CEF renderer: not installed"),
-            }
-            #[cfg(unix)]
-            match cef_daemon::daemon_ping(&config.state_dir).await {
-                Some(st) => println!(
-                    "CEF daemon: running (pid {}, renderer {})",
-                    st.pid,
-                    if st.renderer_alive { "warm" } else { "idle" }
-                ),
-                None => println!("CEF daemon: stopped"),
-            }
-            println!("State dir: {}", config.state_dir.display());
-            println!(
-                "Brave Search API key: {}",
-                if search::brave_api_key_configured() {
-                    "configured"
-                } else {
-                    "unset"
+                } => RendererStatusJson {
+                    status: "protocol_mismatch",
+                    path: Some(path.display().to_string()),
+                    found_protocol: found.clone(),
+                    expected_protocol: expected,
+                },
+                RendererProbe::NotInstalled => RendererStatusJson {
+                    status: "not_installed",
+                    path: None,
+                    found_protocol: None,
+                    expected_protocol: cef::EXPECTED_PROTOCOL,
+                },
+            };
+            let daemon_json = daemon_status_json(&config.state_dir).await;
+
+            if json {
+                let payload = StatusJson {
+                    version: env!("CARGO_PKG_VERSION"),
+                    cronet_enabled: cfg!(feature = "cronet"),
+                    cef_renderer: renderer_json,
+                    cef_daemon: daemon_json,
+                    state_dir: config.state_dir.display().to_string(),
+                    brave_api_key_configured: search::brave_api_key_configured(),
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string(&payload)
+                        .map_err(|e| CliError::runtime("serialization_error", e))?
+                );
+            } else {
+                println!("wick {} (mesh-wick)", env!("CARGO_PKG_VERSION"));
+                println!(
+                    "Cronet: {}",
+                    if cfg!(feature = "cronet") {
+                        "enabled"
+                    } else {
+                        "disabled (reqwest fallback)"
+                    }
+                );
+                match probe {
+                    RendererProbe::Ready(path) => println!(
+                        "CEF renderer: installed ({}, protocol {})",
+                        path.display(),
+                        cef::EXPECTED_PROTOCOL
+                    ),
+                    RendererProbe::ProtocolMismatch {
+                        path,
+                        found,
+                        expected,
+                    } => println!(
+                        "CEF renderer: protocol mismatch at {} (found {}, expected {}; rebuild with: {})",
+                        path.display(),
+                        found.as_deref().unwrap_or("none"),
+                        expected,
+                        cef::rebuild_command_hint()
+                    ),
+                    RendererProbe::NotInstalled => println!("CEF renderer: not installed"),
                 }
-            );
+                if daemon_json.supported {
+                    if daemon_json.running {
+                        println!(
+                            "CEF daemon: running (pid {}, renderer {})",
+                            daemon_json.pid.unwrap_or(0),
+                            if daemon_json.renderer_alive {
+                                "warm"
+                            } else {
+                                "idle"
+                            }
+                        );
+                    } else {
+                        println!("CEF daemon: stopped");
+                    }
+                }
+                println!("State dir: {}", config.state_dir.display());
+                println!(
+                    "Brave Search API key: {}",
+                    if search::brave_api_key_configured() {
+                        "configured"
+                    } else {
+                        "unset"
+                    }
+                );
+            }
             Ok(())
         }
         Command::Fetch {
@@ -330,112 +525,115 @@ async fn main() -> Result<()> {
             no_images,
             no_links,
             max_bytes,
-            json,
-            meta_only,
+            metadata_only,
+            output,
         } => {
-            let ctx = RuntimeContext::new(config)?;
-            let parsed_format = OutputFormat::from_str(&format)?;
-            let extract_mode = ExtractMode::from_str(&extract)?;
-            let render_mode = RenderMode::from_str(&render)?;
+            if format == OutputFormat::Raw && (json || metadata_only) {
+                return Err(CliError::invalid_input(
+                    "--format raw cannot be combined with --json or --metadata-only",
+                ));
+            }
+            if format == OutputFormat::Raw && output.is_none() && std::io::stdout().is_terminal() {
+                return Err(CliError::invalid_input(
+                    "refusing to write raw bytes to a terminal; pass --output <path> or redirect stdout",
+                ));
+            }
 
-            if parsed_format == OutputFormat::Raw {
-                use std::io::{IsTerminal, Write};
-                if std::io::stdout().is_terminal() {
-                    anyhow::bail!(
-                        "refusing to write raw bytes to a terminal; redirect stdout to a file"
+            let ctx = RuntimeContext::new(config)
+                .map_err(|e| CliError::runtime("context_error", e))?;
+
+            if format == OutputFormat::Raw {
+                let res = fetch::fetch_raw(&ctx, &url, respect_robots)
+                    .await
+                    .map_err(CliError::from_fetch)?;
+
+                if !quiet {
+                    eprintln!(
+                        "Status: {} | Time: {}ms | Bytes: {}",
+                        res.status_code,
+                        res.timing_ms,
+                        res.bytes.len()
                     );
                 }
-                match fetch::fetch_raw(&ctx, &url, respect_robots).await {
-                    Ok(res) => {
-                        if !cli.quiet {
-                            eprintln!(
-                                "Status: {} | Time: {}ms | Bytes: {}",
-                                res.status_code,
-                                res.timing_ms,
-                                res.bytes.len()
-                            );
-                        }
-                        std::io::stdout().write_all(&res.bytes)?;
-                        return Ok(());
-                    }
-                    Err(err) => emit_fetch_error_and_exit(&err, json),
+                if let Some(ref path) = output {
+                    std::fs::write(path, &res.bytes)
+                        .map_err(|e| CliError::runtime("io_error", e))?;
+                } else {
+                    use std::io::Write;
+                    std::io::stdout()
+                        .write_all(&res.bytes)
+                        .map_err(|e| CliError::runtime("io_error", e))?;
                 }
+                return Ok(());
             }
 
             let opts = FetchOptions {
-                extract: ExtractOptions {
-                    format: parsed_format,
-                    mode: extract_mode,
+                extract: mesh_wick::extract::ExtractOptions {
+                    format,
+                    mode: extract,
                     include_images: !no_images,
                     include_links: !no_links,
                     max_bytes,
                 },
-                render: render_mode,
+                render,
                 wait_for_selector,
                 respect_robots,
                 apply_rewrites: !no_rewrite,
             };
 
-            match fetch::fetch_document(&ctx, &url, &opts).await {
-                Ok(res) => {
-                    if json {
-                        let out = if meta_only {
-                            serde_json::json!({
-                                "url": res.url,
-                                "final_url": res.final_url,
-                                "status_code": res.status_code,
-                                "content_type": res.content_type,
-                                "title": res.title,
-                                "strategy": res.strategy,
-                                "escalated": res.escalated,
-                                "truncated": res.truncated,
-                                "timing_ms": res.timing_ms,
-                                "content_bytes": res.content.len(),
-                            })
-                        } else {
-                            serde_json::json!({
-                                "url": res.url,
-                                "final_url": res.final_url,
-                                "status_code": res.status_code,
-                                "content_type": res.content_type,
-                                "title": res.title,
-                                "strategy": res.strategy,
-                                "escalated": res.escalated,
-                                "truncated": res.truncated,
-                                "timing_ms": res.timing_ms,
-                                "content_bytes": res.content.len(),
-                                "content": res.content,
-                            })
-                        };
-                        println!("{}", out);
-                    } else {
-                        if !cli.quiet {
-                            if let Some(title) = &res.title {
-                                eprintln!("Title: {}", title);
-                            }
-                            eprintln!(
-                                "Status: {} | Strategy: {} | Time: {}ms\n",
-                                res.status_code, res.strategy, res.timing_ms
-                            );
-                        }
-                        print!("{}", res.content);
-                    }
-                    Ok(())
+            let res = fetch::fetch_document(&ctx, &url, &opts)
+                .await
+                .map_err(CliError::from_fetch)?;
+
+            if json {
+                let encoded = if metadata_only {
+                    serde_json::to_string(&FetchMetadataOutput::from(&res))
+                } else {
+                    serde_json::to_string(&res)
                 }
-                Err(err) => emit_fetch_error_and_exit(&err, json),
+                .map_err(|e| CliError::runtime("serialization_error", e))?;
+
+                if let Some(ref path) = output {
+                    std::fs::write(path, format!("{encoded}\n"))
+                        .map_err(|e| CliError::runtime("io_error", e))?;
+                } else {
+                    println!("{}", encoded);
+                }
+            } else {
+                if !quiet {
+                    if let Some(title) = &res.title {
+                        eprintln!("Title: {}", title);
+                    }
+                    eprintln!(
+                        "Status: {} | Strategy: {} | Time: {}ms\n",
+                        res.status_code, res.strategy, res.timing_ms
+                    );
+                }
+                if let Some(ref path) = output {
+                    std::fs::write(path, res.content.as_bytes())
+                        .map_err(|e| CliError::runtime("io_error", e))?;
+                } else {
+                    print!("{}", res.content);
+                }
             }
+            Ok(())
         }
         Command::Search {
             query,
-            num,
+            limit,
             provider,
-            json,
         } => {
-            let ctx = RuntimeContext::new(config)?;
-            let parsed_provider = SearchProvider::from_str(&provider)?;
-            let response = search::search(&ctx, &query, num, parsed_provider).await?;
+            let ctx = RuntimeContext::new(config)
+                .map_err(|e| CliError::runtime("context_error", e))?;
+            let response = search::search(&ctx, &query, limit, provider)
+                .await
+                .map_err(|e| CliError::runtime("search_error", e))?;
             if json {
-                println!("{}", serde_json::to_string(&response)?);
+                println!(
+                    "{}",
+                    serde_json::to_string(&response)
+                        .map_err(|e| CliError::runtime("serialization_error", e))?
+                );
             } else {
                 println!("{}", search::format_results(&response));
             }
@@ -448,27 +646,32 @@ async fn main() -> Result<()> {
             extract,
             path_filter,
             no_robots,
-            json,
         } => {
-            let ctx = RuntimeContext::new(config)?;
-            let extract_mode = ExtractMode::from_str(&extract)?;
+            let ctx = RuntimeContext::new(config)
+                .map_err(|e| CliError::runtime("context_error", e))?;
             let options = crawl::CrawlOptions {
                 max_depth: depth.min(5),
                 max_pages: max_pages.min(50),
                 format: OutputFormat::Markdown,
-                extract_mode,
+                extract_mode: extract,
                 respect_robots: !no_robots,
                 path_filter,
             };
-            let result = crawl::crawl(&ctx, &url, options).await?;
+            let result = crawl::crawl(&ctx, &url, options)
+                .await
+                .map_err(|e| CliError::runtime("crawl_error", e))?;
             if json {
-                println!("{}", serde_json::to_string(&result)?);
+                println!(
+                    "{}",
+                    serde_json::to_string(&result)
+                        .map_err(|e| CliError::runtime("serialization_error", e))?
+                );
             } else {
                 let host = url::Url::parse(&url)
                     .ok()
                     .and_then(|u| u.host_str().map(|s| s.to_string()))
                     .unwrap_or_else(|| url.clone());
-                if !cli.quiet {
+                if !quiet {
                     eprintln!(
                         "Crawled {} pages in {:.1}s\n",
                         result.pages.len(),
@@ -485,24 +688,30 @@ async fn main() -> Result<()> {
             no_sitemap,
             path_filter,
             no_robots,
-            json,
         } => {
-            let ctx = RuntimeContext::new(config)?;
+            let ctx = RuntimeContext::new(config)
+                .map_err(|e| CliError::runtime("context_error", e))?;
             let options = crawl::MapOptions {
                 limit: limit.min(5000),
                 use_sitemap: !no_sitemap,
                 respect_robots: !no_robots,
                 path_filter,
             };
-            let result = crawl::map(&ctx, &url, options).await?;
+            let result = crawl::map(&ctx, &url, options)
+                .await
+                .map_err(|e| CliError::runtime("map_error", e))?;
             if json {
-                println!("{}", serde_json::to_string(&result)?);
+                println!(
+                    "{}",
+                    serde_json::to_string(&result)
+                        .map_err(|e| CliError::runtime("serialization_error", e))?
+                );
             } else {
                 let host = url::Url::parse(&url)
                     .ok()
                     .and_then(|u| u.host_str().map(|s| s.to_string()))
                     .unwrap_or_else(|| url.clone());
-                if !cli.quiet {
+                if !quiet {
                     eprintln!(
                         "Found {} URLs in {:.1}s\n",
                         result.urls.len(),
@@ -512,6 +721,36 @@ async fn main() -> Result<()> {
                 print!("{}", crawl::format_map_output(&result, &host));
             }
             Ok(())
+        }
+    }
+}
+
+async fn daemon_status_json(state_dir: &std::path::Path) -> DaemonStatusJson {
+    #[cfg(unix)]
+    {
+        match cef_daemon::daemon_ping(state_dir).await {
+            Some(st) => DaemonStatusJson {
+                supported: true,
+                running: true,
+                pid: Some(st.pid),
+                renderer_alive: st.renderer_alive,
+            },
+            None => DaemonStatusJson {
+                supported: true,
+                running: false,
+                pid: None,
+                renderer_alive: false,
+            },
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = state_dir;
+        DaemonStatusJson {
+            supported: false,
+            running: false,
+            pid: None,
+            renderer_alive: false,
         }
     }
 }
@@ -531,15 +770,15 @@ fn init_tracing(verbose: bool) {
         .try_init();
 }
 
-fn emit_fetch_error_and_exit(err: &FetchError, json: bool) -> ! {
+fn emit_cli_error(err: &CliError, json: bool) {
     if json {
         let payload = serde_json::json!({
-            "error": err.to_string(),
-            "exit_code": err.exit_code(),
+            "error": err.message,
+            "kind": err.kind,
+            "exit_code": err.exit_code,
         });
         eprintln!("{}", payload);
     } else {
-        eprintln!("error: {}", err);
+        eprintln!("error: {}", err.message);
     }
-    std::process::exit(err.exit_code());
 }

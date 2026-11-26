@@ -69,6 +69,20 @@ impl FetchError {
             | Self::Transport(_) => 1,
         }
     }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::InvalidUrl(_) => "invalid_url",
+            Self::RobotsDisallowed { .. } => "robots_disallowed",
+            Self::Blocked { .. } => "blocked",
+            Self::Challenge { .. } => "challenge",
+            Self::HttpError { .. } => "http_error",
+            Self::UnsupportedContentType { .. } => "unsupported_content_type",
+            Self::CefUnavailable(_) => "cef_unavailable",
+            Self::Timeout { .. } => "timeout",
+            Self::Transport(_) => "transport",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +114,7 @@ pub struct FetchOutput {
     pub content_type: Option<String>,
     pub title: Option<String>,
     pub content: String,
+    pub content_bytes: usize,
     pub strategy: String,
     pub escalated: bool,
     pub truncated: bool,
@@ -177,6 +192,7 @@ pub async fn fetch_document(
         &options.extract,
     )?;
 
+    let content_bytes = extracted.content.len();
     Ok(FetchOutput {
         url: url.to_string(),
         final_url: page.final_url,
@@ -184,6 +200,7 @@ pub async fn fetch_document(
         content_type: page.content_type,
         title: extracted.title,
         content: extracted.content,
+        content_bytes,
         strategy: page.strategy,
         escalated: page.escalated,
         truncated: extracted.truncated,

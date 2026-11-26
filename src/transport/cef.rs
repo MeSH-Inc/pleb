@@ -325,8 +325,7 @@ impl CefRenderer {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env("MESH_WICK_HOME", &self.state_dir)
-            .env_remove("WICK_PROXY");
+            .env("MESH_WICK_HOME", &self.state_dir);
 
         if let Some(ref cache_dir) = self.cache_dir {
             cmd.arg(format!("--cache-dir={}", cache_dir.display()));
