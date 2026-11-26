@@ -622,6 +622,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     max_bytes,
                 },
                 render,
+                source: mesh_wick::policy::SourceMode::Auto,
                 wait_for_selector,
                 respect_robots,
                 apply_rewrites: !no_rewrite,

@@ -12,6 +12,8 @@ pub struct SiteRule {
     pub wait_for_selector: Option<String>,
     #[serde(default)]
     pub rewrite_host: Option<String>,
+    #[serde(default)]
+    pub accept_markdown: bool,
 }
 
 #[derive(Debug, Deserialize)]

@@ -433,6 +433,7 @@ async fn handle_connection(
             proxy,
             timeout_ms,
             max_body_bytes,
+            accept_markdown: _,
         } => {
             let _active = ActiveRequestGuard::new(active_requests, idle_notify);
             let timeout = Duration::from_millis(timeout_ms.max(1));
@@ -459,6 +460,7 @@ async fn handle_connection(
                             hdr.status_code = Some(resp.status);
                             hdr.final_url = Some(resp.final_url);
                             hdr.content_type = resp.content_type;
+                            hdr.link_header = resp.link_header;
                             hdr.body_bytes = resp.body.len();
                             let _ = write_frame(&mut write_half, &hdr, &resp.body).await;
                         }

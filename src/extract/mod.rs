@@ -72,6 +72,20 @@ pub fn format_page_section(
     )
 }
 
+pub fn wrap_raw_code_document(
+    filename: &str,
+    code: &str,
+    _language: Option<&str>,
+    options: &ExtractOptions,
+) -> ExtractedDocument {
+    let (content, truncated) = apply_utf8_limit(code, options.max_bytes);
+    ExtractedDocument {
+        title: Some(filename.to_string()),
+        content,
+        truncated,
+    }
+}
+
 pub fn extract_document_bytes(
     body: &[u8],
     page_url: &::url::Url,

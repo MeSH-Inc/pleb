@@ -20,6 +20,14 @@ pub enum RenderMode {
     Cronet,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum SourceMode {
+    #[default]
+    Auto,
+    Negotiate,
+    None,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrimaryTransport {
     Cronet,

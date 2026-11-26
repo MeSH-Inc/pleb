@@ -10,7 +10,7 @@ use crate::context::RuntimeContext;
 use crate::extract::{self, ExtractOptions, OutputFormat, ParsedHtml};
 use crate::policy::{
     classify_response_with_context, detect_interstitial_challenge, plan_strategy, PrimaryTransport,
-    RenderMode, ResponseClassification,
+    RenderMode, ResponseClassification, SourceMode,
 };
 use crate::transport::cef::{
     CefProtocolError, CefRenderOptions, CefRenderResult, CefRenderer, CefTimeoutError,
@@ -102,6 +102,7 @@ impl FetchError {
 pub struct FetchOptions {
     pub extract: ExtractOptions,
     pub render: RenderMode,
+    pub source: SourceMode,
     pub wait_for_selector: Option<String>,
     pub respect_robots: bool,
     pub apply_rewrites: bool,
@@ -112,6 +113,7 @@ impl Default for FetchOptions {
         Self {
             extract: ExtractOptions::default(),
             render: RenderMode::Auto,
+            source: SourceMode::Auto,
             wait_for_selector: None,
             respect_robots: false,
             apply_rewrites: true,

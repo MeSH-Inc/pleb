@@ -5,7 +5,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWr
 
 use crate::transport::TransportErrorKind;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const BUILD_ID: &str = env!("WICK_BUILD_ID");
 pub const SOCKET_NAME: &str = "daemon.sock";
 pub const LOCK_NAME: &str = "daemon.lock";
@@ -58,6 +58,8 @@ pub enum DaemonRequest {
         proxy: Option<String>,
         timeout_ms: u64,
         max_body_bytes: usize,
+        #[serde(default)]
+        accept_markdown: bool,
     },
     CefRender {
         url: String,
@@ -89,6 +91,8 @@ pub struct DaemonResponseHeader {
     #[serde(default)]
     pub content_type: Option<String>,
     #[serde(default)]
+    pub link_header: Option<String>,
+    #[serde(default)]
     pub body_bytes: usize,
     #[serde(default)]
     pub error: Option<String>,
@@ -111,6 +115,7 @@ impl DaemonResponseHeader {
             status_code: None,
             final_url: None,
             content_type: None,
+            link_header: None,
             body_bytes: 0,
             error: None,
             error_kind: None,
@@ -134,6 +139,7 @@ impl DaemonResponseHeader {
             status_code: None,
             final_url: None,
             content_type: None,
+            link_header: None,
             body_bytes: 0,
             error: Some(message.into()),
             error_kind: kind,

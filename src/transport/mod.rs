@@ -68,6 +68,7 @@ pub struct HttpResponse {
     pub status: u16,
     pub final_url: String,
     pub content_type: Option<String>,
+    pub link_header: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -190,6 +191,17 @@ impl TransportClient {
         .await
     }
 
+    pub async fn get_with_options(
+        &self,
+        url: &str,
+        timeout: Duration,
+        max_body_bytes: usize,
+        accept_markdown: bool,
+    ) -> Result<HttpResponse> {
+        let _ = accept_markdown;
+        self.get_with_limits(url, timeout, max_body_bytes).await
+    }
+
     pub async fn get_with_limits(
         &self,
         url: &str,
@@ -231,6 +243,7 @@ impl TransportClient {
                         status: resp.status_code,
                         final_url: resp.final_url,
                         content_type: resp.content_type,
+                        link_header: None,
                         body: resp.body,
                     })
                 }
@@ -258,6 +271,7 @@ impl TransportClient {
                             status,
                             final_url,
                             content_type,
+                            link_header: None,
                             body,
                         })
                     };

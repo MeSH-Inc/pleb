@@ -123,6 +123,10 @@ impl ParsedHtml {
             .map(str::to_string)
     }
 
+    pub fn markdown_alternate_url(&self, _page_url: &Url) -> Option<Url> {
+        None
+    }
+
     pub fn effective_base_url(&self, page_url: &Url) -> Url {
         self.base_href()
             .and_then(|href| page_url.join(&href).ok())

@@ -118,6 +118,7 @@ pub async fn daemon_http_get_with_executable(
         proxy: proxy.map(str::to_string),
         timeout_ms: timeout.as_millis().min(u128::from(u64::MAX)) as u64,
         max_body_bytes,
+        accept_markdown: false,
     };
     let io_timeout = timeout.saturating_add(CLIENT_IO_GRACE);
     let (hdr, body) = send_daemon_rpc(
@@ -135,6 +136,7 @@ pub async fn daemon_http_get_with_executable(
             status: hdr.status_code.unwrap_or(200),
             final_url: hdr.final_url.unwrap_or_else(|| url.to_string()),
             content_type: hdr.content_type,
+            link_header: hdr.link_header,
             body,
         })
     } else {
