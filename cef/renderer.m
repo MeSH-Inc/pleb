@@ -1,31 +1,4 @@
-// wick-renderer (macOS): CEF offscreen renderer with stealth patches.
-//
-// Modes:
-//   One-shot: wick-renderer <url> [--cookie name=value]
-//             → outputs rendered HTML to stdout
-//   Daemon:   wick-renderer (no args)
-//             → reads URLs from stdin, writes length-prefixed HTML to stdout
-//
-// Protocol version marker — bump when the stdin protocol or poller
-// semantics change. install-cef-mac.sh greps the installed binary for
-// this exact string and force-rebuilds if missing. Keep this string
-// stable and grep-friendly.
-//
-// History:
-//   v2-selector  : URL\tSELECTOR stdin protocol, selector-aware poller.
-//   v3-cf-aware  : poller refuses to dump while a Cloudflare challenge
-//                  interstitial is on screen, so chroniclingamerica.loc.gov
-//                  and similar JS-challenge pages capture real content.
-__attribute__((used)) static const char WICK_RENDERER_PROTOCOL[] =
-    "WICK_RENDERER_PROTOCOL=v3-cf-aware";
-//
-// Features:
-//   - Stealth patches injected at on_load_start + on_load_end fixup
-//   - Smart content polling (waits for SPA hydration)
-//   - Rendered DOM capture via console.log (not get_source)
-//   - CAPTCHA iframe detection and auto-click
-//   - WebGL support via macOS Metal/OpenGL
-//   - Cookie injection for CAPTCHA retry
+// wick-renderer (macOS): CEF offscreen renderer with v4-meta stdin/stdout JSON+bytes framing.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,7 +11,7 @@ __attribute__((used)) static const char WICK_RENDERER_PROTOCOL[] =
 
 #import <Cocoa/Cocoa.h>
 
-#include "stealth.h"
+#include "protocol.h"
 #include "include/capi/cef_app_capi.h"
 #include "include/capi/cef_browser_capi.h"
 #include "include/capi/cef_client_capi.h"
@@ -47,7 +20,6 @@ __attribute__((used)) static const char WICK_RENDERER_PROTOCOL[] =
 #include "include/capi/cef_life_span_handler_capi.h"
 #include "include/capi/cef_load_handler_capi.h"
 #include "include/capi/cef_render_handler_capi.h"
-#include "include/capi/cef_string_visitor_capi.h"
 #include "include/cef_api_hash.h"
 
 // ── State ─────────────────────────────────────────────────────
@@ -55,34 +27,34 @@ __attribute__((used)) static const char WICK_RENDERER_PROTOCOL[] =
 static cef_browser_t* g_browser = NULL;
 static int g_load_done = 0;
 static int g_source_done = 0;
+static int g_status_code = 0;
+static int g_committed_main_frame = 0;
+static int g_load_error = 0;
 static char* g_html = NULL;
 static size_t g_html_len = 0;
+static char* g_selector_error = NULL;
 static int g_click_x = -1;
 static int g_click_y = -1;
 static int g_clicked = 0;
 static char g_marker[32];
 static char g_click_prefix[48];
-static char g_cookie[2048] = {};
-// Optional CSS selector to wait for before dumping the DOM. Set per-render
-// via the daemon stdin protocol (URL\tSELECTOR\n). Empty = no selector,
-// use the smart-content-stability poller. JS-escaped quotes are the
-// caller's responsibility; we splice the value verbatim into a JS string
-// literal so use simple CSS (data-testid, classes, ids) — not selectors
-// containing single quotes or backslashes.
-static char g_selector[256] = {};
+static char g_sel_err_prefix[48];
 
 static void init_marker(void) {
     FILE* f = fopen("/dev/urandom", "r");
-    unsigned char buf[24];
+    unsigned char buf[36];
     if (f && fread(buf, 1, sizeof(buf), f) == sizeof(buf)) {
         for (int i = 0; i < 12; i++)
-            snprintf(g_marker + i*2, 3, "%02x", buf[i]);
+            snprintf(g_marker + i * 2, 3, "%02x", buf[i]);
         for (int i = 0; i < 12; i++)
-            snprintf(g_click_prefix + i*2, 3, "%02x", buf[12+i]);
+            snprintf(g_click_prefix + i * 2, 3, "%02x", buf[12 + i]);
+        for (int i = 0; i < 12; i++)
+            snprintf(g_sel_err_prefix + i * 2, 3, "%02x", buf[24 + i]);
         fclose(f);
     } else {
-        snprintf(g_marker, sizeof(g_marker), "_%d_%ld_", getpid(), (long)time(NULL));
+        snprintf(g_marker, sizeof(g_marker), "_m%d_%ld_", getpid(), (long)time(NULL));
         snprintf(g_click_prefix, sizeof(g_click_prefix), "_c%d_", getpid());
+        snprintf(g_sel_err_prefix, sizeof(g_sel_err_prefix), "_e%d_", getpid());
     }
 }
 
@@ -101,6 +73,17 @@ static void init_base(cef_base_ref_counted_t* base, size_t size) {
     base->has_at_least_one_ref = has_any;
 }
 
+static void execute_js_on_main_frame(const char* js) {
+    if (!g_browser || !js) return;
+    cef_frame_t* frame = g_browser->get_main_frame(g_browser);
+    if (!frame) return;
+    cef_string_t cef_js = {};
+    cef_string_utf8_to_utf16(js, strlen(js), &cef_js);
+    frame->execute_java_script(frame, &cef_js, NULL, 0);
+    cef_string_clear(&cef_js);
+    frame->base.release(&frame->base);
+}
+
 // ── Display handler — captures console.log for DOM dump ───────
 
 static int CEF_CALLBACK on_console_message(
@@ -113,7 +96,6 @@ static int CEF_CALLBACK on_console_message(
     cef_string_utf8_t utf8 = {};
     cef_string_utf16_to_utf8(message->str, message->length, &utf8);
 
-    // Click coordinates from CAPTCHA detection
     size_t cplen = strlen(g_click_prefix);
     if (utf8.length > cplen && strncmp(utf8.str, g_click_prefix, cplen) == 0) {
         int x = 0, y = 0;
@@ -125,18 +107,38 @@ static int CEF_CALLBACK on_console_message(
         return 1;
     }
 
-    // Content marker — rendered outerHTML
-    if (utf8.length > strlen(g_marker) &&
-        strncmp(utf8.str, g_marker, strlen(g_marker)) == 0) {
-        const char* html = utf8.str + strlen(g_marker);
-        size_t html_len = utf8.length - strlen(g_marker);
-        free(g_html);
-        g_html = malloc(html_len);
-        if (g_html) {
-            memcpy(g_html, html, html_len);
-            g_html_len = html_len;
+    size_t selen = strlen(g_sel_err_prefix);
+    if (utf8.length >= selen && strncmp(utf8.str, g_sel_err_prefix, selen) == 0) {
+        const char* msg = utf8.str + selen;
+        size_t msg_len = utf8.length - selen;
+        free(g_selector_error);
+        g_selector_error = (char*)malloc(msg_len + 1);
+        if (g_selector_error) {
+            memcpy(g_selector_error, msg, msg_len);
+            g_selector_error[msg_len] = '\0';
         }
         g_source_done = 1;
+        cef_string_utf8_clear(&utf8);
+        return 1;
+    }
+
+    size_t mlen = strlen(g_marker);
+    if (utf8.length >= mlen && strncmp(utf8.str, g_marker, mlen) == 0) {
+        const char* html = utf8.str + mlen;
+        size_t html_len = utf8.length - mlen;
+        free(g_html);
+        g_html = NULL;
+        g_html_len = 0;
+        if (html_len > 0) {
+            g_html = (char*)malloc(html_len);
+            if (g_html) {
+                memcpy(g_html, html, html_len);
+                g_html_len = html_len;
+            }
+        }
+        g_source_done = 1;
+        cef_string_utf8_clear(&utf8);
+        return 1;
     }
 
     cef_string_utf8_clear(&utf8);
@@ -144,30 +146,6 @@ static int CEF_CALLBACK on_console_message(
 }
 
 static cef_display_handler_t g_display_handler;
-
-// ── String visitor (fallback) ─────────────────────────────────
-
-static void CEF_CALLBACK visitor_visit(cef_string_visitor_t* self,
-                                        const cef_string_t* string) {
-    (void)self;
-    if (g_source_done) return;
-    free(g_html);
-    g_html = NULL;
-    g_html_len = 0;
-    if (string && string->str) {
-        cef_string_utf8_t utf8 = {};
-        cef_string_utf16_to_utf8(string->str, string->length, &utf8);
-        g_html = malloc(utf8.length);
-        if (g_html) {
-            memcpy(g_html, utf8.str, utf8.length);
-            g_html_len = utf8.length;
-        }
-        cef_string_utf8_clear(&utf8);
-    }
-    g_source_done = 1;
-}
-
-static cef_string_visitor_t g_html_visitor;
 
 // ── POST_LOAD_FIXUP for properties CEF resets ─────────────────
 
@@ -218,29 +196,18 @@ static void CEF_CALLBACK on_load_start(cef_load_handler_t* self,
     cef_browser_t* browser, cef_frame_t* frame, cef_transition_type_t tt) {
     (void)self; (void)browser; (void)tt;
     if (frame && frame->is_main(frame)) {
-        // Stealth patches
-        cef_string_t cef_js = {};
-        cef_string_utf8_to_utf16(STEALTH_JS, strlen(STEALTH_JS), &cef_js);
-        frame->execute_java_script(frame, &cef_js, NULL, 0);
-        cef_string_clear(&cef_js);
-
-        // Cookie injection for CAPTCHA retry
-        if (g_cookie[0]) {
-            char cookie_js[2200];
-            snprintf(cookie_js, sizeof(cookie_js),
-                "document.cookie='%s; path=/; secure; samesite=lax';", g_cookie);
-            cef_string_t cjs = {};
-            cef_string_utf8_to_utf16(cookie_js, strlen(cookie_js), &cjs);
-            frame->execute_java_script(frame, &cjs, NULL, 0);
-            cef_string_clear(&cjs);
-        }
+        g_status_code = 0;
+        g_load_error = 0;
+        g_committed_main_frame = 0;
     }
 }
 
 static void CEF_CALLBACK on_load_end(cef_load_handler_t* self,
     cef_browser_t* browser, cef_frame_t* frame, int httpStatusCode) {
-    (void)self; (void)browser; (void)httpStatusCode;
+    (void)self; (void)browser;
     if (frame && frame->is_main(frame)) {
+        g_status_code = httpStatusCode;
+        g_committed_main_frame = 1;
         cef_string_t cef_js = {};
         cef_string_utf8_to_utf16(POST_LOAD_FIXUP, strlen(POST_LOAD_FIXUP), &cef_js);
         frame->execute_java_script(frame, &cef_js, NULL, 0);
@@ -254,8 +221,13 @@ static void CEF_CALLBACK on_load_error(cef_load_handler_t* self,
     const cef_string_t* failedUrl) {
     (void)self; (void)browser; (void)errorText; (void)failedUrl;
     if (frame && frame->is_main(frame)) {
+        if (errorCode == -3) { // ERR_ABORTED: expected during redirects / challenge reloads
+            return;
+        }
         fprintf(stderr, "wick-renderer: main frame load error %d\n", errorCode);
+        g_load_error = (int)errorCode;
         g_load_done = 1;
+        g_source_done = 1;
     }
 }
 
@@ -272,7 +244,7 @@ static void CEF_CALLBACK get_view_rect(cef_render_handler_t* self,
 static void CEF_CALLBACK on_paint(cef_render_handler_t* self,
     cef_browser_t* browser, cef_paint_element_type_t type,
     size_t n, const cef_rect_t* d, const void* buf, int w, int h) {
-    (void)self;(void)browser;(void)type;(void)n;(void)d;(void)buf;(void)w;(void)h;
+    (void)self; (void)browser; (void)type; (void)n; (void)d; (void)buf; (void)w; (void)h;
 }
 
 static int CEF_CALLBACK get_screen_info(cef_render_handler_t* self,
@@ -316,155 +288,152 @@ static cef_display_handler_t* CEF_CALLBACK get_display_handler(cef_client_t* s) 
 
 static cef_client_t g_client;
 
-// ── Render a URL with smart content polling ───────────────────
+// ── Render a URL with v4-meta response ────────────────────────
 
-static void render_url_smart(const char* url) {
+static void force_dump_dom(void) {
+    char* dump_js = wick_asprintf(
+        "console.log('%s'+(document.documentElement?document.documentElement.outerHTML:''));",
+        g_marker
+    );
+    if (!dump_js) return;
+    execute_js_on_main_frame(dump_js);
+    free(dump_js);
+
+    for (int i = 0; i < 100 && !g_source_done; i++) {
+        cef_do_message_loop_work();
+        usleep(10000);
+    }
+}
+
+static char* copy_main_frame_url(void) {
+    if (!g_browser) return NULL;
+    cef_frame_t* frame = g_browser->get_main_frame(g_browser);
+    if (!frame) return NULL;
+
+    char* result = NULL;
+    cef_string_userfree_t url_str = frame->get_url(frame);
+    if (url_str) {
+        if (url_str->str && url_str->length > 0) {
+            cef_string_utf8_t utf8 = {};
+            cef_string_utf16_to_utf8(url_str->str, url_str->length, &utf8);
+            if (utf8.str && utf8.length > 0) {
+                result = (char*)malloc(utf8.length + 1);
+                if (result) {
+                    memcpy(result, utf8.str, utf8.length);
+                    result[utf8.length] = '\0';
+                }
+            }
+            cef_string_utf8_clear(&utf8);
+        }
+        cef_string_userfree_free(url_str);
+    }
+    frame->base.release(&frame->base);
+    return result;
+}
+
+static void render_url_v4(const WickRenderRequest* req) {
     g_load_done = 0;
     g_source_done = 0;
+    g_status_code = 0;
+    g_committed_main_frame = 0;
+    g_load_error = 0;
     g_click_x = -1;
     g_click_y = -1;
     g_clicked = 0;
     free(g_html);
     g_html = NULL;
     g_html_len = 0;
+    free(g_selector_error);
+    g_selector_error = NULL;
 
     cef_frame_t* frame = g_browser->get_main_frame(g_browser);
-    if (!frame) return;
+    if (!frame) {
+        wick_write_response(stdout, 0, req->url, NULL, 0, "main frame unavailable");
+        return;
+    }
 
     cef_string_t cef_url = {};
-    cef_string_utf8_to_utf16(url, strlen(url), &cef_url);
+    cef_string_utf8_to_utf16(req->url, strlen(req->url), &cef_url);
     frame->load_url(frame, &cef_url);
     cef_string_clear(&cef_url);
+    frame->base.release(&frame->base);
+
+    int has_selector = (req->wait_for_selector && req->wait_for_selector[0]) ? 1 : 0;
+    int total_cap = 0, post_load_cap = 0, js_cap = 0, cf_cap = 0;
+    wick_clamp_timeouts(req->timeout_ms, has_selector, &total_cap, &post_load_cap, &js_cap, &cf_cap);
 
     int post_load_ms = 0;
     const int tick_ms = 50;
     int poll_injected = 0;
     int last_nav = g_nav_count;
     int total_ms = 0;
-    // Selector mode needs longer outer caps than smart-stability mode: the
-    // inner JS poller's own timeout is 20s when waiting on a selector, so
-    // the post-load and absolute caps need to clear that.
-    const int post_load_cap = g_selector[0] ? 30000 : 12000;
-    const int total_cap = g_selector[0] ? 60000 : 45000;
+    int timed_out_uncommitted = 0;
 
     while (!g_source_done) {
         cef_do_message_loop_work();
         usleep(tick_ms * 1000);
         total_ms += tick_ms;
 
-        // Detect page reload (AWS WAF, DataDome, etc.)
         if (g_nav_count != last_nav) {
             last_nav = g_nav_count;
             post_load_ms = 0;
             poll_injected = 0;
+            g_click_x = -1;
+            g_clicked = 0;
         }
+
         if (total_ms >= total_cap) {
-            // Absolute timeout — force dump whatever is in the DOM
-            if (g_browser && !g_source_done) {
-                cef_frame_t* f = g_browser->get_main_frame(g_browser);
-                if (f) {
-                    char js[256];
-                    snprintf(js, sizeof(js),
-                        "console.log('%s'+document.documentElement.outerHTML);",
-                        g_marker);
-                    cef_string_t cef_js = {};
-                    cef_string_utf8_to_utf16(js, strlen(js), &cef_js);
-                    f->execute_java_script(f, &cef_js, NULL, 0);
-                    cef_string_clear(&cef_js);
-                }
-                for (int i = 0; i < 100 && !g_source_done; i++) {
-                    cef_do_message_loop_work();
-                    usleep(10000);
-                }
+            if (g_committed_main_frame && !g_source_done) {
+                force_dump_dom();
+            } else if (!g_committed_main_frame) {
+                timed_out_uncommitted = 1;
             }
             break;
         }
 
-        if (g_load_done) {
+        if (g_load_done && g_load_error == 0) {
             post_load_ms += tick_ms;
 
-            // Inject content poller. When g_selector is set, also gate
-            // completion on the selector existing in the DOM — so SPAs
-            // that lazy-load timelines/feeds dump only after the
-            // requested content has actually appeared.
-            //
-            // Also refuses to count the page as stable while a Cloudflare
-            // "Just a moment" / "Performing security verification"
-            // interstitial is visible: that page is text-stable within a
-            // second, so without this guard the renderer captures it
-            // before the post-verification redirect lands. The cap
-            // stretches to 30s on Cloudflare to give the challenge time
-            // to clear; on other pages it stays at 8s (or 20s with a
-            // selector).
             if (!poll_injected && g_browser) {
-                cef_frame_t* f = g_browser->get_main_frame(g_browser);
-                if (f) {
-                    char js[2400];
-                    snprintf(js, sizeof(js),
-                        "(function(){"
-                        "var sel=%s%s%s;"
-                        "var last=0,stable=0,t=0;"
-                        "var iv=setInterval(function(){"
-                        "  var body=document.body;"
-                        "  var bt=body?body.innerText:'';"
-                        "  var len=bt.length;"
-                        "  var blt=bt.toLowerCase();"
-                        "  var isCF=blt.indexOf('performing security verification')>=0||"
-                        "           blt.indexOf('checking your browser')>=0;"
-                        "  t+=300;"
-                        "  if(isCF){stable=0;last=len;}"
-                        "  else if(len>500&&len===last){stable+=300;}"
-                        "  else{stable=0;last=len;}"
-                        "  var hit=sel?!!document.querySelector(sel):true;"
-                        "  var stableHit=!isCF&&len>500&&stable>=1000&&hit;"
-                        "  var cap=isCF?30000:(sel?20000:8000);"
-                        "  if(stableHit||t>=cap){"
-                        "    clearInterval(iv);"
-                        "    console.log('%s'+document.documentElement.outerHTML);"
-                        "  }"
-                        "},300);"
-                        "})();",
-                        g_selector[0] ? "'" : "",
-                        g_selector[0] ? g_selector : "null",
-                        g_selector[0] ? "'" : "",
-                        g_marker);
-                    cef_string_t cef_js = {};
-                    cef_string_utf8_to_utf16(js, strlen(js), &cef_js);
-                    f->execute_java_script(f, &cef_js, NULL, 0);
-                    cef_string_clear(&cef_js);
+                char* poller_js = wick_build_poller_js(
+                    req->wait_for_selector,
+                    g_marker,
+                    g_sel_err_prefix,
+                    js_cap,
+                    cf_cap
+                );
+                if (poller_js) {
+                    execute_js_on_main_frame(poller_js);
+                    free(poller_js);
                 }
                 poll_injected = 1;
             }
 
-            // CAPTCHA detection at 2s
             if (post_load_ms >= 2000 && !g_clicked && g_click_x == -1 && g_browser) {
-                cef_frame_t* f = g_browser->get_main_frame(g_browser);
-                if (f) {
-                    char js[512];
-                    snprintf(js, sizeof(js),
-                        "(function(){"
-                        "var f=document.querySelector("
-                        "'iframe[src*=\"challenges.cloudflare.com\"],"
-                        "iframe[src*=\"captcha-delivery.com\"],"
-                        "iframe[src*=\"recaptcha\"],"
-                        "iframe[src*=\"hcaptcha\"]');"
-                        "if(f){"
-                        "  var r=f.getBoundingClientRect();"
-                        "  if(r.width>0){"
-                        "    console.log('%s'+"
-                        "      Math.round(r.x+r.width/2)+','+"
-                        "      Math.round(r.y+r.height/2));"
-                        "  }"
-                        "}"
-                        "})();", g_click_prefix);
-                    cef_string_t cef_js = {};
-                    cef_string_utf8_to_utf16(js, strlen(js), &cef_js);
-                    f->execute_java_script(f, &cef_js, NULL, 0);
-                    cef_string_clear(&cef_js);
+                char* click_js = wick_asprintf(
+                    "(function(){"
+                    "var f=document.querySelector("
+                    "'iframe[src*=\"challenges.cloudflare.com\"],"
+                    "iframe[src*=\"captcha-delivery.com\"],"
+                    "iframe[src*=\"recaptcha\"],"
+                    "iframe[src*=\"hcaptcha\"]');"
+                    "if(f){"
+                    "  var r=f.getBoundingClientRect();"
+                    "  if(r.width>0){"
+                    "    console.log('%s'+"
+                    "      Math.round(r.x+r.width/2)+','+"
+                    "      Math.round(r.y+r.height/2));"
+                    "  }"
+                    "}"
+                    "})();",
+                    g_click_prefix
+                );
+                if (click_js) {
+                    execute_js_on_main_frame(click_js);
+                    free(click_js);
                 }
             }
 
-            // Auto-click CAPTCHA
             if (g_click_x >= 0 && !g_clicked && g_browser) {
                 cef_browser_host_t* host = g_browser->get_host(g_browser);
                 if (host) {
@@ -478,6 +447,7 @@ static void render_url_smart(const char* url) {
                     cef_do_message_loop_work();
                     usleep(50000);
                     host->send_mouse_click_event(host, &mouse, MBT_LEFT, 1, 1);
+                    host->base.release(&host->base);
                     g_clicked = 1;
                     post_load_ms = 0;
                     g_load_done = 0;
@@ -485,29 +455,44 @@ static void render_url_smart(const char* url) {
                 }
             }
 
-            // Safety timeout
             if (post_load_ms >= post_load_cap && !g_source_done) {
-                if (g_browser) {
-                    cef_frame_t* f = g_browser->get_main_frame(g_browser);
-                    if (f) {
-                        char js[256];
-                        snprintf(js, sizeof(js),
-                            "console.log('%s'+document.documentElement.outerHTML);",
-                            g_marker);
-                        cef_string_t cef_js = {};
-                        cef_string_utf8_to_utf16(js, strlen(js), &cef_js);
-                        f->execute_java_script(f, &cef_js, NULL, 0);
-                        cef_string_clear(&cef_js);
-                    }
-                }
-                for (int i = 0; i < 100 && !g_source_done; i++) {
-                    cef_do_message_loop_work();
-                    usleep(10000);
+                if (g_committed_main_frame) {
+                    force_dump_dom();
+                } else {
+                    timed_out_uncommitted = 1;
                 }
                 break;
             }
         }
     }
+
+    if (g_load_error != 0) {
+        char err_msg[96];
+        snprintf(err_msg, sizeof(err_msg), "load error %d", g_load_error);
+        wick_write_response(stdout, 0, req->url, NULL, 0, err_msg);
+        return;
+    }
+
+    if (g_selector_error && g_selector_error[0]) {
+        char* err_msg = wick_asprintf("invalid selector: %s", g_selector_error);
+        wick_write_response(stdout, g_status_code, req->url, NULL, 0,
+                            err_msg ? err_msg : "invalid selector");
+        free(err_msg);
+        return;
+    }
+
+    if (timed_out_uncommitted || !g_source_done) {
+        const char* msg = timed_out_uncommitted
+            ? "timed out before main frame commit"
+            : "timed out capturing rendered DOM";
+        wick_write_response(stdout, g_status_code, req->url, NULL, 0, msg);
+        return;
+    }
+
+    char* final_url = copy_main_frame_url();
+    const char* out_url = (final_url && final_url[0]) ? final_url : req->url;
+    wick_write_response(stdout, g_status_code, out_url, g_html, g_html_len, NULL);
+    free(final_url);
 }
 
 // ── Main ──────────────────────────────────────────────────────
@@ -518,17 +503,30 @@ int main(int argc, char* argv[]) {
     char exe_buf[4096];
     uint32_t exe_buf_size = sizeof(exe_buf);
     if (_NSGetExecutablePath(exe_buf, &exe_buf_size) != 0) {
-        fprintf(stderr, "wick-renderer: executable path too long\n");
+        wick_write_ready(stdout, 0, "executable path too long");
         return 1;
     }
 
-    // macOS: no --disable-gpu (Metal provides WebGL), no --single-process
-    // (use helper for stealth injection at V8 context creation)
-    int new_argc = argc + 2;
-    char** new_argv = malloc(sizeof(char*) * (new_argc + 1));
-    for (int i = 0; i < argc; i++) new_argv[i] = argv[i];
-    new_argv[argc] = "--no-sandbox";
-    new_argv[argc + 1] = "--disable-gpu-compositing";
+    const char* cache_dir_arg = NULL;
+    char** new_argv = (char**)malloc(sizeof(char*) * ((size_t)argc + 3));
+    if (!new_argv) {
+        wick_write_ready(stdout, 0, "out of memory");
+        return 1;
+    }
+
+    int new_argc = 0;
+    new_argv[new_argc++] = argv[0];
+    for (int i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "--cache-dir=", 12) == 0) {
+            cache_dir_arg = argv[i] + 12;
+        } else if (strcmp(argv[i], "--cache-dir") == 0 && i + 1 < argc) {
+            cache_dir_arg = argv[++i];
+        } else {
+            new_argv[new_argc++] = argv[i];
+        }
+    }
+    new_argv[new_argc++] = (char*)"--no-sandbox";
+    new_argv[new_argc++] = (char*)"--disable-gpu-compositing";
     new_argv[new_argc] = NULL;
 
     cef_api_hash(CEF_API_VERSION, 0);
@@ -540,26 +538,10 @@ int main(int argc, char* argv[]) {
         return exit_code;
     }
 
-    // Parse arguments
-    int one_shot = 0;
-    const char* url_arg = NULL;
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--cookie") == 0 && i + 1 < argc) {
-            snprintf(g_cookie, sizeof(g_cookie), "%s", argv[++i]);
-        } else if (argv[i][0] != '-') {
-            url_arg = argv[i];
-            one_shot = 1;
-        }
-    }
-
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
     }
-
-    // Initialize handlers
-    init_base(&g_html_visitor.base, sizeof(cef_string_visitor_t));
-    g_html_visitor.visit = visitor_visit;
 
     init_base(&g_display_handler.base, sizeof(cef_display_handler_t));
     g_display_handler.on_console_message = on_console_message;
@@ -586,7 +568,6 @@ int main(int argc, char* argv[]) {
     g_client.get_render_handler = get_render_handler;
     g_client.get_display_handler = get_display_handler;
 
-    // CEF settings
     cef_settings_t settings = {};
     settings.size = sizeof(cef_settings_t);
     settings.windowless_rendering_enabled = 1;
@@ -599,7 +580,6 @@ int main(int argc, char* argv[]) {
     snprintf(fw_dir, sizeof(fw_dir), "%s/../Frameworks/Chromium Embedded Framework.framework", exe_dir);
     cef_string_utf8_to_utf16(fw_dir, strlen(fw_dir), &settings.framework_dir_path);
 
-    // Use helper for multi-process (stealth patches at V8 context creation)
     char helper_path[4096];
     snprintf(helper_path, sizeof(helper_path),
              "%s/../Frameworks/wick Helper.app/Contents/MacOS/wick Helper", exe_dir);
@@ -615,23 +595,27 @@ int main(int argc, char* argv[]) {
         cef_string_utf8_to_utf16(bundle_real, strlen(bundle_real), &settings.main_bundle_path);
     }
 
-    const char* state_home = getenv("MESH_WICK_HOME");
     char cache_path[4096];
-    if (state_home && state_home[0]) {
-        snprintf(cache_path, sizeof(cache_path), "%s/cef-cache", state_home);
+    if (cache_dir_arg && cache_dir_arg[0]) {
+        snprintf(cache_path, sizeof(cache_path), "%s", cache_dir_arg);
     } else {
-        snprintf(cache_path, sizeof(cache_path), "%s/.mesh-wick/cef-cache",
-                 getenv("HOME") ? getenv("HOME") : "/tmp");
+        const char* state_home = getenv("MESH_WICK_HOME");
+        if (state_home && state_home[0]) {
+            snprintf(cache_path, sizeof(cache_path), "%s/cef-cache", state_home);
+        } else {
+            snprintf(cache_path, sizeof(cache_path), "%s/.mesh-wick/cef-cache",
+                     getenv("HOME") ? getenv("HOME") : "/tmp");
+        }
     }
     cef_string_utf8_to_utf16(cache_path, strlen(cache_path), &settings.root_cache_path);
 
-    // Profile cache path — required for cookie persistence (AWS WAF, etc.)
     char profile_path[4096];
     snprintf(profile_path, sizeof(profile_path), "%s/Default", cache_path);
     cef_string_utf8_to_utf16(profile_path, strlen(profile_path), &settings.cache_path);
 
     if (!cef_initialize(&main_args, &settings, NULL, NULL)) {
-        fprintf(stderr, "wick-renderer: cef_initialize failed\n");
+        wick_write_ready(stdout, 0, "cef_initialize failed");
+        free(new_argv);
         return 1;
     }
 
@@ -644,142 +628,54 @@ int main(int argc, char* argv[]) {
     browser_settings.size = sizeof(cef_browser_settings_t);
     browser_settings.windowless_frame_rate = 1;
 
-    const char* initial_url = one_shot ? url_arg : "about:blank";
     cef_string_t cef_url = {};
-    cef_string_utf8_to_utf16(initial_url, strlen(initial_url), &cef_url);
-
+    cef_string_utf8_to_utf16("about:blank", 11, &cef_url);
     cef_browser_host_create_browser_sync(
         &window_info, &g_client, &cef_url, &browser_settings, NULL, NULL);
     cef_string_clear(&cef_url);
 
-    if (one_shot) {
-        // Smart content polling — waits for SPA hydration
-        int post_load_ms = 0;
-        const int tick_ms = 50;
-        int poll_injected = 0;
-
-        while (!g_source_done) {
-            cef_do_message_loop_work();
-            usleep(tick_ms * 1000);
-
-            if (g_load_done) {
-                post_load_ms += tick_ms;
-
-                if (!poll_injected && g_browser) {
-                    cef_frame_t* f = g_browser->get_main_frame(g_browser);
-                    if (f) {
-                        // One-shot mode poller. Mirrors the daemon
-                        // poller's Cloudflare-aware logic — see daemon
-                        // injection above for rationale.
-                        char js[1400];
-                        snprintf(js, sizeof(js),
-                            "(function(){"
-                            "var last=0,stable=0,t=0;"
-                            "var iv=setInterval(function(){"
-                            "  var body=document.body;"
-                            "  var bt=body?body.innerText:'';"
-                            "  var len=bt.length;"
-                            "  var blt=bt.toLowerCase();"
-                            "  var isCF=blt.indexOf('performing security verification')>=0||"
-                            "           blt.indexOf('checking your browser')>=0;"
-                            "  t+=300;"
-                            "  if(isCF){stable=0;last=len;}"
-                            "  else if(len>500&&len===last){stable+=300;}"
-                            "  else{stable=0;last=len;}"
-                            "  var stableHit=!isCF&&len>500&&stable>=1000;"
-                            "  var cap=isCF?30000:8000;"
-                            "  if(stableHit||t>=cap){"
-                            "    clearInterval(iv);"
-                            "    console.log('%s'+document.documentElement.outerHTML);"
-                            "  }"
-                            "},300);"
-                            "})();", g_marker);
-                        cef_string_t cef_js = {};
-                        cef_string_utf8_to_utf16(js, strlen(js), &cef_js);
-                        f->execute_java_script(f, &cef_js, NULL, 0);
-                        cef_string_clear(&cef_js);
-                    }
-                    poll_injected = 1;
-                }
-
-                if (post_load_ms >= 12000 && !g_source_done) {
-                    if (g_browser) {
-                        cef_frame_t* f = g_browser->get_main_frame(g_browser);
-                        if (f) {
-                            char js[256];
-                            snprintf(js, sizeof(js),
-                                "console.log('%s'+document.documentElement.outerHTML);",
-                                g_marker);
-                            cef_string_t cef_js = {};
-                            cef_string_utf8_to_utf16(js, strlen(js), &cef_js);
-                            f->execute_java_script(f, &cef_js, NULL, 0);
-                            cef_string_clear(&cef_js);
-                        }
-                    }
-                    for (int i = 0; i < 100 && !g_source_done; i++) {
-                        cef_do_message_loop_work();
-                        usleep(10000);
-                    }
-                    break;
-                }
-            }
-        }
-
-        // Output to stdout
-        if (g_html && g_html_len > 0) {
-            fwrite(g_html, 1, g_html_len, stdout);
-        }
-        fflush(stdout);
-
-        cef_shutdown();
-        free(new_argv);
-        return 0;
-    }
-
-    // ── Persistent daemon mode ────────────────────────────────
-    while (!g_browser) {
+    // Wait for initial about:blank creation + idle load before advertising ready.
+    for (int i = 0; i < 500 && (!g_browser || !g_load_done); i++) {
         cef_do_message_loop_work();
         usleep(10000);
     }
-
-    char line[8192];
-    while (fgets(line, sizeof(line), stdin)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
-            line[--len] = '\0';
-        if (len == 0) break;
-
-        // Protocol: "URL" or "URL\tSELECTOR" — tab separates the optional
-        // selector. Backward-compatible with the URL-only callers.
-        g_selector[0] = '\0';
-        char* tab = strchr(line, '\t');
-        if (tab) {
-            *tab = '\0';
-            const char* sel = tab + 1;
-            // Skip any leading whitespace on the selector.
-            while (*sel == ' ' || *sel == '\t') sel++;
-            // Strip single quotes and backslashes — we splice this into a
-            // JS '...' literal, so quote/backslash injection would break
-            // the poller. Conservative: drop unsafe chars rather than
-            // attempt JS escaping.
-            char* dst = g_selector;
-            size_t dst_cap = sizeof(g_selector) - 1;
-            for (; *sel && (size_t)(dst - g_selector) < dst_cap; sel++) {
-                if (*sel == '\'' || *sel == '\\') continue;
-                *dst++ = *sel;
-            }
-            *dst = '\0';
-        }
-
-        render_url_smart(line);
-
-        fprintf(stdout, "%zu\n", g_html_len);
-        if (g_html && g_html_len > 0) {
-            fwrite(g_html, 1, g_html_len, stdout);
-        }
-        fflush(stdout);
+    if (!g_browser) {
+        wick_write_ready(stdout, 0, "failed to create CEF browser");
+        cef_shutdown();
+        free(new_argv);
+        return 1;
     }
 
+    wick_write_ready(stdout, 1, NULL);
+
+    char* line = NULL;
+    int too_long = 0;
+    while (wick_read_line(stdin, &line, WICK_MAX_REQUEST_LINE_BYTES, &too_long)) {
+        if (too_long) {
+            wick_write_response(stdout, 0, "", NULL, 0, "request line exceeds 64 KiB limit");
+            continue;
+        }
+        if (line[0] == '\0') {
+            free(line);
+            break;
+        }
+
+        WickRenderRequest req = {};
+        char err_buf[256] = {};
+        if (wick_parse_request_line(line, &req, err_buf, sizeof(err_buf)) != 0) {
+            wick_write_response(stdout, 0, "", NULL, 0, err_buf);
+            free(line);
+            continue;
+        }
+        free(line);
+        line = NULL;
+
+        render_url_v4(&req);
+        wick_render_request_free(&req);
+    }
+
+    free(g_html);
+    free(g_selector_error);
     cef_shutdown();
     free(new_argv);
     return 0;

@@ -49,7 +49,7 @@ CEF_DIR="cef_binary_${CEF_VERSION}_${CEF_PLATFORM}_minimal"
 CEF_URL="https://cef-builds.spotifycdn.com/${CEF_DIR}.tar.bz2"
 APP_DIR="$INSTALL_DIR/wick-renderer.app"
 RENDERER_BIN="$APP_DIR/Contents/MacOS/wick-renderer"
-RENDERER_PROTOCOL="v3-cf-aware"
+RENDERER_PROTOCOL="v4-meta"
 
 mkdir -p "$INSTALL_DIR"
 
@@ -80,6 +80,7 @@ fi
 echo "Compiling wick-renderer..."
 clang -o "$TMP_BUILD_BIN" "$RENDERER_SRC/renderer.m" \
     -DCEF_API_VERSION=14400 \
+    -I"$RENDERER_SRC" \
     -I"$INSTALL_DIR/$CEF_DIR" \
     -F"$INSTALL_DIR/$CEF_DIR/Release" \
     -framework "Chromium Embedded Framework" \

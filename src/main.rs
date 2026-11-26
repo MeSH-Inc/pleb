@@ -271,7 +271,6 @@ async fn main() -> Result<()> {
             }
         },
         Command::Status => {
-            let renderer_path = cef::find_renderer_in(&config.state_dir);
             println!("wick {} (mesh-wick)", env!("CARGO_PKG_VERSION"));
             println!(
                 "Cronet: {}",
@@ -281,9 +280,24 @@ async fn main() -> Result<()> {
                     "disabled (reqwest fallback)"
                 }
             );
-            match renderer_path {
-                Some(path) => println!("CEF renderer: installed ({})", path.display()),
-                None => println!("CEF renderer: not installed"),
+            match cef::probe_renderer_in(&config.state_dir) {
+                cef::RendererProbe::Ready(path) => println!(
+                    "CEF renderer: installed ({}, protocol {})",
+                    path.display(),
+                    cef::EXPECTED_PROTOCOL
+                ),
+                cef::RendererProbe::ProtocolMismatch {
+                    path,
+                    found,
+                    expected,
+                } => println!(
+                    "CEF renderer: protocol mismatch at {} (found {}, expected {}; rebuild with: {})",
+                    path.display(),
+                    found.as_deref().unwrap_or("none"),
+                    expected,
+                    cef::rebuild_command_hint()
+                ),
+                cef::RendererProbe::NotInstalled => println!("CEF renderer: not installed"),
             }
             #[cfg(unix)]
             match cef_daemon::daemon_ping(&config.state_dir).await {

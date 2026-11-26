@@ -21,6 +21,7 @@ echo "Compiling wick Helper..."
 clang -DCEF_API_VERSION=14400 \
     -o "$SCRIPT_DIR/wick_helper" \
     "$SCRIPT_DIR/helper.m" \
+    -I"$SCRIPT_DIR" \
     -I"$CEF_DIR" \
     -F"$CEF_DIR/Release" \
     -framework "Chromium Embedded Framework" \

@@ -49,7 +49,7 @@ CEF_PLATFORM="linux64"
 CEF_DIR="cef_binary_${CEF_VERSION}_${CEF_PLATFORM}_minimal"
 CEF_URL="https://cef-builds.spotifycdn.com/${CEF_DIR}.tar.bz2"
 RENDERER_BIN="$INSTALL_DIR/wick-renderer"
-RENDERER_PROTOCOL="v3-cf-aware"
+RENDERER_PROTOCOL="v4-meta"
 
 mkdir -p "$INSTALL_DIR"
 

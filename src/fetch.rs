@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use crate::context::RuntimeContext;
@@ -8,7 +8,9 @@ use crate::policy::{
     classify_response_with_parsed, detect_interstitial_challenge, plan_strategy, PrimaryTransport,
     RenderMode, ResponseClassification,
 };
-use crate::transport::cef::{CefRenderOptions, CefRenderer};
+use crate::transport::cef::{
+    CefProtocolError, CefRenderOptions, CefRenderResult, CefRenderer, CefTimeoutError,
+};
 
 #[derive(Debug, Error)]
 pub enum FetchError {
@@ -48,6 +50,9 @@ pub enum FetchError {
     #[error("CEF renderer unavailable: {0}")]
     CefUnavailable(String),
 
+    #[error("timed out fetching {url}: {detail}")]
+    Timeout { url: String, detail: String },
+
     #[error(transparent)]
     Transport(#[from] anyhow::Error),
 }
@@ -58,7 +63,10 @@ impl FetchError {
             Self::RobotsDisallowed { .. } | Self::Blocked { .. } | Self::Challenge { .. } => 2,
             Self::HttpError { .. } => 3,
             Self::UnsupportedContentType { .. } => 5,
-            Self::InvalidUrl(_) | Self::CefUnavailable(_) | Self::Transport(_) => 1,
+            Self::InvalidUrl(_)
+            | Self::CefUnavailable(_)
+            | Self::Timeout { .. }
+            | Self::Transport(_) => 1,
         }
     }
 }
@@ -281,24 +289,16 @@ async fn acquire_page(
 
     let mut cef_fallback = false;
     if plan.primary == PrimaryTransport::Cef {
-        match render_cef_checked(&ctx.cef, url_str, effective_selector).await {
-            Ok(html) => {
-                let timing_ms = start.elapsed().as_millis() as u64;
-                ctx.site_cache.record(host, "cef", timing_ms);
-                return Ok(AcquiredPage {
-                    body: html,
-                    final_url: url_str.to_string(),
-                    status_code: 200,
-                    content_type: Some("text/html".to_string()),
-                    strategy: "cef".to_string(),
-                    escalated: false,
-                    parsed: None,
-                });
-            }
+        match render_cef_checked(&ctx.cef, url_str, effective_selector, ctx.config.cef_timeout)
+            .await
+        {
+            Ok(cef_res) => return classify_cef_result(ctx, host, start, cef_res, false),
             Err(err) => {
                 let timing_ms = start.elapsed().as_millis() as u64;
-                ctx.site_cache.record(host, "cef_timeout", timing_ms);
-                if !plan.allow_cronet_fallback {
+                if matches!(err, FetchError::Timeout { .. }) {
+                    ctx.site_cache.record(host, "cef_timeout", timing_ms);
+                }
+                if matches!(err, FetchError::CefUnavailable(_)) || !plan.allow_cronet_fallback {
                     return Err(err);
                 }
                 tracing::warn!(
@@ -351,20 +351,16 @@ async fn acquire_page(
         }
         ResponseClassification::JavaScriptShell { reason } => {
             if plan.allow_cef_escalation {
-                match render_cef_checked(&ctx.cef, &final_url, effective_selector).await {
-                    Ok(html) => {
-                        let timing_ms = start.elapsed().as_millis() as u64;
-                        ctx.site_cache.record(host, "cef", timing_ms);
-                        return Ok(AcquiredPage {
-                            body: html,
-                            final_url,
-                            status_code: 200,
-                            content_type: Some("text/html".to_string()),
-                            strategy: "cef".to_string(),
-                            escalated: true,
-                            parsed: None,
-                        });
-                    }
+                match render_cef_checked(
+                    &ctx.cef,
+                    &final_url,
+                    effective_selector,
+                    ctx.config.cef_timeout,
+                )
+                .await
+                {
+                    Ok(cef_res) => return classify_cef_result(ctx, host, start, cef_res, true),
+                    Err(err) if matches!(err, FetchError::CefUnavailable(_)) => return Err(err),
                     Err(err) => {
                         tracing::warn!(
                             "JS shell detected ({}) on {} and CEF escalation failed: {}",
@@ -390,20 +386,16 @@ async fn acquire_page(
         }
         ResponseClassification::Blocked { status } => {
             if plan.allow_cef_escalation {
-                match render_cef_checked(&ctx.cef, &final_url, effective_selector).await {
-                    Ok(html) => {
-                        let timing_ms = start.elapsed().as_millis() as u64;
-                        ctx.site_cache.record(host, "cef", timing_ms);
-                        return Ok(AcquiredPage {
-                            body: html,
-                            final_url,
-                            status_code: 200,
-                            content_type: Some("text/html".to_string()),
-                            strategy: "cef".to_string(),
-                            escalated: true,
-                            parsed: None,
-                        });
-                    }
+                match render_cef_checked(
+                    &ctx.cef,
+                    &final_url,
+                    effective_selector,
+                    ctx.config.cef_timeout,
+                )
+                .await
+                {
+                    Ok(cef_res) => return classify_cef_result(ctx, host, start, cef_res, true),
+                    Err(err) if matches!(err, FetchError::CefUnavailable(_)) => return Err(err),
                     Err(err) => {
                         return Err(FetchError::Blocked {
                             url: final_url,
@@ -426,20 +418,16 @@ async fn acquire_page(
         }
         ResponseClassification::Challenge { status, reason } => {
             if plan.allow_cef_escalation {
-                match render_cef_checked(&ctx.cef, &final_url, effective_selector).await {
-                    Ok(html) => {
-                        let timing_ms = start.elapsed().as_millis() as u64;
-                        ctx.site_cache.record(host, "cef", timing_ms);
-                        return Ok(AcquiredPage {
-                            body: html,
-                            final_url,
-                            status_code: 200,
-                            content_type: Some("text/html".to_string()),
-                            strategy: "cef".to_string(),
-                            escalated: true,
-                            parsed: None,
-                        });
-                    }
+                match render_cef_checked(
+                    &ctx.cef,
+                    &final_url,
+                    effective_selector,
+                    ctx.config.cef_timeout,
+                )
+                .await
+                {
+                    Ok(cef_res) => return classify_cef_result(ctx, host, start, cef_res, true),
+                    Err(err) if matches!(err, FetchError::CefUnavailable(_)) => return Err(err),
                     Err(err) => {
                         return Err(FetchError::Challenge {
                             url: final_url,
@@ -462,33 +450,124 @@ async fn acquire_page(
     }
 }
 
+fn classify_cef_result(
+    ctx: &RuntimeContext,
+    host: &str,
+    start: Instant,
+    res: CefRenderResult,
+    escalated: bool,
+) -> std::result::Result<AcquiredPage, FetchError> {
+    if res.status_code == 0 {
+        return Err(FetchError::Transport(anyhow::anyhow!(
+            "CEF render did not capture an HTTP status code for {}",
+            res.final_url
+        )));
+    }
+
+    let mut parsed_html = None;
+    match classify_response_with_parsed(res.status_code, true, &res.html, &mut parsed_html) {
+        ResponseClassification::Ok | ResponseClassification::JavaScriptShell { .. } => {
+            let timing_ms = start.elapsed().as_millis() as u64;
+            ctx.site_cache.record(host, "cef", timing_ms);
+            Ok(AcquiredPage {
+                body: res.html,
+                final_url: res.final_url,
+                status_code: res.status_code,
+                content_type: Some("text/html".to_string()),
+                strategy: "cef".to_string(),
+                escalated,
+                parsed: parsed_html,
+            })
+        }
+        ResponseClassification::Blocked { status } => Err(FetchError::Blocked {
+            url: res.final_url,
+            status,
+            detail: "site blocked the request after CEF render".to_string(),
+        }),
+        ResponseClassification::Challenge { status, reason } => Err(FetchError::Challenge {
+            url: res.final_url,
+            status,
+            reason,
+        }),
+        ResponseClassification::HttpError { status } => Err(FetchError::HttpError {
+            url: res.final_url,
+            status,
+        }),
+    }
+}
+
 async fn render_cef_checked(
     cef: &CefRenderer,
     url: &str,
     wait_for_selector: Option<&str>,
-) -> std::result::Result<String, FetchError> {
+    timeout: Duration,
+) -> std::result::Result<CefRenderResult, FetchError> {
+    let deadline = Instant::now() + timeout;
     let opts = CefRenderOptions {
         wait_for_selector: wait_for_selector.map(|s| s.to_string()),
     };
 
-    let html = match cef.render(url, &opts).await {
+    let first_attempt = cef.render(url, &opts, timeout).await;
+    let result = match first_attempt {
         Ok(first) if is_acceptable_cef_render(&first) => first,
-        _ => cef.render(url, &opts).await.map_err(FetchError::Transport)?,
+        Ok(first) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining > Duration::from_secs(2) {
+                cef.render(url, &opts, remaining)
+                    .await
+                    .map_err(|err| map_cef_error(url, err))?
+            } else {
+                first
+            }
+        }
+        Err(err) => {
+            if err.is::<CefProtocolError>() || err.is::<CefTimeoutError>() {
+                return Err(map_cef_error(url, err));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining > Duration::from_secs(2) {
+                cef.render(url, &opts, remaining)
+                    .await
+                    .map_err(|retry_err| map_cef_error(url, retry_err))?
+            } else {
+                return Err(map_cef_error(url, err));
+            }
+        }
     };
 
-    if let Some(reason) = detect_interstitial_challenge(&html) {
+    if let Some(reason) = detect_interstitial_challenge(&result.html) {
+        let status = if result.status_code != 0 {
+            result.status_code
+        } else {
+            403
+        };
         return Err(FetchError::Challenge {
-            url: url.to_string(),
-            status: 403,
+            url: result.final_url,
+            status,
             reason,
         });
     }
 
-    Ok(html)
+    Ok(result)
 }
 
-fn is_acceptable_cef_render(html: &str) -> bool {
-    html.len() >= 2000 && detect_interstitial_challenge(html).is_none()
+fn map_cef_error(url: &str, err: anyhow::Error) -> FetchError {
+    if err.is::<CefProtocolError>() {
+        FetchError::CefUnavailable(err.to_string())
+    } else if err.is::<CefTimeoutError>() {
+        FetchError::Timeout {
+            url: url.to_string(),
+            detail: err.to_string(),
+        }
+    } else {
+        FetchError::Transport(err)
+    }
+}
+
+fn is_acceptable_cef_render(res: &CefRenderResult) -> bool {
+    !res.html.trim().is_empty()
+        && res.status_code != 0
+        && detect_interstitial_challenge(&res.html).is_none()
 }
 
 fn parse_http_url(url: &str) -> std::result::Result<url::Url, FetchError> {

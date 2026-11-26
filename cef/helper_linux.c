@@ -2,8 +2,10 @@
 // Pure C — no Cocoa/Objective-C dependencies.
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
+#include "stealth.h"
 #include "include/capi/cef_app_capi.h"
 #include "include/capi/cef_render_process_handler_capi.h"
 #include "include/cef_api_hash.h"
@@ -23,13 +25,18 @@ static void init_base(cef_base_ref_counted_t* base, size_t size) {
     base->has_at_least_one_ref = has_any;
 }
 
-// ── Stealth JS (same as macOS helper.m) ───────────────────────
-// Loaded from helper.m via include to keep a single source of truth.
-// If building standalone, copy the STEALTH_JS string from helper.m.
-
-#include "stealth.h"
-
 // ── Render process handler ────────────────────────────────────
+
+static void execute_js_utf8(cef_frame_t* frame, const char* js) {
+    if (!frame || !js || !js[0]) return;
+    cef_string_t code = {};
+    cef_string_utf8_to_utf16(js, strlen(js), &code);
+    cef_string_t url = {};
+    cef_string_utf8_to_utf16("", 0, &url);
+    frame->execute_java_script(frame, &code, &url, 0);
+    cef_string_clear(&code);
+    cef_string_clear(&url);
+}
 
 static void CEF_CALLBACK on_context_created(
     cef_render_process_handler_t* self,
@@ -39,13 +46,12 @@ static void CEF_CALLBACK on_context_created(
     (void)self; (void)browser; (void)context;
 
     if (frame) {
-        cef_string_t code = {};
-        cef_string_utf8_to_utf16(STEALTH_JS, strlen(STEALTH_JS), &code);
-        cef_string_t url = {};
-        cef_string_utf8_to_utf16("", 0, &url);
-        frame->execute_java_script(frame, &code, &url, 0);
-        cef_string_clear(&code);
-        cef_string_clear(&url);
+        execute_js_utf8(frame, STEALTH_JS);
+        char* tz_js = wick_build_timezone_js(getenv("MESH_WICK_TIMEZONE"));
+        if (tz_js) {
+            execute_js_utf8(frame, tz_js);
+            free(tz_js);
+        }
     }
 }
 

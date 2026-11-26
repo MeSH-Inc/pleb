@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use super::cef::{CefRenderOptions, CefRenderer};
+use super::cef::{CefProtocolError, CefRenderOptions, CefRenderResult, CefRenderer, CefTimeoutError};
 
 const SOCKET_NAME: &str = "cef.sock";
 const LOCK_NAME: &str = "cef.lock";
@@ -43,9 +43,15 @@ struct DaemonResponse {
     #[serde(default)]
     renderer_alive: Option<bool>,
     #[serde(default)]
+    status_code: Option<u16>,
+    #[serde(default)]
+    final_url: Option<String>,
+    #[serde(default)]
     html: Option<String>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    error_kind: Option<String>,
 }
 
 struct SocketCleanupGuard {
@@ -80,7 +86,6 @@ pub async fn run_daemon(state_dir: PathBuf, idle_timeout: Duration, verbose: boo
     match lock_file.try_lock() {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => {
-            // Another daemon instance already holds the lock for this state_dir.
             return Ok(());
         }
         Err(err) => {
@@ -109,7 +114,8 @@ pub async fn run_daemon(state_dir: PathBuf, idle_timeout: Duration, verbose: boo
         sock_path: sock_path.clone(),
     };
 
-    let mut active_renderer: Option<(Option<String>, Duration, CefRenderer)> = None;
+    // Pooled by proxy only (not timeout) so per-request timeout differences never respawn Chromium.
+    let mut active_renderer: Option<(Option<String>, CefRenderer)> = None;
 
     loop {
         let stream = tokio::select! {
@@ -140,7 +146,7 @@ pub async fn run_daemon(state_dir: PathBuf, idle_timeout: Duration, verbose: boo
 async fn handle_connection(
     stream: UnixStream,
     state_dir: &Path,
-    active_renderer: &mut Option<(Option<String>, Duration, CefRenderer)>,
+    active_renderer: &mut Option<(Option<String>, CefRenderer)>,
     verbose: bool,
 ) -> Result<bool> {
     let (read_half, mut write_half) = stream.into_split();
@@ -179,7 +185,7 @@ async fn handle_connection(
         DaemonRequest::Ping => {
             let renderer_alive = active_renderer
                 .as_ref()
-                .is_some_and(|(_, _, r)| r.has_live_process());
+                .is_some_and(|(_, r)| r.has_live_process());
             let resp = DaemonResponse {
                 ok: true,
                 pid: Some(std::process::id()),
@@ -205,30 +211,41 @@ async fn handle_connection(
         } => {
             let timeout = Duration::from_millis(timeout_ms.max(1));
             let needs_new = match active_renderer {
-                Some((ref p, t, _)) => p != &proxy || *t != timeout,
+                Some((ref p, _)) => p != &proxy,
                 None => true,
             };
             if needs_new {
                 *active_renderer = Some((
                     proxy.clone(),
-                    timeout,
-                    CefRenderer::new_direct(state_dir.to_path_buf(), proxy, timeout, verbose),
+                    CefRenderer::new_direct(state_dir.to_path_buf(), proxy, verbose),
                 ));
             }
 
-            let (_, _, renderer) = active_renderer.as_ref().expect("renderer initialized");
+            let (_, renderer) = active_renderer.as_ref().expect("renderer initialized");
             let opts = CefRenderOptions { wait_for_selector };
-            let resp = match renderer.render(&url, &opts).await {
-                Ok(html) => DaemonResponse {
+            let resp = match renderer.render(&url, &opts, timeout).await {
+                Ok(result) => DaemonResponse {
                     ok: true,
-                    html: Some(html),
+                    status_code: Some(result.status_code),
+                    final_url: Some(result.final_url),
+                    html: Some(result.html),
                     ..Default::default()
                 },
-                Err(err) => DaemonResponse {
-                    ok: false,
-                    error: Some(err.to_string()),
-                    ..Default::default()
-                },
+                Err(err) => {
+                    let error_kind = if err.is::<CefTimeoutError>() {
+                        Some("timeout".to_string())
+                    } else if err.is::<CefProtocolError>() {
+                        Some("protocol".to_string())
+                    } else {
+                        None
+                    };
+                    DaemonResponse {
+                        ok: false,
+                        error: Some(err.to_string()),
+                        error_kind,
+                        ..Default::default()
+                    }
+                }
             };
             let _ = write_response(&mut write_half, &resp).await;
             Ok(false)
@@ -236,7 +253,10 @@ async fn handle_connection(
     }
 }
 
-async fn write_response(write_half: &mut tokio::net::unix::OwnedWriteHalf, resp: &DaemonResponse) -> Result<()> {
+async fn write_response(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    resp: &DaemonResponse,
+) -> Result<()> {
     let mut encoded = serde_json::to_string(resp)?;
     encoded.push('\n');
     write_half.write_all(encoded.as_bytes()).await?;
@@ -306,7 +326,7 @@ pub async fn daemon_render(
     verbose: bool,
     url: &str,
     opts: &CefRenderOptions,
-) -> Result<String> {
+) -> Result<CefRenderResult> {
     let sock = socket_path(state_dir);
     let req = DaemonRequest::Render {
         url: url.to_string(),
@@ -327,14 +347,23 @@ pub async fn daemon_render(
     };
 
     if resp.ok {
-        resp.html
-            .ok_or_else(|| anyhow::anyhow!("CEF daemon returned ok=true with no HTML"))
+        let html = resp
+            .html
+            .ok_or_else(|| anyhow::anyhow!("CEF daemon returned ok=true with no HTML"))?;
+        Ok(CefRenderResult {
+            html,
+            final_url: resp.final_url.unwrap_or_else(|| url.to_string()),
+            status_code: resp.status_code.unwrap_or(200),
+        })
     } else {
-        bail!(
-            "{}",
-            resp.error
-                .unwrap_or_else(|| "CEF daemon render failed".to_string())
-        )
+        let msg = resp
+            .error
+            .unwrap_or_else(|| "CEF daemon render failed".to_string());
+        match resp.error_kind.as_deref() {
+            Some("timeout") => Err(anyhow::Error::new(CefTimeoutError(msg))),
+            Some("protocol") => Err(anyhow::Error::new(CefProtocolError(msg))),
+            _ => bail!("{}", msg),
+        }
     }
 }
 
@@ -387,7 +416,11 @@ async fn wait_for_socket_gone(sock_path: &Path, limit: Duration) {
     }
 }
 
-async fn send_request(sock_path: &Path, req: &DaemonRequest, timeout: Duration) -> Result<DaemonResponse> {
+async fn send_request(
+    sock_path: &Path,
+    req: &DaemonRequest,
+    timeout: Duration,
+) -> Result<DaemonResponse> {
     let fut = async {
         let stream = UnixStream::connect(sock_path).await?;
         let (read_half, mut write_half) = stream.into_split();
@@ -409,7 +442,7 @@ async fn send_request(sock_path: &Path, req: &DaemonRequest, timeout: Duration) 
 
     tokio::time::timeout(timeout, fut)
         .await
-        .map_err(|_| anyhow::anyhow!("CEF daemon request timed out after {:?}", timeout))?
+        .map_err(|_| CefTimeoutError(format!("CEF daemon request timed out after {:?}", timeout)))?
 }
 
 fn is_not_running_error(err: &anyhow::Error) -> bool {

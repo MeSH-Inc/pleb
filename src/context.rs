@@ -61,7 +61,6 @@ impl RuntimeContext {
         let cef = CefRenderer::new(
             config.state_dir.clone(),
             config.proxy.clone(),
-            config.cef_timeout,
             config.cef_idle_timeout,
             config.cef_daemon,
             config.verbose,
