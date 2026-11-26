@@ -2239,3 +2239,544 @@ async fn fetch_cdp_render_escalation_challenge_proxy_and_batch_tools() {
         BatchItemResult::Failure(f) => panic!("unexpected batch failure: {f:?}"),
     }
 }
+
+#[tokio::test]
+async fn adversarial_fetch_cdp_webmcp_merge_axtree_manifest_timeout_cache_and_unsigned_wba() {
+    use futures_util::{SinkExt, StreamExt};
+    use pleb::auth::{set_credential, CredentialProvider, CredentialStorage};
+    use pleb::extract::WebMcpToolSource;
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+    use tokio_tungstenite::tungstenite::Message;
+
+    const ADVERSARIAL_CDP_HTML: &str = concat!(
+        "<html><head><title>Dining</title></head><body>",
+        "<form toolname=\"reserve_table\" tooldescription=\"Reserve dinner table\" ",
+        "action=\"/api/reserve\" method=\"post\">",
+        "<label for=\"guests\">Party size</label>",
+        "<input id=\"guests\" name=\"guests\" type=\"number\" min=\"1\" max=\"8\" required>",
+        "<input type=\"password\" name=\"secret_pin\">",
+        "</form>",
+        "<form hidden toolname=\"hidden_admin\" tooldescription=\"Secret admin form\">",
+        "<input name=\"x\">",
+        "</form>",
+        "<main><h1>Dining Guide</h1>",
+        "<p>Reserve safely without form chrome. Our kitchen serves seasonal tasting menus ",
+        "every evening from five until ten, with vegetarian and gluten-free pairings ",
+        "prepared fresh to order by our culinary team in the main dining room.</p>",
+        "<p>Walk-in seating remains available at the chef counter throughout dinner service, ",
+        "and private dining tables for celebrations can accommodate larger parties upon ",
+        "advance request with forty-eight hours notice before your preferred date.</p>",
+        "</main>",
+        "</body></html>"
+    );
+
+    type LoggedHttpRequests = Arc<Mutex<Vec<(String, HashMap<String, String>)>>>;
+
+    let http_requests: LoggedHttpRequests = Arc::new(Mutex::new(Vec::new()));
+    let http_log = Arc::clone(&http_requests);
+    let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_port = http_listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = http_listener.accept().await else {
+                break;
+            };
+            let log = Arc::clone(&http_log);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let raw = String::from_utf8_lossy(&buf[..n]);
+                let mut lines = raw.lines();
+                let req_line = lines.next().unwrap_or("");
+                let path = req_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .to_string();
+                let mut headers = HashMap::new();
+                for line in lines {
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = line.split_once(':') {
+                        headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+                    }
+                }
+                log.lock().unwrap().push((path.clone(), headers));
+                let resp = match path.as_str() {
+                    "/robots.txt" => {
+                        http_response("200 OK", "text/plain", b"User-agent: *\nAllow: /\n")
+                    }
+                    "/blocked" => http_response(
+                        "403 Forbidden",
+                        "text/html",
+                        b"<html><body>Blocked Origin</body></html>",
+                    ),
+                    _ => http_response(
+                        "200 OK",
+                        "text/html",
+                        b"<html><head><title>Plain</title></head><body><main>Plain Origin</main></body></html>",
+                    ),
+                };
+                let _ = socket.write_all(&resp).await;
+            });
+        }
+    });
+
+    let ws_headers: Arc<Mutex<Vec<HashMap<String, String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let nav_delay_ms = Arc::new(AtomicU64::new(0));
+    let ws_headers_bg = Arc::clone(&ws_headers);
+    let nav_delay_bg = Arc::clone(&nav_delay_ms);
+    let cdp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cdp_port = cdp_listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = cdp_listener.accept().await else {
+                break;
+            };
+            let hdr_log = Arc::clone(&ws_headers_bg);
+            let delay_ctl = Arc::clone(&nav_delay_bg);
+            tokio::spawn(async move {
+                #[allow(clippy::result_large_err)]
+                let on_headers = |req: &Request, resp: Response| {
+                    let mut map = HashMap::new();
+                    for (name, val) in req.headers() {
+                        if let Ok(s) = val.to_str() {
+                            map.insert(name.as_str().to_ascii_lowercase(), s.to_string());
+                        }
+                    }
+                    hdr_log.lock().unwrap().push(map);
+                    Ok(resp)
+                };
+                let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(stream, on_headers).await
+                else {
+                    return;
+                };
+                while let Some(Ok(Message::Text(text))) = ws.next().await {
+                    let Ok(val) = serde_json::from_str::<Value>(text.as_str()) else {
+                        continue;
+                    };
+                    let id = val["id"].as_i64().unwrap_or(0);
+                    let method = val["method"].as_str().unwrap_or("");
+                    let sid = val["sessionId"].as_str().map(|s| s.to_string());
+                    let send_frame =
+                        |id_opt: Option<i64>, ev_method: Option<&str>, result: Value| {
+                            let mut obj = serde_json::Map::new();
+                            if let Some(i) = id_opt {
+                                obj.insert("id".into(), json!(i));
+                                obj.insert("result".into(), result);
+                            } else if let Some(m) = ev_method {
+                                obj.insert("method".into(), json!(m));
+                                obj.insert("params".into(), result);
+                            }
+                            if let Some(ref s) = sid {
+                                obj.insert("sessionId".into(), json!(s));
+                            }
+                            Message::Text(Value::Object(obj).to_string().into())
+                        };
+
+                    let replies = match method {
+                        "Target.createTarget" => {
+                            vec![send_frame(Some(id), None, json!({ "targetId": "tgt-adv" }))]
+                        }
+                        "Target.attachToTarget" => {
+                            vec![send_frame(
+                                Some(id),
+                                None,
+                                json!({ "sessionId": "sess-adv" }),
+                            )]
+                        }
+                        "Target.closeTarget" | "Page.enable" | "Network.enable"
+                        | "Fetch.enable" | "WebMCP.enable" => {
+                            vec![send_frame(Some(id), None, json!({}))]
+                        }
+                        "Page.getFrameTree" => vec![send_frame(
+                            Some(id),
+                            None,
+                            json!({ "frameTree": { "frame": { "id": "mf-adv" } } }),
+                        )],
+                        "Page.navigate" => {
+                            let ms = delay_ctl.load(Ordering::Relaxed);
+                            if ms > 0 {
+                                tokio::time::sleep(Duration::from_millis(ms)).await;
+                            }
+                            let nav_url = val["params"]["url"]
+                                .as_str()
+                                .unwrap_or("http://127.0.0.1/")
+                                .to_string();
+                            vec![
+                                send_frame(
+                                    None,
+                                    Some("Network.responseReceived"),
+                                    json!({
+                                        "requestId": "req-adv",
+                                        "frameId": "mf-adv",
+                                        "type": "Document",
+                                        "response": {
+                                            "url": nav_url,
+                                            "status": 200,
+                                            "headers": { "Content-Type": "text/html; charset=utf-8" }
+                                        }
+                                    }),
+                                ),
+                                send_frame(
+                                    None,
+                                    Some("WebMCP.toolsAdded"),
+                                    json!({
+                                        "tools": [
+                                            {
+                                                "name": "reserve_table",
+                                                "description": "STALE_CDP_CLOBBER",
+                                                "frameId": "mf-adv",
+                                                "backendNodeId": 77
+                                            },
+                                            {
+                                                "name": "hidden_admin",
+                                                "description": "REINJECTED_HIDDEN",
+                                                "frameId": "mf-adv",
+                                                "backendNodeId": 88
+                                            },
+                                            {
+                                                "name": "foreign_tool",
+                                                "description": "SUBFRAME",
+                                                "frameId": "sub-frame"
+                                            },
+                                            {
+                                                "name": "ephemeral_tool",
+                                                "description": "EPHEMERAL",
+                                                "frameId": "mf-adv"
+                                            },
+                                            {
+                                                "name": "live_slots",
+                                                "description": "Check live ```slots\x1b[31m",
+                                                "frameId": "mf-adv",
+                                                "inputSchema": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "note": {
+                                                            "type": "string",
+                                                            "description": "Use ``` fence"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        ]
+                                    }),
+                                ),
+                                send_frame(
+                                    None,
+                                    Some("WebMCP.toolsRemoved"),
+                                    json!({
+                                        "tools": [
+                                            { "name": "ephemeral_tool", "frameId": "mf-adv" },
+                                            { "name": "live_slots", "frameId": "sub-frame" }
+                                        ]
+                                    }),
+                                ),
+                                send_frame(Some(id), None, json!({})),
+                                send_frame(None, Some("Page.loadEventFired"), json!({})),
+                            ]
+                        }
+                        "DOM.getDocument" => {
+                            vec![send_frame(
+                                Some(id),
+                                None,
+                                json!({ "root": { "nodeId": 9 } }),
+                            )]
+                        }
+                        "DOM.getOuterHTML" => {
+                            vec![send_frame(
+                                Some(id),
+                                None,
+                                json!({ "outerHTML": ADVERSARIAL_CDP_HTML }),
+                            )]
+                        }
+                        "Accessibility.getFullAXTree" => {
+                            vec![send_frame(
+                                Some(id),
+                                None,
+                                json!({
+                                    "nodes": [
+                                        {
+                                            "nodeId": "1",
+                                            "ignored": false,
+                                            "role": { "value": "RootWebArea" },
+                                            "name": { "value": "Dining AX" },
+                                            "childIds": ["2", "3"]
+                                        },
+                                        {
+                                            "nodeId": "2",
+                                            "ignored": false,
+                                            "role": { "value": "generic" },
+                                            "childIds": ["4"]
+                                        },
+                                        {
+                                            "nodeId": "3",
+                                            "ignored": true,
+                                            "role": { "value": "button" },
+                                            "name": { "value": "HiddenAX" },
+                                            "childIds": []
+                                        },
+                                        {
+                                            "nodeId": "4",
+                                            "ignored": false,
+                                            "role": { "value": "button" },
+                                            "name": { "value": "Book\x1b[31m\nNow" },
+                                            "childIds": []
+                                        }
+                                    ]
+                                }),
+                            )]
+                        }
+                        _ => {
+                            let mut obj = json!({
+                                "id": id,
+                                "error": { "code": -32601, "message": "not found" }
+                            });
+                            if let Some(ref s) = sid {
+                                obj["sessionId"] = json!(s);
+                            }
+                            vec![Message::Text(obj.to_string().into())]
+                        }
+                    };
+                    for msg in replies {
+                        if ws.send(msg).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let cdp_ws = format!("ws://127.0.0.1:{cdp_port}/devtools/browser");
+    let origin = format!("http://127.0.0.1:{http_port}");
+    let state_dir = temp_state_dir();
+
+    // Configure WBA credentials (file-backed, no global env mutation) and keep signing enabled.
+    set_credential(
+        state_dir.path(),
+        CredentialProvider::WebBotAuthJwk,
+        r#"{"crv":"Ed25519","d":"nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A","kty":"OKP","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}"#,
+        CredentialStorage::File,
+    )
+    .unwrap();
+    set_credential(
+        state_dir.path(),
+        CredentialProvider::WebBotAuthAgent,
+        "https://agent.example.com",
+        CredentialStorage::File,
+    )
+    .unwrap();
+
+    let ctx = RuntimeContext::new(RuntimeConfig {
+        state_dir: state_dir.path().to_path_buf(),
+        cdp_url: Some(cdp_ws.clone()),
+        cdp_timeout: Duration::from_secs(5),
+        no_web_bot_auth: false,
+        ..Default::default()
+    })
+    .unwrap();
+
+    // A. Declarative vs imperative WebMCP merge + manifest rendering + dynamic fence + unsigned CDP WS.
+    let merged = fetch_document(
+        &ctx,
+        &format!("{origin}/plain"),
+        &FetchOptions {
+            render: RenderMode::Cdp,
+            tools: ToolPolicy::Manifest,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(merged.strategy, "cdp");
+    assert_eq!(merged.tools.len(), 2);
+    let decl = merged
+        .tools
+        .iter()
+        .find(|t| t.name == "reserve_table")
+        .expect("declarative HTML tool must remain present");
+    assert_eq!(decl.source, WebMcpToolSource::Declarative);
+    assert_eq!(decl.description, "Reserve dinner table");
+    assert_eq!(
+        decl.action_url.as_deref(),
+        Some(format!("{origin}/api/reserve").as_str())
+    );
+    assert_eq!(decl.method.as_deref(), Some("POST"));
+    assert_eq!(
+        decl.annotations.as_ref().and_then(|a| a.untrusted_content),
+        Some(true)
+    );
+    let schema_str = decl.input_schema.as_ref().unwrap().to_string();
+    assert!(schema_str.contains("guests"));
+    assert!(!schema_str.contains("secret_pin"));
+
+    let imp = merged
+        .tools
+        .iter()
+        .find(|t| t.name == "live_slots")
+        .expect("imperative CDP tool must merge");
+    assert_eq!(imp.source, WebMcpToolSource::Imperative);
+    assert!(!imp.description.contains('\x1b'));
+    assert_eq!(
+        imp.annotations.as_ref().and_then(|a| a.untrusted_content),
+        Some(true)
+    );
+
+    assert!(merged.content.contains("Dining Guide"));
+    assert!(merged.content.contains("## Page Tools (WebMCP)"));
+    assert!(merged.content.contains("````json"));
+    for forbidden in [
+        "STALE_CDP_CLOBBER",
+        "REINJECTED_HIDDEN",
+        "SUBFRAME",
+        "EPHEMERAL",
+        "hidden_admin",
+        "secret_pin",
+    ] {
+        assert!(
+            !merged.content.contains(forbidden),
+            "merged output unexpectedly contained {forbidden}"
+        );
+    }
+
+    // Check --tools manifest + --max-bytes preserves merged tools and bounds final output.
+    let capped_manifest = fetch_document(
+        &ctx,
+        &format!("{origin}/plain"),
+        &FetchOptions {
+            render: RenderMode::Cdp,
+            tools: ToolPolicy::Manifest,
+            extract: ExtractOptions {
+                max_bytes: Some(140),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(capped_manifest.truncated);
+    assert!(capped_manifest.content.len() <= 140);
+    assert_eq!(capped_manifest.content_bytes, capped_manifest.content.len());
+    assert_eq!(capped_manifest.tools.len(), 2);
+
+    // B. Cold RenderMode::Auto + --format axtree promotes directly to CDP, promotes children across generic, omits ignored, escapes controls, and bounds --max-bytes.
+    let ax_cold_dir = temp_state_dir();
+    let ax_cold_ctx = RuntimeContext::new(RuntimeConfig {
+        state_dir: ax_cold_dir.path().to_path_buf(),
+        cdp_url: Some(cdp_ws.clone()),
+        cdp_timeout: Duration::from_secs(5),
+        no_web_bot_auth: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let ax_full = fetch_document(
+        &ax_cold_ctx,
+        &format!("{origin}/plain"),
+        &FetchOptions {
+            render: RenderMode::Auto,
+            extract: ExtractOptions {
+                format: OutputFormat::Axtree,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(ax_full.strategy, "cdp");
+    assert!(!ax_full.escalated);
+    assert!(!ax_full.content.contains('\x1b'));
+    assert!(!ax_full.content.contains("HiddenAX"));
+    assert!(!ax_full.content.contains("generic"));
+    assert!(ax_full.content.contains("RootWebArea \"Dining AX\""));
+    assert!(ax_full.content.contains("\n  button \"Book[31m\\nNow\""));
+    assert_eq!(ax_full.tools.len(), 2);
+
+    let ax_capped = fetch_document(
+        &ctx,
+        &format!("{origin}/plain"),
+        &FetchOptions {
+            render: RenderMode::Cdp,
+            tools: ToolPolicy::Manifest,
+            extract: ExtractOptions {
+                format: OutputFormat::Axtree,
+                max_bytes: Some(90),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(ax_capped.truncated);
+    assert!(ax_capped.content.len() <= 90);
+    assert_eq!(ax_capped.content_bytes, ax_capped.content.len());
+
+    // C. Verify WBA never signs CDP handshakes, robots.txt fetches, or plaintext http:// origins.
+    let _plain_ok = fetch_document(
+        &ctx,
+        &format!("{origin}/plain"),
+        &FetchOptions {
+            render: RenderMode::Cronet,
+            respect_robots: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    for hdrs in ws_headers.lock().unwrap().iter() {
+        for forbidden in ["signature", "signature-input", "signature-agent"] {
+            assert!(
+                !hdrs.contains_key(forbidden),
+                "CDP WebSocket handshake leaked WBA header {forbidden}"
+            );
+        }
+    }
+    {
+        let http_log_guard = http_requests.lock().unwrap();
+        assert!(http_log_guard.iter().any(|(p, _)| p == "/robots.txt"));
+        assert!(http_log_guard.iter().any(|(p, _)| p == "/plain"));
+        for (path, hdrs) in http_log_guard.iter() {
+            for forbidden in ["signature", "signature-input", "signature-agent"] {
+                assert!(
+                    !hdrs.contains_key(forbidden),
+                    "plaintext http://{path} leaked WBA header {forbidden}"
+                );
+            }
+        }
+    }
+
+    // D. Escalation CDP timeout persists "cdp_timeout" into site_cache.
+    let timeout_dir = temp_state_dir();
+    let timeout_ctx = RuntimeContext::new(RuntimeConfig {
+        state_dir: timeout_dir.path().to_path_buf(),
+        cdp_url: Some(cdp_ws),
+        cdp_timeout: Duration::from_millis(150),
+        no_web_bot_auth: true,
+        ..Default::default()
+    })
+    .unwrap();
+    nav_delay_ms.store(500, Ordering::Relaxed);
+    let esc_err = fetch_document(
+        &timeout_ctx,
+        &format!("{origin}/blocked"),
+        &FetchOptions::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(esc_err, FetchError::Blocked { .. }));
+    let cached = timeout_ctx
+        .site_cache
+        .get("127.0.0.1")
+        .expect("cdp_timeout should be recorded in site_cache");
+    assert_eq!(cached.strategy, "cdp_timeout");
+}
