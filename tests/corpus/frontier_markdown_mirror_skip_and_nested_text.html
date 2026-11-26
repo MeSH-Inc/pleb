@@ -1,0 +1,18 @@
+<!-- wick-fixture: {"tier":"ratchet","url":"https://docs.example.com/workers/get-started/guide/","status_code":200,"content_type":"text/markdown; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"CLI","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["Documentation Index","# CLI","Set up and deploy your first service with the CLI.","Skip to section 2"],"forbidden_substrings":["[Skip to content](#main-content)"],"minimum_output_bytes":120,"maximum_output_bytes":1200,"expected_structure":{"minimum_headings":1}},{"name":"clean_text","format":"text","mode":"clean","expected_substrings":["Set up and deploy your first service with the CLI.","Build status","Docs","See bold and code or Skip to section 2 for details."],"forbidden_substrings":["Skip to content","![Build status]","![](https://","badge.svg","logo.svg","**bold**","](https://"],"minimum_output_bytes":80,"maximum_output_bytes":800},{"name":"full_md","format":"markdown","mode":"full","expected_substrings":["title: CLI","[Skip to content](#main-content)","# CLI"]}]} -->
+---
+title: CLI
+description: Deploy your first service.
+---
+
+[Skip to content](#main-content)
+
+> Documentation Index
+> Fetch the complete index at: https://docs.example.com/llms.txt
+
+# CLI
+
+Set up and deploy your first service with the CLI.
+
+[![Build status](https://ci.example.com/badge.svg)](https://ci.example.com/actions)
+[![](https://docs.example.com/logo.svg)Docs](https://docs.example.com/)
+See [**bold** and `code`](/guide) or [Skip to section 2](#sec2) for details.

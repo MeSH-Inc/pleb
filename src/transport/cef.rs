@@ -349,16 +349,8 @@ impl CefRenderer {
         }
 
         #[cfg(target_os = "linux")]
-        if std::env::var("DISPLAY").is_err() {
-            if !std::path::Path::new("/tmp/.X99-lock").exists() {
-                let _ = Command::new("Xvfb")
-                    .args([":99", "-screen", "0", "1920x1080x24"])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn();
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            cmd.env("DISPLAY", ":99");
+        if std::env::var("DISPLAY").is_ok_and(|d| d.trim().is_empty()) {
+            cmd.env_remove("DISPLAY");
         }
 
         let lib_path = match std::env::var("LD_LIBRARY_PATH") {
@@ -366,9 +358,7 @@ impl CefRenderer {
                 #[cfg(target_os = "linux")]
                 {
                     let mut parts = Vec::new();
-                    if std::env::var("DISPLAY").is_ok()
-                        || std::path::Path::new("/tmp/.X99-lock").exists()
-                    {
+                    if std::env::var("DISPLAY").is_ok_and(|d| !d.trim().is_empty()) {
                         if let Some(multiarch) = linux_multiarch_lib_dir() {
                             parts.push(multiarch.display().to_string());
                         }

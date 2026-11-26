@@ -42,15 +42,15 @@ pub fn extract_native_markdown(
     };
 
     let frontmatter_title = frontmatter.as_ref().and_then(|fm| fm.title.clone());
-    let title = frontmatter_title
-        .clone()
-        .or_else(|| first_markdown_h1(markdown_body));
+    let first_h1 = first_markdown_h1(markdown_body);
+    let title = frontmatter_title.clone().or_else(|| first_h1.clone());
 
     let rewritten_body = rewrite_markdown_links(
         markdown_body,
         page_url,
         options.include_images,
         options.include_links,
+        options.mode != ExtractMode::Full,
     );
 
     match options.format {
@@ -68,8 +68,14 @@ pub fn extract_native_markdown(
                 }
             } else {
                 let trimmed = compacted_body.trim();
+                let has_matching_h1 = |t: &str| {
+                    starts_with_title_heading(trimmed, t)
+                        || first_h1
+                            .as_deref()
+                            .is_some_and(|h| h.trim().eq_ignore_ascii_case(t.trim()))
+                };
                 match &frontmatter_title {
-                    Some(t) if !starts_with_title_heading(trimmed, t) => {
+                    Some(t) if !has_matching_h1(t) => {
                         if trimmed.is_empty() {
                             format!("# {t}")
                         } else {
@@ -288,6 +294,7 @@ fn rewrite_markdown_links(
     base_url: &Url,
     include_images: bool,
     include_links: bool,
+    strip_skip_lines: bool,
 ) -> String {
     let mut out = String::with_capacity(md.len());
     let mut fence = FenceTracker::default();
@@ -307,6 +314,10 @@ fn rewrite_markdown_links(
             continue;
         }
 
+        if strip_skip_lines && is_standalone_markdown_skip_link(line) {
+            continue;
+        }
+
         if let Some(rewritten_def) =
             rewrite_link_ref_definition(line, base_url, include_images, include_links)
         {
@@ -322,6 +333,30 @@ fn rewrite_markdown_links(
     }
 
     out
+}
+
+fn is_standalone_markdown_skip_link(line: &str) -> bool {
+    let t = line.trim();
+    if !t.starts_with('[') || !t.ends_with(')') {
+        return false;
+    }
+    let Some(close) = find_matching_bracket(t, 0) else {
+        return false;
+    };
+    let label = t[1..close].trim();
+    let Some(dest) = t
+        .get(close + 1..)
+        .and_then(|r| r.strip_prefix('('))
+        .and_then(|r| r.strip_suffix(')'))
+        .map(str::trim)
+    else {
+        return false;
+    };
+    label.len() <= 48
+        && label.to_ascii_lowercase().starts_with("skip to ")
+        && dest.starts_with('#')
+        && dest.len() > 1
+        && !dest.contains(|c: char| c.is_ascii_whitespace())
 }
 
 struct LinkRefDef<'a> {
@@ -921,15 +956,19 @@ fn strip_line_markdown(line: &str, defined_refs: &HashSet<String>) -> String {
         }
     };
     let without_quote = without_heading.trim_start_matches(['>', ' ']).trim_start();
-
     let mut out = String::with_capacity(without_quote.len());
-    let bytes = without_quote.as_bytes();
+    strip_inline_markdown(without_quote, defined_refs, &mut out);
+    out
+}
+
+fn strip_inline_markdown(s: &str, defined_refs: &HashSet<String>, out: &mut String) {
+    let bytes = s.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
         if bytes[i] == b'`' {
             let run = count_byte_run(bytes, i, b'`');
             if let Some(close_end) = find_closing_backticks(bytes, i + run, run) {
-                out.push_str(&without_quote[i + run..close_end - run]);
+                out.push_str(&s[i + run..close_end - run]);
                 i = close_end;
                 continue;
             }
@@ -938,10 +977,10 @@ fn strip_line_markdown(line: &str, defined_refs: &HashSet<String>) -> String {
         }
         if matches!(bytes.get(i..i + 2), Some(b"**" | b"~~")) {
             let marker = &bytes[i..i + 2];
-            if let Some(rel) = without_quote[i + 2..].find(std::str::from_utf8(marker).unwrap()) {
-                let inner = &without_quote[i + 2..i + 2 + rel];
+            if let Some(rel) = s[i + 2..].find(std::str::from_utf8(marker).unwrap()) {
+                let inner = &s[i + 2..i + 2 + rel];
                 if !inner.is_empty() {
-                    out.push_str(&strip_line_markdown(inner, defined_refs));
+                    strip_inline_markdown(inner, defined_refs, out);
                     i = i + 2 + rel + 2;
                     continue;
                 }
@@ -951,30 +990,29 @@ fn strip_line_markdown(line: &str, defined_refs: &HashSet<String>) -> String {
         let is_link = bytes[i] == b'[';
         if is_image || is_link {
             let bracket_start = if is_image { i + 1 } else { i };
-            if let Some(bracket_end) = find_matching_bracket(without_quote, bracket_start) {
-                let label = &without_quote[bracket_start + 1..bracket_end];
+            if let Some(bracket_end) = find_matching_bracket(s, bracket_start) {
+                let label = &s[bracket_start + 1..bracket_end];
                 if bracket_end + 1 < bytes.len() && bytes[bracket_end + 1] == b'(' {
-                    if let Some(parsed) = parse_paren_destination(without_quote, bracket_end + 1) {
-                        out.push_str(label);
+                    if let Some(parsed) = parse_paren_destination(s, bracket_end + 1) {
+                        strip_inline_markdown(label, defined_refs, out);
                         i = parsed.close_paren + 1;
                         continue;
                     }
                 } else if bracket_end + 1 < bytes.len() && bytes[bracket_end + 1] == b'[' {
-                    if let Some(ref_end) = find_matching_bracket(without_quote, bracket_end + 1) {
-                        out.push_str(label);
+                    if let Some(ref_end) = find_matching_bracket(s, bracket_end + 1) {
+                        strip_inline_markdown(label, defined_refs, out);
                         i = ref_end + 1;
                         continue;
                     }
                 } else if !is_image && defined_refs.contains(&label.trim().to_ascii_lowercase()) {
-                    out.push_str(label);
+                    strip_inline_markdown(label, defined_refs, out);
                     i = bracket_end + 1;
                     continue;
                 }
             }
         }
-        let ch = without_quote[i..].chars().next().unwrap();
+        let ch = s[i..].chars().next().unwrap();
         out.push(ch);
         i += ch.len_utf8();
     }
-    out
 }

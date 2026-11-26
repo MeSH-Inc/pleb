@@ -100,6 +100,7 @@ static MAIN_SEL: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("main, [role=\"main\"]").unwrap());
 static BLOCK_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("section, div").unwrap());
 static A_HREF_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("a[href]").unwrap());
+static BUTTON_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("button").unwrap());
 static STYLE_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("[style]").unwrap());
 static IMG_DIM_SEL: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("img[width], img[height]").unwrap());
@@ -462,8 +463,9 @@ fn walk_node_metrics(
                 }
             }
 
-            let entering_link = tag == "a" && !in_link;
-            let child_in_link = in_link || tag == "a";
+            let is_nav_control = matches!(tag, "a" | "button");
+            let entering_link = is_nav_control && !in_link;
+            let child_in_link = in_link || is_nav_control;
             let child_in_code = in_code || matches!(tag, "pre" | "code");
 
             let mut acc = NodeMetrics {
@@ -578,6 +580,15 @@ fn prune_dom(doc: &mut Html, mode: ExtractMode) -> HashMap<NodeId, NodeMetrics> 
                 to_detach.push(skip_target);
             }
         }
+        for el in doc.select(&BUTTON_SEL) {
+            if is_skip_text(*el)
+                && !el
+                    .ancestors()
+                    .any(|a| matches!(a.value(), Node::Element(e) if is_landmark_element(e)))
+            {
+                to_detach.push(el.id());
+            }
+        }
     }
 
     detach_nodes(doc, to_detach);
@@ -676,21 +687,21 @@ fn is_inline_hidden_style(style: &str) -> bool {
     })
 }
 
-fn is_skip_fragment_link(node: NodeRef<'_, Node>) -> bool {
-    let Node::Element(el) = node.value() else {
-        return false;
-    };
-    if !el
-        .attr("href")
-        .is_some_and(|h| h.trim().starts_with('#') && h.trim().len() > 1)
-    {
-        return false;
-    }
+fn is_skip_text(node: NodeRef<'_, Node>) -> bool {
     let mut raw = String::new();
     collect_raw_text(node, &mut raw);
     let collapsed = collapse_inline_whitespace(&raw);
     let trimmed = collapsed.trim();
     trimmed.len() <= 48 && trimmed.to_ascii_lowercase().starts_with("skip to ")
+}
+
+fn is_skip_fragment_link(node: NodeRef<'_, Node>) -> bool {
+    let Node::Element(el) = node.value() else {
+        return false;
+    };
+    el.attr("href")
+        .is_some_and(|h| h.trim().starts_with('#') && h.trim().len() > 1)
+        && is_skip_text(node)
 }
 
 fn container_only_skip_links(node: NodeRef<'_, Node>) -> bool {

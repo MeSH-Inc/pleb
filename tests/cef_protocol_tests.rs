@@ -697,6 +697,15 @@ fn chromium_cronet_cef_version_and_keyring_parity() {
         renderer_linux.contains("--password-store=basic"),
         "cef/renderer_linux.c must pass --password-store=basic to prevent headless keyring hangs"
     );
+    assert!(
+        renderer_linux.contains("display_env[0] != '\\0'"),
+        "cef/renderer_linux.c must treat empty DISPLAY=\"\" as headless (Ozone headless)"
+    );
+    let cef_rs = fs::read_to_string(root.join("src/transport/cef.rs")).unwrap();
+    assert!(
+        !cef_rs.contains("Command::new(\"Xvfb\")") && !cef_rs.contains("cmd.env(\"DISPLAY\", \":99\")"),
+        "src/transport/cef.rs must not unconditionally inject DISPLAY=:99 / Xvfb and break Ozone headless"
+    );
 }
 
 #[cfg(unix)]

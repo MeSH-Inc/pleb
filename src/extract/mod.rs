@@ -381,7 +381,7 @@ pub(crate) fn starts_with_title_heading(md: &str, title: &str) -> bool {
     if heading.eq_ignore_ascii_case(title_trimmed) {
         return true;
     }
-    for sep in [" | ", " - ", " — ", " – ", " :: ", " · "] {
+    for sep in [" | ", " - ", " — ", " – ", " :: ", " · ", " • "] {
         if let Some((prefix, _)) = title_trimmed.split_once(sep) {
             let p = prefix.trim();
             if !p.is_empty() && heading.eq_ignore_ascii_case(p) {

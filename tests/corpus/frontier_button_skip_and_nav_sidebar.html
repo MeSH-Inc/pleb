@@ -1,0 +1,34 @@
+<!-- wick-fixture: {"tier":"ratchet","url":"https://docs.example.dev/overview","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"What is Framework? • Framework","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["# What is Framework?","Framework empowers developers to build fast, reliable web applications with reactive primitives.","Skip to step 2"],"forbidden_substrings":["Skip to main content","In-depth Guides","Directives","What is Framework? • Framework"],"minimum_output_bytes":80,"maximum_output_bytes":1000,"expected_structure":{"minimum_headings":1}}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><title>What is Framework? • Framework</title></head>
+<body>
+  <app-shell>
+    <button type="button" class="skip-btn">Skip to main content</button>
+    <app-secondary-navigation>
+      <div id="secondaryNav">
+        <ul class="docs-navigation-list">
+          <li>
+            <div><span>In-depth Guides</span></div>
+            <ul>
+              <li><button type="button">Signals</button></li>
+              <li><button type="button">Components</button></li>
+              <li><button type="button">Templates</button></li>
+              <li><button type="button">Directives</button></li>
+              <li><button type="button">Routing</button></li>
+              <li><button type="button">Forms</button></li>
+              <li><button type="button">Testing</button></li>
+              <li><a href="/guide/drag-drop">Drag and drop</a></li>
+            </ul>
+          </li>
+        </ul>
+      </div>
+    </app-secondary-navigation>
+    <main>
+      <h1>What is Framework?</h1>
+      <p>Framework empowers developers to build fast, reliable web applications with reactive primitives.</p>
+      <p><button type="button">Skip to step 2</button></p>
+    </main>
+  </app-shell>
+</body>
+</html>

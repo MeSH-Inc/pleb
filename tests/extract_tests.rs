@@ -1608,4 +1608,62 @@ fn adversarial_canary_inverse_false_positives_preserve_valid_content() {
     assert!(mdx_doc
         .content
         .contains("<div class=\"keep\"><Note>verbatim</Note></div>"));
+
+    // 6. Inverse tests for button controls inside landmarks, Markdown mirror deduplication,
+    // fenced/Full skip-link preservation, and `#`/nested inline formatting in `--format text`.
+    let landmark_buttons_html = concat!(
+        "<!doctype html><html><head><title>Controls • Docs</title></head><body>",
+        "<button type=\"button\">Skip to content</button>",
+        "<article><h1>Controls</h1><ul>",
+        "<li><button type=\"button\">Alpha</button></li>",
+        "<li><button type=\"button\">Beta</button></li>",
+        "<li><button type=\"button\">Gamma</button></li>",
+        "<li><button type=\"button\">Skip to step 2</button></li>",
+        "</ul></article></body></html>"
+    );
+    let landmark_doc = extract_document(
+        landmark_buttons_html,
+        &Url::parse("https://docs.example.dev/controls").unwrap(),
+        Some("text/html"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert!(!landmark_doc.content.contains("Skip to content"));
+    assert!(!landmark_doc.content.contains("Controls • Docs"));
+    assert!(landmark_doc.content.contains("Alpha"));
+    assert!(landmark_doc.content.contains("Skip to step 2"));
+
+    let mirror_md = concat!(
+        "---\ntitle: CLI\n---\n\n",
+        "[Skip to content](#main-content)\n\n",
+        "> Index note\n\n",
+        "# CLI\n\n",
+        "Issue [#123](https://example.com/123) and [Skip to section](#s) inline.\n\n",
+        "```md\n[Skip to content](#fenced)\n```\n"
+    );
+    let mirror_clean = extract_document(
+        mirror_md,
+        &md_url,
+        Some("text/markdown"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(mirror_clean.content.matches("# CLI").count(), 1);
+    assert!(!mirror_clean.content.contains("#main-content"));
+    assert!(mirror_clean.content.contains("[Skip to content](#fenced)"));
+    assert!(mirror_clean.content.contains("[Skip to section]"));
+
+    let mirror_text = extract_document(
+        mirror_md,
+        &md_url,
+        Some("text/markdown"),
+        &ExtractOptions {
+            format: OutputFormat::Text,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(mirror_text
+        .content
+        .contains("Issue #123 and Skip to section inline."));
 }

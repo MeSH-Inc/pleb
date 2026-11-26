@@ -17,7 +17,8 @@ static int get_exe_dir(char* buf, size_t bufsize) {
 }
 
 int main(int argc, char* argv[]) {
-    int has_display = (getenv("DISPLAY") != NULL);
+    const char* display_env = getenv("DISPLAY");
+    int has_display = (display_env != NULL && display_env[0] != '\0');
     int extra_args = has_display ? 7 : 9;
 
     const char* cache_dir_arg = NULL;
