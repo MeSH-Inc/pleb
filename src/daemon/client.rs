@@ -15,7 +15,7 @@ use super::protocol::{
 use super::server::stop_legacy_cef_daemon;
 use crate::context::ensure_private_dir;
 use crate::transport::cef::{CefProtocolError, CefRenderOptions, CefRenderResult, CefTimeoutError};
-use crate::transport::{HttpResponse, ResponseTooLargeError};
+use crate::transport::{HttpResponse, ResponseTooLargeError, TransportError, TransportErrorKind};
 
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(3);
 const CLIENT_IO_GRACE: Duration = Duration::from_secs(5);
@@ -207,13 +207,14 @@ pub async fn daemon_cef_render_with_executable(
 
 fn map_daemon_error(hdr: &DaemonResponseHeader, default_msg: &str) -> anyhow::Error {
     let msg = hdr.error.as_deref().unwrap_or(default_msg).to_string();
-    match hdr.error_kind.as_deref() {
-        Some("timeout") => anyhow::Error::new(CefTimeoutError(msg)),
-        Some("protocol") => anyhow::Error::new(CefProtocolError(msg)),
-        Some("response_too_large") => anyhow::Error::new(ResponseTooLargeError {
+    match hdr.error_kind {
+        Some(TransportErrorKind::Timeout) => anyhow::Error::new(CefTimeoutError(msg)),
+        Some(TransportErrorKind::ProtocolMismatch) => anyhow::Error::new(CefProtocolError(msg)),
+        Some(TransportErrorKind::ResponseTooLarge) => anyhow::Error::new(ResponseTooLargeError {
             limit_bytes: hdr.limit_bytes.unwrap_or(0),
         }),
-        _ => anyhow::anyhow!(msg),
+        Some(kind) => anyhow::Error::new(TransportError::new(kind, msg)),
+        None => anyhow::Error::new(TransportError::new(TransportErrorKind::Network, msg)),
     }
 }
 

@@ -3,8 +3,9 @@ use mesh_wick::fetch::{fetch_document, FetchError, FetchOptions};
 use mesh_wick::policy::RenderMode;
 use mesh_wick::transport::cef::{
     find_renderer_in, probe_renderer_binary, probe_renderer_in, CefProtocolError, CefRenderOptions,
-    CefRenderer, RendererProbe, EXPECTED_PROTOCOL,
+    CefRenderer, CefTimeoutError, RendererProbe, EXPECTED_PROTOCOL,
 };
+use mesh_wick::transport::{TransportError, TransportErrorKind};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -100,7 +101,15 @@ for raw in sys.stdin:
         sys.stdout.buffer.write(html)
         sys.stdout.buffer.flush()
     elif url.endswith("/load-fail"):
-        hdr = {{"status_code": 0, "final_url": url, "html_bytes": 0, "error": "load error -105"}}
+        hdr = {{"status_code": 0, "final_url": url, "html_bytes": 0, "error": "load error -105", "error_kind": "load_error"}}
+        sys.stdout.write(json.dumps(hdr) + "\n")
+        sys.stdout.flush()
+    elif url.endswith("/bad-selector"):
+        hdr = {{"status_code": 200, "final_url": url, "html_bytes": 0, "error": "invalid selector: [unclosed", "error_kind": "invalid_selector"}}
+        sys.stdout.write(json.dumps(hdr) + "\n")
+        sys.stdout.flush()
+    elif url.endswith("/timeout-kind"):
+        hdr = {{"status_code": 0, "final_url": url, "html_bytes": 0, "error": "renderer budget exhausted", "error_kind": "timeout"}}
         sys.stdout.write(json.dumps(hdr) + "\n")
         sys.stdout.flush()
     else:
@@ -135,7 +144,7 @@ for raw in sys.stdin:
     assert_eq!(short.final_url, "https://final.example/short-landed");
     assert!(short.html.contains("Tiny ok"));
 
-    // Logical renderer error leaves the warm renderer process alive for subsequent requests.
+    // Logical renderer error leaves the warm renderer process alive and preserves error_kind.
     let err = renderer
         .render(
             "https://mock.example/load-fail",
@@ -144,7 +153,39 @@ for raw in sys.stdin:
         )
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("load error -105"));
+    let load_te = err
+        .downcast_ref::<TransportError>()
+        .expect("load error must carry structured TransportError");
+    assert_eq!(load_te.kind, TransportErrorKind::LoadError);
+    assert!(renderer.has_live_process());
+
+    let sel_err = renderer
+        .render(
+            "https://mock.example/bad-selector",
+            &opts,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+    let sel_te = sel_err
+        .downcast_ref::<TransportError>()
+        .expect("invalid selector error must carry structured TransportError");
+    assert_eq!(sel_te.kind, TransportErrorKind::InvalidSelector);
+    assert!(renderer.has_live_process());
+
+    // Timeout error_kind maps to CefTimeoutError regardless of message wording.
+    let timeout_err = renderer
+        .render(
+            "https://mock.example/timeout-kind",
+            &opts,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        timeout_err.is::<CefTimeoutError>(),
+        "expected CefTimeoutError from error_kind=timeout, got: {timeout_err}"
+    );
     assert!(renderer.has_live_process());
 
     let recovered = renderer
@@ -286,7 +327,13 @@ int main(void) {
     char* js = wick_build_poller_js(req.wait_for_selector, "MARK", "SERR", 5000, 9000);
     assert(js != NULL);
     assert(strstr(js, "\\'a\\\\b\\'") != NULL);
-    assert(strstr(js, "try{hit=!!document.querySelector(sel);}") != NULL);
+    assert(strstr(js, "try{el=document.querySelector(sel);}") != NULL);
+    assert(strstr(js, "window.__wickPollerActive") != NULL);
+    assert(strstr(js, "MutationObserver") != NULL);
+    assert(strstr(js, "requestAnimationFrame") != NULL);
+    assert(strstr(js, "hasEmptySpaRoot") != NULL);
+    assert(strstr(js, "window.__wickInflight") != NULL);
+    assert(strstr(js, "len>500") == NULL);
     free(js);
     wick_render_request_free(&req);
 
@@ -312,6 +359,7 @@ int main(void) {
     assert(tmp != NULL);
     wick_write_ready(tmp, 1, NULL);
     wick_write_response(tmp, 200, "https://example.com/a\"b", "<b>hi</b>", 9, NULL, NULL);
+    wick_write_response(tmp, 0, "https://example.com/err", NULL, 0, "load error -105", "load_error");
     rewind(tmp);
 
     char* rline = NULL;
@@ -322,6 +370,15 @@ int main(void) {
 
     assert(wick_read_line(tmp, &rline, WICK_MAX_REQUEST_LINE_BYTES, &too_long) == 1);
     assert(too_long == 0 && strstr(rline, "\"html_bytes\":9") != NULL && strstr(rline, "a\\\"b") != NULL);
+    free(rline);
+
+    // Consume the 9 raw HTML bytes before reading the error response line.
+    char raw_html[10] = {0};
+    assert(fread(raw_html, 1, 9, tmp) == 9);
+    assert(strcmp(raw_html, "<b>hi</b>") == 0);
+
+    assert(wick_read_line(tmp, &rline, WICK_MAX_REQUEST_LINE_BYTES, &too_long) == 1);
+    assert(too_long == 0 && strstr(rline, "\"error_kind\":\"load_error\"") != NULL);
     free(rline);
     fclose(tmp);
 
@@ -385,5 +442,162 @@ fn adversarial_explicit_missing_renderer_override_does_not_fallback_to_state_dir
             Some(std::path::Path::new(""))
         ),
         Some(state_renderer)
+    );
+}
+
+#[test]
+fn v5_poller_js_short_page_settles_fast_and_waits_for_empty_spa_root() {
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+
+    let c_emitter = r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include "protocol.h"
+
+int main(void) {
+    char* js = wick_build_poller_js(NULL, "MARK:", "SERR:", 4000, 8000);
+    if (!js) return 1;
+    fputs(js, stdout);
+    free(js);
+    return 0;
+}
+"#;
+    let dir = TempStateDir::new();
+    let src = dir.path().join("emit_poller.c");
+    let bin = dir.path().join("emit_poller");
+    fs::write(&src, c_emitter).unwrap();
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let cef_inc = manifest_dir.join("cef");
+    let compile = std::process::Command::new("cc")
+        .arg("-std=c99")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-Wno-unused-function")
+        .arg("-Werror")
+        .arg(format!("-I{}", cef_inc.display()))
+        .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .expect("cc compiler must be available");
+    assert!(compile.success());
+
+    let emitted = std::process::Command::new(&bin)
+        .output()
+        .expect("failed to execute poller emitter");
+    assert!(emitted.status.success());
+    let poller_js = String::from_utf8(emitted.stdout).unwrap();
+
+    let node_harness = format!(
+        r#"
+const vm = require('vm');
+const pollerCode = {poller_json};
+
+function runScenario(setupFn) {{
+    return new Promise((resolve, reject) => {{
+        const logs = [];
+        const started = Date.now();
+        const sandbox = {{
+            window: {{}},
+            document: {{
+                body: {{ innerText: '' }},
+                documentElement: {{ outerHTML: '<html></html>' }},
+                scripts: [],
+                querySelector: () => null,
+            }},
+            MutationObserver: class {{
+                constructor(cb) {{ this.cb = cb; }}
+                observe() {{}}
+                disconnect() {{}}
+            }},
+            requestAnimationFrame: (fn) => setTimeout(fn, 10),
+            setInterval,
+            clearInterval,
+            setTimeout,
+            Date,
+            console: {{
+                log: (msg) => {{
+                    logs.push({{ msg: String(msg), elapsed: Date.now() - started }});
+                }},
+            }},
+        }};
+        setupFn(sandbox, () => logs);
+        vm.runInNewContext(pollerCode, sandbox);
+        const wait = setInterval(() => {{
+            if (logs.length > 0) {{
+                clearInterval(wait);
+                setTimeout(() => resolve({{ logs, elapsed: logs[0].elapsed }}), 60);
+            }} else if (Date.now() - started > 3000) {{
+                clearInterval(wait);
+                reject(new Error('poller timed out'));
+            }}
+        }}, 20);
+    }});
+}}
+
+(async () => {{
+    // 1. Short static page (<= 500 chars) must settle quickly (< 350ms, well below 1500ms floor).
+    const shortRes = await runScenario((sb) => {{
+        sb.document.body.innerText = 'Hello short page';
+        sb.document.documentElement.outerHTML = '<html><body><p>Hello short page</p></body></html>';
+        sb.window.__wickInflight = 0;
+    }});
+    if (shortRes.logs.length !== 1 || shortRes.elapsed >= 350) {{
+        throw new Error('short page failed fast settle: ' + JSON.stringify(shortRes));
+    }}
+
+    // 2. Empty SPA root (#root with < 50 chars) must wait until hydrated before settling.
+    const spaRes = await runScenario((sb) => {{
+        const rootEl = {{ innerText: '' }};
+        sb.document.body.innerText = '';
+        sb.document.documentElement.outerHTML = '<html><body><div id="root"></div></body></html>';
+        sb.document.querySelector = (s) => s.includes('#root') ? rootEl : null;
+        sb.window.__wickInflight = 0;
+        setTimeout(() => {{
+            rootEl.innerText = 'Hydrated SPA article content with more than fifty characters of prose.';
+            sb.document.body.innerText = rootEl.innerText;
+            sb.document.documentElement.outerHTML = '<html><body><div id="root"><p>Hydrated</p></div></body></html>';
+        }}, 160);
+    }});
+    if (spaRes.logs.length !== 1 || spaRes.elapsed < 300 || !spaRes.logs[0].msg.includes('Hydrated')) {{
+        throw new Error('empty SPA root failed hydration wait: ' + JSON.stringify(spaRes));
+    }}
+
+    // 3. Active inflight subresources block settle until __wickInflight reaches 0.
+    const inflightRes = await runScenario((sb) => {{
+        sb.document.body.innerText = 'Ready text';
+        sb.document.documentElement.outerHTML = '<html><body>Ready text</body></html>';
+        sb.window.__wickInflight = 2;
+        setTimeout(() => {{ sb.window.__wickInflight = 0; }}, 160);
+    }});
+    if (inflightRes.logs.length !== 1 || inflightRes.elapsed < 300) {{
+        throw new Error('inflight subresources did not gate settle: ' + JSON.stringify(inflightRes));
+    }}
+}})().catch((err) => {{
+    console.error(err);
+    process.exit(1);
+}});
+"#,
+        poller_json = serde_json::to_string(&poller_js).unwrap()
+    );
+
+    let script_path = dir.path().join("verify_poller.js");
+    fs::write(&script_path, node_harness).unwrap();
+    let out = std::process::Command::new("node")
+        .arg(&script_path)
+        .output()
+        .expect("failed to run node poller harness");
+    assert!(
+        out.status.success(),
+        "poller JS behavioral harness failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
 }

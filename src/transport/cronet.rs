@@ -8,6 +8,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 
 use super::cronet_ffi as ffi;
+use super::{TransportError, TransportErrorKind};
 
 const READ_BUFFER_SIZE: u64 = 32 * 1024;
 const ENGINE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -195,11 +196,17 @@ impl Engine {
             }
             Ok(Err(_)) => {
                 drop(guard);
-                bail!("Cronet request cancelled")
+                Err(anyhow::Error::new(TransportError::new(
+                    TransportErrorKind::Canceled,
+                    "Cronet request canceled",
+                )))
             }
             Err(_) => {
                 drop(guard);
-                bail!("Cronet request timed out after {:?}", timeout)
+                Err(anyhow::Error::new(TransportError::new(
+                    TransportErrorKind::Timeout,
+                    format!("Cronet request timed out after {:?}", timeout),
+                )))
             }
         }
     }
@@ -517,15 +524,23 @@ unsafe extern "C" fn on_failed(
     _info: ffi::Cronet_UrlResponseInfoPtr,
     error: ffi::Cronet_ErrorPtr,
 ) {
-    let code_name = if error.is_null() {
-        "ERROR_OTHER"
+    let (code_name, kind) = if error.is_null() {
+        ("ERROR_OTHER", TransportErrorKind::Network)
     } else {
-        net_error_name(ffi::Cronet_Error_error_code_get(error))
+        let code = ffi::Cronet_Error_error_code_get(error);
+        let kind = match code {
+            4 | 6 => TransportErrorKind::Timeout,
+            _ => TransportErrorKind::Network,
+        };
+        (net_error_name(code), kind)
     };
     let boxed = finish_request(callback);
     complete(
         &boxed,
-        Err(anyhow::anyhow!("cronet request failed [{}]", code_name)),
+        Err(anyhow::Error::new(TransportError::new(
+            kind,
+            format!("cronet request failed [{}]", code_name),
+        ))),
     );
 }
 
@@ -557,7 +572,10 @@ unsafe extern "C" fn on_canceled(
             limit_bytes: boxed.max_body_bytes,
         })
     } else {
-        anyhow::anyhow!("cronet request canceled")
+        anyhow::Error::new(TransportError::new(
+            TransportErrorKind::Canceled,
+            "cronet request canceled",
+        ))
     };
     complete(&boxed, Err(err));
 }
@@ -637,8 +655,8 @@ mod tests {
         let base = spawn_edge_server().await;
         let storage = temp_storage("edge");
 
-        let engine = Engine::new(&storage, "mesh-wick-test", None)
-            .expect("cronet engine should start");
+        let engine =
+            Engine::new(&storage, "mesh-wick-test", None).expect("cronet engine should start");
 
         let err_large = engine
             .get(&format!("{base}/large"), &[], Duration::from_secs(5), 1024)
@@ -651,14 +669,19 @@ mod tests {
         );
 
         let err_slow = engine
-            .get(&format!("{base}/slow"), &[], Duration::from_millis(150), 65536)
+            .get(
+                &format!("{base}/slow"),
+                &[],
+                Duration::from_millis(150),
+                65536,
+            )
             .await
             .err()
             .expect("slow endpoint should time out");
-        assert!(
-            err_slow.to_string().contains("timed out"),
-            "unexpected timeout error: {err_slow}"
-        );
+        let slow_te = err_slow
+            .downcast_ref::<TransportError>()
+            .expect("slow endpoint error must be a structured TransportError");
+        assert_eq!(slow_te.kind, TransportErrorKind::Timeout);
 
         drop(engine);
         let _ = std::fs::remove_dir_all(&storage);

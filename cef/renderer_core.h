@@ -1,6 +1,7 @@
 #ifndef WICK_RENDERER_CORE_H
 #define WICK_RENDERER_CORE_H
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,8 @@
 #include "include/capi/cef_life_span_handler_capi.h"
 #include "include/capi/cef_load_handler_capi.h"
 #include "include/capi/cef_render_handler_capi.h"
+#include "include/capi/cef_request_handler_capi.h"
+#include "include/capi/cef_resource_request_handler_capi.h"
 #include "include/cef_api_hash.h"
 
 // ── Shared renderer state ─────────────────────────────────────
@@ -27,11 +30,26 @@ static int g_status_code = 0;
 static int g_committed_main_frame = 0;
 static int g_load_error = 0;
 static int g_nav_count = 0;
+static volatile int g_inflight_subresources = 0;
 static char* g_html = NULL;
 static size_t g_html_len = 0;
 static char* g_selector_error = NULL;
 static char g_marker[32];
 static char g_sel_err_prefix[48];
+
+static int wick_is_tracked_subresource(cef_resource_type_t rt) {
+    return rt == RT_XHR || rt == RT_SCRIPT || rt == RT_SUB_RESOURCE;
+}
+
+static void wick_inflight_dec_clamped(void) {
+    int cur = __atomic_load_n(&g_inflight_subresources, __ATOMIC_ACQUIRE);
+    while (cur > 0) {
+        if (__atomic_compare_exchange_n(
+                &g_inflight_subresources, &cur, cur - 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            return;
+        }
+    }
+}
 
 static void wick_init_markers(void) {
     static unsigned long fallback_seq = 0;
@@ -157,6 +175,7 @@ static void CEF_CALLBACK on_load_start(
         g_status_code = 0;
         g_load_error = 0;
         g_committed_main_frame = 0;
+        __atomic_store_n(&g_inflight_subresources, 0, __ATOMIC_RELEASE);
     }
 }
 
@@ -233,6 +252,55 @@ static void CEF_CALLBACK on_before_close(
 
 static cef_life_span_handler_t g_life_span_handler;
 
+// ── Request / Resource handler — tracks in-flight subresources ─
+
+static cef_return_value_t CEF_CALLBACK on_before_resource_load(
+    cef_resource_request_handler_t* self,
+    cef_browser_t* browser,
+    cef_frame_t* frame,
+    cef_request_t* request,
+    cef_callback_t* callback) {
+    (void)self; (void)browser; (void)frame; (void)callback;
+    if (request && wick_is_tracked_subresource(request->get_resource_type(request))) {
+        __atomic_fetch_add(&g_inflight_subresources, 1, __ATOMIC_ACQ_REL);
+    }
+    return RV_CONTINUE;
+}
+
+static void CEF_CALLBACK on_resource_load_complete(
+    cef_resource_request_handler_t* self,
+    cef_browser_t* browser,
+    cef_frame_t* frame,
+    cef_request_t* request,
+    cef_response_t* response,
+    cef_urlrequest_status_t status,
+    int64_t received_content_length) {
+    (void)self; (void)browser; (void)frame; (void)response;
+    (void)status; (void)received_content_length;
+    if (request && wick_is_tracked_subresource(request->get_resource_type(request))) {
+        wick_inflight_dec_clamped();
+    }
+}
+
+static cef_resource_request_handler_t g_resource_request_handler;
+
+static cef_resource_request_handler_t* CEF_CALLBACK get_resource_request_handler(
+    cef_request_handler_t* self,
+    cef_browser_t* browser,
+    cef_frame_t* frame,
+    cef_request_t* request,
+    int is_navigation,
+    int is_download,
+    const cef_string_t* request_initiator,
+    int* disable_default_handling) {
+    (void)self; (void)browser; (void)frame; (void)request;
+    (void)is_navigation; (void)is_download; (void)request_initiator;
+    (void)disable_default_handling;
+    return &g_resource_request_handler;
+}
+
+static cef_request_handler_t g_request_handler;
+
 // ── Client ────────────────────────────────────────────────────
 
 static cef_life_span_handler_t* CEF_CALLBACK get_life_span_handler(cef_client_t* s) {
@@ -246,6 +314,9 @@ static cef_render_handler_t* CEF_CALLBACK get_render_handler(cef_client_t* s) {
 }
 static cef_display_handler_t* CEF_CALLBACK get_display_handler(cef_client_t* s) {
     (void)s; return &g_display_handler;
+}
+static cef_request_handler_t* CEF_CALLBACK get_request_handler(cef_client_t* s) {
+    (void)s; return &g_request_handler;
 }
 
 static cef_client_t g_client;
@@ -272,14 +343,22 @@ static void wick_init_cef_handlers(void) {
     g_life_span_handler.do_close = do_close;
     g_life_span_handler.on_before_close = on_before_close;
 
+    init_base(&g_resource_request_handler.base, sizeof(cef_resource_request_handler_t));
+    g_resource_request_handler.on_before_resource_load = on_before_resource_load;
+    g_resource_request_handler.on_resource_load_complete = on_resource_load_complete;
+
+    init_base(&g_request_handler.base, sizeof(cef_request_handler_t));
+    g_request_handler.get_resource_request_handler = get_resource_request_handler;
+
     init_base(&g_client.base, sizeof(cef_client_t));
     g_client.get_life_span_handler = get_life_span_handler;
     g_client.get_load_handler = get_load_handler;
     g_client.get_render_handler = get_render_handler;
     g_client.get_display_handler = get_display_handler;
+    g_client.get_request_handler = get_request_handler;
 }
 
-// ── Render a URL with v4-meta response ────────────────────────
+// ── Render a URL with v5-meta response ────────────────────────
 
 static void force_dump_dom(void) {
     char* dump_js = wick_asprintf(
@@ -322,7 +401,7 @@ static char* copy_main_frame_url(void) {
     return result;
 }
 
-static void render_url_v4(const WickRenderRequest* req) {
+static void render_url_v5(const WickRenderRequest* req) {
     wick_init_markers();
 
     g_load_done = 0;
@@ -330,6 +409,7 @@ static void render_url_v4(const WickRenderRequest* req) {
     g_status_code = 0;
     g_committed_main_frame = 0;
     g_load_error = 0;
+    __atomic_store_n(&g_inflight_subresources, 0, __ATOMIC_RELEASE);
     free(g_html);
     g_html = NULL;
     g_html_len = 0;
@@ -338,7 +418,7 @@ static void render_url_v4(const WickRenderRequest* req) {
 
     cef_frame_t* frame = g_browser->get_main_frame(g_browser);
     if (!frame) {
-        wick_write_response(stdout, 0, req->url, NULL, 0, "main frame unavailable", NULL);
+        wick_write_response(stdout, 0, req->url, NULL, 0, "main frame unavailable", "network");
         return;
     }
 
@@ -353,9 +433,10 @@ static void render_url_v4(const WickRenderRequest* req) {
     wick_clamp_timeouts(req->timeout_ms, has_selector, &total_cap, &post_load_cap, &js_cap, &cf_cap);
 
     int post_load_ms = 0;
-    const int tick_ms = 50;
+    const int tick_ms = 25;
     int poll_injected = 0;
     int last_nav = g_nav_count;
+    int last_pushed_inflight = -1;
     int total_ms = 0;
     int timed_out_uncommitted = 0;
 
@@ -368,6 +449,7 @@ static void render_url_v4(const WickRenderRequest* req) {
             last_nav = g_nav_count;
             post_load_ms = 0;
             poll_injected = 0;
+            last_pushed_inflight = -1;
         }
 
         if (total_ms >= total_cap) {
@@ -381,6 +463,14 @@ static void render_url_v4(const WickRenderRequest* req) {
 
         if (g_load_done && g_load_error == 0) {
             post_load_ms += tick_ms;
+
+            int cur_inflight = __atomic_load_n(&g_inflight_subresources, __ATOMIC_ACQUIRE);
+            if (cur_inflight != last_pushed_inflight && g_browser) {
+                char sync_js[64];
+                snprintf(sync_js, sizeof(sync_js), "window.__wickInflight=%d;", cur_inflight);
+                execute_js_on_main_frame(sync_js);
+                last_pushed_inflight = cur_inflight;
+            }
 
             if (!poll_injected && g_browser) {
                 char* poller_js = wick_build_poller_js(
@@ -411,14 +501,14 @@ static void render_url_v4(const WickRenderRequest* req) {
     if (g_load_error != 0) {
         char err_msg[96];
         snprintf(err_msg, sizeof(err_msg), "load error %d", g_load_error);
-        wick_write_response(stdout, 0, req->url, NULL, 0, err_msg, NULL);
+        wick_write_response(stdout, 0, req->url, NULL, 0, err_msg, "load_error");
         return;
     }
 
     if (g_selector_error && g_selector_error[0]) {
         char* err_msg = wick_asprintf("invalid selector: %s", g_selector_error);
         wick_write_response(stdout, g_status_code, req->url, NULL, 0,
-                            err_msg ? err_msg : "invalid selector", NULL);
+                            err_msg ? err_msg : "invalid selector", "invalid_selector");
         free(err_msg);
         return;
     }
@@ -427,7 +517,7 @@ static void render_url_v4(const WickRenderRequest* req) {
         const char* msg = timed_out_uncommitted
             ? "timed out before main frame commit"
             : "timed out capturing rendered DOM";
-        wick_write_response(stdout, g_status_code, req->url, NULL, 0, msg, NULL);
+        wick_write_response(stdout, g_status_code, req->url, NULL, 0, msg, "timeout");
         return;
     }
 
@@ -460,7 +550,8 @@ static void wick_run_request_loop(void) {
     int too_long = 0;
     while (wick_read_line(stdin, &line, WICK_MAX_REQUEST_LINE_BYTES, &too_long)) {
         if (too_long) {
-            wick_write_response(stdout, 0, "", NULL, 0, "request line exceeds 64 KiB limit", NULL);
+            wick_write_response(stdout, 0, "", NULL, 0, "request line exceeds 64 KiB limit",
+                                "protocol_mismatch");
             continue;
         }
         if (line[0] == '\0') {
@@ -472,7 +563,7 @@ static void wick_run_request_loop(void) {
         WickRenderRequest req = {};
         char err_buf[256] = {};
         if (wick_parse_request_line(line, &req, err_buf, sizeof(err_buf)) != 0) {
-            wick_write_response(stdout, 0, "", NULL, 0, err_buf, NULL);
+            wick_write_response(stdout, 0, "", NULL, 0, err_buf, "protocol_mismatch");
             free(line);
             line = NULL;
             continue;
@@ -480,7 +571,7 @@ static void wick_run_request_loop(void) {
         free(line);
         line = NULL;
 
-        render_url_v4(&req);
+        render_url_v5(&req);
         wick_render_request_free(&req);
     }
 

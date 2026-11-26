@@ -70,7 +70,6 @@ struct RendererResponseHeader {
     #[serde(default)]
     error: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)]
     error_kind: Option<crate::transport::TransportErrorKind>,
 }
 
@@ -551,10 +550,18 @@ fn perform_render(
 
     if let Some(err_msg) = header.error {
         let formatted = format!("wick-renderer failed for {}: {}", url, err_msg);
-        if err_msg.starts_with("timed out") {
-            return Ok(Err(anyhow::Error::new(CefTimeoutError(formatted))));
-        }
-        return Ok(Err(anyhow::anyhow!(formatted)));
+        let kind = header
+            .error_kind
+            .unwrap_or(crate::transport::TransportErrorKind::Network);
+        return Ok(Err(match kind {
+            crate::transport::TransportErrorKind::Timeout => {
+                anyhow::Error::new(CefTimeoutError(formatted))
+            }
+            crate::transport::TransportErrorKind::ProtocolMismatch => {
+                anyhow::Error::new(CefProtocolError(formatted))
+            }
+            other => anyhow::Error::new(crate::transport::TransportError::new(other, formatted)),
+        }));
     }
 
     let final_url = if header.final_url.is_empty() {

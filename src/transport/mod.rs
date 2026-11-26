@@ -41,6 +41,22 @@ impl TransportError {
     }
 }
 
+pub fn transport_error_kind(err: &anyhow::Error) -> Option<TransportErrorKind> {
+    if let Some(te) = err.downcast_ref::<TransportError>() {
+        return Some(te.kind);
+    }
+    if err.is::<ResponseTooLargeError>() {
+        return Some(TransportErrorKind::ResponseTooLarge);
+    }
+    if err.is::<cef::CefTimeoutError>() {
+        return Some(TransportErrorKind::Timeout);
+    }
+    if err.is::<cef::CefProtocolError>() {
+        return Some(TransportErrorKind::ProtocolMismatch);
+    }
+    None
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("response body exceeded {limit_bytes} byte limit")]
 pub struct ResponseTooLargeError {
@@ -248,7 +264,10 @@ impl TransportClient {
 
                     match tokio::time::timeout(timeout, fut).await {
                         Ok(res) => res,
-                        Err(_) => anyhow::bail!("request timed out after {:?}", timeout),
+                        Err(_) => Err(anyhow::Error::new(TransportError::new(
+                            TransportErrorKind::Timeout,
+                            format!("request timed out after {:?}", timeout),
+                        ))),
                     }
                 }
             }

@@ -16,8 +16,10 @@ use super::protocol::{
     DaemonResponseHeader, MAX_HEADER_LINE_BYTES,
 };
 use crate::context::ensure_private_dir;
-use crate::transport::cef::{CefProtocolError, CefRenderOptions, CefRenderer, CefTimeoutError};
-use crate::transport::{ResponseTooLargeError, TransportClient};
+use crate::transport::cef::{CefRenderOptions, CefRenderer};
+use crate::transport::{
+    transport_error_kind, ResponseTooLargeError, TransportClient, TransportErrorKind,
+};
 
 const MAX_PROXY_SLOTS: usize = 4;
 const LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -379,7 +381,7 @@ async fn handle_connection(
         Ok(Err(err)) => {
             let hdr = DaemonResponseHeader::err(
                 format!("invalid daemon request frame: {}", err),
-                Some("protocol"),
+                Some(TransportErrorKind::ProtocolMismatch),
                 None,
             );
             let _ = write_frame(&mut write_half, &hdr, &[]).await;
@@ -388,7 +390,7 @@ async fn handle_connection(
         Err(_) => {
             let hdr = DaemonResponseHeader::err(
                 "timed out reading daemon request",
-                Some("timeout"),
+                Some(TransportErrorKind::Timeout),
                 None,
             );
             let _ = write_frame(&mut write_half, &hdr, &[]).await;
@@ -401,7 +403,7 @@ async fn handle_connection(
         Err(err) => {
             let hdr = DaemonResponseHeader::err(
                 format!("invalid daemon request: {}", err),
-                Some("protocol"),
+                Some(TransportErrorKind::ProtocolMismatch),
                 None,
             );
             let _ = write_frame(&mut write_half, &hdr, &[]).await;
@@ -464,11 +466,13 @@ async fn handle_connection(
                             let hdr = if let Some(too_large) = err.downcast_ref::<ResponseTooLargeError>() {
                                 DaemonResponseHeader::err(
                                     err.to_string(),
-                                    Some("response_too_large"),
+                                    Some(TransportErrorKind::ResponseTooLarge),
                                     Some(too_large.limit_bytes),
                                 )
                             } else {
-                                DaemonResponseHeader::err(err.to_string(), None, None)
+                                let kind =
+                                    transport_error_kind(&err).unwrap_or(TransportErrorKind::Network);
+                                DaemonResponseHeader::err(err.to_string(), Some(kind), None)
                             };
                             let _ = write_frame(&mut write_half, &hdr, &[]).await;
                         }
@@ -505,7 +509,7 @@ async fn handle_connection(
                 _ = tokio::time::sleep_until(deadline) => {
                     let hdr = DaemonResponseHeader::err(
                         format!("CEF render timed out waiting for browser slot after {:?}", timeout),
-                        Some("timeout"),
+                        Some(TransportErrorKind::Timeout),
                         None,
                     );
                     let _ = write_frame(&mut write_half, &hdr, &[]).await;
@@ -518,7 +522,7 @@ async fn handle_connection(
             if remaining.is_zero() {
                 let hdr = DaemonResponseHeader::err(
                     format!("CEF render timed out after {:?}", timeout),
-                    Some("timeout"),
+                    Some(TransportErrorKind::Timeout),
                     None,
                 );
                 let _ = write_frame(&mut write_half, &hdr, &[]).await;
@@ -537,14 +541,8 @@ async fn handle_connection(
                     let _ = write_frame(&mut write_half, &hdr, bytes).await;
                 }
                 Err(err) => {
-                    let kind = if err.is::<CefTimeoutError>() {
-                        Some("timeout")
-                    } else if err.is::<CefProtocolError>() {
-                        Some("protocol")
-                    } else {
-                        None
-                    };
-                    let hdr = DaemonResponseHeader::err(err.to_string(), kind, None);
+                    let kind = transport_error_kind(&err).unwrap_or(TransportErrorKind::Network);
+                    let hdr = DaemonResponseHeader::err(err.to_string(), Some(kind), None);
                     let _ = write_frame(&mut write_half, &hdr, &[]).await;
                 }
             }

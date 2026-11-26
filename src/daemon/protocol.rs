@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::transport::TransportErrorKind;
+
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const BUILD_ID: &str = env!("WICK_BUILD_ID");
 pub const SOCKET_NAME: &str = "daemon.sock";
@@ -91,7 +93,7 @@ pub struct DaemonResponseHeader {
     #[serde(default)]
     pub error: Option<String>,
     #[serde(default)]
-    pub error_kind: Option<String>,
+    pub error_kind: Option<TransportErrorKind>,
     #[serde(default)]
     pub limit_bytes: Option<usize>,
 }
@@ -118,7 +120,7 @@ impl DaemonResponseHeader {
 
     pub fn err(
         message: impl Into<String>,
-        kind: Option<&str>,
+        kind: Option<TransportErrorKind>,
         limit_bytes: Option<usize>,
     ) -> Self {
         Self {
@@ -134,7 +136,7 @@ impl DaemonResponseHeader {
             content_type: None,
             body_bytes: 0,
             error: Some(message.into()),
-            error_kind: kind.map(str::to_string),
+            error_kind: kind,
             limit_bytes,
         }
     }

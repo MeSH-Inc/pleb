@@ -409,3 +409,73 @@ async fn run_daemon_exits_immediately_when_live_daemon_responds_to_ping() {
     assert!(daemon_stop(dir.path()).await.unwrap());
     let _ = handle.await;
 }
+
+#[tokio::test]
+async fn daemon_round_trips_structured_transport_error_kinds() {
+    use mesh_wick::transport::cef::{CefProtocolError, CefTimeoutError};
+    use mesh_wick::transport::{ResponseTooLargeError, TransportError, TransportErrorKind};
+
+    let dir = TempStateDir::new();
+    let sock = socket_path(dir.path());
+    let listener = UnixListener::bind(&sock).unwrap();
+
+    let cases: Vec<(TransportErrorKind, Option<usize>)> = vec![
+        (TransportErrorKind::LoadError, None),
+        (TransportErrorKind::InvalidSelector, None),
+        (TransportErrorKind::Canceled, None),
+        (TransportErrorKind::Network, None),
+        (TransportErrorKind::Timeout, None),
+        (TransportErrorKind::ProtocolMismatch, None),
+        (TransportErrorKind::ResponseTooLarge, Some(4096)),
+    ];
+
+    let server_cases = cases.clone();
+    let server = tokio::spawn(async move {
+        for (kind, limit) in server_cases {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line).await;
+            let hdr = DaemonResponseHeader::err("structured failure", Some(kind), limit);
+            let mut enc = serde_json::to_string(&hdr).unwrap();
+            enc.push('\n');
+            write_half.write_all(enc.as_bytes()).await.unwrap();
+            write_half.flush().await.unwrap();
+        }
+    });
+
+    for (kind, limit) in cases {
+        let err = daemon_http_get_with_executable(
+            dir.path(),
+            None,
+            Duration::from_secs(5),
+            1024 * 1024,
+            Duration::from_secs(5),
+            false,
+            "http://127.0.0.1/err",
+            Some(Path::new(env!("CARGO_BIN_EXE_wick"))),
+        )
+        .await
+        .unwrap_err();
+
+        match kind {
+            TransportErrorKind::Timeout => assert!(err.is::<CefTimeoutError>()),
+            TransportErrorKind::ProtocolMismatch => assert!(err.is::<CefProtocolError>()),
+            TransportErrorKind::ResponseTooLarge => {
+                let rtl = err
+                    .downcast_ref::<ResponseTooLargeError>()
+                    .expect("expected ResponseTooLargeError");
+                assert_eq!(rtl.limit_bytes, limit.unwrap());
+            }
+            other => {
+                let te = err
+                    .downcast_ref::<TransportError>()
+                    .expect("expected TransportError");
+                assert_eq!(te.kind, other);
+            }
+        }
+    }
+
+    server.await.unwrap();
+}
