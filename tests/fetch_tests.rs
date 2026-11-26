@@ -945,3 +945,35 @@ async fn adversarial_corrupt_gzip_sitemap_is_skipped_without_breaking_valid_site
     assert!(res.urls.contains(&format!("{base}/survived-corrupt-gz")));
     assert_eq!(res.from_sitemap, 1);
 }
+
+#[tokio::test]
+async fn adversarial_fetch_document_decodes_windows1252_over_http() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+
+    tokio::spawn(async move {
+        if let Ok((mut socket, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let body: &[u8] = b"<!DOCTYPE html><html><head><title>Caf\xe9</title></head><body><main><h1>Caf\xe9</h1><p>Price \x8012 \x97 \x93ok\x94</p></main></body></html>";
+            let resp = http_response("200 OK", "text/html; charset=windows-1252", body);
+            let _ = socket.write_all(&resp).await;
+        }
+    });
+
+    let state_dir = temp_state_dir();
+    let ctx = RuntimeContext::new(RuntimeConfig {
+        state_dir: state_dir.path().to_path_buf(),
+        timeout: Duration::from_secs(5),
+        cef_timeout: Duration::from_secs(5),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let out = fetch_document(&ctx, &format!("{base}/cafe"), &FetchOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(out.title.as_deref(), Some("Café"));
+    assert!(out.content.contains("Price €12 — “ok”"));
+    assert!(!out.content.contains('\u{FFFD}'));
+}

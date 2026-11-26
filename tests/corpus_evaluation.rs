@@ -1,6 +1,6 @@
 use mesh_wick::extract::{
-    detect_binary_content, extract_document_parsed, is_html_content_type, ExtractMode,
-    ExtractOptions, OutputFormat,
+    decode_text_bytes, detect_binary_content, extract_document_parsed, is_html_content_type,
+    ExtractMode, ExtractOptions, OutputFormat,
 };
 use mesh_wick::policy::{classify_response_with_parsed, ResponseClassification};
 use serde::Deserialize;
@@ -312,7 +312,7 @@ fn evaluate_fixture(path: &Path) -> (String, FixtureSpec, FixtureOutcome) {
         .trim();
     let spec: FixtureSpec = serde_json::from_str(json).expect("valid fixture json");
     let body_bytes = &raw[nl + 1..];
-    let body_str = String::from_utf8_lossy(body_bytes);
+    let body_str = decode_text_bytes(body_bytes, spec.content_type.as_deref());
 
     let mut out = FixtureOutcome::default();
     let is_html = is_html_content_type(spec.content_type.as_deref());
