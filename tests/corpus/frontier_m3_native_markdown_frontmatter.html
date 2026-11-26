@@ -1,0 +1,19 @@
+<!-- wick-fixture: {"tier":"frontier","url":"https://docs.example.com/engine/index.md","status_code":200,"content_type":"text/markdown; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"Vector Index Internals","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["See the","Architecture","guide for shard layout.","Vector partitions are stored in append-only segments."],"expected_code_blocks":[{"language":"rust","snippet":"pub fn search_nearest(query: &[f32], top_k: usize) -> Vec<u64> {\n    let mut hits = Vec::with_capacity(top_k);\n    hits.push(query.len() as u64);\n    hits\n}"}],"expected_links":["https://docs.example.com/engine/arch.md"],"expected_images":["https://docs.example.com/img/vec.png"],"forbidden_substrings":["author: \"ops\"","utm_source=docs"],"minimum_output_bytes":180,"maximum_output_bytes":1200,"expected_structure":{"minimum_headings":1,"minimum_code_blocks":1,"minimum_links":1}},{"name":"clean_md_truncated","format":"markdown","mode":"clean","max_bytes":240,"maximum_output_bytes":240,"require_balanced_fences":true,"forbidden_substrings":["author: \"ops\""]},{"name":"clean_no_links_no_images","format":"markdown","mode":"clean","include_images":false,"include_links":false,"expected_substrings":["Architecture","guide for shard layout."],"forbidden_substrings":["https://docs.example.com/engine/arch.md","https://docs.example.com/img/vec.png","author: \"ops\""]},{"name":"full_md","format":"markdown","mode":"full","expected_substrings":["author: \"ops\"","Vector partitions are stored in append-only segments."],"expected_links":["https://docs.example.com/engine/arch.md"]}]} -->
+---
+title: "Vector Index Internals"
+author: "ops"
+---
+
+See the [Architecture](./arch.md?utm_source=docs) guide for shard layout.
+
+![Diagram](../img/vec.png)
+
+Vector partitions are stored in append-only segments.
+
+```rust
+pub fn search_nearest(query: &[f32], top_k: usize) -> Vec<u64> {
+    let mut hits = Vec::with_capacity(top_k);
+    hits.push(query.len() as u64);
+    hits
+}
+```

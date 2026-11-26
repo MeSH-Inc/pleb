@@ -1,0 +1,22 @@
+<!-- wick-fixture: {"tier":"frontier","url":"https://digest.example.net/feed.json","status_code":200,"content_type":"application/feed+json","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"Distributed Systems Digest","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["Consensus and storage papers.","Deterministic Simulation Testing","Seeded fault injection catches rare","split-brain bugs","Log Compaction Tradeoffs","Tiered segments cut tail compaction spikes."],"expected_links":["https://digest.example.net/articles/dst","https://digest.example.net/articles/compaction"],"forbidden_substrings":["\"content_html\"","jsonfeed.org/version","utm_medium=feed"],"minimum_output_bytes":140,"maximum_output_bytes":1600,"expected_structure":{"minimum_headings":3,"minimum_links":2}},{"name":"full_passthrough","format":"markdown","mode":"full","exact_passthrough":true}]} -->
+{
+  "version": "https://jsonfeed.org/version/1.1",
+  "title": "Distributed Systems Digest",
+  "description": "Consensus and storage papers.",
+  "items": [
+    {
+      "id": "dst-2026",
+      "url": "/articles/dst?utm_medium=feed",
+      "title": "Deterministic Simulation Testing",
+      "date_published": "2026-11-22T15:00:00Z",
+      "content_html": "<p>Seeded fault injection catches rare <strong>split-brain bugs</strong>.</p>"
+    },
+    {
+      "id": "compaction-2026",
+      "url": "https://digest.example.net/articles/compaction",
+      "title": "Log Compaction Tradeoffs",
+      "date_published": "2026-11-15T10:00:00Z",
+      "content_text": "Tiered segments cut tail compaction spikes."
+    }
+  ]
+}

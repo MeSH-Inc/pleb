@@ -1,6 +1,6 @@
 use mesh_wick::extract::{
     decode_text_bytes, detect_binary_content, extract_document_parsed, is_html_content_type,
-    ExtractMode, ExtractOptions, OutputFormat,
+    ExtractMode, ExtractOptions, OutputFormat, ParsedHtml,
 };
 use mesh_wick::policy::{classify_response_with_context, ResponseClassification};
 use serde::Deserialize;
@@ -21,6 +21,7 @@ struct FixtureSpec {
     expected_error_kind: Option<String>,
     expected_response_classification: Option<String>,
     expected_title: Option<String>,
+    expected_markdown_alternate: Option<String>,
     #[serde(default)]
     exact_passthrough: bool,
     #[serde(default)]
@@ -39,6 +40,11 @@ struct VariantSpec {
     #[serde(default = "default_true")]
     include_links: bool,
     max_bytes: Option<usize>,
+    expected_title: Option<String>,
+    #[serde(default)]
+    exact_passthrough: bool,
+    #[serde(default)]
+    require_balanced_fences: bool,
     #[serde(default)]
     expected_substrings: Vec<String>,
     #[serde(default)]
@@ -141,6 +147,25 @@ fn parse_fenced_blocks(md: &str) -> Vec<(Option<String>, String)> {
         }
     }
     blocks
+}
+
+fn has_unclosed_fence(md: &str) -> bool {
+    let mut open: Option<(char, usize)> = None;
+    for line in md.lines() {
+        let trimmed = line.trim_start();
+        if let Some((fc, fl)) = open {
+            let t = line.trim();
+            if t.len() >= fl && t.chars().all(|c| c == fc) {
+                open = None;
+            }
+        } else if let Some(fc) = trimmed.chars().next().filter(|&c| c == '`' || c == '~') {
+            let fl = trimmed.chars().take_while(|&c| c == fc).count();
+            if fl >= 3 {
+                open = Some((fc, fl));
+            }
+        }
+    }
+    open.is_some()
 }
 
 fn parse_markdown_destinations(md: &str) -> (Vec<String>, Vec<String>) {
@@ -362,6 +387,20 @@ fn evaluate_fixture(path: &Path) -> (String, FixtureSpec, FixtureOutcome) {
     out.cls_exact = cls_ok;
 
     let page_url = Url::parse(spec.final_url.as_deref().unwrap_or(&spec.url)).expect("valid url");
+    if let Some(exp_alt) = &spec.expected_markdown_alternate {
+        let parsed_ref = parsed.get_or_insert_with(|| ParsedHtml::parse(&body_str));
+        let got = parsed_ref.markdown_alternate_url(&page_url);
+        out.expected_total += 1;
+        if got.as_ref().map(Url::as_str) == Some(exp_alt.as_str()) {
+            out.expected_hits += 1;
+        } else {
+            out.failures.push(format!(
+                "markdown_alternate: got {:?}, want {:?}",
+                got.as_ref().map(Url::as_str),
+                exp_alt
+            ));
+        }
+    }
     let mut densities = Vec::new();
     for v in &spec.variants {
         let format = match v.format.as_str() {
@@ -389,17 +428,26 @@ fn evaluate_fixture(path: &Path) -> (String, FixtureSpec, FixtureOutcome) {
             &opts,
         )
         .expect("extract_document_parsed");
-        if let Some(exp_title) = &spec.expected_title {
-            if doc.title.as_deref() != Some(exp_title.as_str()) {
+        let want_title = v.expected_title.as_deref().or(if v.exact_passthrough {
+            None
+        } else {
+            spec.expected_title.as_deref()
+        });
+        if let Some(exp_title) = want_title {
+            if doc.title.as_deref() != Some(exp_title) {
                 out.failures.push(format!(
                     "{}: title {:?} != {exp_title:?}",
                     v.name, doc.title
                 ));
             }
         }
-        if spec.exact_passthrough && doc.content != body_str {
+        if (spec.exact_passthrough || v.exact_passthrough) && doc.content != body_str {
             out.failures
                 .push(format!("{}: passthrough mismatch", v.name));
+        }
+        if v.require_balanced_fences && has_unclosed_fence(&doc.content) {
+            out.failures
+                .push(format!("{}: unclosed code fence", v.name));
         }
         if let Some(min_b) = v.minimum_output_bytes {
             if doc.content.len() < min_b {

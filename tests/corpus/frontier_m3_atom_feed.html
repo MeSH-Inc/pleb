@@ -1,0 +1,19 @@
+<!-- wick-fixture: {"tier":"frontier","url":"https://kernel.example.org/atom.xml","status_code":200,"content_type":"application/atom+xml","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"Kernel Engineering Feed","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["Weekly kernel notes.","Zero-Copy Ring Buffers","Direct submission reduces","syscall overhead","Scheduler Preemption Metrics","Latency histograms now track wake-to-run delay."],"expected_links":["https://kernel.example.org/posts/io-uring","https://kernel.example.org/posts/scheduler"],"forbidden_substrings":["<feed","<entry>","utm_campaign=atom"],"minimum_output_bytes":140,"maximum_output_bytes":1600,"expected_structure":{"minimum_headings":3,"minimum_links":2}},{"name":"full_passthrough","format":"markdown","mode":"full","exact_passthrough":true}]} -->
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Kernel Engineering Feed</title>
+  <subtitle>Weekly kernel notes.</subtitle>
+  <updated>2026-11-25T12:00:00Z</updated>
+  <entry>
+    <title>Zero-Copy Ring Buffers</title>
+    <link rel="alternate" href="/posts/io-uring?utm_campaign=atom"/>
+    <updated>2026-11-25T11:00:00Z</updated>
+    <summary type="html">&lt;p&gt;Direct submission reduces &lt;em&gt;syscall overhead&lt;/em&gt;.&lt;/p&gt;</summary>
+  </entry>
+  <entry>
+    <title>Scheduler Preemption Metrics</title>
+    <link rel="alternate" href="https://kernel.example.org/posts/scheduler"/>
+    <updated>2026-11-18T09:00:00Z</updated>
+    <summary type="text">Latency histograms now track wake-to-run delay.</summary>
+  </entry>
+</feed>
