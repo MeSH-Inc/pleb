@@ -10,7 +10,7 @@ name = "mesh_wick"
 path = "src/lib.rs"
 
 [[bin]]
-name = "mesh-wick"
+name = "wick"
 path = "src/main.rs"
 
 [features]

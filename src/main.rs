@@ -13,7 +13,7 @@ use std::time::Duration;
 
 #[derive(Parser)]
 #[command(
-    name = "mesh-wick",
+    name = "wick",
     version,
     about = "Local browser-grade web fetch and search CLI for AI agents"
 )]
@@ -188,7 +188,7 @@ async fn main() -> Result<()> {
         },
         Command::Status => {
             let renderer_path = cef::find_renderer_in(&config.state_dir);
-            println!("mesh-wick {}", env!("CARGO_PKG_VERSION"));
+            println!("wick {} (mesh-wick)", env!("CARGO_PKG_VERSION"));
             println!(
                 "Cronet: {}",
                 if cfg!(feature = "cronet") {

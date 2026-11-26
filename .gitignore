@@ -1,4 +1,5 @@
 /target
+/wick
 /mesh-wick
 *.dylib
 *.so

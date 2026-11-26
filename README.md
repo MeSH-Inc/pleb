@@ -1,10 +1,10 @@
 # mesh-wick
 
-Local, zero-telemetry web fetch and search CLI for AI agents, forked from [wickproject/wick](https://github.com/wickproject/wick).
+Local, zero-telemetry web fetch and search CLI (`wick`) for AI agents, forked from [wickproject/wick](https://github.com/wickproject/wick).
 
 Uses Chrome's network stack (Cronet) for browser-identical TLS/HTTP2/QUIC fingerprinting, an optional embedded Chromium (CEF) renderer for JS-heavy pages, DOM-pruned compact markdown extraction, and Brave Search API / DuckDuckGo search.
 
-## Build
+## Build & Install
 
 Default (`reqwest` TLS fallback):
 
@@ -16,19 +16,21 @@ With Cronet on macOS Apple Silicon (recommended):
 
 ```bash
 ./scripts/download-cronet-macos.sh
-cargo build --release --features cronet
+cargo install --path . --features cronet --locked
 ```
 
 With Cronet on Linux:
 
 ```bash
 ./scripts/download-cronet-linux.sh
-cargo build --release --features cronet
+cargo install --path . --features cronet --locked
 ```
+
+This builds the `mesh-wick` crate and installs the canonical `wick` binary onto `PATH`.
 
 ## CEF Renderer (Optional)
 
-When installed at `~/.mesh-wick/cef/wick-renderer.app` (or `$MESH_WICK_HOME/cef`), `mesh-wick` automatically escalates blocked responses (`403`/`503`) and JS-only shells to CEF in `--render auto` mode.
+When installed at `~/.mesh-wick/cef/wick-renderer.app` (or `$MESH_WICK_HOME/cef`), `wick` automatically escalates blocked responses (`403`/`503`) and JS-only shells to CEF in `--render auto` mode.
 
 To build and install the CEF renderer on macOS from this checkout:
 
@@ -47,12 +49,12 @@ bash scripts/install-cef-linux.sh
 ### Fetch a page
 
 ```bash
-mesh-wick fetch https://example.com
-mesh-wick fetch --extract article --no-images https://example.com/post
-mesh-wick fetch --render cef --wait-for-selector "article" https://x.com/user
-mesh-wick fetch --format text https://news.ycombinator.com
-mesh-wick fetch --format raw https://example.com/doc.pdf > doc.pdf
-mesh-wick fetch --json --meta-only https://example.com
+wick fetch https://example.com
+wick fetch --extract article --no-images https://example.com/post
+wick fetch --render cef --wait-for-selector "article" https://x.com/user
+wick fetch --format text https://news.ycombinator.com
+wick fetch --format raw https://example.com/doc.pdf > doc.pdf
+wick fetch --json --meta-only https://example.com
 ```
 
 Key `fetch` flags:
@@ -71,8 +73,8 @@ Key `fetch` flags:
 Uses the Brave Search API when `BRAVE_API_KEY` is set (`--provider auto`), falling back to DuckDuckGo HTML search:
 
 ```bash
-mesh-wick search "rust async runtime" -n 8
-mesh-wick search --provider ddg --json "cronet tls fingerprint"
+wick search "rust async runtime" -n 8
+wick search --provider ddg --json "cronet tls fingerprint"
 ```
 
 ### Crawl and Map
@@ -80,20 +82,20 @@ mesh-wick search --provider ddg --json "cronet tls fingerprint"
 Both `crawl` and `map` respect `robots.txt` by default (pass `--no-robots` to override):
 
 ```bash
-mesh-wick crawl https://docs.example.com --depth 2 --max-pages 10
-mesh-wick map https://example.com --limit 100
+wick crawl https://docs.example.com --depth 2 --max-pages 10
+wick map https://example.com --limit 100
 ```
 
 ### Session and Status
 
 ```bash
-mesh-wick status
-mesh-wick session clear
+wick status
+wick session clear
 ```
 
 ## Configuration
 
-- `MESH_WICK_HOME` / `--state-dir`: state directory for cookies, HTTP cache, CEF `cef-cache`, `site-cache.json`, and optional local `site-rules.json` overlay (default: `~/.mesh-wick`; `mesh-wick session clear` clears cookies, HTTP cache, `cef-cache`, and `site-cache.json`)
+- `MESH_WICK_HOME` / `--state-dir`: state directory for cookies, HTTP cache, CEF `cef-cache`, `site-cache.json`, and optional local `site-rules.json` overlay (default: `~/.mesh-wick`; `wick session clear` clears cookies, HTTP cache, `cef-cache`, and `site-cache.json`)
 - `MESH_WICK_PROXY` / `WICK_PROXY` / `--proxy`: SOCKS5/HTTP proxy URL
 - `BRAVE_API_KEY`: enables Brave Search API in `search`
 - `--timeout <SECS>`: network request timeout (default: `30`)
