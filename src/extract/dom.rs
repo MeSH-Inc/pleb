@@ -124,14 +124,7 @@ impl ParsedHtml {
 
     pub fn title(&self) -> Option<String> {
         let title_el = self.doc.select(&TITLE_SEL).next()?;
-        let raw: String = title_el.text().collect();
-        let collapsed = collapse_inline_whitespace(&raw);
-        let trimmed = collapsed.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
+        collapsed_node_text(*title_el)
     }
 
     pub fn base_href(&self) -> Option<String> {
@@ -291,14 +284,28 @@ impl ParsedHtml {
         links
     }
 
-    pub fn into_pruned_html(mut self, mode: ExtractMode) -> String {
+    fn prune_and_render(
+        &mut self,
+        mode: ExtractMode,
+        resources_base: Option<&Url>,
+        render: impl FnOnce(NodeRef<'_, Node>, &mut String),
+    ) -> (String, Vec<ResourceDescriptor>) {
         let metrics = prune_dom(&mut self.doc, mode);
         let root_id = select_root_id(&self.doc, mode, &metrics);
         let mut out = String::new();
+        let mut resources = Vec::new();
         if let Some(root) = self.doc.tree.get(root_id) {
-            serialize_pruned_html(root, false, &mut out);
+            if let Some(base) = resources_base {
+                resources = index_resources_in_subtree(&self.doc, root, base);
+            }
+            render(root, &mut out);
         }
-        out
+        (out, resources)
+    }
+
+    pub fn into_pruned_html(mut self, mode: ExtractMode) -> String {
+        self.prune_and_render(mode, None, |r, o| serialize_pruned_html(r, false, o))
+            .0
     }
 
     pub fn into_pruned_html_and_resources(
@@ -306,25 +313,15 @@ impl ParsedHtml {
         mode: ExtractMode,
         base_url: &Url,
     ) -> (String, Vec<ResourceDescriptor>) {
-        let metrics = prune_dom(&mut self.doc, mode);
-        let root_id = select_root_id(&self.doc, mode, &metrics);
-        let mut out = String::new();
-        let mut resources = Vec::new();
-        if let Some(root) = self.doc.tree.get(root_id) {
-            resources = index_resources_in_subtree(&self.doc, root, base_url);
-            serialize_pruned_html(root, false, &mut out);
-        }
-        (out, resources)
+        self.prune_and_render(mode, Some(base_url), |r, o| {
+            serialize_pruned_html(r, false, o)
+        })
     }
 
     pub fn into_plain_text(mut self, mode: ExtractMode) -> String {
-        let metrics = prune_dom(&mut self.doc, mode);
-        let root_id = select_root_id(&self.doc, mode, &metrics);
-
-        let mut raw = String::new();
-        if let Some(root) = self.doc.tree.get(root_id) {
-            collect_plain_text(root, false, false, &mut raw);
-        }
+        let raw = self
+            .prune_and_render(mode, None, |r, o| collect_plain_text(r, false, false, o))
+            .0;
         normalize_plain_text(&raw)
     }
 
@@ -333,15 +330,9 @@ impl ParsedHtml {
         mode: ExtractMode,
         base_url: &Url,
     ) -> (String, Vec<ResourceDescriptor>) {
-        let metrics = prune_dom(&mut self.doc, mode);
-        let root_id = select_root_id(&self.doc, mode, &metrics);
-
-        let mut raw = String::new();
-        let mut resources = Vec::new();
-        if let Some(root) = self.doc.tree.get(root_id) {
-            resources = index_resources_in_subtree(&self.doc, root, base_url);
-            collect_plain_text(root, false, false, &mut raw);
-        }
+        let (raw, resources) = self.prune_and_render(mode, Some(base_url), |r, o| {
+            collect_plain_text(r, false, false, o)
+        });
         (normalize_plain_text(&raw), resources)
     }
 
@@ -350,13 +341,7 @@ impl ParsedHtml {
         mode: ExtractMode,
         base_url: &Url,
     ) -> Vec<ResourceDescriptor> {
-        let metrics = prune_dom(&mut self.doc, mode);
-        let root_id = select_root_id(&self.doc, mode, &metrics);
-        self.doc
-            .tree
-            .get(root_id)
-            .map(|root| index_resources_in_subtree(&self.doc, root, base_url))
-            .unwrap_or_default()
+        self.prune_and_render(mode, Some(base_url), |_, _| {}).1
     }
 }
 
@@ -687,12 +672,17 @@ fn is_inline_hidden_style(style: &str) -> bool {
     })
 }
 
-fn is_skip_text(node: NodeRef<'_, Node>) -> bool {
+fn collapsed_node_text(node: NodeRef<'_, Node>) -> Option<String> {
     let mut raw = String::new();
     collect_raw_text(node, &mut raw);
     let collapsed = collapse_inline_whitespace(&raw);
     let trimmed = collapsed.trim();
-    trimmed.len() <= 48 && trimmed.to_ascii_lowercase().starts_with("skip to ")
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn is_skip_text(node: NodeRef<'_, Node>) -> bool {
+    collapsed_node_text(node)
+        .is_some_and(|t| t.len() <= 48 && t.to_ascii_lowercase().starts_with("skip to "))
 }
 
 fn is_skip_fragment_link(node: NodeRef<'_, Node>) -> bool {
@@ -1364,6 +1354,14 @@ fn collect_svg_text_segments(svg_node: NodeRef<'_, Node>) -> Vec<String> {
     segments
 }
 
+fn is_svg_non_content_tag(tag: &str) -> bool {
+    tag.eq_ignore_ascii_case("style")
+        || tag.eq_ignore_ascii_case("script")
+        || tag.eq_ignore_ascii_case("defs")
+        || tag.eq_ignore_ascii_case("title")
+        || tag.eq_ignore_ascii_case("desc")
+}
+
 fn walk_svg_text_segments(
     node: NodeRef<'_, Node>,
     segments: &mut Vec<String>,
@@ -1381,12 +1379,7 @@ fn walk_svg_text_segments(
             continue;
         };
         let tag = el.name();
-        if tag.eq_ignore_ascii_case("style")
-            || tag.eq_ignore_ascii_case("script")
-            || tag.eq_ignore_ascii_case("defs")
-            || tag.eq_ignore_ascii_case("title")
-            || tag.eq_ignore_ascii_case("desc")
-        {
+        if is_svg_non_content_tag(tag) {
             continue;
         }
         if tag.eq_ignore_ascii_case("text") || tag.eq_ignore_ascii_case("foreignobject") {
@@ -1411,12 +1404,7 @@ fn collect_svg_visible_text(node: NodeRef<'_, Node>, out: &mut String) {
         Node::Text(text) => out.push_str(text),
         Node::Element(el) => {
             let tag = el.name();
-            if tag.eq_ignore_ascii_case("style")
-                || tag.eq_ignore_ascii_case("script")
-                || tag.eq_ignore_ascii_case("defs")
-                || tag.eq_ignore_ascii_case("title")
-                || tag.eq_ignore_ascii_case("desc")
-            {
+            if is_svg_non_content_tag(tag) {
                 return;
             }
             let sep = tag.eq_ignore_ascii_case("tspan")
@@ -1461,20 +1449,9 @@ fn extract_svg_label(node: NodeRef<'_, Node>, el: &scraper::node::Element) -> Op
             return Some(trimmed.to_string());
         }
     }
-    for child in node.children() {
-        if let Node::Element(child_el) = child.value() {
-            if child_el.name() == "title" {
-                let mut raw = String::new();
-                collect_raw_text(child, &mut raw);
-                let collapsed = collapse_inline_whitespace(&raw);
-                let trimmed = collapsed.trim();
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_string());
-                }
-            }
-        }
-    }
-    None
+    node.children()
+        .filter(|child| matches!(child.value(), Node::Element(e) if e.name() == "title"))
+        .find_map(collapsed_node_text)
 }
 
 fn try_extract_code_gutter_table(table: NodeRef<'_, Node>) -> Option<(Option<String>, String)> {

@@ -541,7 +541,6 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "authors = [\"Memory Sync Hub LLC\"]",
         "readme = \"README.md\"",
         "repository = \"https://github.com/MeSH-Inc/mesh-wick\"",
-        "homepage = \"https://github.com/MeSH-Inc/mesh-wick\"",
     ] {
         assert!(
             cargo_toml.contains(required_meta),

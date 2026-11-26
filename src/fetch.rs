@@ -19,11 +19,9 @@ use crate::policy::{
     RawSourceCandidate, RawSourceKind, RenderMode, ResourcePolicy, ResponseClassification,
     SourceMode,
 };
-use crate::transport::cef::{
-    CefProtocolError, CefRenderOptions, CefRenderResult, CefRenderer, CefTimeoutError,
-};
+use crate::transport::cef::{CefRenderOptions, CefRenderResult, CefRenderer};
 use crate::transport::{
-    RequestHeaderOptions, ResponseTooLargeError, SubresourceDest, TransportError,
+    transport_error_kind, RequestHeaderOptions, ResponseTooLargeError, SubresourceDest,
     TransportErrorKind, DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES, DEFAULT_RAW_MAX_RESPONSE_BYTES,
 };
 
@@ -518,6 +516,15 @@ where
     results.into_iter().flatten().collect()
 }
 
+fn host_semaphore(map: &Mutex<HashMap<String, Arc<Semaphore>>>, host: String) -> Arc<Semaphore> {
+    let mut guard = map.lock().expect("host semaphore map poisoned");
+    Arc::clone(
+        guard
+            .entry(host)
+            .or_insert_with(|| Arc::new(Semaphore::new(2))),
+    )
+}
+
 struct SelectedSubresource {
     index: usize,
     url: url::Url,
@@ -636,15 +643,7 @@ async fn enrich_document_resources(
                 .host_str()
                 .map(str::to_ascii_lowercase)
                 .unwrap_or_default();
-            let sem = {
-                let mut map = host_sems
-                    .lock()
-                    .expect("subresource semaphore map poisoned");
-                Arc::clone(
-                    map.entry(host_key)
-                        .or_insert_with(|| Arc::new(Semaphore::new(2))),
-                )
-            };
+            let sem = host_semaphore(&host_sems, host_key);
             async move {
                 let _permit = sem.acquire_owned().await.ok()?;
                 if respect_robots && !ctx.robots.is_allowed(&ctx.client, item.url.as_str()).await {
@@ -1088,23 +1087,37 @@ async fn acquire_page(
         &mut parsed_html,
     );
 
+    let record_network_page =
+        |body, final_url, extract_base_url, content_type, strategy: &str, parsed| -> AcquiredPage {
+            ctx.site_cache.record(
+                host,
+                ctx.client.transport_name(),
+                start.elapsed().as_millis() as u64,
+            );
+            AcquiredPage {
+                body,
+                final_url,
+                extract_base_url,
+                status_code: status,
+                content_type,
+                strategy: strategy.to_string(),
+                escalated: cef_fallback,
+                parsed,
+            }
+        };
+
     match classification {
         ResponseClassification::Ok => {
             if accept_markdown && status < 400 && is_markdown_content_type(content_type.as_deref())
             {
-                let timing_ms = start.elapsed().as_millis() as u64;
-                ctx.site_cache
-                    .record(host, ctx.client.transport_name(), timing_ms);
-                return Ok(AcquiredPage {
+                return Ok(record_network_page(
                     body,
                     final_url,
-                    extract_base_url: None,
-                    status_code: status,
+                    None,
                     content_type,
-                    strategy: "markdown_negotiated".to_string(),
-                    escalated: cef_fallback,
-                    parsed: None,
-                });
+                    "markdown_negotiated",
+                    None,
+                ));
             }
 
             if source_mode != SourceMode::None && status == 200 && is_html {
@@ -1121,35 +1134,25 @@ async fn acquire_page(
                 )
                 .await
                 {
-                    let timing_ms = start.elapsed().as_millis() as u64;
-                    ctx.site_cache
-                        .record(host, ctx.client.transport_name(), timing_ms);
-                    return Ok(AcquiredPage {
-                        body: mirror_body,
+                    return Ok(record_network_page(
+                        mirror_body,
                         final_url,
-                        extract_base_url: Some(mirror_base_url),
-                        status_code: status,
-                        content_type: Some("text/markdown".to_string()),
-                        strategy: "markdown_mirror".to_string(),
-                        escalated: cef_fallback,
-                        parsed: None,
-                    });
+                        Some(mirror_base_url),
+                        Some("text/markdown".to_string()),
+                        "markdown_mirror",
+                        None,
+                    ));
                 }
             }
 
-            let timing_ms = start.elapsed().as_millis() as u64;
-            let strategy = ctx.client.transport_name().to_string();
-            ctx.site_cache.record(host, &strategy, timing_ms);
-            Ok(AcquiredPage {
+            Ok(record_network_page(
                 body,
                 final_url,
-                extract_base_url: None,
-                status_code: status,
+                None,
                 content_type,
-                strategy,
-                escalated: cef_fallback,
-                parsed: parsed_html,
-            })
+                ctx.client.transport_name(),
+                parsed_html,
+            ))
         }
         ResponseClassification::JavaScriptShell { reason } => {
             if plan.allow_cef_escalation {
@@ -1166,19 +1169,14 @@ async fn acquire_page(
                     }
                 }
             }
-            let timing_ms = start.elapsed().as_millis() as u64;
-            let strategy = ctx.client.transport_name().to_string();
-            ctx.site_cache.record(host, &strategy, timing_ms);
-            Ok(AcquiredPage {
+            Ok(record_network_page(
                 body,
                 final_url,
-                extract_base_url: None,
-                status_code: status,
+                None,
                 content_type,
-                strategy,
-                escalated: cef_fallback,
-                parsed: parsed_html,
-            })
+                ctx.client.transport_name(),
+                parsed_html,
+            ))
         }
         ResponseClassification::Blocked { status } => {
             if plan.allow_cef_escalation {
@@ -1360,12 +1358,9 @@ fn challenge_error_from_cef(result: CefRenderResult, reason: String) -> FetchErr
 }
 
 fn is_non_retryable_cef_error(err: &anyhow::Error) -> bool {
-    if err.is::<CefProtocolError>() || err.is::<CefTimeoutError>() {
-        return true;
-    }
-    err.downcast_ref::<TransportError>().is_some_and(|te| {
-        matches!(
-            te.kind,
+    matches!(
+        transport_error_kind(err),
+        Some(
             TransportErrorKind::Timeout
                 | TransportErrorKind::ProtocolMismatch
                 | TransportErrorKind::InvalidSelector
@@ -1373,7 +1368,7 @@ fn is_non_retryable_cef_error(err: &anyhow::Error) -> bool {
                 | TransportErrorKind::ResponseTooLarge
                 | TransportErrorKind::RedirectBlocked
         )
-    })
+    )
 }
 
 fn map_transport_error(url: &str, err: anyhow::Error, max_response_bytes: usize) -> FetchError {
@@ -1383,33 +1378,17 @@ fn map_transport_error(url: &str, err: anyhow::Error, max_response_bytes: usize)
             limit_bytes: too_large.limit_bytes,
         };
     }
-    if let Some(te) = err.downcast_ref::<TransportError>() {
-        return match te.kind {
-            TransportErrorKind::Timeout => FetchError::Timeout {
-                url: url.to_string(),
-                detail: te.message.clone(),
-            },
-            TransportErrorKind::ResponseTooLarge => FetchError::ResponseTooLarge {
-                url: url.to_string(),
-                limit_bytes: max_response_bytes,
-            },
-            TransportErrorKind::ProtocolMismatch => FetchError::CefUnavailable(te.message.clone()),
-            TransportErrorKind::LoadError
-            | TransportErrorKind::InvalidSelector
-            | TransportErrorKind::Canceled
-            | TransportErrorKind::RedirectBlocked
-            | TransportErrorKind::Network => FetchError::Transport(err),
-        };
-    }
-    if err.is::<CefProtocolError>() {
-        FetchError::CefUnavailable(err.to_string())
-    } else if err.is::<CefTimeoutError>() {
-        FetchError::Timeout {
+    match transport_error_kind(&err) {
+        Some(TransportErrorKind::Timeout) => FetchError::Timeout {
             url: url.to_string(),
             detail: err.to_string(),
-        }
-    } else {
-        FetchError::Transport(err)
+        },
+        Some(TransportErrorKind::ResponseTooLarge) => FetchError::ResponseTooLarge {
+            url: url.to_string(),
+            limit_bytes: max_response_bytes,
+        },
+        Some(TransportErrorKind::ProtocolMismatch) => FetchError::CefUnavailable(err.to_string()),
+        _ => FetchError::Transport(err),
     }
 }
 
@@ -1575,13 +1554,7 @@ where
 
         set.spawn(async move {
             let host_key = batch_host_key(&ctx_c, &raw_url, opts_c.apply_rewrites);
-            let host_sem = {
-                let mut map = host_sems_c.lock().expect("host semaphore map poisoned");
-                Arc::clone(
-                    map.entry(host_key)
-                        .or_insert_with(|| Arc::new(Semaphore::new(2))),
-                )
-            };
+            let host_sem = host_semaphore(&host_sems_c, host_key);
 
             let _host_permit = host_sem
                 .acquire_owned()
@@ -1622,6 +1595,7 @@ fn batch_host_key(ctx: &RuntimeContext, raw_url: &str, apply_rewrites: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::TransportError;
 
     #[test]
     fn transport_error_kind_maps_directly_to_fetch_error() {
