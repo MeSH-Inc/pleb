@@ -843,6 +843,7 @@ dependencies = [
  "cc",
  "clap",
  "ego-tree",
+ "flate2",
  "htmd",
  "reqwest",
  "robotstxt",

@@ -359,6 +359,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
         daemon_idle_timeout: Duration::from_secs(cli.daemon_idle_timeout.max(1)),
         use_daemon: !cli.no_daemon,
         verbose: cli.verbose,
+        daemon_executable: None,
+        cef_renderer_executable: None,
     };
 
     match cli.command {

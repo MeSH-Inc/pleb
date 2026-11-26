@@ -15,6 +15,8 @@ pub struct RuntimeConfig {
     pub daemon_idle_timeout: Duration,
     pub use_daemon: bool,
     pub verbose: bool,
+    pub daemon_executable: Option<PathBuf>,
+    pub cef_renderer_executable: Option<PathBuf>,
 }
 
 impl Default for RuntimeConfig {
@@ -28,6 +30,8 @@ impl Default for RuntimeConfig {
             daemon_idle_timeout: Duration::from_secs(300),
             use_daemon: false,
             verbose: false,
+            daemon_executable: None,
+            cef_renderer_executable: None,
         }
     }
 }
@@ -162,9 +166,27 @@ pub fn clear_state_dir(state_dir: &Path) -> Result<()> {
     if cef_cache_dir.exists() {
         std::fs::remove_dir_all(&cef_cache_dir)?;
     }
-    let cache_file = state_dir.join("site-cache.json");
-    if cache_file.exists() {
-        std::fs::remove_file(&cache_file)?;
+    let lock_path = state_dir.join("site-cache.lock");
+    let mut lock_opts = std::fs::OpenOptions::new();
+    lock_opts
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        lock_opts.mode(0o600);
     }
+    let lock_file = lock_opts.open(&lock_path)?;
+    lock_file.lock()?;
+
+    let cache_file = state_dir.join("site-cache.json");
+    match std::fs::remove_file(&cache_file) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    drop(lock_file);
     Ok(())
 }
