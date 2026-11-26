@@ -1,9 +1,9 @@
-use mesh_wick::auth::{
+use pleb::auth::{
     remove_credential, resolve_credential, set_credential, CredentialProvider, CredentialSource,
     CredentialStorage,
 };
-use mesh_wick::context::{clear_state_dir, RuntimeConfig, RuntimeContext};
-use mesh_wick::search::{
+use pleb::context::{clear_state_dir, RuntimeConfig, RuntimeContext};
+use pleb::search::{
     civil_from_days, days_from_civil, parse_retry_after, provider_health_summary,
     search_with_endpoints, ProviderEndpoints, SearchMode, SearchOptions, SearchProvider,
 };
@@ -29,8 +29,8 @@ impl EnvGuard {
     fn new(vars: &[(&'static str, Option<&str>)]) -> Self {
         let lock = ENV_LOCK.blocking_lock();
         let mut saved = Vec::with_capacity(vars.len() + 1);
-        saved.push(("WICK_NO_KEYCHAIN", std::env::var("WICK_NO_KEYCHAIN").ok()));
-        std::env::set_var("WICK_NO_KEYCHAIN", "1");
+        saved.push(("PLEB_NO_KEYCHAIN", std::env::var("PLEB_NO_KEYCHAIN").ok()));
+        std::env::set_var("PLEB_NO_KEYCHAIN", "1");
 
         for &(key, value) in vars {
             saved.push((key, std::env::var(key).ok()));
@@ -67,14 +67,14 @@ impl SearchEnvGuard {
             "SERPER_API_KEY",
             "EXA_API_KEY",
             "SEARXNG_URL",
-            "WICK_NO_KEYCHAIN",
-            "WICK_NO_HOME_CEF",
+            "PLEB_NO_KEYCHAIN",
+            "PLEB_NO_HOME_CEF",
         ] {
             saved.push((key, std::env::var(key).ok()));
             std::env::remove_var(key);
         }
-        std::env::set_var("WICK_NO_KEYCHAIN", "1");
-        std::env::set_var("WICK_NO_HOME_CEF", "1");
+        std::env::set_var("PLEB_NO_KEYCHAIN", "1");
+        std::env::set_var("PLEB_NO_HOME_CEF", "1");
         for &(k, v) in overrides {
             std::env::set_var(k, v);
         }
@@ -101,7 +101,7 @@ impl TempStateDir {
     fn new() -> Self {
         let pid = std::process::id();
         let seq = ADV_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = PathBuf::from(format!("/tmp/wick-t-adv-{pid}-{seq}"));
+        let path = PathBuf::from(format!("/tmp/pleb-t-adv-{pid}-{seq}"));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("create temp state dir");
         #[cfg(unix)]
@@ -261,7 +261,7 @@ fn adversarial_session_clear_preserves_credentials_and_lock_files() {
 
 #[tokio::test]
 async fn adversarial_cli_zero_secret_leakage_in_json_and_verbose_logs() {
-    let wick_bin = env!("CARGO_BIN_EXE_wick");
+    let pleb_bin = env!("CARGO_BIN_EXE_pleb");
     let state_dir = TempStateDir::new();
 
     let brave_secret = "BSA-adversarial-top-secret-918273645";
@@ -269,9 +269,9 @@ async fn adversarial_cli_zero_secret_leakage_in_json_and_verbose_logs() {
     let searxng_url = "http://127.0.0.1:19999";
 
     // 1. Positional secret argument must be rejected by clap (exit 2).
-    let positional = Command::new(wick_bin)
-        .env("WICK_NO_KEYCHAIN", "1")
-        .env("WICK_NO_HOME_CEF", "1")
+    let positional = Command::new(pleb_bin)
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .env("PLEB_NO_HOME_CEF", "1")
         .args(["--state-dir"])
         .arg(&state_dir.path)
         .args(["auth", "set", "brave", brave_secret])
@@ -280,15 +280,15 @@ async fn adversarial_cli_zero_secret_leakage_in_json_and_verbose_logs() {
         .unwrap();
     assert_eq!(positional.status.code(), Some(2));
 
-    // 2. `wick status --json --verbose` and `wick auth status --json --verbose` must never leak
+    // 2. `pleb status --json --verbose` and `pleb auth status --json --verbose` must never leak
     //    configured secrets, prefixes, or SEARXNG_URL on stdout or stderr.
     for args in [
         vec!["--verbose", "--json", "status"],
         vec!["--verbose", "auth", "status", "--json"],
     ] {
-        let out = Command::new(wick_bin)
-            .env("WICK_NO_KEYCHAIN", "1")
-            .env("WICK_NO_HOME_CEF", "1")
+        let out = Command::new(pleb_bin)
+            .env("PLEB_NO_KEYCHAIN", "1")
+            .env("PLEB_NO_HOME_CEF", "1")
             .env("BRAVE_API_KEY", brave_secret)
             .env("TAVILY_API_KEY", tavily_secret)
             .env("SEARXNG_URL", searxng_url)
@@ -324,9 +324,9 @@ async fn adversarial_cli_zero_secret_leakage_in_json_and_verbose_logs() {
 
     // 3. Rejected `--stdin` input with `--verbose --json` must not echo any part of the rejected secret.
     let bad_secret = "secret-with-\x07-control-byte-998877";
-    let mut child = Command::new(wick_bin)
-        .env("WICK_NO_KEYCHAIN", "1")
-        .env("WICK_NO_HOME_CEF", "1")
+    let mut child = Command::new(pleb_bin)
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .env("PLEB_NO_HOME_CEF", "1")
         .args(["--state-dir"])
         .arg(&state_dir.path)
         .args([

@@ -1,4 +1,4 @@
-// wick-renderer (Linux): CEF offscreen renderer with v4-meta stdin/stdout JSON+bytes framing.
+// pleb-renderer (Linux): CEF offscreen renderer with v5-meta stdin/stdout JSON+bytes framing.
 
 #include <libgen.h>
 #include <limits.h>
@@ -24,7 +24,7 @@ int main(int argc, char* argv[]) {
     const char* cache_dir_arg = NULL;
     char** new_argv = (char**)malloc(sizeof(char*) * ((size_t)argc + (size_t)extra_args + 1));
     if (!new_argv) {
-        wick_write_ready(stdout, 0, "out of memory");
+        pleb_write_ready(stdout, 0, "out of memory");
         return 1;
     }
 
@@ -68,7 +68,7 @@ int main(int argc, char* argv[]) {
         return exit_code;
     }
 
-    wick_init_cef_handlers();
+    pleb_init_cef_handlers();
 
     cef_settings_t settings = {};
     settings.size = sizeof(cef_settings_t);
@@ -80,7 +80,7 @@ int main(int argc, char* argv[]) {
     char exe_dir[PATH_MAX];
     if (get_exe_dir(exe_dir, sizeof(exe_dir)) == 0) {
         char helper_path[PATH_MAX];
-        snprintf(helper_path, sizeof(helper_path), "%s/wick-helper", exe_dir);
+        snprintf(helper_path, sizeof(helper_path), "%s/pleb-helper", exe_dir);
         if (access(helper_path, X_OK) == 0) {
             cef_string_utf8_to_utf16(helper_path, strlen(helper_path),
                                       &settings.browser_subprocess_path);
@@ -106,7 +106,7 @@ int main(int argc, char* argv[]) {
     }
 
     char cache_path[PATH_MAX];
-    wick_resolve_cache_path(cache_dir_arg, cache_path, sizeof(cache_path));
+    pleb_resolve_cache_path(cache_dir_arg, cache_path, sizeof(cache_path));
     cef_string_utf8_to_utf16(cache_path, strlen(cache_path), &settings.root_cache_path);
 
     char profile_path[PATH_MAX];
@@ -114,7 +114,7 @@ int main(int argc, char* argv[]) {
     cef_string_utf8_to_utf16(profile_path, strlen(profile_path), &settings.cache_path);
 
     if (!cef_initialize(&main_args, &settings, NULL, NULL)) {
-        wick_write_ready(stdout, 0, "cef_initialize failed");
+        pleb_write_ready(stdout, 0, "cef_initialize failed");
         free(new_argv);
         return 1;
     }
@@ -138,14 +138,14 @@ int main(int argc, char* argv[]) {
         usleep(10000);
     }
     if (!g_browser) {
-        wick_write_ready(stdout, 0, "failed to create CEF browser");
+        pleb_write_ready(stdout, 0, "failed to create CEF browser");
         cef_shutdown();
         free(new_argv);
         return 1;
     }
 
-    wick_write_ready(stdout, 1, NULL);
-    wick_run_request_loop();
+    pleb_write_ready(stdout, 1, NULL);
+    pleb_run_request_loop();
 
     cef_shutdown();
     free(new_argv);

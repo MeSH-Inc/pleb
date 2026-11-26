@@ -1,21 +1,19 @@
 /target*
-/wick
-/mesh-wick
+/pleb
 *.dylib
 *.so
 *.dll
 *.a
-.mesh-wick/
-.wick/
+.pleb/
 .DS_Store
 lib/*/libcronet.*
 
 # CEF compiled artifacts (source files are tracked in cef/)
-cef/wick-renderer
-cef/wick-renderer.app/
-cef/wick-helper
-cef/wick-helper-mac
-cef/wick-renderer-mac
+cef/pleb-renderer
+cef/pleb-renderer.app/
+cef/pleb-helper
+cef/pleb-helper-mac
+cef/pleb-renderer-mac
 cef/cef_binary_*/
 Frameworks/
 
@@ -23,3 +21,6 @@ Frameworks/
 *.app/
 *.framework/
 *.tar.bz2
+
+# Local reference checkouts
+/research/

@@ -1,5 +1,5 @@
-#ifndef WICK_BROWSER_ENVIRONMENT_H
-#define WICK_BROWSER_ENVIRONMENT_H
+#ifndef PLEB_BROWSER_ENVIRONMENT_H
+#define PLEB_BROWSER_ENVIRONMENT_H
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,7 +44,7 @@ __attribute__((unused)) static const char* OSR_ENVIRONMENT_JS =
 
 // Escapes `src` so it can be spliced inside single quotes `'...'` in JavaScript.
 // Caller owns returned buffer and must free().
-__attribute__((unused)) static char* wick_escape_js_string(const char* src) {
+__attribute__((unused)) static char* pleb_escape_js_string(const char* src) {
     if (!src) return NULL;
     size_t cap = strlen(src) * 6 + 1;
     char* out = (char*)malloc(cap);
@@ -98,11 +98,11 @@ __attribute__((unused)) static char* wick_escape_js_string(const char* src) {
     return out;
 }
 
-// Builds an optional Intl.DateTimeFormat override script when MESH_WICK_TIMEZONE
+// Builds an optional Intl.DateTimeFormat override script when PLEB_TIMEZONE
 // is explicitly configured. Returns NULL when unset/empty so local TZ is untouched.
-__attribute__((unused)) static char* wick_build_timezone_js(const char* tz) {
+__attribute__((unused)) static char* pleb_build_timezone_js(const char* tz) {
     if (!tz || !tz[0]) return NULL;
-    char* escaped = wick_escape_js_string(tz);
+    char* escaped = pleb_escape_js_string(tz);
     if (!escaped) return NULL;
 
     const char* fmt =

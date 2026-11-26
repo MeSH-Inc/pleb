@@ -322,7 +322,7 @@ pub fn resolve_daemon_executable(override_exe: Option<&Path>) -> Result<PathBuf>
             return Ok(path.to_path_buf());
         }
     }
-    if let Some(path) = std::env::var_os("WICK_DAEMON_EXECUTABLE") {
+    if let Some(path) = std::env::var_os("PLEB_DAEMON_EXECUTABLE") {
         if !path.is_empty() {
             return Ok(PathBuf::from(path));
         }
@@ -334,7 +334,7 @@ pub fn resolve_daemon_executable(override_exe: Option<&Path>) -> Result<PathBuf>
         .is_some_and(|name| name == "deps")
     {
         bail!(
-            "refusing to spawn Cargo test binary {} as wick daemon; set RuntimeConfig::daemon_executable or WICK_DAEMON_EXECUTABLE",
+            "refusing to spawn Cargo test binary {} as pleb daemon; set RuntimeConfig::daemon_executable or PLEB_DAEMON_EXECUTABLE",
             exe.display()
         );
     }

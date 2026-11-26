@@ -1,20 +1,18 @@
 use clap::{Parser, Subcommand};
-use mesh_wick::auth::{
-    self, CredentialProvider, CredentialSource, CredentialStorage, SecretString,
-};
-use mesh_wick::context::{clear_state_dir, default_state_dir, RuntimeConfig, RuntimeContext};
-use mesh_wick::crawl;
+use pleb::auth::{self, CredentialProvider, CredentialSource, CredentialStorage, SecretString};
+use pleb::context::{clear_state_dir, default_state_dir, RuntimeConfig, RuntimeContext};
+use pleb::crawl;
 #[cfg(unix)]
-use mesh_wick::daemon;
-use mesh_wick::extract::{format_page_section, ExtractMode, OutputFormat};
-use mesh_wick::fetch::{
+use pleb::daemon;
+use pleb::extract::{format_page_section, ExtractMode, OutputFormat};
+use pleb::fetch::{
     self, BatchFetchOptions, BatchItemResult, FetchError, FetchOptions, FetchOutput,
 };
-use mesh_wick::policy::{RenderMode, ResourcePolicy, SourceMode};
-use mesh_wick::search::{
+use pleb::policy::{RenderMode, ResourcePolicy, SourceMode};
+use pleb::search::{
     self, Freshness, SearchMode, SearchOptions, SearchProvider, SearchProviderStatus,
 };
-use mesh_wick::transport::cef::{self, RendererProbe};
+use pleb::transport::cef::{self, RendererProbe};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read, Write};
@@ -26,13 +24,13 @@ use std::time::Duration;
 
 #[derive(Parser)]
 #[command(
-    name = "wick",
+    name = "pleb",
     version,
     about = "Local browser-grade web fetch and search CLI for AI agents"
 )]
 struct Cli {
     /// SOCKS5/HTTP proxy URL (e.g., socks5://localhost:1080)
-    #[arg(long, global = true, env = "MESH_WICK_PROXY")]
+    #[arg(long, global = true, env = "PLEB_PROXY")]
     proxy: Option<String>,
 
     /// Network request timeout in seconds
@@ -48,18 +46,18 @@ struct Cli {
     cef_timeout: u64,
 
     /// Directory for local cache and session state
-    #[arg(long, global = true, env = "MESH_WICK_HOME")]
+    #[arg(long, global = true, env = "PLEB_HOME")]
     state_dir: Option<PathBuf>,
 
     /// Disable persistent background daemon sharing for this command
-    #[arg(long, global = true, env = "MESH_WICK_NO_DAEMON")]
+    #[arg(long, global = true, env = "PLEB_NO_DAEMON")]
     no_daemon: bool,
 
     /// Idle timeout in seconds for the auto-spawned background daemon
     #[arg(
         long,
         global = true,
-        env = "MESH_WICK_DAEMON_IDLE_SECONDS",
+        env = "PLEB_DAEMON_IDLE_SECONDS",
         default_value = "300"
     )]
     daemon_idle_timeout: u64,
@@ -222,7 +220,7 @@ enum Command {
     },
     /// Show binary, Cronet, CEF, and search configuration status
     Status,
-    /// Emit the canonical version-locked mesh-wick agent skill
+    /// Emit the canonical version-locked pleb agent skill
     Skill {
         #[command(subcommand)]
         action: SkillAction,
@@ -258,11 +256,11 @@ enum AuthAction {
 
 #[derive(Subcommand)]
 enum SkillAction {
-    /// Print the bundled mesh-wick SKILL.md to stdout
+    /// Print the bundled pleb SKILL.md to stdout
     Print,
 }
 
-const BUNDLED_SKILL_MD: &str = include_str!("../skills/mesh-wick/SKILL.md");
+const BUNDLED_SKILL_MD: &str = include_str!("../skills/pleb/SKILL.md");
 
 #[derive(Subcommand)]
 enum DaemonAction {
@@ -326,7 +324,7 @@ struct FetchMetadataOutput<'a> {
     timing_ms: u64,
     content_bytes: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    resources: Vec<mesh_wick::extract::ResourceDescriptor>,
+    resources: Vec<pleb::extract::ResourceDescriptor>,
 }
 
 impl<'a> From<&'a FetchOutput> for FetchMetadataOutput<'a> {
@@ -559,7 +557,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 };
                 print_json(&payload)?;
             } else {
-                println!("wick {} (mesh-wick)", env!("CARGO_PKG_VERSION"));
+                println!("pleb {}", env!("CARGO_PKG_VERSION"));
                 println!(
                     "Cronet: {}",
                     if cfg!(feature = "cronet") {
@@ -609,7 +607,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             SkillAction::Print => {
                 if json {
                     print_json(&serde_json::json!({
-                        "name": "mesh-wick",
+                        "name": "pleb",
                         "version": env!("CARGO_PKG_VERSION"),
                         "content": BUNDLED_SKILL_MD,
                     }))?;
@@ -747,7 +745,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 .collect();
 
             let opts = FetchOptions {
-                extract: mesh_wick::extract::ExtractOptions {
+                extract: pleb::extract::ExtractOptions {
                     format,
                     mode: extract,
                     include_images: !no_images,
@@ -1352,7 +1350,7 @@ fn print_auth_statuses(statuses: &BTreeMap<String, SearchProviderStatus>) {
 
 fn init_tracing(verbose: bool) {
     let default_spec = if verbose {
-        "warn,mesh_wick=debug,reqwest=warn,hyper=warn,hyper_util=warn,h2=warn,rustls=warn"
+        "warn,pleb=debug,reqwest=warn,hyper=warn,hyper_util=warn,h2=warn,rustls=warn"
     } else {
         "warn,reqwest=warn,hyper=warn,hyper_util=warn,h2=warn,rustls=warn"
     };

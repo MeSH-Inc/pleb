@@ -9,7 +9,7 @@ use thiserror::Error;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
 pub const EXPECTED_PROTOCOL: &str = "v5-meta";
-const PROTOCOL_MARKER_PREFIX: &[u8] = b"WICK_RENDERER_PROTOCOL=";
+const PROTOCOL_MARKER_PREFIX: &[u8] = b"PLEB_RENDERER_PROTOCOL=";
 const STDERR_TAIL_MAX_BYTES: usize = 64 * 1024;
 const MAX_HTML_BYTES: usize = 64 * 1024 * 1024;
 
@@ -91,7 +91,7 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// Manages a persistent `wick-renderer` CEF child process.
+/// Manages a persistent `pleb-renderer` CEF child process.
 pub struct CefRenderer {
     state_dir: PathBuf,
     cache_dir: Option<PathBuf>,
@@ -244,7 +244,7 @@ impl CefRenderer {
 
         let (tx, rx) = oneshot::channel();
         std::thread::Builder::new()
-            .name("mesh-wick-cef-io".into())
+            .name("pleb-cef-io".into())
             .spawn(move || {
                 let res = perform_render(
                     &mut stdin,
@@ -311,7 +311,7 @@ impl CefRenderer {
                 expected,
             } => {
                 return Err(anyhow::Error::new(CefProtocolError(format!(
-                    "wick-renderer at {} has protocol {} (expected {}); rebuild with: {}",
+                    "pleb-renderer at {} has protocol {} (expected {}); rebuild with: {}",
                     path.display(),
                     found.as_deref().unwrap_or("unknown"),
                     expected,
@@ -320,7 +320,7 @@ impl CefRenderer {
             }
             RendererProbe::NotInstalled => {
                 return Err(anyhow::Error::new(CefProtocolError(format!(
-                    "wick-renderer not found; install with: {}",
+                    "pleb-renderer not found; install with: {}",
                     rebuild_command_hint()
                 ))));
             }
@@ -335,7 +335,7 @@ impl CefRenderer {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env("MESH_WICK_HOME", &self.state_dir);
+            .env("PLEB_HOME", &self.state_dir);
 
         if let Some(ref cache_dir) = self.cache_dir {
             cmd.arg(format!("--cache-dir={}", cache_dir.display()));
@@ -399,7 +399,7 @@ impl CefRenderer {
         let mut kill_guard = KillOnDrop(Some(child));
         let (tx, rx) = oneshot::channel();
         std::thread::Builder::new()
-            .name("mesh-wick-cef-ready".into())
+            .name("pleb-cef-ready".into())
             .spawn(move || {
                 let res = read_ready_banner(&mut stdout);
                 let _ = tx.send((stdout, res));
@@ -448,7 +448,7 @@ impl CefRenderer {
 impl Drop for CefRenderer {
     fn drop(&mut self) {
         if let Some(mut proc) = self.daemon.get_mut().take() {
-            // Close stdin first so wick-renderer observes EOF and runs cef_shutdown().
+            // Close stdin first so pleb-renderer observes EOF and runs cef_shutdown().
             drop(proc.stdin);
             let deadline = Instant::now() + Duration::from_millis(300);
             loop {
@@ -470,18 +470,18 @@ fn read_ready_banner(stdout: &mut BufReader<ChildStdout>) -> Result<()> {
     let mut line = String::new();
     let n = stdout.read_line(&mut line)?;
     if n == 0 {
-        bail!("wick-renderer closed stdout before sending ready handshake");
+        bail!("pleb-renderer closed stdout before sending ready handshake");
     }
     let banner: ReadyBanner = serde_json::from_str(line.trim()).map_err(|e| {
         anyhow::anyhow!(
-            "invalid wick-renderer ready banner '{}': {}",
+            "invalid pleb-renderer ready banner '{}': {}",
             line.trim(),
             e
         )
     })?;
     if banner.protocol != EXPECTED_PROTOCOL {
         return Err(anyhow::Error::new(CefProtocolError(format!(
-            "wick-renderer reported protocol '{}' (expected {}); rebuild with: {}",
+            "pleb-renderer reported protocol '{}' (expected {}); rebuild with: {}",
             banner.protocol,
             EXPECTED_PROTOCOL,
             rebuild_command_hint()
@@ -489,7 +489,7 @@ fn read_ready_banner(stdout: &mut BufReader<ChildStdout>) -> Result<()> {
     }
     if !banner.ready {
         bail!(
-            "wick-renderer failed startup: {}",
+            "pleb-renderer failed startup: {}",
             banner
                 .error
                 .unwrap_or_else(|| "unknown initialization error".to_string())
@@ -519,7 +519,7 @@ fn perform_render(
     let mut header_line = String::new();
     let n = stdout.read_line(&mut header_line)?;
     if n == 0 {
-        bail!("wick-renderer closed stdout without a response");
+        bail!("pleb-renderer closed stdout without a response");
     }
 
     let header: RendererResponseHeader = serde_json::from_str(header_line.trim())
@@ -527,7 +527,7 @@ fn perform_render(
 
     if header.html_bytes > MAX_HTML_BYTES {
         bail!(
-            "wick-renderer response exceeded {} byte limit ({} bytes)",
+            "pleb-renderer response exceeded {} byte limit ({} bytes)",
             MAX_HTML_BYTES,
             header.html_bytes
         );
@@ -539,7 +539,7 @@ fn perform_render(
     }
 
     if let Some(err_msg) = header.error {
-        let formatted = format!("wick-renderer failed for {}: {}", url, err_msg);
+        let formatted = format!("pleb-renderer failed for {}: {}", url, err_msg);
         let kind = header
             .error_kind
             .unwrap_or(crate::transport::TransportErrorKind::Network);
@@ -573,7 +573,7 @@ fn spawn_stderr_drain(
     verbose: bool,
 ) {
     let _ = std::thread::Builder::new()
-        .name("mesh-wick-cef-stderr".into())
+        .name("pleb-cef-stderr".into())
         .spawn(move || {
             let mut buf = [0u8; 4096];
             loop {
@@ -669,7 +669,7 @@ fn extract_protocol_version(bytes: &[u8]) -> Option<String> {
 }
 
 fn is_no_home_cef_enabled() -> bool {
-    std::env::var("WICK_NO_HOME_CEF")
+    std::env::var("PLEB_NO_HOME_CEF")
         .is_ok_and(|val| val == "1" || val.eq_ignore_ascii_case("true"))
 }
 
@@ -687,7 +687,7 @@ pub fn find_renderer_with_override(
         }
     }
 
-    if let Some(env_path) = std::env::var_os("WICK_CEF_RENDERER") {
+    if let Some(env_path) = std::env::var_os("PLEB_CEF_RENDERER") {
         if !env_path.is_empty() {
             let path = PathBuf::from(env_path);
             return path.exists().then_some(path);
@@ -700,24 +700,24 @@ pub fn find_renderer_with_override(
     if !no_home_cef {
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
-                candidates.push(dir.join("wick-renderer.app/Contents/MacOS/wick-renderer"));
-                candidates.push(dir.join("wick-renderer"));
+                candidates.push(dir.join("pleb-renderer.app/Contents/MacOS/pleb-renderer"));
+                candidates.push(dir.join("pleb-renderer"));
             }
         }
     }
 
     let state_cef = state_dir.join("cef");
-    candidates.push(state_cef.join("wick-renderer.app/Contents/MacOS/wick-renderer"));
-    candidates.push(state_cef.join("wick-renderer"));
+    candidates.push(state_cef.join("pleb-renderer.app/Contents/MacOS/pleb-renderer"));
+    candidates.push(state_cef.join("pleb-renderer"));
 
     if !no_home_cef {
         if let Some(home) = std::env::var_os("HOME") {
-            let mesh_cef = PathBuf::from(home).join(".mesh-wick").join("cef");
-            candidates.push(mesh_cef.join("wick-renderer.app/Contents/MacOS/wick-renderer"));
-            candidates.push(mesh_cef.join("wick-renderer"));
+            let pleb_cef = PathBuf::from(home).join(".pleb").join("cef");
+            candidates.push(pleb_cef.join("pleb-renderer.app/Contents/MacOS/pleb-renderer"));
+            candidates.push(pleb_cef.join("pleb-renderer"));
         }
 
-        candidates.push(PathBuf::from("/opt/mesh-wick/wick-renderer"));
+        candidates.push(PathBuf::from("/opt/pleb/pleb-renderer"));
     }
 
     candidates.into_iter().find(|path| path.exists())

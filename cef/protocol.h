@@ -1,5 +1,5 @@
-#ifndef WICK_PROTOCOL_H
-#define WICK_PROTOCOL_H
+#ifndef PLEB_PROTOCOL_H
+#define PLEB_PROTOCOL_H
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -8,19 +8,19 @@
 
 #include "browser_environment.h"
 
-#define WICK_RENDERER_PROTOCOL_VERSION "v5-meta"
-#define WICK_MAX_REQUEST_LINE_BYTES (64 * 1024)
+#define PLEB_RENDERER_PROTOCOL_VERSION "v5-meta"
+#define PLEB_MAX_REQUEST_LINE_BYTES (64 * 1024)
 
-__attribute__((used)) static const char WICK_RENDERER_PROTOCOL[] =
-    "WICK_RENDERER_PROTOCOL=" WICK_RENDERER_PROTOCOL_VERSION;
+__attribute__((used)) static const char PLEB_RENDERER_PROTOCOL[] =
+    "PLEB_RENDERER_PROTOCOL=" PLEB_RENDERER_PROTOCOL_VERSION;
 
 typedef struct {
     char* url;
     char* wait_for_selector;
     int timeout_ms;
-} WickRenderRequest;
+} PlebRenderRequest;
 
-static void wick_render_request_free(WickRenderRequest* req) {
+static void pleb_render_request_free(PlebRenderRequest* req) {
     if (!req) return;
     free(req->url);
     free(req->wait_for_selector);
@@ -29,7 +29,7 @@ static void wick_render_request_free(WickRenderRequest* req) {
     req->timeout_ms = 0;
 }
 
-static char* wick_asprintf(const char* fmt, ...) {
+static char* pleb_asprintf(const char* fmt, ...) {
     va_list ap1;
     va_start(ap1, fmt);
     int needed = vsnprintf(NULL, 0, fmt, ap1);
@@ -48,7 +48,7 @@ static char* wick_asprintf(const char* fmt, ...) {
 
 // Reads one line up to `max_bytes`. Returns 1 if a line was read (or exceeded
 // `max_bytes`, setting *out_too_long = 1 and consuming through '\n'), 0 on EOF.
-static int wick_read_line(FILE* in, char** out_buf, size_t max_bytes, int* out_too_long) {
+static int pleb_read_line(FILE* in, char** out_buf, size_t max_bytes, int* out_too_long) {
     *out_buf = NULL;
     *out_too_long = 0;
 
@@ -95,24 +95,24 @@ static int wick_read_line(FILE* in, char** out_buf, size_t max_bytes, int* out_t
     return 1;
 }
 
-static const char* wick_skip_ws(const char* p) {
+static const char* pleb_skip_ws(const char* p) {
     while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
         p++;
     }
     return p;
 }
 
-static int wick_hex_digit(char c) {
+static int pleb_hex_digit(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
     if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
     return -1;
 }
 
-static int wick_parse_hex4(const char* p, unsigned int* out) {
+static int pleb_parse_hex4(const char* p, unsigned int* out) {
     unsigned int val = 0;
     for (int i = 0; i < 4; i++) {
-        int d = wick_hex_digit(p[i]);
+        int d = pleb_hex_digit(p[i]);
         if (d < 0) return -1;
         val = (val << 4) | (unsigned int)d;
     }
@@ -120,7 +120,7 @@ static int wick_parse_hex4(const char* p, unsigned int* out) {
     return 0;
 }
 
-static int wick_append_utf8(char* dst, size_t* len, size_t cap, unsigned int cp) {
+static int pleb_append_utf8(char* dst, size_t* len, size_t cap, unsigned int cp) {
     if (cp == 0) return -1; // Reject embedded NUL for C strings.
     if (cp <= 0x7F) {
         if (*len + 1 >= cap) return -1;
@@ -146,7 +146,7 @@ static int wick_append_utf8(char* dst, size_t* len, size_t cap, unsigned int cp)
     return 0;
 }
 
-static int wick_parse_json_string(const char** cursor, char** out_str, char* err_buf, size_t err_cap) {
+static int pleb_parse_json_string(const char** cursor, char** out_str, char* err_buf, size_t err_cap) {
     const char* p = *cursor;
     if (*p != '"') {
         snprintf(err_buf, err_cap, "expected JSON string");
@@ -201,7 +201,7 @@ static int wick_parse_json_string(const char** cursor, char** out_str, char* err
             case 't': buf[out_len++] = '\t'; break;
             case 'u': {
                 unsigned int cp = 0;
-                if (wick_parse_hex4(p, &cp) != 0) {
+                if (pleb_parse_hex4(p, &cp) != 0) {
                     free(buf);
                     snprintf(err_buf, err_cap, "invalid \\uXXXX escape");
                     return -1;
@@ -215,7 +215,7 @@ static int wick_parse_json_string(const char** cursor, char** out_str, char* err
                     }
                     p += 2;
                     unsigned int low = 0;
-                    if (wick_parse_hex4(p, &low) != 0 || low < 0xDC00 || low > 0xDFFF) {
+                    if (pleb_parse_hex4(p, &low) != 0 || low < 0xDC00 || low > 0xDFFF) {
                         free(buf);
                         snprintf(err_buf, err_cap, "invalid UTF-16 low surrogate");
                         return -1;
@@ -227,7 +227,7 @@ static int wick_parse_json_string(const char** cursor, char** out_str, char* err
                     snprintf(err_buf, err_cap, "unexpected UTF-16 low surrogate");
                     return -1;
                 }
-                if (wick_append_utf8(buf, &out_len, raw_cap, cp) != 0) {
+                if (pleb_append_utf8(buf, &out_len, raw_cap, cp) != 0) {
                     free(buf);
                     snprintf(err_buf, err_cap, "invalid Unicode codepoint in JSON string");
                     return -1;
@@ -246,21 +246,21 @@ static int wick_parse_json_string(const char** cursor, char** out_str, char* err
     return -1;
 }
 
-static int wick_parse_request_line(
+static int pleb_parse_request_line(
     const char* line,
-    WickRenderRequest* out,
+    PlebRenderRequest* out,
     char* err_buf,
     size_t err_cap
 ) {
     memset(out, 0, sizeof(*out));
     out->timeout_ms = 60000;
 
-    const char* p = wick_skip_ws(line);
+    const char* p = pleb_skip_ws(line);
     if (*p != '{') {
         snprintf(err_buf, err_cap, "request must be a JSON object");
         return -1;
     }
-    p = wick_skip_ws(p + 1);
+    p = pleb_skip_ws(p + 1);
     if (*p == '}') {
         snprintf(err_buf, err_cap, "request object missing required field 'url'");
         return -1;
@@ -268,24 +268,24 @@ static int wick_parse_request_line(
 
     for (;;) {
         char* key = NULL;
-        if (wick_parse_json_string(&p, &key, err_buf, err_cap) != 0) {
-            wick_render_request_free(out);
+        if (pleb_parse_json_string(&p, &key, err_buf, err_cap) != 0) {
+            pleb_render_request_free(out);
             return -1;
         }
-        p = wick_skip_ws(p);
+        p = pleb_skip_ws(p);
         if (*p != ':') {
             free(key);
-            wick_render_request_free(out);
+            pleb_render_request_free(out);
             snprintf(err_buf, err_cap, "expected ':' after JSON key");
             return -1;
         }
-        p = wick_skip_ws(p + 1);
+        p = pleb_skip_ws(p + 1);
 
         if (strcmp(key, "url") == 0) {
             char* val = NULL;
-            if (wick_parse_json_string(&p, &val, err_buf, err_cap) != 0) {
+            if (pleb_parse_json_string(&p, &val, err_buf, err_cap) != 0) {
                 free(key);
-                wick_render_request_free(out);
+                pleb_render_request_free(out);
                 return -1;
             }
             free(out->url);
@@ -297,9 +297,9 @@ static int wick_parse_request_line(
                 out->wait_for_selector = NULL;
             } else {
                 char* val = NULL;
-                if (wick_parse_json_string(&p, &val, err_buf, err_cap) != 0) {
+                if (pleb_parse_json_string(&p, &val, err_buf, err_cap) != 0) {
                     free(key);
-                    wick_render_request_free(out);
+                    pleb_render_request_free(out);
                     return -1;
                 }
                 free(out->wait_for_selector);
@@ -311,7 +311,7 @@ static int wick_parse_request_line(
             long val = strtol(p, &endptr, 10);
             if (endptr == p || val <= 0) {
                 free(key);
-                wick_render_request_free(out);
+                pleb_render_request_free(out);
                 snprintf(err_buf, err_cap, "timeout_ms must be a positive integer");
                 return -1;
             }
@@ -321,33 +321,33 @@ static int wick_parse_request_line(
         } else {
             snprintf(err_buf, err_cap, "unknown request field '%s'", key);
             free(key);
-            wick_render_request_free(out);
+            pleb_render_request_free(out);
             return -1;
         }
 
         free(key);
-        p = wick_skip_ws(p);
+        p = pleb_skip_ws(p);
         if (*p == ',') {
-            p = wick_skip_ws(p + 1);
+            p = pleb_skip_ws(p + 1);
             continue;
         }
         if (*p == '}') {
-            p = wick_skip_ws(p + 1);
+            p = pleb_skip_ws(p + 1);
             break;
         }
-        wick_render_request_free(out);
+        pleb_render_request_free(out);
         snprintf(err_buf, err_cap, "expected ',' or '}' in request object");
         return -1;
     }
 
     if (*p != '\0') {
-        wick_render_request_free(out);
+        pleb_render_request_free(out);
         snprintf(err_buf, err_cap, "trailing characters after JSON request object");
         return -1;
     }
 
     if (!out->url || out->url[0] == '\0') {
-        wick_render_request_free(out);
+        pleb_render_request_free(out);
         snprintf(err_buf, err_cap, "request field 'url' must be a non-empty string");
         return -1;
     }
@@ -355,7 +355,7 @@ static int wick_parse_request_line(
     return 0;
 }
 
-static void wick_write_json_escaped(FILE* out, const char* s) {
+static void pleb_write_json_escaped(FILE* out, const char* s) {
     if (!s) {
         fputs("null", out);
         return;
@@ -382,12 +382,12 @@ static void wick_write_json_escaped(FILE* out, const char* s) {
     fputc('"', out);
 }
 
-static void wick_write_ready(FILE* out, int ok, const char* error) {
+static void pleb_write_ready(FILE* out, int ok, const char* error) {
     fprintf(out, "{\"ready\":%s,\"protocol\":\"%s\"",
-            ok ? "true" : "false", WICK_RENDERER_PROTOCOL_VERSION);
+            ok ? "true" : "false", PLEB_RENDERER_PROTOCOL_VERSION);
     if (error && error[0]) {
         fputs(",\"error\":", out);
-        wick_write_json_escaped(out, error);
+        pleb_write_json_escaped(out, error);
     } else {
         fputs(",\"error\":null", out);
     }
@@ -395,7 +395,7 @@ static void wick_write_ready(FILE* out, int ok, const char* error) {
     fflush(out);
 }
 
-static void wick_write_response(
+static void pleb_write_response(
     FILE* out,
     int status_code,
     const char* final_url,
@@ -405,11 +405,11 @@ static void wick_write_response(
     const char* error_kind
 ) {
     fprintf(out, "{\"status_code\":%d,\"final_url\":", status_code);
-    wick_write_json_escaped(out, final_url ? final_url : "");
+    pleb_write_json_escaped(out, final_url ? final_url : "");
     fprintf(out, ",\"html_bytes\":%zu,\"error\":", (error && error[0]) ? (size_t)0 : html_len);
-    wick_write_json_escaped(out, (error && error[0]) ? error : NULL);
+    pleb_write_json_escaped(out, (error && error[0]) ? error : NULL);
     fputs(",\"error_kind\":", out);
-    wick_write_json_escaped(out, (error_kind && error_kind[0]) ? error_kind : NULL);
+    pleb_write_json_escaped(out, (error_kind && error_kind[0]) ? error_kind : NULL);
     fputs("}\n", out);
     if ((!error || !error[0]) && html && html_len > 0) {
         fwrite(html, 1, html_len, out);
@@ -417,7 +417,7 @@ static void wick_write_response(
     fflush(out);
 }
 
-static void wick_clamp_timeouts(
+static void pleb_clamp_timeouts(
     int timeout_ms,
     int has_selector,
     int* total_cap,
@@ -440,7 +440,7 @@ static void wick_clamp_timeouts(
     *js_cap = eff_js;
 }
 
-static char* wick_build_poller_js(
+static char* pleb_build_poller_js(
     const char* selector_or_null,
     const char* marker,
     const char* sel_err_prefix,
@@ -450,18 +450,18 @@ static char* wick_build_poller_js(
     const char* sel_expr = "null";
     char* quoted_sel = NULL;
     if (selector_or_null && selector_or_null[0]) {
-        escaped_sel = wick_escape_js_string(selector_or_null);
+        escaped_sel = pleb_escape_js_string(selector_or_null);
         if (!escaped_sel) return NULL;
-        quoted_sel = wick_asprintf("'%s'", escaped_sel);
+        quoted_sel = pleb_asprintf("'%s'", escaped_sel);
         free(escaped_sel);
         if (!quoted_sel) return NULL;
         sel_expr = quoted_sel;
     }
 
-    char* js = wick_asprintf(
+    char* js = pleb_asprintf(
         "(function(){"
-        "if(window.__wickPollerActive)return;"
-        "window.__wickPollerActive=true;"
+        "if(window.__plebPollerActive)return;"
+        "window.__plebPollerActive=true;"
         "var sel=%s;"
         "var start=Date.now(),lastMut=start,selMatchedAt=0,done=false,scheduled=false;"
         "var QUIET_MS=180;"
@@ -469,7 +469,7 @@ static char* wick_build_poller_js(
         "var cleanup=function(){"
         "  if(iv){clearInterval(iv);iv=null;}"
         "  if(obs){try{obs.disconnect();}catch(_){}obs=null;}"
-        "  window.__wickPollerActive=false;"
+        "  window.__plebPollerActive=false;"
         "};"
         "var dump=function(){"
         "  if(done)return;"
@@ -526,7 +526,7 @@ static char* wick_build_poller_js(
         "  var spa=document.querySelector('#root,#app,#__next,#__nuxt,app-root,[data-reactroot]');"
         "  var hasEmptySpaRoot=(!!spa&&((spa.innerText||'').trim().length<50))||"
         "                      (bt.trim().length===0&&document.scripts&&document.scripts.length>0);"
-        "  var inflight=(typeof window.__wickInflight==='number')?window.__wickInflight:0;"
+        "  var inflight=(typeof window.__plebInflight==='number')?window.__plebInflight:0;"
         "  if(hasEmptySpaRoot||inflight>0){lastMut=now;return;}"
         "  if(now-lastMut>=QUIET_MS){finishAfterRaf();}"
         "};"

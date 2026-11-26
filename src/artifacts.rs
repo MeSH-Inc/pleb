@@ -341,7 +341,7 @@ mod tests {
 
     fn temp_dir(tag: &str) -> PathBuf {
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = PathBuf::from(format!("/tmp/wick-t-{}-{tag}-{seq}", std::process::id()));
+        let dir = PathBuf::from(format!("/tmp/pleb-t-{}-{tag}-{seq}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

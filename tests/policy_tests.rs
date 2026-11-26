@@ -1,5 +1,5 @@
-use mesh_wick::extract::ParsedHtml;
-use mesh_wick::policy::{
+use pleb::extract::ParsedHtml;
+use pleb::policy::{
     classify_response, classify_response_with_parsed, plan_strategy, PrimaryTransport, RenderMode,
     ResponseClassification, SiteCache, SiteCacheEntry, SiteRule, SiteRules,
 };
@@ -10,7 +10,7 @@ static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn temp_dir(_name: &str) -> std::path::PathBuf {
     let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::path::PathBuf::from(format!("/tmp/wick-t-{}-{}", std::process::id(), seq));
+    let dir = std::path::PathBuf::from(format!("/tmp/pleb-t-{}-{}", std::process::id(), seq));
     std::fs::create_dir_all(&dir).unwrap();
     #[cfg(unix)]
     {
@@ -330,8 +330,8 @@ fn site_cache_does_not_overwrite_unreadable_file() {
 #[test]
 #[ignore]
 fn site_cache_subprocess_worker() {
-    let cache_path = std::env::var("WICK_TEST_CACHE_PATH").expect("WICK_TEST_CACHE_PATH");
-    let host = std::env::var("WICK_TEST_CACHE_HOST").expect("WICK_TEST_CACHE_HOST");
+    let cache_path = std::env::var("PLEB_TEST_CACHE_PATH").expect("PLEB_TEST_CACHE_PATH");
+    let host = std::env::var("PLEB_TEST_CACHE_HOST").expect("PLEB_TEST_CACHE_HOST");
     let cache = SiteCache::load(std::path::PathBuf::from(cache_path));
     cache.record_at(&host, "cronet", 40, 1_000_000);
 }
@@ -351,8 +351,8 @@ fn site_cache_eight_subprocess_contention_preserves_all_entries() {
                     "--ignored",
                     "--nocapture",
                 ])
-                .env("WICK_TEST_CACHE_PATH", &cache_path)
-                .env("WICK_TEST_CACHE_HOST", format!("subproc-{i}.example"))
+                .env("PLEB_TEST_CACHE_PATH", &cache_path)
+                .env("PLEB_TEST_CACHE_HOST", format!("subproc-{i}.example"))
                 .spawn()
                 .expect("spawn subprocess worker")
         })
@@ -378,7 +378,7 @@ fn site_cache_eight_subprocess_contention_preserves_all_entries() {
 
 #[test]
 fn classify_response_with_context_gates_http200_on_prose_and_detects_soft_blocks() {
-    use mesh_wick::policy::classify_response_with_context;
+    use pleb::policy::classify_response_with_context;
 
     // Long technical article (>= 600 prose bytes) quoting challenge text must stay Ok.
     let long_prose =
@@ -435,7 +435,7 @@ fn classify_response_with_context_gates_http200_on_prose_and_detects_soft_blocks
 
 #[test]
 fn adversarial_auth_path_segment_boundary_does_not_flag_login_guide_or_oauth2_docs() {
-    use mesh_wick::policy::classify_response_with_context;
+    use pleb::policy::classify_response_with_context;
 
     let short_doc = "<html><head><title>Migration Guide</title></head><body><main><p>Short technical guide with no password form.</p></main></body></html>";
 
@@ -462,7 +462,7 @@ fn adversarial_auth_path_segment_boundary_does_not_flag_login_guide_or_oauth2_do
 
 #[test]
 fn adversarial_sveltekit_hydrated_and_zero_script_pages_not_flagged_as_js_shell() {
-    use mesh_wick::policy::classify_response_with_context;
+    use pleb::policy::classify_response_with_context;
 
     // Empty HTML with zero <script> tags must stay Ok (not JavaScriptShell).
     let no_script = "<html><head><title>Blank</title></head><body></body></html>";

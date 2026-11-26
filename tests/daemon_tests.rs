@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
-use mesh_wick::context::{RuntimeConfig, RuntimeContext};
-use mesh_wick::daemon::{
+use pleb::context::{RuntimeConfig, RuntimeContext};
+use pleb::daemon::{
     daemon_http_get, daemon_http_get_with_executable, daemon_ping, daemon_stop, lock_path,
     resolve_daemon_executable, run_daemon, socket_path, storage_key, DaemonResponseHeader,
     BUILD_ID, PROTOCOL_VERSION,
@@ -22,7 +22,7 @@ struct TempStateDir(PathBuf);
 impl TempStateDir {
     fn new() -> Self {
         let seq = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = PathBuf::from(format!("/tmp/wick-t-{}-{}", std::process::id(), seq));
+        let dir = PathBuf::from(format!("/tmp/pleb-t-{}-{}", std::process::id(), seq));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -44,7 +44,7 @@ impl Drop for TempStateDir {
     }
 }
 
-async fn wait_for_ping(dir: &Path) -> mesh_wick::daemon::DaemonStatus {
+async fn wait_for_ping(dir: &Path) -> pleb::daemon::DaemonStatus {
     for _ in 0..80 {
         if let Some(status) = daemon_ping(dir).await {
             return status;
@@ -353,7 +353,7 @@ async fn daemon_restarts_automatically_on_build_id_mismatch() {
         }
     });
 
-    // Drop mock lock when mock_task shuts down; pass explicit CARGO_BIN_EXE_wick path.
+    // Drop mock lock when mock_task shuts down; pass explicit CARGO_BIN_EXE_pleb path.
     drop(_lock);
 
     let resp = daemon_http_get_with_executable(
@@ -364,7 +364,7 @@ async fn daemon_restarts_automatically_on_build_id_mismatch() {
         Duration::from_secs(5),
         false,
         &format!("{base}/fast-a"),
-        Some(Path::new(env!("CARGO_BIN_EXE_wick"))),
+        Some(Path::new(env!("CARGO_BIN_EXE_pleb"))),
     )
     .await
     .unwrap();
@@ -378,13 +378,13 @@ async fn daemon_restarts_automatically_on_build_id_mismatch() {
 
 #[test]
 fn resolve_daemon_executable_rejects_cargo_test_runner_and_accepts_override() {
-    let explicit = Path::new(env!("CARGO_BIN_EXE_wick"));
+    let explicit = Path::new(env!("CARGO_BIN_EXE_pleb"));
     assert_eq!(resolve_daemon_executable(Some(explicit)).unwrap(), explicit);
 
-    if std::env::var_os("WICK_DAEMON_EXECUTABLE").is_none() {
+    if std::env::var_os("PLEB_DAEMON_EXECUTABLE").is_none() {
         let err = resolve_daemon_executable(None)
             .expect_err("Cargo test runner under deps/ must not be spawned as daemon");
-        assert!(err.to_string().contains("WICK_DAEMON_EXECUTABLE"));
+        assert!(err.to_string().contains("PLEB_DAEMON_EXECUTABLE"));
     }
 }
 
@@ -412,8 +412,8 @@ async fn run_daemon_exits_immediately_when_live_daemon_responds_to_ping() {
 
 #[tokio::test]
 async fn daemon_round_trips_structured_transport_error_kinds() {
-    use mesh_wick::transport::cef::{CefProtocolError, CefTimeoutError};
-    use mesh_wick::transport::{ResponseTooLargeError, TransportError, TransportErrorKind};
+    use pleb::transport::cef::{CefProtocolError, CefTimeoutError};
+    use pleb::transport::{ResponseTooLargeError, TransportError, TransportErrorKind};
 
     let dir = TempStateDir::new();
     let sock = socket_path(dir.path());
@@ -455,7 +455,7 @@ async fn daemon_round_trips_structured_transport_error_kinds() {
             Duration::from_secs(5),
             false,
             "http://127.0.0.1/err",
-            Some(Path::new(env!("CARGO_BIN_EXE_wick"))),
+            Some(Path::new(env!("CARGO_BIN_EXE_pleb"))),
         )
         .await
         .unwrap_err();
@@ -611,7 +611,7 @@ async fn spawn_link_and_accept_server() -> String {
 
 #[tokio::test]
 async fn transport_captures_multiple_link_headers_and_accept_markdown_direct_and_daemon() {
-    use mesh_wick::transport::{TransportClient, MARKDOWN_ACCEPT_HEADER};
+    use pleb::transport::{TransportClient, MARKDOWN_ACCEPT_HEADER};
 
     let base = spawn_link_and_accept_server().await;
     let expected_link = "</docs/page.md>; rel=\"alternate\"; type=\"text/markdown\", </feed.xml>; rel=\"alternate\"; type=\"application/atom+xml\"";
@@ -765,7 +765,7 @@ async fn daemon_restarts_automatically_on_protocol_version_mismatch() {
         Duration::from_secs(5),
         false,
         &format!("{base}/fast-a"),
-        Some(Path::new(env!("CARGO_BIN_EXE_wick"))),
+        Some(Path::new(env!("CARGO_BIN_EXE_pleb"))),
     )
     .await
     .unwrap();
@@ -783,7 +783,7 @@ async fn daemon_restarts_automatically_on_protocol_version_mismatch() {
 
 #[tokio::test]
 async fn adversarial_accept_markdown_no_sticky_leak_and_absent_link_is_none() {
-    use mesh_wick::transport::{TransportClient, MARKDOWN_ACCEPT_HEADER};
+    use pleb::transport::{TransportClient, MARKDOWN_ACCEPT_HEADER};
 
     let base = spawn_link_and_accept_server().await;
 
@@ -876,7 +876,7 @@ async fn adversarial_accept_markdown_no_sticky_leak_and_absent_link_is_none() {
 
 #[tokio::test]
 async fn transport_subresource_headers_and_referer_direct_and_daemon() {
-    use mesh_wick::transport::{
+    use pleb::transport::{
         RequestHeaderOptions, SubresourceDest, TransportClient, ASSET_ACCEPT_HEADER,
         IMAGE_ACCEPT_HEADER,
     };
@@ -1018,8 +1018,8 @@ async fn transport_subresource_headers_and_referer_direct_and_daemon() {
 
 #[tokio::test]
 async fn adversarial_subresource_ssrf_referer_and_image_accept_precedence() {
-    use mesh_wick::policy::source::{compute_safe_referer, is_safe_subresource_url};
-    use mesh_wick::transport::{
+    use pleb::policy::source::{compute_safe_referer, is_safe_subresource_url};
+    use pleb::transport::{
         RequestHeaderOptions, SubresourceDest, TransportClient, IMAGE_ACCEPT_HEADER,
     };
     use url::Url;
@@ -1116,7 +1116,7 @@ async fn adversarial_subresource_ssrf_referer_and_image_accept_precedence() {
 
 #[tokio::test]
 async fn daemon_rejects_version_mismatch_before_executing_upstream_http_request() {
-    use mesh_wick::daemon::protocol::read_frame;
+    use pleb::daemon::protocol::read_frame;
     use tokio::net::UnixStream;
 
     let hits = Arc::new(AtomicUsize::new(0));
@@ -1171,7 +1171,7 @@ async fn daemon_rejects_version_mismatch_before_executing_upstream_http_request(
     assert_eq!(hdr.protocol_version, PROTOCOL_VERSION);
     assert_eq!(
         hdr.error_kind,
-        Some(mesh_wick::transport::TransportErrorKind::ProtocolMismatch)
+        Some(pleb::transport::TransportErrorKind::ProtocolMismatch)
     );
     assert!(body.is_empty());
     assert_eq!(
@@ -1186,18 +1186,18 @@ async fn daemon_rejects_version_mismatch_before_executing_upstream_http_request(
 
 #[tokio::test]
 async fn daemon_cancels_inflight_cef_render_on_client_disconnect() {
-    use mesh_wick::daemon::daemon_cef_render;
-    use mesh_wick::transport::cef::CefRenderOptions;
+    use pleb::daemon::daemon_cef_render;
+    use pleb::transport::cef::CefRenderOptions;
 
     let dir = TempStateDir::new();
     let cef_dir = dir.path().join("cef");
     std::fs::create_dir_all(&cef_dir).unwrap();
-    let renderer_bin = cef_dir.join("wick-renderer");
+    let renderer_bin = cef_dir.join("pleb-renderer");
     let started_flag = dir.path().join("slow-started.flag");
 
     let script = format!(
         r#"#!/usr/bin/env python3
-# WICK_RENDERER_PROTOCOL=v5-meta
+# PLEB_RENDERER_PROTOCOL=v5-meta
 import json, sys, time
 
 flag_path = {flag_path:?}

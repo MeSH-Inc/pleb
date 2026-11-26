@@ -1,11 +1,11 @@
 #!/bin/bash
-# install-cef-linux.sh: Build and install the CEF renderer for mesh-wick on Linux.
+# install-cef-linux.sh: Build and install the CEF renderer for pleb on Linux.
 #
 # Usage:
 #   bash scripts/install-cef-linux.sh [--force] [--prefix <dir>]
 #
-# Installs wick-renderer, wick-helper, and CEF runtime files into
-# --prefix <dir> (default: ${MESH_WICK_HOME:-$HOME/.mesh-wick}/cef).
+# Installs pleb-renderer, pleb-helper, and CEF runtime files into
+# --prefix <dir> (default: ${PLEB_HOME:-$HOME/.pleb}/cef).
 
 set -euo pipefail
 
@@ -68,13 +68,13 @@ if ! command -v gcc &>/dev/null; then
     exit 1
 fi
 
-RENDERER_PROTOCOL="$(sed -n 's/^#define[[:space:]]\{1,\}WICK_RENDERER_PROTOCOL_VERSION[[:space:]]\{1,\}"\([^"]*\)"/\1/p' "$PROTOCOL_HEADER" | head -n 1)"
+RENDERER_PROTOCOL="$(sed -n 's/^#define[[:space:]]\{1,\}PLEB_RENDERER_PROTOCOL_VERSION[[:space:]]\{1,\}"\([^"]*\)"/\1/p' "$PROTOCOL_HEADER" | head -n 1)"
 if [[ -z "$RENDERER_PROTOCOL" ]]; then
-    echo "Error: failed to parse WICK_RENDERER_PROTOCOL_VERSION from $PROTOCOL_HEADER" >&2
+    echo "Error: failed to parse PLEB_RENDERER_PROTOCOL_VERSION from $PROTOCOL_HEADER" >&2
     exit 1
 fi
 
-STATE_HOME="${MESH_WICK_HOME:-$HOME/.mesh-wick}"
+STATE_HOME="${PLEB_HOME:-$HOME/.pleb}"
 if [[ -n "$PREFIX" ]]; then
     INSTALL_DIR="$PREFIX"
 else
@@ -101,14 +101,14 @@ esac
 CEF_DIR="cef_binary_${CEF_VERSION}_${CEF_PLATFORM}_minimal"
 CEF_URL="https://cef-builds.spotifycdn.com/${CEF_DIR}.tar.bz2"
 
-SDK_CACHE_DIR="${HOME}/.cache/mesh-wick/cef-sdk"
+SDK_CACHE_DIR="${HOME}/.cache/pleb/cef-sdk"
 SDK_TARBALL="${SDK_CACHE_DIR}/${CEF_DIR}.tar.bz2"
 SDK_DIR="${SDK_CACHE_DIR}/${CEF_DIR}"
 SDK_READY="${SDK_DIR}/.extracted-ok"
 SDK_LOCK_FILE="${SDK_CACHE_DIR}/.lock"
 SDK_LOCK_DIR="${SDK_CACHE_DIR}/.lock.d"
 
-RENDERER_BIN="$INSTALL_DIR/wick-renderer"
+RENDERER_BIN="$INSTALL_DIR/pleb-renderer"
 
 mkdir -p "$INSTALL_DIR"
 if [[ -z "$PREFIX" ]]; then
@@ -118,7 +118,7 @@ else
 fi
 
 if [[ "$FORCE" -eq 0 && -f "$RENDERER_BIN" && -f "$INSTALL_DIR/libcef.so" ]] && \
-   grep -q "WICK_RENDERER_PROTOCOL=${RENDERER_PROTOCOL}" "$RENDERER_BIN" 2>/dev/null; then
+   grep -q "PLEB_RENDERER_PROTOCOL=${RENDERER_PROTOCOL}" "$RENDERER_BIN" 2>/dev/null; then
     echo "CEF renderer (${RENDERER_PROTOCOL}) already installed at $INSTALL_DIR (use --force to rebuild)."
     exit 0
 fi
@@ -208,8 +208,8 @@ rm -rf locales
 cp -rf "$SDK_DIR/Resources/locales" .
 strip libcef.so libEGL.so libGLESv2.so libvk_swiftshader.so libvulkan.so.1 2>/dev/null || true
 
-echo "Compiling wick-renderer and wick-helper (${RENDERER_PROTOCOL})..."
-gcc -o wick-renderer "$RENDERER_SRC/renderer_linux.c" \
+echo "Compiling pleb-renderer and pleb-helper (${RENDERER_PROTOCOL})..."
+gcc -o pleb-renderer "$RENDERER_SRC/renderer_linux.c" \
     -DCEF_API_VERSION="${CEF_API_VERSION}" \
     -I"$SDK_DIR" \
     -I"$RENDERER_SRC" \
@@ -217,7 +217,7 @@ gcc -o wick-renderer "$RENDERER_SRC/renderer_linux.c" \
     -Wl,-rpath,'$ORIGIN' \
     -pthread
 
-gcc -o wick-helper "$RENDERER_SRC/helper_linux.c" \
+gcc -o pleb-helper "$RENDERER_SRC/helper_linux.c" \
     -DCEF_API_VERSION="${CEF_API_VERSION}" \
     -I"$SDK_DIR" \
     -I"$RENDERER_SRC" \
@@ -225,7 +225,7 @@ gcc -o wick-helper "$RENDERER_SRC/helper_linux.c" \
     -Wl,-rpath,'$ORIGIN' \
     -pthread
 
-strip wick-renderer wick-helper 2>/dev/null || true
-chmod +x wick-renderer wick-helper
+strip pleb-renderer pleb-helper 2>/dev/null || true
+chmod +x pleb-renderer pleb-helper
 
 echo "Installed CEF renderer (${RENDERER_PROTOCOL}) at $INSTALL_DIR"

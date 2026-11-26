@@ -1,5 +1,5 @@
-#ifndef WICK_HELPER_CORE_H
-#define WICK_HELPER_CORE_H
+#ifndef PLEB_HELPER_CORE_H
+#define PLEB_HELPER_CORE_H
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,7 +44,7 @@ static void CEF_CALLBACK helper_on_context_created(
 
     if (frame) {
         helper_execute_js_utf8(frame, OSR_ENVIRONMENT_JS);
-        char* tz_js = wick_build_timezone_js(getenv("MESH_WICK_TIMEZONE"));
+        char* tz_js = pleb_build_timezone_js(getenv("PLEB_TIMEZONE"));
         if (tz_js) {
             helper_execute_js_utf8(frame, tz_js);
             free(tz_js);
@@ -62,7 +62,7 @@ static cef_render_process_handler_t* CEF_CALLBACK helper_get_render_process_hand
 
 static cef_app_t g_helper_app;
 
-static int wick_run_helper_process(int argc, char* argv[]) {
+static int pleb_run_helper_process(int argc, char* argv[]) {
     cef_api_hash(CEF_API_VERSION, 0);
 
     helper_init_base(&g_helper_render_process_handler.base,

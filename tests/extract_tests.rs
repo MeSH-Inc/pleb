@@ -1,6 +1,6 @@
-use mesh_wick::extract::markdown::{compact_markdown, open_fence_at};
-use mesh_wick::extract::url::{clean_url, resolve_and_clean_url, ResolvedUrl};
-use mesh_wick::extract::{
+use pleb::extract::markdown::{compact_markdown, open_fence_at};
+use pleb::extract::url::{clean_url, resolve_and_clean_url, ResolvedUrl};
+use pleb::extract::{
     decode_text_bytes, detect_binary_content, extract_document, extract_document_bytes,
     format_resource_manifest_markdown, truncate_markdown, truncate_utf8, wrap_raw_code_document,
     ExtractMode, ExtractOptions, OutputFormat, ParsedHtml, ResourceKind, ResourceSalience,
@@ -466,7 +466,7 @@ fn charset_decoding_handles_windows1252_latin1_meta_and_boms() {
 
 #[test]
 fn adversarial_charset_and_four_backtick_utf8_fence_boundaries() {
-    use mesh_wick::extract::markdown::open_fence_at;
+    use pleb::extract::markdown::open_fence_at;
 
     // Odd-byte UTF-16LE/BE payloads after BOM emit U+FFFD cleanly without panicking.
     let odd_le = decode_text_bytes(b"\xFF\xFEa\x00\x42", None);

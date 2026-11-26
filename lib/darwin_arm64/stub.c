@@ -1,6 +1,6 @@
 // Stub for Cronet_CreateCertVerifierWithPublicKeySHA256 which exists in the
 // cronet-go Go bindings but was not included in the prebuilt static library.
-// This function is never called by Wick — it's only needed to satisfy the linker.
+// This function is never called by pleb — it's only needed to satisfy the linker.
 // If it is ever called, abort immediately to surface the mismatch.
 
 #include <stddef.h>

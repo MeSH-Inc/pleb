@@ -1,11 +1,11 @@
-use mesh_wick::context::{RuntimeConfig, RuntimeContext};
-use mesh_wick::fetch::{fetch_document, FetchError, FetchOptions};
-use mesh_wick::policy::RenderMode;
-use mesh_wick::transport::cef::{
+use pleb::context::{RuntimeConfig, RuntimeContext};
+use pleb::fetch::{fetch_document, FetchError, FetchOptions};
+use pleb::policy::RenderMode;
+use pleb::transport::cef::{
     find_renderer_in, probe_renderer_binary, probe_renderer_in, CefProtocolError, CefRenderOptions,
     CefRenderer, CefTimeoutError, RendererProbe, EXPECTED_PROTOCOL,
 };
-use mesh_wick::transport::{TransportError, TransportErrorKind};
+use pleb::transport::{TransportError, TransportErrorKind};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,7 +18,7 @@ struct TempStateDir(PathBuf);
 impl TempStateDir {
     fn new() -> Self {
         let seq = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = PathBuf::from(format!("/tmp/wick-t-{}-{}", std::process::id(), seq));
+        let dir = PathBuf::from(format!("/tmp/pleb-t-{}-{}", std::process::id(), seq));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         #[cfg(unix)]
@@ -62,12 +62,12 @@ fn write_executable(path: &std::path::Path, content: &str) {
 async fn v4_meta_mock_renderer_handles_metadata_selectors_and_errors() {
     let state_dir = TempStateDir::with_cef_dir();
     let custom_cache = state_dir.path().join("custom-cache");
-    let renderer_bin = state_dir.path().join("cef").join("wick-renderer");
+    let renderer_bin = state_dir.path().join("cef").join("pleb-renderer");
     let log_file = state_dir.path().join("requests.log");
 
     let script = format!(
         r#"#!/usr/bin/env python3
-# WICK_RENDERER_PROTOCOL=v5-meta
+# PLEB_RENDERER_PROTOCOL=v5-meta
 import json, sys
 
 args_log = {log_path:?}
@@ -247,10 +247,10 @@ for raw in sys.stdin:
 #[tokio::test]
 async fn outdated_v3_renderer_fails_loudly_with_rebuild_hint() {
     let state_dir = TempStateDir::with_cef_dir();
-    let renderer_bin = state_dir.path().join("cef").join("wick-renderer");
+    let renderer_bin = state_dir.path().join("cef").join("pleb-renderer");
     write_executable(
         &renderer_bin,
-        "#!/bin/sh\n# WICK_RENDERER_PROTOCOL=v3-cf-aware\nexit 1\n",
+        "#!/bin/sh\n# PLEB_RENDERER_PROTOCOL=v3-cf-aware\nexit 1\n",
     );
 
     assert_eq!(
@@ -282,7 +282,7 @@ async fn outdated_v3_renderer_fails_loudly_with_rebuild_hint() {
 #[test]
 fn renderer_override_and_no_home_cef_isolation() {
     let empty_state = TempStateDir::new();
-    if std::env::var("WICK_NO_HOME_CEF").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")) {
+    if std::env::var("PLEB_NO_HOME_CEF").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")) {
         assert_eq!(find_renderer_in(empty_state.path()), None);
         assert_eq!(
             probe_renderer_in(empty_state.path()),
@@ -294,7 +294,7 @@ fn renderer_override_and_no_home_cef_isolation() {
     let custom_bin = custom_dir.path().join("custom-renderer");
     write_executable(
         &custom_bin,
-        "#!/bin/sh\n# WICK_RENDERER_PROTOCOL=v5-meta\nexit 0\n",
+        "#!/bin/sh\n# PLEB_RENDERER_PROTOCOL=v5-meta\nexit 0\n",
     );
 
     let renderer = CefRenderer::new_direct(empty_state.to_path_buf(), None, false)
@@ -312,62 +312,62 @@ fn c_protocol_header_parses_escapes_surrogates_and_clamps_timeouts() {
 #include "protocol.h"
 
 int main(void) {
-    WickRenderRequest req = {0};
+    PlebRenderRequest req = {0};
     char err[256] = {0};
 
     // Surrogate pair (U+1F980 crab) + single quote + backslash in selector
     const char* line = "{\"url\":\"https://example.com/a?x=1&y=2\",\"wait_for_selector\":\"[data-x='a\\\\b'] \\uD83E\\uDD80\",\"timeout_ms\":12000}";
-    int rc = wick_parse_request_line(line, &req, err, sizeof(err));
+    int rc = pleb_parse_request_line(line, &req, err, sizeof(err));
     assert(rc == 0);
     assert(strcmp(req.url, "https://example.com/a?x=1&y=2") == 0);
     assert(req.timeout_ms == 12000);
     assert(strstr(req.wait_for_selector, "[data-x='a\\b']") != NULL);
     assert(strstr(req.wait_for_selector, "\xF0\x9F\xA6\x80") != NULL);
 
-    char* js = wick_build_poller_js(req.wait_for_selector, "MARK", "SERR", 5000);
+    char* js = pleb_build_poller_js(req.wait_for_selector, "MARK", "SERR", 5000);
     assert(js != NULL);
     assert(strstr(js, "\\'a\\\\b\\'") != NULL);
     assert(strstr(js, "try{el=document.querySelector(sel);}") != NULL);
-    assert(strstr(js, "window.__wickPollerActive") != NULL);
+    assert(strstr(js, "window.__plebPollerActive") != NULL);
     assert(strstr(js, "MutationObserver") != NULL);
     assert(strstr(js, "requestAnimationFrame") != NULL);
     assert(strstr(js, "hasEmptySpaRoot") != NULL);
-    assert(strstr(js, "window.__wickInflight") != NULL);
+    assert(strstr(js, "window.__plebInflight") != NULL);
     assert(strstr(js, "len>500") == NULL);
     free(js);
-    wick_render_request_free(&req);
+    pleb_render_request_free(&req);
 
     // Timeout clamping leaves headroom below caller deadline.
     int total = 0, post = 0, js_cap = 0;
-    wick_clamp_timeouts(5000, 1, &total, &post, &js_cap);
+    pleb_clamp_timeouts(5000, 1, &total, &post, &js_cap);
     assert(total == 3500);
     assert(post == 3500);
     assert(js_cap == 3500);
 
     // Unpaired surrogate must fail loudly.
-    assert(wick_parse_request_line("{\"url\":\"https://x.com\",\"wait_for_selector\":\"\\uD800\"}", &req, err, sizeof(err)) != 0);
+    assert(pleb_parse_request_line("{\"url\":\"https://x.com\",\"wait_for_selector\":\"\\uD800\"}", &req, err, sizeof(err)) != 0);
 
     // Exercise timezone helper and stdio line reader / ready+response writers.
-    assert(wick_build_timezone_js(NULL) == NULL);
-    assert(wick_build_timezone_js("") == NULL);
-    char* tz_js = wick_build_timezone_js("America/New_York");
+    assert(pleb_build_timezone_js(NULL) == NULL);
+    assert(pleb_build_timezone_js("") == NULL);
+    char* tz_js = pleb_build_timezone_js("America/New_York");
     assert(tz_js != NULL && strstr(tz_js, "America/New_York") != NULL);
     free(tz_js);
 
     FILE* tmp = tmpfile();
     assert(tmp != NULL);
-    wick_write_ready(tmp, 1, NULL);
-    wick_write_response(tmp, 200, "https://example.com/a\"b", "<b>hi</b>", 9, NULL, NULL);
-    wick_write_response(tmp, 0, "https://example.com/err", NULL, 0, "load error -105", "load_error");
+    pleb_write_ready(tmp, 1, NULL);
+    pleb_write_response(tmp, 200, "https://example.com/a\"b", "<b>hi</b>", 9, NULL, NULL);
+    pleb_write_response(tmp, 0, "https://example.com/err", NULL, 0, "load error -105", "load_error");
     rewind(tmp);
 
     char* rline = NULL;
     int too_long = 0;
-    assert(wick_read_line(tmp, &rline, WICK_MAX_REQUEST_LINE_BYTES, &too_long) == 1);
+    assert(pleb_read_line(tmp, &rline, PLEB_MAX_REQUEST_LINE_BYTES, &too_long) == 1);
     assert(too_long == 0 && strstr(rline, "\"ready\":true") != NULL);
     free(rline);
 
-    assert(wick_read_line(tmp, &rline, WICK_MAX_REQUEST_LINE_BYTES, &too_long) == 1);
+    assert(pleb_read_line(tmp, &rline, PLEB_MAX_REQUEST_LINE_BYTES, &too_long) == 1);
     assert(too_long == 0 && strstr(rline, "\"html_bytes\":9") != NULL && strstr(rline, "a\\\"b") != NULL);
     free(rline);
 
@@ -376,7 +376,7 @@ int main(void) {
     assert(fread(raw_html, 1, 9, tmp) == 9);
     assert(strcmp(raw_html, "<b>hi</b>") == 0);
 
-    assert(wick_read_line(tmp, &rline, WICK_MAX_REQUEST_LINE_BYTES, &too_long) == 1);
+    assert(pleb_read_line(tmp, &rline, PLEB_MAX_REQUEST_LINE_BYTES, &too_long) == 1);
     assert(too_long == 0 && strstr(rline, "\"error_kind\":\"load_error\"") != NULL);
     free(rline);
     fclose(tmp);
@@ -415,28 +415,27 @@ fn adversarial_explicit_missing_renderer_override_does_not_fallback_to_state_dir
     let dir = TempStateDir::new();
     let cef_dir = dir.path().join("cef");
     fs::create_dir_all(&cef_dir).unwrap();
-    let state_renderer = cef_dir.join("wick-renderer");
+    let state_renderer = cef_dir.join("pleb-renderer");
     fs::write(
         &state_renderer,
-        b"#!/bin/sh\n# WICK_RENDERER_PROTOCOL=v5-meta\n",
+        b"#!/bin/sh\n# PLEB_RENDERER_PROTOCOL=v5-meta\n",
     )
     .unwrap();
 
-    // Nonexistent explicit override must NOT silently fall back to state_dir/cef/wick-renderer.
+    // Nonexistent explicit override must NOT silently fall back to state_dir/cef/pleb-renderer.
     let missing = dir.path().join("does-not-exist-renderer");
     assert!(
-        mesh_wick::transport::cef::find_renderer_with_override(dir.path(), Some(&missing))
-            .is_none(),
+        pleb::transport::cef::find_renderer_with_override(dir.path(), Some(&missing)).is_none(),
         "explicit missing renderer override must not fall back to state_dir"
     );
     assert!(matches!(
-        mesh_wick::transport::cef::probe_renderer_with_override(dir.path(), Some(&missing)),
+        pleb::transport::cef::probe_renderer_with_override(dir.path(), Some(&missing)),
         RendererProbe::NotInstalled
     ));
 
-    // Empty path override falls through cleanly to state_dir/cef/wick-renderer.
+    // Empty path override falls through cleanly to state_dir/cef/pleb-renderer.
     assert_eq!(
-        mesh_wick::transport::cef::find_renderer_with_override(
+        pleb::transport::cef::find_renderer_with_override(
             dir.path(),
             Some(std::path::Path::new(""))
         ),
@@ -460,7 +459,7 @@ fn v5_poller_js_short_page_settles_fast_and_waits_for_empty_spa_root() {
 #include "protocol.h"
 
 int main(void) {
-    char* js = wick_build_poller_js(NULL, "MARK:", "SERR:", 4000);
+    char* js = pleb_build_poller_js(NULL, "MARK:", "SERR:", 4000);
     if (!js) return 1;
     fputs(js, stdout);
     free(js);
@@ -546,7 +545,7 @@ function runScenario(setupFn) {{
     const shortRes = await runScenario((sb) => {{
         sb.document.body.innerText = 'Hello short page';
         sb.document.documentElement.outerHTML = '<html><body><p>Hello short page</p></body></html>';
-        sb.window.__wickInflight = 0;
+        sb.window.__plebInflight = 0;
     }});
     if (shortRes.logs.length !== 1 || shortRes.elapsed >= 350) {{
         throw new Error('short page failed fast settle: ' + JSON.stringify(shortRes));
@@ -558,7 +557,7 @@ function runScenario(setupFn) {{
         sb.document.body.innerText = '';
         sb.document.documentElement.outerHTML = '<html><body><div id="root"></div></body></html>';
         sb.document.querySelector = (s) => s.includes('#root') ? rootEl : null;
-        sb.window.__wickInflight = 0;
+        sb.window.__plebInflight = 0;
         setTimeout(() => {{
             rootEl.innerText = 'Hydrated SPA article content with more than fifty characters of prose.';
             sb.document.body.innerText = rootEl.innerText;
@@ -569,12 +568,12 @@ function runScenario(setupFn) {{
         throw new Error('empty SPA root failed hydration wait: ' + JSON.stringify(spaRes));
     }}
 
-    // 3. Active inflight subresources block settle until __wickInflight reaches 0.
+    // 3. Active inflight subresources block settle until __plebInflight reaches 0.
     const inflightRes = await runScenario((sb) => {{
         sb.document.body.innerText = 'Ready text';
         sb.document.documentElement.outerHTML = '<html><body>Ready text</body></html>';
-        sb.window.__wickInflight = 2;
-        setTimeout(() => {{ sb.window.__wickInflight = 0; }}, 160);
+        sb.window.__plebInflight = 2;
+        setTimeout(() => {{ sb.window.__plebInflight = 0; }}, 160);
     }});
     if (inflightRes.logs.length !== 1 || inflightRes.elapsed < 300) {{
         throw new Error('inflight subresources did not gate settle: ' + JSON.stringify(inflightRes));
@@ -584,7 +583,7 @@ function runScenario(setupFn) {{
     const challengeRes = await runScenario((sb) => {{
         sb.document.body.innerText = 'Just a moment... Checking your browser before accessing';
         sb.document.documentElement.outerHTML = '<html><body>Checking your browser</body></html>';
-        sb.window.__wickInflight = 1;
+        sb.window.__plebInflight = 1;
     }});
     if (challengeRes.logs.length !== 1 || challengeRes.elapsed >= 200) {{
         throw new Error('challenge interstitial did not fail fast: ' + JSON.stringify(challengeRes));
@@ -720,15 +719,15 @@ async fn live_cef_renderer_cold_start_static_and_spa_hydration() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    let renderer_path = std::env::var_os("WICK_CEF_RENDERER")
+    let renderer_path = std::env::var_os("PLEB_CEF_RENDERER")
         .map(PathBuf::from)
         .filter(|p| p.is_file())
         .or_else(|| {
             let home = std::env::var_os("HOME").map(PathBuf::from)?;
-            find_renderer_in(&home.join(".mesh-wick"))
+            find_renderer_in(&home.join(".pleb"))
         })
         .expect(
-            "installed v5-meta CEF renderer not found; build with `bash scripts/install-cef-mac.sh --force` or set WICK_CEF_RENDERER",
+            "installed v5-meta CEF renderer not found; build with `bash scripts/install-cef-mac.sh --force` or set PLEB_CEF_RENDERER",
         );
     assert_eq!(
         probe_renderer_binary(&renderer_path),

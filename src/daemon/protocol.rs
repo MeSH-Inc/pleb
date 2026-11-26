@@ -6,7 +6,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWr
 use crate::transport::{SubresourceDest, TransportErrorKind};
 
 pub const PROTOCOL_VERSION: u32 = 3;
-pub const BUILD_ID: &str = env!("WICK_BUILD_ID");
+pub const BUILD_ID: &str = env!("PLEB_BUILD_ID");
 pub const SOCKET_NAME: &str = "daemon.sock";
 pub const LOCK_NAME: &str = "daemon.lock";
 pub const LOG_NAME: &str = "daemon.log";

@@ -14,7 +14,7 @@ if [ -z "$CEF_DIR" ] || [ ! -d "$CEF_DIR" ]; then
     exit 1
 fi
 
-TMP_HELPER="$(mktemp "${TMPDIR:-/tmp}/mesh-wick-helper.XXXXXX")"
+TMP_HELPER="$(mktemp "${TMPDIR:-/tmp}/pleb-helper.XXXXXX")"
 cleanup() {
     rm -f "$TMP_HELPER"
 }
@@ -23,7 +23,7 @@ trap cleanup EXIT
 echo "Setting up CEF helper bundles in $DEST..."
 
 # Compile helper binary
-echo "Compiling wick Helper..."
+echo "Compiling pleb Helper..."
 clang -DCEF_API_VERSION="${CEF_API_VERSION}" \
     -o "$TMP_HELPER" \
     "$SCRIPT_DIR/helper.m" \
@@ -51,8 +51,8 @@ HELPERS=(
 
 for entry in "${HELPERS[@]}"; do
     IFS=: read -r suffix bid_suffix <<< "$entry"
-    name="wick Helper${suffix}"
-    bundle_id="io.mesh-wick.renderer.helper${bid_suffix}"
+    name="pleb Helper${suffix}"
+    bundle_id="com.memorysynchub.pleb.renderer.helper${bid_suffix}"
     bundle_dir="$DEST/${name}.app/Contents"
 
     echo "  Creating ${name}.app (${bundle_id})"
@@ -63,7 +63,7 @@ for entry in "${HELPERS[@]}"; do
         cp "$TMP_HELPER" "$bundle_dir/MacOS/$name"
         chmod +x "$bundle_dir/MacOS/$name"
     else
-        ln -f "$DEST/wick Helper.app/Contents/MacOS/wick Helper" "$bundle_dir/MacOS/$name" 2>/dev/null \
+        ln -f "$DEST/pleb Helper.app/Contents/MacOS/pleb Helper" "$bundle_dir/MacOS/$name" 2>/dev/null \
             || { cp "$TMP_HELPER" "$bundle_dir/MacOS/$name" && chmod +x "$bundle_dir/MacOS/$name"; }
     fi
 

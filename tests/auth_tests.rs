@@ -1,9 +1,9 @@
-use mesh_wick::auth::{
+use pleb::auth::{
     all_credential_statuses, remove_credential, resolve_credential, set_credential,
     CredentialProvider, CredentialSource, CredentialStorage, ResolvedCredential, SecretString,
     MAX_SECRET_BYTES,
 };
-use mesh_wick::context::{clear_state_dir, ensure_private_dir};
+use pleb::context::{clear_state_dir, ensure_private_dir};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -20,8 +20,8 @@ impl EnvGuard {
     fn new(vars: &[(&'static str, Option<&str>)]) -> Self {
         let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut saved = Vec::with_capacity(vars.len() + 1);
-        saved.push(("WICK_NO_KEYCHAIN", std::env::var("WICK_NO_KEYCHAIN").ok()));
-        std::env::set_var("WICK_NO_KEYCHAIN", "1");
+        saved.push(("PLEB_NO_KEYCHAIN", std::env::var("PLEB_NO_KEYCHAIN").ok()));
+        std::env::set_var("PLEB_NO_KEYCHAIN", "1");
 
         for &(key, value) in vars {
             saved.push((key, std::env::var(key).ok()));
@@ -53,7 +53,7 @@ impl TempStateDir {
     fn new() -> Self {
         let pid = std::process::id();
         let seq = TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = PathBuf::from(format!("/tmp/wick-t-{pid}-{seq}"));
+        let path = PathBuf::from(format!("/tmp/pleb-t-{pid}-{seq}"));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("create temp state dir");
         #[cfg(unix)]
@@ -349,7 +349,7 @@ fn no_keychain_env_rejects_explicit_keychain_storage() {
     )
     .unwrap_err();
     assert!(
-        set_err.to_string().contains("WICK_NO_KEYCHAIN=1")
+        set_err.to_string().contains("PLEB_NO_KEYCHAIN=1")
             || set_err.to_string().contains("only supported on macOS"),
         "unexpected error: {set_err}"
     );
@@ -361,7 +361,7 @@ fn no_keychain_env_rejects_explicit_keychain_storage() {
     )
     .unwrap_err();
     assert!(
-        rm_err.to_string().contains("WICK_NO_KEYCHAIN=1")
+        rm_err.to_string().contains("PLEB_NO_KEYCHAIN=1")
             || rm_err.to_string().contains("only supported on macOS"),
         "unexpected error: {rm_err}"
     );

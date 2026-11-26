@@ -1,5 +1,5 @@
-#ifndef WICK_RENDERER_CORE_H
-#define WICK_RENDERER_CORE_H
+#ifndef PLEB_RENDERER_CORE_H
+#define PLEB_RENDERER_CORE_H
 
 #include <stdint.h>
 #include <stdio.h>
@@ -37,11 +37,11 @@ static char* g_selector_error = NULL;
 static char g_marker[32];
 static char g_sel_err_prefix[48];
 
-static int wick_is_tracked_subresource(cef_resource_type_t rt) {
+static int pleb_is_tracked_subresource(cef_resource_type_t rt) {
     return rt == RT_XHR || rt == RT_SCRIPT || rt == RT_SUB_RESOURCE;
 }
 
-static void wick_inflight_dec_clamped(void) {
+static void pleb_inflight_dec_clamped(void) {
     int cur = __atomic_load_n(&g_inflight_subresources, __ATOMIC_ACQUIRE);
     while (cur > 0) {
         if (__atomic_compare_exchange_n(
@@ -51,7 +51,7 @@ static void wick_inflight_dec_clamped(void) {
     }
 }
 
-static void wick_init_markers(void) {
+static void pleb_init_markers(void) {
     static unsigned long fallback_seq = 0;
     FILE* f = fopen("/dev/urandom", "r");
     unsigned char buf[24];
@@ -198,7 +198,7 @@ static void CEF_CALLBACK on_load_error(
         if (errorCode == -3) { // ERR_ABORTED: expected during redirects / challenge reloads
             return;
         }
-        fprintf(stderr, "wick-renderer: main frame load error %d\n", errorCode);
+        fprintf(stderr, "pleb-renderer: main frame load error %d\n", errorCode);
         g_load_error = (int)errorCode;
         g_load_done = 1;
         g_source_done = 1;
@@ -261,7 +261,7 @@ static cef_return_value_t CEF_CALLBACK on_before_resource_load(
     cef_request_t* request,
     cef_callback_t* callback) {
     (void)self; (void)browser; (void)frame; (void)callback;
-    if (request && wick_is_tracked_subresource(request->get_resource_type(request))) {
+    if (request && pleb_is_tracked_subresource(request->get_resource_type(request))) {
         __atomic_fetch_add(&g_inflight_subresources, 1, __ATOMIC_ACQ_REL);
     }
     return RV_CONTINUE;
@@ -277,8 +277,8 @@ static void CEF_CALLBACK on_resource_load_complete(
     int64_t received_content_length) {
     (void)self; (void)browser; (void)frame; (void)response;
     (void)status; (void)received_content_length;
-    if (request && wick_is_tracked_subresource(request->get_resource_type(request))) {
-        wick_inflight_dec_clamped();
+    if (request && pleb_is_tracked_subresource(request->get_resource_type(request))) {
+        pleb_inflight_dec_clamped();
     }
 }
 
@@ -321,8 +321,8 @@ static cef_request_handler_t* CEF_CALLBACK get_request_handler(cef_client_t* s) 
 
 static cef_client_t g_client;
 
-static void wick_init_cef_handlers(void) {
-    wick_init_markers();
+static void pleb_init_cef_handlers(void) {
+    pleb_init_markers();
 
     init_base(&g_display_handler.base, sizeof(cef_display_handler_t));
     g_display_handler.on_console_message = on_console_message;
@@ -361,7 +361,7 @@ static void wick_init_cef_handlers(void) {
 // ── Render a URL with v5-meta response ────────────────────────
 
 static void force_dump_dom(void) {
-    char* dump_js = wick_asprintf(
+    char* dump_js = pleb_asprintf(
         "console.log('%s'+(document.documentElement?document.documentElement.outerHTML:''));",
         g_marker
     );
@@ -401,8 +401,8 @@ static char* copy_main_frame_url(void) {
     return result;
 }
 
-static void render_url_v5(const WickRenderRequest* req) {
-    wick_init_markers();
+static void render_url_v5(const PlebRenderRequest* req) {
+    pleb_init_markers();
 
     g_load_done = 0;
     g_source_done = 0;
@@ -418,7 +418,7 @@ static void render_url_v5(const WickRenderRequest* req) {
 
     cef_frame_t* frame = g_browser->get_main_frame(g_browser);
     if (!frame) {
-        wick_write_response(stdout, 0, req->url, NULL, 0, "main frame unavailable", "network");
+        pleb_write_response(stdout, 0, req->url, NULL, 0, "main frame unavailable", "network");
         return;
     }
 
@@ -430,7 +430,7 @@ static void render_url_v5(const WickRenderRequest* req) {
 
     int has_selector = (req->wait_for_selector && req->wait_for_selector[0]) ? 1 : 0;
     int total_cap = 0, post_load_cap = 0, js_cap = 0;
-    wick_clamp_timeouts(req->timeout_ms, has_selector, &total_cap, &post_load_cap, &js_cap);
+    pleb_clamp_timeouts(req->timeout_ms, has_selector, &total_cap, &post_load_cap, &js_cap);
 
     int post_load_ms = 0;
     const int tick_ms = 25;
@@ -467,13 +467,13 @@ static void render_url_v5(const WickRenderRequest* req) {
             int cur_inflight = __atomic_load_n(&g_inflight_subresources, __ATOMIC_ACQUIRE);
             if (cur_inflight != last_pushed_inflight && g_browser) {
                 char sync_js[64];
-                snprintf(sync_js, sizeof(sync_js), "window.__wickInflight=%d;", cur_inflight);
+                snprintf(sync_js, sizeof(sync_js), "window.__plebInflight=%d;", cur_inflight);
                 execute_js_on_main_frame(sync_js);
                 last_pushed_inflight = cur_inflight;
             }
 
             if (!poll_injected && g_browser) {
-                char* poller_js = wick_build_poller_js(
+                char* poller_js = pleb_build_poller_js(
                     req->wait_for_selector,
                     g_marker,
                     g_sel_err_prefix,
@@ -500,13 +500,13 @@ static void render_url_v5(const WickRenderRequest* req) {
     if (g_load_error != 0) {
         char err_msg[96];
         snprintf(err_msg, sizeof(err_msg), "load error %d", g_load_error);
-        wick_write_response(stdout, 0, req->url, NULL, 0, err_msg, "load_error");
+        pleb_write_response(stdout, 0, req->url, NULL, 0, err_msg, "load_error");
         return;
     }
 
     if (g_selector_error && g_selector_error[0]) {
-        char* err_msg = wick_asprintf("invalid selector: %s", g_selector_error);
-        wick_write_response(stdout, g_status_code, req->url, NULL, 0,
+        char* err_msg = pleb_asprintf("invalid selector: %s", g_selector_error);
+        pleb_write_response(stdout, g_status_code, req->url, NULL, 0,
                             err_msg ? err_msg : "invalid selector", "invalid_selector");
         free(err_msg);
         return;
@@ -516,29 +516,29 @@ static void render_url_v5(const WickRenderRequest* req) {
         const char* msg = timed_out_uncommitted
             ? "timed out before main frame commit"
             : "timed out capturing rendered DOM";
-        wick_write_response(stdout, g_status_code, req->url, NULL, 0, msg, "timeout");
+        pleb_write_response(stdout, g_status_code, req->url, NULL, 0, msg, "timeout");
         return;
     }
 
     char* final_url = copy_main_frame_url();
     const char* out_url = (final_url && final_url[0]) ? final_url : req->url;
-    wick_write_response(stdout, g_status_code, out_url, g_html, g_html_len, NULL, NULL);
+    pleb_write_response(stdout, g_status_code, out_url, g_html, g_html_len, NULL, NULL);
     free(final_url);
 }
 
-static void wick_resolve_cache_path(const char* cache_dir_arg, char* out, size_t out_cap) {
+static void pleb_resolve_cache_path(const char* cache_dir_arg, char* out, size_t out_cap) {
     char raw[4096];
     if (cache_dir_arg && cache_dir_arg[0]) {
         snprintf(raw, sizeof(raw), "%s", cache_dir_arg);
     } else {
-        const char* state_home = getenv("MESH_WICK_HOME");
+        const char* state_home = getenv("PLEB_HOME");
         const char* home = getenv("HOME");
         if (state_home && state_home[0]) {
             snprintf(raw, sizeof(raw), "%s/cef-cache", state_home);
         } else if (home && home[0]) {
-            snprintf(raw, sizeof(raw), "%s/.mesh-wick/cef-cache", home);
+            snprintf(raw, sizeof(raw), "%s/.pleb/cef-cache", home);
         } else {
-            snprintf(raw, sizeof(raw), "/tmp/mesh-wick-%lu/cef-cache", (unsigned long)getuid());
+            snprintf(raw, sizeof(raw), "/tmp/pleb-%lu/cef-cache", (unsigned long)getuid());
         }
     }
     char resolved[4096];
@@ -549,12 +549,12 @@ static void wick_resolve_cache_path(const char* cache_dir_arg, char* out, size_t
     }
 }
 
-static void wick_run_request_loop(void) {
+static void pleb_run_request_loop(void) {
     char* line = NULL;
     int too_long = 0;
-    while (wick_read_line(stdin, &line, WICK_MAX_REQUEST_LINE_BYTES, &too_long)) {
+    while (pleb_read_line(stdin, &line, PLEB_MAX_REQUEST_LINE_BYTES, &too_long)) {
         if (too_long) {
-            wick_write_response(stdout, 0, "", NULL, 0, "request line exceeds 64 KiB limit",
+            pleb_write_response(stdout, 0, "", NULL, 0, "request line exceeds 64 KiB limit",
                                 "protocol_mismatch");
             continue;
         }
@@ -564,10 +564,10 @@ static void wick_run_request_loop(void) {
             break;
         }
 
-        WickRenderRequest req = {};
+        PlebRenderRequest req = {};
         char err_buf[256] = {};
-        if (wick_parse_request_line(line, &req, err_buf, sizeof(err_buf)) != 0) {
-            wick_write_response(stdout, 0, "", NULL, 0, err_buf, "protocol_mismatch");
+        if (pleb_parse_request_line(line, &req, err_buf, sizeof(err_buf)) != 0) {
+            pleb_write_response(stdout, 0, "", NULL, 0, err_buf, "protocol_mismatch");
             free(line);
             line = NULL;
             continue;
@@ -576,7 +576,7 @@ static void wick_run_request_loop(void) {
         line = NULL;
 
         render_url_v5(&req);
-        wick_render_request_free(&req);
+        pleb_render_request_free(&req);
     }
 
     free(g_html);

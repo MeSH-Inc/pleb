@@ -35,10 +35,7 @@ impl RobotsCache {
         };
 
         let mut matcher = DefaultMatcher::default();
-        if !matcher.one_agent_allowed_by_robots(&robots_body, "mesh-wick", url) {
-            return false;
-        }
-        if !matcher.one_agent_allowed_by_robots(&robots_body, "Wick", url) {
+        if !matcher.one_agent_allowed_by_robots(&robots_body, "pleb", url) {
             return false;
         }
         matcher.one_agent_allowed_by_robots(&robots_body, "*", url)
@@ -180,7 +177,7 @@ fn parse_crawl_delay(robots_body: &str) -> Option<Duration> {
                 current = GroupMatch::None;
                 saw_rule_in_group = false;
             }
-            if value.eq_ignore_ascii_case("mesh-wick") || value.eq_ignore_ascii_case("wick") {
+            if value.eq_ignore_ascii_case("pleb") {
                 current = GroupMatch::Specific;
             } else if value == "*" && current != GroupMatch::Specific {
                 current = GroupMatch::Wildcard;

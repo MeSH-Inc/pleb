@@ -11,13 +11,13 @@ use crate::context::{acquire_private_lock, ensure_private_dir, write_private_fil
 pub const MAX_SECRET_BYTES: usize = 4096;
 
 #[cfg(target_os = "macos")]
-const KEYCHAIN_SERVICE: &str = "mesh-wick";
+const KEYCHAIN_SERVICE: &str = "pleb";
 #[cfg(target_os = "macos")]
 const ERR_SEC_ITEM_NOT_FOUND: i32 = 44;
 
 const CREDENTIALS_FILE_NAME: &str = "credentials.json";
 const CREDENTIALS_LOCK_NAME: &str = "credentials.lock";
-const NO_KEYCHAIN_ENV: &str = "WICK_NO_KEYCHAIN";
+const NO_KEYCHAIN_ENV: &str = "PLEB_NO_KEYCHAIN";
 
 fn zeroize_bytes(bytes: &mut [u8]) {
     for byte in bytes {

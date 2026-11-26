@@ -41,7 +41,7 @@ impl Default for RuntimeConfig {
 }
 
 pub fn default_state_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("MESH_WICK_HOME") {
+    if let Some(dir) = std::env::var_os("PLEB_HOME") {
         let path = PathBuf::from(dir);
         if !path.as_os_str().is_empty() {
             return path;
@@ -50,14 +50,14 @@ pub fn default_state_dir() -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
         let path = PathBuf::from(home);
         if !path.as_os_str().is_empty() {
-            return path.join(".mesh-wick");
+            return path.join(".pleb");
         }
     }
     let user = std::env::var("USER")
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| std::process::id().to_string());
-    std::env::temp_dir().join(format!("mesh-wick-{user}"))
+    std::env::temp_dir().join(format!("pleb-{user}"))
 }
 
 pub fn ensure_private_dir(path: &Path) -> Result<()> {
@@ -206,7 +206,7 @@ impl RuntimeContext {
         #[cfg(unix)]
         if !config.use_daemon && crate::daemon::is_daemon_running(&config.state_dir) {
             anyhow::bail!(
-                "a background wick daemon owns {} (run `wick daemon stop` or pass an isolated `--state-dir`)",
+                "a background pleb daemon owns {} (run `pleb daemon stop` or pass an isolated `--state-dir`)",
                 config.state_dir.display()
             );
         }
@@ -269,7 +269,7 @@ impl RuntimeContext {
             return Ok(client.clone());
         }
         let mut builder = reqwest::Client::builder()
-            .user_agent(concat!("mesh-wick/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("pleb/", env!("CARGO_PKG_VERSION")))
             .timeout(self.config.timeout);
         if let Some(proxy_url) = self.config.proxy.as_deref() {
             let trimmed = proxy_url.trim();

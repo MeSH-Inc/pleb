@@ -1,25 +1,25 @@
 ---
-name: mesh-wick
-description: Reference for the local MeSH-wick CLI (`wick` binary with Cronet TLS, `v5-meta` CEF renderer, unified `daemon.sock` v3, structured source negotiation, feed/transcript extraction, and selective resource staging). Use when fetching pages that resist built-in web fetch, batch-fetching search results, inspecting or staging diagrams/PDFs/transcripts, or debugging `wick` daemon and CEF behavior.
+name: pleb
+description: Reference for the local pleb CLI (Cronet TLS, `v5-meta` CEF renderer, unified `daemon.sock` v3, structured source negotiation, feed/transcript extraction, and selective resource staging). Use when fetching pages that resist built-in web fetch, batch-fetching search results, inspecting or staging diagrams/PDFs/transcripts, or debugging `pleb` daemon and CEF behavior.
 metadata:
   author: Memory Sync Hub LLC
   repository: https://github.com/MeSH-Inc/mesh-wick
   scope: user
 ---
 
-# MeSH-wick (`wick`)
+# pleb
 
-Local, MIT-licensed, zero-telemetry web acquisition and search CLI by Memory Sync Hub LLC, built from `~/apps/mesh-wick`.
+Local, MIT-licensed, zero-telemetry web acquisition and search CLI by Memory Sync Hub LLC.
 
 ## Identity and Version Contract
 
-Verify the active `wick` binary is `mesh-wick` (not upstream `wickproject/wick`) before relying on `mesh-wick`-specific flags:
+Verify the active `pleb` binary is genuine (and not an unrelated tool) before relying on `pleb`-specific flags:
 
 ```bash
-wick status --json
+pleb status --json
 ```
 
-Expected markers: `"cronet_enabled": true`, `"cef_renderer": { "expected_protocol": "v5-meta" }`, and unified daemon (`daemon.sock`, `protocol_version: 3`). All upstream telemetry pings and remote `site-rules.json` sync calls are removed.
+Expected markers: `"cronet_enabled": true`, `"cef_renderer": { "expected_protocol": "v5-meta" }`, and unified daemon (`daemon.sock`, `protocol_version: 3`). All upstream telemetry pings and remote `site-rules.json` sync calls from `wickproject/wick` are removed.
 
 ---
 
@@ -27,7 +27,7 @@ Expected markers: `"cronet_enabled": true`, `"cef_renderer": { "expected_protoco
 
 1. **Default fetch (`--render auto --source auto --extract clean`):**
    ```bash
-   wick fetch <url>
+   pleb fetch <url>
    ```
    - Skips `robots.txt` by default on single-URL fetches (pass `--respect-robots` to enforce).
    - **Structured source resolution (`--source auto`):** automatically rewrites GitHub `/blob/`, GitLab `/-/blob/`, and Gist URLs to lossless raw source (`strategy: "raw_source"`, with automatic HTML fallback on `404`/binary), and follows RFC 8288 `Link` / HTML `<link rel="alternate" type="text/markdown">` mirrors (`strategy: "markdown_mirror"`).
@@ -36,35 +36,35 @@ Expected markers: `"cronet_enabled": true`, `"cef_renderer": { "expected_protoco
    - **Automatic CEF escalation:** escalates `403`/`503` blocks and unhydrated JS/SvelteKit/React SPA shells to the warm `v5-meta` offscreen Chromium renderer. Active bot challenges fail fast (exit `2`) without CEF retries.
 2. **Documentation Markdown negotiation (`--source negotiate`):**
    ```bash
-   wick fetch --source negotiate <url>
+   pleb fetch --source negotiate <url>
    ```
    Sends `Accept: text/markdown` on the primary request (`strategy: "markdown_negotiated"`) and probes `<path>.md` if HTML returns without an advertised alternate. Use `--source none` (or `--format html` / `--format raw` / `--render cef`) to disable source resolution.
 3. **Forced Chromium rendering (`--render cef`):**
    ```bash
-   wick fetch --render cef --wait-for-selector "<css>" <url>
+   pleb fetch --render cef --wait-for-selector "<css>" <url>
    ```
    Use `--render cronet` to force network-only transport without spawning CEF.
 4. **Active bot challenge or login wall (exit code `2`):**
-   `mesh-wick` never solves CAPTCHAs or runs anti-bot bypass scripts. Stop retrying via `wick` and switch to an interactive browser session.
+   `pleb` never solves CAPTCHAs or runs anti-bot bypass scripts. Stop retrying via `pleb` and switch to an interactive browser session.
 
 ---
 
 ## Decision Tree 2 — Selective Resource Enrichment
 
-`wick fetch` indexes high-salience page resources (`diagram`, `image`, `transcript`, `document`, `dataset`, `schema`) during its single `O(N)` DOM pass with zero extra network requests, and rescues inline `<svg>` `<text>` labels directly into Markdown (`[Diagram: <label> — ...]`).
+`pleb fetch` indexes high-salience page resources (`diagram`, `image`, `transcript`, `document`, `dataset`, `schema`) during its single `O(N)` DOM pass with zero extra network requests, and rescues inline `<svg>` `<text>` labels directly into Markdown (`[Diagram: <label> — ...]`).
 
 1. **Read prose first and check resource cues:**
    - Default non-JSON fetches print a one-line `stderr` cue whenever high-salience resources exist (`Resources: 2 diagrams (r1, r2), 1 transcript (r3) ...`).
    - `--json` / `--jsonl` / `--metadata-only` include the full `resources` array (`identifier`, `kind`, `url`, `section_heading`, `label`, `dimensions`, `salience`).
    - If the prose and rescued `<svg>` labels answer the task, stop—zero extra requests or vision tokens spent.
 2. **Pull only the resources that enrich context:**
-   - Inspect full resource table on `stdout`: `wick fetch --resources manifest <url>`
-   - Pull specific resource IDs from the page: `wick fetch --stage-resources r1,r3 <url> --json`
-   - Inline video/audio captions (`.vtt`/`.srt`): `wick fetch --resources transcripts <url>`
-   - Stage high-salience diagrams (or all high-salience assets): `wick fetch --resources diagrams <url>` / `--resources all`
+   - Inspect full resource table on `stdout`: `pleb fetch --resources manifest <url>`
+   - Pull specific resource IDs from the page: `pleb fetch --stage-resources r1,r3 <url> --json`
+   - Inline video/audio captions (`.vtt`/`.srt`): `pleb fetch --resources transcripts <url>`
+   - Stage high-salience diagrams (or all high-salience assets): `pleb fetch --resources diagrams <url>` / `--resources all`
    - Stage a direct binary/image/PDF URL with parent `Referer` and Chrome subresource headers (`Sec-Fetch-Dest`, `strict-origin-when-cross-origin`):
      ```bash
-     wick fetch --stage --referer <parent_url> <asset_url>
+     pleb fetch --stage --referer <parent_url> <asset_url>
      ```
 3. **Inspect staged binaries locally:**
    Staged files live under `<state_dir>/artifacts/<hash>-<name>.<ext>` (`0o600`, `256 MiB` LRU cap, magic-byte verified against disguised HTML soft-404s). Pass `staged_path` directly to a local file/image/PDF reader tool.
@@ -75,25 +75,25 @@ Expected markers: `"cronet_enabled": true`, `"cef_renderer": { "expected_protoco
 
 - **Multi-provider search (`auto` balances configured providers with cooldown/burst pacing and intent routing; DuckDuckGo HTML fallback):**
   ```bash
-  wick search -n 8 [--provider auto|brave|tavily|serper|exa|searxng|duckduckgo|federated] [--mode auto|exact|semantic] [--freshness day|week|month|year] [--site <domain>] [--extra-snippets] "<query>"
+  pleb search -n 8 [--provider auto|brave|tavily|serper|exa|searxng|duckduckgo|federated] [--mode auto|exact|semantic] [--freshness day|week|month|year] [--site <domain>] [--extra-snippets] "<query>"
   ```
 - **Tool-owned credential storage (`env -> macOS Keychain -> <state_dir>/credentials.json`):**
   ```bash
-  wick auth set <brave|tavily|serper|exa|searxng> [--stdin] [--storage auto|keychain|file]
-  wick auth remove <brave|tavily|serper|exa|searxng> [--storage auto|keychain|file]
-  wick auth status [--json]
+  pleb auth set <brave|tavily|serper|exa|searxng> [--stdin] [--storage auto|keychain|file]
+  pleb auth remove <brave|tavily|serper|exa|searxng> [--storage auto|keychain|file]
+  pleb auth status [--json]
   ```
-  Environment overrides: `BRAVE_API_KEY`, `TAVILY_API_KEY`, `SERPER_API_KEY`, `EXA_API_KEY`, `SEARXNG_URL`. Set `WICK_NO_KEYCHAIN=1` to bypass macOS Keychain in hermetic/headless runs. Secrets are never accepted as positional CLI args or printed in status/error output.
+  Environment overrides: `BRAVE_API_KEY`, `TAVILY_API_KEY`, `SERPER_API_KEY`, `EXA_API_KEY`, `SEARXNG_URL`. Set `PLEB_NO_KEYCHAIN=1` to bypass macOS Keychain in hermetic/headless runs. Secrets are never accepted as positional CLI args or printed in status/error output.
 - **Search-to-Batch Fetch pipeline:**
   ```bash
-  wick search --urls-only -n 5 "<query>" | wick fetch - --jsonl --concurrency 4
+  pleb search --urls-only -n 5 "<query>" | pleb fetch - --jsonl --concurrency 4
   ```
   Batch mode (`2+` URLs or `-` stdin) enforces a per-host `Semaphore(2)` cap; `--json` emits an ordered array, `--jsonl` streams per completion, and `--metadata-only` omits `content` while keeping `resources`.
 - **Extraction & output flags:** `--format <markdown|html|text|raw>`, `--extract <clean|article|full>`, `--no-rewrite`, `--no-images`, `--no-links`, `--max-bytes <N>`, `--max-response-bytes <BYTES>`, `-o <path>` (written only on success).
 - **Site crawl and map (`robots.txt` enforced by default; pass `--no-robots` to override):**
   ```bash
-  wick crawl <url> --depth 2 --max-pages 10
-  wick map <url> --limit 100
+  pleb crawl <url> --depth 2 --max-pages 10
+  pleb map <url> --limit 100
   ```
 
 ---
@@ -113,7 +113,7 @@ Expected markers: `"cronet_enabled": true`, `"cef_renderer": { "expected_protoco
 
 ## Daemon, State, CEF `v5-meta`, and Skill Maintenance
 
-- **State directory (`MESH_WICK_HOME` / `--state-dir`, default `~/.mesh-wick`, `0o700`):** holds `data/`, `cef-cache/`, `artifacts/`, `daemon.sock`, `daemon.log`, `site-cache.json`, `search-state.json`, `credentials.json` (`0o600`), and optional local `site-rules.json`.
-- **Daemon controls:** auto-starts `daemon.sock` (idle exit `--daemon-idle-timeout` / `MESH_WICK_DAEMON_IDLE_SECONDS`, default `300`; bypass via `--no-daemon` / `MESH_WICK_NO_DAEMON`). Manage with `wick daemon status`, `wick daemon stop`, and `wick session clear` (stops daemon and clears `data/`, `cef-cache/`, `artifacts/`, `site-cache.json`, and `search-state.json` while preserving `credentials.json` and Keychain items).
-- **CEF `v5-meta` installer & overrides:** rebuild via `bash ~/apps/mesh-wick/scripts/install-cef-mac.sh --force` (macOS arm64) or `bash ~/apps/mesh-wick/scripts/install-cef-linux.sh --force` (Linux `x86_64` / `aarch64`, runs natively under Ozone headless without Xvfb when `DISPLAY` is unset or empty; both support `--prefix <dir>`). Override binaries in tests/scripts with `WICK_CEF_RENDERER`, `WICK_DAEMON_EXECUTABLE`, and `WICK_NO_HOME_CEF=1`.
-- **Emit this exact version-locked skill from any machine with `wick` installed:** `wick skill print`.
+- **State directory (`PLEB_HOME` / `--state-dir`, default `~/.pleb`, `0o700`):** holds `data/`, `cef-cache/`, `artifacts/`, `daemon.sock`, `daemon.log`, `site-cache.json`, `search-state.json`, `credentials.json` (`0o600`), and optional local `site-rules.json`.
+- **Daemon controls:** auto-starts `daemon.sock` (idle exit `--daemon-idle-timeout` / `PLEB_DAEMON_IDLE_SECONDS`, default `300`; bypass via `--no-daemon` / `PLEB_NO_DAEMON`). Manage with `pleb daemon status`, `pleb daemon stop`, and `pleb session clear` (stops daemon and clears `data/`, `cef-cache/`, `artifacts/`, `site-cache.json`, and `search-state.json` while preserving `credentials.json` and Keychain items).
+- **CEF `v5-meta` installer & overrides:** rebuild from the repository root via `bash scripts/install-cef-mac.sh --force` (macOS arm64) or `bash scripts/install-cef-linux.sh --force` (Linux `x86_64` / `aarch64`, runs natively under Ozone headless without Xvfb when `DISPLAY` is unset or empty; both support `--prefix <dir>`). Override binaries in tests/scripts with `PLEB_CEF_RENDERER`, `PLEB_DAEMON_EXECUTABLE`, and `PLEB_NO_HOME_CEF=1`.
+- **Emit this exact version-locked skill from any machine with `pleb` installed:** `pleb skill print`.

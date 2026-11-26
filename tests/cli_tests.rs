@@ -12,7 +12,7 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new() -> Self {
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = PathBuf::from(format!("/tmp/wick-t-{}-{}", std::process::id(), seq));
+        let dir = PathBuf::from(format!("/tmp/pleb-t-{}-{}", std::process::id(), seq));
         fs::create_dir_all(&dir).unwrap();
         #[cfg(unix)]
         {
@@ -105,11 +105,11 @@ async fn cli_supports_value_enums_output_file_and_uniform_json_errors() {
     let base = spawn_cli_test_server().await;
     let state_dir = temp_dir();
     let out_dir = temp_dir();
-    let wick_bin = env!("CARGO_BIN_EXE_wick");
+    let pleb_bin = env!("CARGO_BIN_EXE_pleb");
 
     // 1. status --json emits structured JSON.
-    let status_out = Command::new(wick_bin)
-        .env("WICK_NO_KEYCHAIN", "1")
+    let status_out = Command::new(pleb_bin)
+        .env("PLEB_NO_KEYCHAIN", "1")
         .args(["--state-dir"])
         .arg(&state_dir)
         .args(["--json", "status"])
@@ -122,7 +122,7 @@ async fn cli_supports_value_enums_output_file_and_uniform_json_errors() {
     assert_eq!(status_json["cef_renderer"]["expected_protocol"], "v5-meta");
 
     // 2. daemon status --json and session clear --json work cleanly.
-    let daemon_out = Command::new(wick_bin)
+    let daemon_out = Command::new(pleb_bin)
         .args(["--state-dir"])
         .arg(&state_dir)
         .args(["daemon", "status", "--json"])
@@ -133,7 +133,7 @@ async fn cli_supports_value_enums_output_file_and_uniform_json_errors() {
     let daemon_json: serde_json::Value = serde_json::from_slice(&daemon_out.stdout).unwrap();
     assert_eq!(daemon_json["running"], false);
 
-    let session_out = Command::new(wick_bin)
+    let session_out = Command::new(pleb_bin)
         .args(["--state-dir"])
         .arg(&state_dir)
         .args(["session", "clear", "--json"])
@@ -145,7 +145,7 @@ async fn cli_supports_value_enums_output_file_and_uniform_json_errors() {
     assert_eq!(session_json["cleared"], true);
 
     // 3. ValueEnum aliases/case-insensitivity and --json --metadata-only.
-    let fetch_ok = Command::new(wick_bin)
+    let fetch_ok = Command::new(pleb_bin)
         .args(["--state-dir"])
         .arg(&state_dir)
         .args([
@@ -179,7 +179,7 @@ async fn cli_supports_value_enums_output_file_and_uniform_json_errors() {
 
     // 4. --format raw --output writes exact bytes without touching stdout.
     let raw_path = out_dir.path().join("doc.pdf");
-    let raw_out = Command::new(wick_bin)
+    let raw_out = Command::new(pleb_bin)
         .args(["--state-dir"])
         .arg(&state_dir)
         .args([
@@ -204,7 +204,7 @@ async fn cli_supports_value_enums_output_file_and_uniform_json_errors() {
 
     // 5. Failed fetch with --output must NOT create an empty file, and --json writes error JSON to stderr.
     let fail_path = out_dir.path().join("should-not-exist.md");
-    let fail_404 = Command::new(wick_bin)
+    let fail_404 = Command::new(pleb_bin)
         .args(["--state-dir"])
         .arg(&state_dir)
         .args([
@@ -226,7 +226,7 @@ async fn cli_supports_value_enums_output_file_and_uniform_json_errors() {
     assert_eq!(err_404_json["exit_code"], 3);
 
     // 6. 403 -> exit 2, PDF in non-raw -> exit 5, raw+json conflict -> exit 1.
-    let fail_403 = Command::new(wick_bin)
+    let fail_403 = Command::new(pleb_bin)
         .args(["--state-dir"])
         .arg(&state_dir)
         .args([
@@ -243,7 +243,7 @@ async fn cli_supports_value_enums_output_file_and_uniform_json_errors() {
     let err_403_json: serde_json::Value = serde_json::from_slice(&fail_403.stderr).unwrap();
     assert_eq!(err_403_json["kind"], "blocked");
 
-    let fail_pdf = Command::new(wick_bin)
+    let fail_pdf = Command::new(pleb_bin)
         .args(["--state-dir"])
         .arg(&state_dir)
         .args([
@@ -260,7 +260,7 @@ async fn cli_supports_value_enums_output_file_and_uniform_json_errors() {
     let err_pdf_json: serde_json::Value = serde_json::from_slice(&fail_pdf.stderr).unwrap();
     assert_eq!(err_pdf_json["kind"], "unsupported_content_type");
 
-    let fail_raw_json = Command::new(wick_bin)
+    let fail_raw_json = Command::new(pleb_bin)
         .args(["--state-dir"])
         .arg(&state_dir)
         .args([
@@ -278,8 +278,8 @@ async fn cli_supports_value_enums_output_file_and_uniform_json_errors() {
     assert_eq!(err_raw_json["kind"], "invalid_input");
 
     // 7. search error without BRAVE_API_KEY respects global --json envelope.
-    let fail_search = Command::new(wick_bin)
-        .env("WICK_NO_KEYCHAIN", "1")
+    let fail_search = Command::new(pleb_bin)
+        .env("PLEB_NO_KEYCHAIN", "1")
         .env_remove("BRAVE_API_KEY")
         .args(["--state-dir"])
         .arg(&state_dir)
@@ -291,7 +291,7 @@ async fn cli_supports_value_enums_output_file_and_uniform_json_errors() {
     let err_search_json: serde_json::Value = serde_json::from_slice(&fail_search.stderr).unwrap();
     assert_eq!(err_search_json["kind"], "search_error");
 
-    let _ = Command::new(wick_bin)
+    let _ = Command::new(pleb_bin)
         .args(["--state-dir"])
         .arg(&state_dir)
         .args(["daemon", "stop"])
@@ -306,10 +306,10 @@ async fn cli_batch_fetch_modes_stdin_and_flag_conflicts() {
 
     let base = spawn_cli_test_server().await;
     let state_dir = temp_dir();
-    let wick_bin = env!("CARGO_BIN_EXE_wick");
+    let pleb_bin = env!("CARGO_BIN_EXE_pleb");
 
     // 1. Multi-URL --json returns ordered JSON array.
-    let batch_json = Command::new(wick_bin)
+    let batch_json = Command::new(pleb_bin)
         .args(["--state-dir"])
         .arg(&state_dir)
         .args([
@@ -333,7 +333,7 @@ async fn cli_batch_fetch_modes_stdin_and_flag_conflicts() {
     assert_eq!(items[1]["url"], format!("{base}/ok?v=2"));
 
     // 2. Multi-URL --jsonl --metadata-only streams one line per URL without content.
-    let batch_jsonl = Command::new(wick_bin)
+    let batch_jsonl = Command::new(pleb_bin)
         .args(["--state-dir"])
         .arg(&state_dir)
         .args([
@@ -363,7 +363,7 @@ async fn cli_batch_fetch_modes_stdin_and_flag_conflicts() {
         .any(|v| v["ok"] == false && v["exit_code"] == 3));
 
     // 3. Multi-URL default markdown prints numbered sections.
-    let batch_md = Command::new(wick_bin)
+    let batch_md = Command::new(pleb_bin)
         .args(["--state-dir"])
         .arg(&state_dir)
         .args([
@@ -382,7 +382,7 @@ async fn cli_batch_fetch_modes_stdin_and_flag_conflicts() {
     assert!(md_out.contains("## [2/2]"));
 
     // 4. Stdin '-' with 1 URL still emits a 1-element JSON array.
-    let mut child = Command::new(wick_bin)
+    let mut child = Command::new(pleb_bin)
         .args(["--state-dir"])
         .arg(&state_dir)
         .args(["--json", "fetch", "--render", "cronet", "-"])
@@ -404,7 +404,7 @@ async fn cli_batch_fetch_modes_stdin_and_flag_conflicts() {
     assert_eq!(stdin_arr.as_array().unwrap().len(), 1);
 
     // 5. Empty stdin -> exit 1 with JSON error envelope.
-    let mut empty_child = Command::new(wick_bin)
+    let mut empty_child = Command::new(pleb_bin)
         .args(["--state-dir"])
         .arg(&state_dir)
         .args(["--json", "fetch", "-"])
@@ -426,7 +426,7 @@ async fn cli_batch_fetch_modes_stdin_and_flag_conflicts() {
     assert_eq!(empty_err["kind"], "invalid_input");
 
     // 6. Uniform all-fail -> exit 3; heterogeneous all-fail -> exit 1.
-    let uniform_fail = Command::new(wick_bin)
+    let uniform_fail = Command::new(pleb_bin)
         .args(["--state-dir"])
         .arg(&state_dir)
         .args([
@@ -441,7 +441,7 @@ async fn cli_batch_fetch_modes_stdin_and_flag_conflicts() {
         .unwrap();
     assert_eq!(uniform_fail.status.code(), Some(3));
 
-    let hetero_fail = Command::new(wick_bin)
+    let hetero_fail = Command::new(pleb_bin)
         .args(["--state-dir"])
         .arg(&state_dir)
         .args([
@@ -476,7 +476,7 @@ async fn cli_batch_fetch_modes_stdin_and_flag_conflicts() {
         vec!["fetch", "--metadata-only", &format!("{base}/ok")],
         vec!["search", "--urls-only", "--json", "rust"],
     ] {
-        let out = Command::new(wick_bin)
+        let out = Command::new(pleb_bin)
             .args(["--state-dir"])
             .arg(&state_dir)
             .args(&args)
@@ -486,7 +486,7 @@ async fn cli_batch_fetch_modes_stdin_and_flag_conflicts() {
         assert_eq!(out.status.code(), Some(1), "expected exit 1 for {args:?}");
     }
 
-    let _ = Command::new(wick_bin)
+    let _ = Command::new(pleb_bin)
         .args(["--state-dir"])
         .arg(&state_dir)
         .args(["daemon", "stop"])
@@ -496,16 +496,16 @@ async fn cli_batch_fetch_modes_stdin_and_flag_conflicts() {
 
 #[tokio::test]
 async fn adversarial_status_json_defaults_and_readme_contract_parity() {
-    let wick_bin = env!("CARGO_BIN_EXE_wick");
+    let pleb_bin = env!("CARGO_BIN_EXE_pleb");
     let state_dir = TempDir::new();
 
-    // `wick status --json` must emit clean default daemon fields when no daemon is running.
-    let out = Command::new(wick_bin)
+    // `pleb status --json` must emit clean default daemon fields when no daemon is running.
+    let out = Command::new(pleb_bin)
         .args(["--state-dir"])
         .arg(state_dir.path())
         .args(["status", "--json"])
-        .env("WICK_NO_HOME_CEF", "1")
-        .env("WICK_NO_KEYCHAIN", "1")
+        .env("PLEB_NO_HOME_CEF", "1")
+        .env("PLEB_NO_KEYCHAIN", "1")
         .output()
         .await
         .unwrap();
@@ -524,8 +524,8 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
 
     for (doc_name, doc_text) in [("README.md", &readme), ("README-FULL.md", &readme_full)] {
         assert!(
-            doc_text.contains("MeSH-wick"),
-            "{doc_name} missing canonical MeSH-wick stylization"
+            doc_text.contains("pleb"),
+            "{doc_name} missing canonical pleb name"
         );
         assert!(
             doc_text.contains("Memory Sync Hub LLC"),
@@ -538,6 +538,7 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
     );
     let cargo_toml = std::fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
     for required_meta in [
+        "name = \"pleb\"",
         "authors = [\"Memory Sync Hub LLC\"]",
         "readme = \"README.md\"",
         "repository = \"https://github.com/MeSH-Inc/mesh-wick\"",
@@ -714,9 +715,9 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
     // README-FULL.md must stay in sync with v5-meta, env overrides, batch/search flags, and JSON schemas.
     for required in [
         "v5-meta",
-        "WICK_CEF_RENDERER",
-        "WICK_NO_HOME_CEF",
-        "WICK_DAEMON_EXECUTABLE",
+        "PLEB_CEF_RENDERER",
+        "PLEB_NO_HOME_CEF",
+        "PLEB_DAEMON_EXECUTABLE",
         "--jsonl",
         "--urls-only",
         "daemon.sock",
@@ -733,10 +734,10 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "<svg>",
         ".vtt",
         ".srt",
-        "wick auth set",
-        "wick auth remove",
-        "wick auth status",
-        "WICK_NO_KEYCHAIN=1",
+        "pleb auth set",
+        "pleb auth remove",
+        "pleb auth status",
+        "PLEB_NO_KEYCHAIN=1",
         "TAVILY_API_KEY",
         "SERPER_API_KEY",
         "EXA_API_KEY",
@@ -759,16 +760,29 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
             "README-FULL.md missing documented capability: {required}"
         );
     }
+    let retired_docs_and_skill = [
+        "--meta-only",
+        "--no-cef-daemon",
+        "--cef-idle-timeout",
+        "MESH_WICK_CEF_IDLE_SECS",
+        "MESH_WICK_NO_CEF_DAEMON",
+        "cef.sock",
+        "v4-meta",
+        "MeSH-wick",
+        "MESH_WICK_HOME",
+        "MESH_WICK_PROXY",
+        "MESH_WICK_NO_DAEMON",
+        "MESH_WICK_DAEMON_IDLE_SECONDS",
+        "MESH_WICK_TIMEZONE",
+        "WICK_NO_KEYCHAIN",
+        "WICK_CEF_RENDERER",
+        "WICK_NO_HOME_CEF",
+        "WICK_DAEMON_EXECUTABLE",
+        "WICK_BUILD_ID",
+        "WICK_RENDERER_PROTOCOL",
+    ];
     for (doc_name, doc_text) in [("README.md", &readme), ("README-FULL.md", &readme_full)] {
-        for retired in [
-            "--meta-only",
-            "--no-cef-daemon",
-            "--cef-idle-timeout",
-            "MESH_WICK_CEF_IDLE_SECS",
-            "MESH_WICK_NO_CEF_DAEMON",
-            "cef.sock",
-            "v4-meta",
-        ] {
+        for retired in retired_docs_and_skill {
             assert!(
                 !doc_text.contains(retired),
                 "{doc_name} contains retired identifier: {retired}"
@@ -776,13 +790,13 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         }
     }
 
-    // Canonical skills/mesh-wick/SKILL.md must stay in sync with CLI flags, exit codes, and `wick skill print`.
+    // Canonical skills/pleb/SKILL.md must stay in sync with CLI flags, exit codes, and `pleb skill print`.
     let skill_md = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("skills/mesh-wick/SKILL.md"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("skills/pleb/SKILL.md"),
     )
     .unwrap();
     for required in [
-        "name: mesh-wick",
+        "name: pleb",
         "v5-meta",
         "daemon.sock",
         "protocol_version: 3",
@@ -799,15 +813,15 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "--metadata-only",
         "--daemon-idle-timeout",
         "--no-daemon",
-        "WICK_CEF_RENDERER",
-        "WICK_DAEMON_EXECUTABLE",
-        "WICK_NO_HOME_CEF",
-        "wick skill print",
+        "PLEB_CEF_RENDERER",
+        "PLEB_DAEMON_EXECUTABLE",
+        "PLEB_NO_HOME_CEF",
+        "pleb skill print",
         "artifacts/",
-        "wick auth set",
-        "wick auth remove",
-        "wick auth status",
-        "WICK_NO_KEYCHAIN=1",
+        "pleb auth set",
+        "pleb auth remove",
+        "pleb auth status",
+        "PLEB_NO_KEYCHAIN=1",
         "TAVILY_API_KEY",
         "SERPER_API_KEY",
         "EXA_API_KEY",
@@ -819,25 +833,17 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
     ] {
         assert!(
             skill_md.contains(required),
-            "skills/mesh-wick/SKILL.md missing documented capability: {required}"
+            "skills/pleb/SKILL.md missing documented capability: {required}"
         );
     }
-    for retired in [
-        "--meta-only",
-        "--no-cef-daemon",
-        "--cef-idle-timeout",
-        "MESH_WICK_CEF_IDLE_SECS",
-        "MESH_WICK_NO_CEF_DAEMON",
-        "cef.sock",
-        "v4-meta",
-    ] {
+    for retired in retired_docs_and_skill {
         assert!(
             !skill_md.contains(retired),
-            "skills/mesh-wick/SKILL.md contains retired identifier: {retired}"
+            "skills/pleb/SKILL.md contains retired identifier: {retired}"
         );
     }
 
-    let skill_out = Command::new(wick_bin)
+    let skill_out = Command::new(pleb_bin)
         .args(["skill", "print"])
         .output()
         .await
@@ -850,11 +856,11 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
 async fn cli_direct_stage_rejects_disguised_html_conflicts_and_clears_artifacts() {
     let base = spawn_cli_test_server().await;
     let state_dir = temp_dir();
-    let wick_bin = env!("CARGO_BIN_EXE_wick");
+    let pleb_bin = env!("CARGO_BIN_EXE_pleb");
 
     // 1. Direct --stage with --referer stages PNG and prints local path on stdout.
-    let stage_plain = Command::new(wick_bin)
-        .env("WICK_NO_HOME_CEF", "1")
+    let stage_plain = Command::new(pleb_bin)
+        .env("PLEB_NO_HOME_CEF", "1")
         .args(["--state-dir"])
         .arg(&state_dir)
         .args([
@@ -891,8 +897,8 @@ async fn cli_direct_stage_rejects_disguised_html_conflicts_and_clears_artifacts(
     assert!(stderr_str.contains("Status: 200 | Bytes: 16 | Staged:"));
 
     // 2. Direct --stage --json emits structured JSON.
-    let stage_json = Command::new(wick_bin)
-        .env("WICK_NO_HOME_CEF", "1")
+    let stage_json = Command::new(pleb_bin)
+        .env("PLEB_NO_HOME_CEF", "1")
         .args(["--state-dir"])
         .arg(&state_dir)
         .args([
@@ -913,8 +919,8 @@ async fn cli_direct_stage_rejects_disguised_html_conflicts_and_clears_artifacts(
     assert!(Path::new(val["staged_path"].as_str().unwrap()).exists());
 
     // 3. Disguised HTML-as-PNG soft-404 is rejected with exit 1.
-    let stage_fake = Command::new(wick_bin)
-        .env("WICK_NO_HOME_CEF", "1")
+    let stage_fake = Command::new(pleb_bin)
+        .env("PLEB_NO_HOME_CEF", "1")
         .args(["--state-dir"])
         .arg(&state_dir)
         .args([
@@ -970,8 +976,8 @@ async fn cli_direct_stage_rejects_disguised_html_conflicts_and_clears_artifacts(
             1,
         ),
     ] {
-        let out = Command::new(wick_bin)
-            .env("WICK_NO_HOME_CEF", "1")
+        let out = Command::new(pleb_bin)
+            .env("PLEB_NO_HOME_CEF", "1")
             .args(["--state-dir"])
             .arg(&state_dir)
             .args(&args)
@@ -985,10 +991,10 @@ async fn cli_direct_stage_rejects_disguised_html_conflicts_and_clears_artifacts(
         );
     }
 
-    // 5. `wick session clear` removes `<state_dir>/artifacts`.
+    // 5. `pleb session clear` removes `<state_dir>/artifacts`.
     assert!(state_dir.path().join("artifacts").exists());
-    let clear_out = Command::new(wick_bin)
-        .env("WICK_NO_HOME_CEF", "1")
+    let clear_out = Command::new(pleb_bin)
+        .env("PLEB_NO_HOME_CEF", "1")
         .args(["--state-dir"])
         .arg(&state_dir)
         .args(["session", "clear"])
@@ -1005,10 +1011,10 @@ async fn cli_auth_subcommands_help_and_zero_secret_leakage() {
     use tokio::io::AsyncWriteExt as _;
 
     let state_dir = temp_dir();
-    let wick_bin = env!("CARGO_BIN_EXE_wick");
+    let pleb_bin = env!("CARGO_BIN_EXE_pleb");
 
-    // 1. Help parity for `wick search --help`, `wick auth --help`, and `wick auth set --help`.
-    let search_help = Command::new(wick_bin)
+    // 1. Help parity for `pleb search --help`, `pleb auth --help`, and `pleb auth set --help`.
+    let search_help = Command::new(pleb_bin)
         .args(["search", "--help"])
         .output()
         .await
@@ -1031,11 +1037,11 @@ async fn cli_auth_subcommands_help_and_zero_secret_leakage() {
     ] {
         assert!(
             search_help_txt.contains(expected),
-            "`wick search --help` missing {expected}"
+            "`pleb search --help` missing {expected}"
         );
     }
 
-    let auth_help = Command::new(wick_bin)
+    let auth_help = Command::new(pleb_bin)
         .args(["auth", "--help"])
         .output()
         .await
@@ -1045,11 +1051,11 @@ async fn cli_auth_subcommands_help_and_zero_secret_leakage() {
     for expected in ["set", "remove", "status"] {
         assert!(
             auth_help_txt.contains(expected),
-            "`wick auth --help` missing {expected}"
+            "`pleb auth --help` missing {expected}"
         );
     }
 
-    let auth_set_help = Command::new(wick_bin)
+    let auth_set_help = Command::new(pleb_bin)
         .args(["auth", "set", "--help"])
         .output()
         .await
@@ -1059,14 +1065,14 @@ async fn cli_auth_subcommands_help_and_zero_secret_leakage() {
     for expected in ["--stdin", "--storage", "auto", "keychain", "file"] {
         assert!(
             auth_set_help_txt.contains(expected),
-            "`wick auth set --help` missing {expected}"
+            "`pleb auth set --help` missing {expected}"
         );
     }
 
-    // 2. Non-TTY `wick auth set` without `--stdin` must fail loudly with exit 1.
-    let non_tty = Command::new(wick_bin)
-        .env("WICK_NO_KEYCHAIN", "1")
-        .env("WICK_NO_HOME_CEF", "1")
+    // 2. Non-TTY `pleb auth set` without `--stdin` must fail loudly with exit 1.
+    let non_tty = Command::new(pleb_bin)
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .env("PLEB_NO_HOME_CEF", "1")
         .args(["--state-dir"])
         .arg(&state_dir)
         .args(["--json", "auth", "set", "brave"])
@@ -1090,9 +1096,9 @@ async fn cli_auth_subcommands_help_and_zero_secret_leakage() {
             "secret-line-1",
         ),
     ] {
-        let mut child = Command::new(wick_bin)
-            .env("WICK_NO_KEYCHAIN", "1")
-            .env("WICK_NO_HOME_CEF", "1")
+        let mut child = Command::new(pleb_bin)
+            .env("PLEB_NO_KEYCHAIN", "1")
+            .env("PLEB_NO_HOME_CEF", "1")
             .args(["--state-dir"])
             .arg(&state_dir)
             .args([
@@ -1126,12 +1132,12 @@ async fn cli_auth_subcommands_help_and_zero_secret_leakage() {
         }
     }
 
-    // 4. `wick auth status --json` and plain text with env vars report source without leaking secret or URL.
-    let env_secret = "wick-env-secret-9f8e7d6c";
+    // 4. `pleb auth status --json` and plain text with env vars report source without leaking secret or URL.
+    let env_secret = "pleb-env-secret-9f8e7d6c";
     let env_searxng = "http://127.0.0.1:18888";
-    let env_status_json = Command::new(wick_bin)
-        .env("WICK_NO_KEYCHAIN", "1")
-        .env("WICK_NO_HOME_CEF", "1")
+    let env_status_json = Command::new(pleb_bin)
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .env("PLEB_NO_HOME_CEF", "1")
         .env("BRAVE_API_KEY", env_secret)
         .env("SEARXNG_URL", env_searxng)
         .env_remove("TAVILY_API_KEY")
@@ -1164,9 +1170,9 @@ async fn cli_auth_subcommands_help_and_zero_secret_leakage() {
     assert_eq!(val["tavily"]["configured"], false);
     assert!(val["tavily"]["source"].is_null());
 
-    let env_status_plain = Command::new(wick_bin)
-        .env("WICK_NO_KEYCHAIN", "1")
-        .env("WICK_NO_HOME_CEF", "1")
+    let env_status_plain = Command::new(pleb_bin)
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .env("PLEB_NO_HOME_CEF", "1")
         .env("BRAVE_API_KEY", env_secret)
         .env("SEARXNG_URL", env_searxng)
         .args(["--state-dir"])
@@ -1182,11 +1188,11 @@ async fn cli_auth_subcommands_help_and_zero_secret_leakage() {
     assert!(!plain_out.contains(env_secret));
     assert!(!plain_out.contains(env_searxng));
 
-    // 5. `wick auth set --stdin --storage file` -> `wick auth status --json` -> `wick auth remove`.
-    let file_secret = "wick-file-secret-a1b2c3d4";
-    let mut set_child = Command::new(wick_bin)
-        .env("WICK_NO_KEYCHAIN", "1")
-        .env("WICK_NO_HOME_CEF", "1")
+    // 5. `pleb auth set --stdin --storage file` -> `pleb auth status --json` -> `pleb auth remove`.
+    let file_secret = "pleb-file-secret-a1b2c3d4";
+    let mut set_child = Command::new(pleb_bin)
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .env("PLEB_NO_HOME_CEF", "1")
         .env_remove("BRAVE_API_KEY")
         .args(["--state-dir"])
         .arg(&state_dir)
@@ -1211,9 +1217,9 @@ async fn cli_auth_subcommands_help_and_zero_secret_leakage() {
 
     if set_out.status.code() == Some(1) && set_stderr.contains("not yet implemented") {
         // Wave-header stub in src/auth.rs before auth-store lands: verify remove routes cleanly too.
-        let remove_out = Command::new(wick_bin)
-            .env("WICK_NO_KEYCHAIN", "1")
-            .env("WICK_NO_HOME_CEF", "1")
+        let remove_out = Command::new(pleb_bin)
+            .env("PLEB_NO_KEYCHAIN", "1")
+            .env("PLEB_NO_HOME_CEF", "1")
             .env_remove("BRAVE_API_KEY")
             .args(["--state-dir"])
             .arg(&state_dir)
@@ -1225,9 +1231,9 @@ async fn cli_auth_subcommands_help_and_zero_secret_leakage() {
         assert!(String::from_utf8_lossy(&remove_out.stderr).contains("not yet implemented"));
     } else {
         assert_eq!(set_out.status.code(), Some(0), "stderr: {set_stderr}");
-        let file_status = Command::new(wick_bin)
-            .env("WICK_NO_KEYCHAIN", "1")
-            .env("WICK_NO_HOME_CEF", "1")
+        let file_status = Command::new(pleb_bin)
+            .env("PLEB_NO_KEYCHAIN", "1")
+            .env("PLEB_NO_HOME_CEF", "1")
             .env_remove("BRAVE_API_KEY")
             .args(["--state-dir"])
             .arg(&state_dir)
@@ -1243,9 +1249,9 @@ async fn cli_auth_subcommands_help_and_zero_secret_leakage() {
         assert_eq!(file_status_json["brave"]["source"], "file");
 
         // Removing while BRAVE_API_KEY is set emits a warning on stderr without leaking the key.
-        let remove_with_env = Command::new(wick_bin)
-            .env("WICK_NO_KEYCHAIN", "1")
-            .env("WICK_NO_HOME_CEF", "1")
+        let remove_with_env = Command::new(pleb_bin)
+            .env("PLEB_NO_KEYCHAIN", "1")
+            .env("PLEB_NO_HOME_CEF", "1")
             .env("BRAVE_API_KEY", env_secret)
             .args(["--state-dir"])
             .arg(&state_dir)
@@ -1259,9 +1265,9 @@ async fn cli_auth_subcommands_help_and_zero_secret_leakage() {
         assert!(!remove_stderr.contains(env_secret));
 
         // After removal without env var, brave is no longer configured.
-        let after_remove = Command::new(wick_bin)
-            .env("WICK_NO_KEYCHAIN", "1")
-            .env("WICK_NO_HOME_CEF", "1")
+        let after_remove = Command::new(pleb_bin)
+            .env("PLEB_NO_KEYCHAIN", "1")
+            .env("PLEB_NO_HOME_CEF", "1")
             .env_remove("BRAVE_API_KEY")
             .args(["--state-dir"])
             .arg(&state_dir)

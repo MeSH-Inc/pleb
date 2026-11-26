@@ -1,10 +1,10 @@
 #!/bin/bash
-# install-cef-mac.sh: Build and install the CEF renderer for mesh-wick on macOS arm64.
+# install-cef-mac.sh: Build and install the CEF renderer for pleb on macOS arm64.
 #
 # Usage:
 #   bash scripts/install-cef-mac.sh [--force] [--prefix <dir>]
 #
-# Installs wick-renderer.app into --prefix <dir> (default: ${MESH_WICK_HOME:-$HOME/.mesh-wick}/cef).
+# Installs pleb-renderer.app into --prefix <dir> (default: ${PLEB_HOME:-$HOME/.pleb}/cef).
 
 set -euo pipefail
 
@@ -67,13 +67,13 @@ if [[ ! -f "$PROTOCOL_HEADER" ]]; then
     exit 1
 fi
 
-RENDERER_PROTOCOL="$(sed -n 's/^#define[[:space:]]\{1,\}WICK_RENDERER_PROTOCOL_VERSION[[:space:]]\{1,\}"\([^"]*\)"/\1/p' "$PROTOCOL_HEADER" | head -n 1)"
+RENDERER_PROTOCOL="$(sed -n 's/^#define[[:space:]]\{1,\}PLEB_RENDERER_PROTOCOL_VERSION[[:space:]]\{1,\}"\([^"]*\)"/\1/p' "$PROTOCOL_HEADER" | head -n 1)"
 if [[ -z "$RENDERER_PROTOCOL" ]]; then
-    echo "Error: failed to parse WICK_RENDERER_PROTOCOL_VERSION from $PROTOCOL_HEADER" >&2
+    echo "Error: failed to parse PLEB_RENDERER_PROTOCOL_VERSION from $PROTOCOL_HEADER" >&2
     exit 1
 fi
 
-STATE_HOME="${MESH_WICK_HOME:-$HOME/.mesh-wick}"
+STATE_HOME="${PLEB_HOME:-$HOME/.pleb}"
 if [[ -n "$PREFIX" ]]; then
     INSTALL_DIR="$PREFIX"
 else
@@ -87,15 +87,15 @@ CEF_DIR="cef_binary_${CEF_VERSION}_${CEF_PLATFORM}_minimal"
 CEF_URL="https://cef-builds.spotifycdn.com/${CEF_DIR}.tar.bz2"
 CEF_SHA1="b7081f6609e5edccf07be96b5d7977329fbe1bdf"
 
-SDK_CACHE_DIR="${HOME}/.cache/mesh-wick/cef-sdk"
+SDK_CACHE_DIR="${HOME}/.cache/pleb/cef-sdk"
 SDK_TARBALL="${SDK_CACHE_DIR}/${CEF_DIR}.tar.bz2"
 SDK_DIR="${SDK_CACHE_DIR}/${CEF_DIR}"
 SDK_READY="${SDK_DIR}/.extracted-ok"
 SDK_LOCK_FILE="${SDK_CACHE_DIR}/.lock"
 SDK_LOCK_DIR="${SDK_CACHE_DIR}/.lock.d"
 
-APP_DIR="$INSTALL_DIR/wick-renderer.app"
-RENDERER_BIN="$APP_DIR/Contents/MacOS/wick-renderer"
+APP_DIR="$INSTALL_DIR/pleb-renderer.app"
+RENDERER_BIN="$APP_DIR/Contents/MacOS/pleb-renderer"
 
 mkdir -p "$INSTALL_DIR"
 if [[ -z "$PREFIX" ]]; then
@@ -105,12 +105,12 @@ else
 fi
 
 if [[ "$FORCE" -eq 0 && -f "$RENDERER_BIN" ]] && \
-   grep -q "WICK_RENDERER_PROTOCOL=${RENDERER_PROTOCOL}" "$RENDERER_BIN" 2>/dev/null; then
+   grep -q "PLEB_RENDERER_PROTOCOL=${RENDERER_PROTOCOL}" "$RENDERER_BIN" 2>/dev/null; then
     echo "CEF renderer (${RENDERER_PROTOCOL}) already installed at $APP_DIR (use --force to rebuild)."
     exit 0
 fi
 
-TMP_BUILD_BIN="$(mktemp "${TMPDIR:-/tmp}/mesh-wick-renderer.XXXXXX")"
+TMP_BUILD_BIN="$(mktemp "${TMPDIR:-/tmp}/pleb-renderer.XXXXXX")"
 TMP_TAR=""
 LOCK_HELD_DIR=0
 
@@ -178,7 +178,7 @@ else
     release_sdk_lock
 fi
 
-echo "Compiling wick-renderer (${RENDERER_PROTOCOL})..."
+echo "Compiling pleb-renderer (${RENDERER_PROTOCOL})..."
 clang -o "$TMP_BUILD_BIN" "$RENDERER_SRC/renderer.m" \
     -DCEF_API_VERSION="${CEF_API_VERSION}" \
     -I"$RENDERER_SRC" \
@@ -198,9 +198,9 @@ cat > "$APP_DIR/Contents/Info.plist" << 'PLIST'
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key>
-    <string>wick-renderer</string>
+    <string>pleb-renderer</string>
     <key>CFBundleIdentifier</key>
-    <string>io.mesh-wick.renderer</string>
+    <string>com.memorysynchub.pleb.renderer</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSUIElement</key>
@@ -230,7 +230,7 @@ echo "Building CEF helper bundles..."
 bash "$RENDERER_SRC/setup-helpers.sh" "$APP_DIR/Contents/Frameworks" "$SDK_DIR" "$CEF_API_VERSION"
 
 # Each helper .app looks in its own Contents/Frameworks via @executable_path/../Frameworks.
-for helper in "$APP_DIR/Contents/Frameworks"/wick\ Helper*.app; do
+for helper in "$APP_DIR/Contents/Frameworks"/pleb\ Helper*.app; do
     mkdir -p "$helper/Contents/Frameworks"
     ln -sf "../../../Chromium Embedded Framework.framework" \
         "$helper/Contents/Frameworks/Chromium Embedded Framework.framework"

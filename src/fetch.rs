@@ -970,7 +970,7 @@ async fn acquire_page(
 
     if render_mode == RenderMode::Cef && !cef_available {
         return Err(FetchError::CefUnavailable(
-            "render=cef requested but wick-renderer was not found".to_string(),
+            "render=cef requested but pleb-renderer was not found".to_string(),
         ));
     }
 
@@ -1701,7 +1701,7 @@ mod tests {
         });
 
         let state_dir =
-            std::path::PathBuf::from(format!("/tmp/wick-t-{}-rawsrc", std::process::id()));
+            std::path::PathBuf::from(format!("/tmp/pleb-t-{}-rawsrc", std::process::id()));
         let _ = std::fs::remove_dir_all(&state_dir);
         std::fs::create_dir_all(&state_dir).unwrap();
         let ctx = RuntimeContext::new(crate::context::RuntimeConfig {
@@ -1920,7 +1920,7 @@ mod tests {
         });
 
         let state_dir =
-            std::path::PathBuf::from(format!("/tmp/wick-t-{}-enrich", std::process::id()));
+            std::path::PathBuf::from(format!("/tmp/pleb-t-{}-enrich", std::process::id()));
         let _ = std::fs::remove_dir_all(&state_dir);
         std::fs::create_dir_all(&state_dir).unwrap();
         let ctx = RuntimeContext::new(crate::context::RuntimeConfig {

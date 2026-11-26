@@ -1,4 +1,4 @@
-// wick Helper (macOS): CEF subprocess entry point for OSR defaults.
+// pleb Helper (macOS): CEF subprocess entry point for OSR defaults.
 
 #import <Cocoa/Cocoa.h>
 
@@ -6,6 +6,6 @@
 
 int main(int argc, char* argv[]) {
     @autoreleasepool {
-        return wick_run_helper_process(argc, argv);
+        return pleb_run_helper_process(argc, argv);
     }
 }

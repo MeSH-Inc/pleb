@@ -68,7 +68,7 @@ fn emit_build_id(manifest_dir: &Path) {
         hash = fnv1a_update(hash, &[0xff]);
     }
 
-    println!("cargo:rustc-env=WICK_BUILD_ID={hash:016x}");
+    println!("cargo:rustc-env=PLEB_BUILD_ID={hash:016x}");
 }
 
 fn main() {

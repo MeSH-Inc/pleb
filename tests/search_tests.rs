@@ -1,6 +1,6 @@
-use mesh_wick::auth::CredentialProvider;
-use mesh_wick::context::{RuntimeConfig, RuntimeContext};
-use mesh_wick::search::{
+use pleb::auth::CredentialProvider;
+use pleb::context::{RuntimeConfig, RuntimeContext};
+use pleb::search::{
     build_brave_search_url, build_ddg_search_url, build_effective_query, civil_from_days,
     clean_ddg_url, clear_provider_cooldown, clear_search_state, days_from_civil, format_results,
     format_urls_only, is_lexical_needle, normalize_site, parse_brave_json, parse_ddg_html,
@@ -37,13 +37,13 @@ impl EnvGuard {
         let mut saved = Vec::new();
         for &key in ALL_CRED_ENV_VARS
             .iter()
-            .chain(&["WICK_NO_KEYCHAIN", "WICK_NO_HOME_CEF"])
+            .chain(&["PLEB_NO_KEYCHAIN", "PLEB_NO_HOME_CEF"])
         {
             saved.push((key, std::env::var(key).ok()));
             std::env::remove_var(key);
         }
-        std::env::set_var("WICK_NO_KEYCHAIN", "1");
-        std::env::set_var("WICK_NO_HOME_CEF", "1");
+        std::env::set_var("PLEB_NO_KEYCHAIN", "1");
+        std::env::set_var("PLEB_NO_HOME_CEF", "1");
         for &(k, v) in overrides {
             std::env::set_var(k, v);
         }
@@ -64,7 +64,7 @@ impl Drop for EnvGuard {
 
 fn temp_state_dir() -> PathBuf {
     let seq = TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = PathBuf::from(format!("/tmp/wick-t-{}-s{seq}", std::process::id()));
+    let dir = PathBuf::from(format!("/tmp/pleb-t-{}-s{seq}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     #[cfg(unix)]

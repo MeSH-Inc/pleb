@@ -648,7 +648,7 @@ mod tests {
             .unwrap_or_default()
             .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "mesh-wick-cronet-{}-{}-{}",
+            "pleb-cronet-{}-{}-{}",
             tag,
             std::process::id(),
             nanos
@@ -734,8 +734,7 @@ mod tests {
         let base = spawn_edge_server().await;
         let storage = temp_storage("edge");
 
-        let engine =
-            Engine::new(&storage, "mesh-wick-test", None).expect("cronet engine should start");
+        let engine = Engine::new(&storage, "pleb-test", None).expect("cronet engine should start");
 
         let err_large = engine
             .get(&format!("{base}/large"), &[], Duration::from_secs(5), 1024)

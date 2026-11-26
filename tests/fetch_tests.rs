@@ -1,13 +1,13 @@
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use mesh_wick::context::{RuntimeConfig, RuntimeContext};
-use mesh_wick::crawl::{crawl, map, CrawlOptions, MapOptions};
-use mesh_wick::extract::{ExtractMode, ExtractOptions, OutputFormat};
-use mesh_wick::fetch::{
+use pleb::context::{RuntimeConfig, RuntimeContext};
+use pleb::crawl::{crawl, map, CrawlOptions, MapOptions};
+use pleb::extract::{ExtractMode, ExtractOptions, OutputFormat};
+use pleb::fetch::{
     batch_exit_code, fetch_batch, fetch_document, fetch_raw, parse_batch_stdin, BatchFetchOptions,
     BatchItemResult, FetchError, FetchOptions,
 };
-use mesh_wick::policy::{
+use pleb::policy::{
     parse_markdown_link_header, resolve_raw_source_candidate, RawSourceKind, RenderMode, SourceMode,
 };
 use std::io::Write;
@@ -25,7 +25,7 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new() -> Self {
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = PathBuf::from(format!("/tmp/wick-t-{}-{}", std::process::id(), seq));
+        let dir = PathBuf::from(format!("/tmp/pleb-t-{}-{}", std::process::id(), seq));
         std::fs::create_dir_all(&dir).unwrap();
         #[cfg(unix)]
         {
@@ -988,12 +988,12 @@ async fn cef_challenge_interstitial_fails_fast_without_retry() {
     let state_dir = temp_state_dir();
     let cef_dir = state_dir.path().join("cef");
     std::fs::create_dir_all(&cef_dir).unwrap();
-    let renderer_bin = cef_dir.join("wick-renderer");
+    let renderer_bin = cef_dir.join("pleb-renderer");
     let count_file = state_dir.path().join("invocations.log");
 
     let script = format!(
         r#"#!/usr/bin/env python3
-# WICK_RENDERER_PROTOCOL=v5-meta
+# PLEB_RENDERER_PROTOCOL=v5-meta
 import json, sys
 
 count_path = {count_path:?}
@@ -1086,12 +1086,12 @@ async fn auto_mode_fails_fast_on_cronet_challenge_without_escalating_to_cef() {
     let state_dir = temp_state_dir();
     let cef_dir = state_dir.path().join("cef");
     std::fs::create_dir_all(&cef_dir).unwrap();
-    let renderer_bin = cef_dir.join("wick-renderer");
+    let renderer_bin = cef_dir.join("pleb-renderer");
     let count_file = state_dir.path().join("auto_challenge_cef.log");
 
     let script = format!(
         r#"#!/usr/bin/env python3
-# WICK_RENDERER_PROTOCOL=v5-meta
+# PLEB_RENDERER_PROTOCOL=v5-meta
 import json, sys
 
 with open({count_path:?}, "a") as f:
@@ -1143,12 +1143,12 @@ async fn adversarial_cef_transient_empty_render_retries_once_and_succeeds() {
     let state_dir = temp_state_dir();
     let cef_dir = state_dir.path().join("cef");
     std::fs::create_dir_all(&cef_dir).unwrap();
-    let renderer_bin = cef_dir.join("wick-renderer");
+    let renderer_bin = cef_dir.join("pleb-renderer");
     let count_file = state_dir.path().join("retry_invocations.log");
 
     let script = format!(
         r#"#!/usr/bin/env python3
-# WICK_RENDERER_PROTOCOL=v5-meta
+# PLEB_RENDERER_PROTOCOL=v5-meta
 import json, sys
 
 count_path = {count_path:?}
@@ -1675,9 +1675,9 @@ async fn adversarial_source_mirror_404_binary_fallback_ssrf_and_forge_binary_ski
 
 #[tokio::test]
 async fn fetch_staged_asset_and_session_clear_artifact_lifecycle() {
-    use mesh_wick::artifacts::{evict_artifacts_over_budget, stage_artifact};
-    use mesh_wick::context::clear_state_dir;
-    use mesh_wick::fetch::fetch_staged_asset;
+    use pleb::artifacts::{evict_artifacts_over_budget, stage_artifact};
+    use pleb::context::clear_state_dir;
+    use pleb::fetch::fetch_staged_asset;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1780,8 +1780,8 @@ async fn fetch_staged_asset_and_session_clear_artifact_lifecycle() {
 
 #[test]
 fn adversarial_artifact_staging_traversal_bom_html_magic_mismatch_and_perms() {
-    use mesh_wick::artifacts::stage_artifact;
-    use mesh_wick::extract::ResourceKind;
+    use pleb::artifacts::stage_artifact;
+    use pleb::extract::ResourceKind;
 
     let state_dir = temp_state_dir();
     let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";

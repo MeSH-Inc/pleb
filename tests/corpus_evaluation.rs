@@ -1,8 +1,8 @@
-use mesh_wick::extract::{
+use pleb::extract::{
     decode_text_bytes, detect_binary_content, extract_document_parsed, is_html_content_type,
     ExtractMode, ExtractOptions, OutputFormat, ParsedHtml, ResourceKind,
 };
-use mesh_wick::policy::{classify_response_with_context, ResponseClassification};
+use pleb::policy::{classify_response_with_context, ResponseClassification};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -348,9 +348,9 @@ fn evaluate_fixture(path: &Path) -> (String, FixtureSpec, FixtureOutcome) {
         .expect("header newline");
     let header = std::str::from_utf8(&raw[..nl]).expect("utf8 header").trim();
     let json = header
-        .strip_prefix("<!-- wick-fixture:")
+        .strip_prefix("<!-- pleb-fixture:")
         .and_then(|s| s.strip_suffix("-->"))
-        .expect("wick-fixture frontmatter")
+        .expect("pleb-fixture frontmatter")
         .trim();
     let spec: FixtureSpec = serde_json::from_str(json).expect("valid fixture json");
     let body_bytes = &raw[nl + 1..];

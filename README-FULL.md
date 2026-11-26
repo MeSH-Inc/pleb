@@ -1,6 +1,6 @@
-# MeSH-wick — Full Documentation
+# pleb — Full Documentation
 
-MeSH-wick, maintained by Memory Sync Hub LLC, is a local, zero-telemetry web acquisition and search CLI (`wick`) and Rust library (`mesh_wick`, Cargo package `mesh-wick`) for AI agents, forked from [wickproject/wick](https://github.com/wickproject/wick). For a short overview and quick start, see [README.md](README.md).
+`pleb`, maintained by Memory Sync Hub LLC, is a local, zero-telemetry web acquisition and search CLI (`pleb`) and Rust library (`pleb`, Cargo package `pleb`) for AI agents, forked from [wickproject/wick](https://github.com/wickproject/wick). For a short overview and quick start, see [README.md](README.md).
 
 ## Contents
 
@@ -23,20 +23,20 @@ MeSH-wick, maintained by Memory Sync Hub LLC, is a local, zero-telemetry web acq
 
 ## Overview and Design Boundaries
 
-MeSH-wick acquires public web documents over browser-grade network and offscreen-rendering transports and emits compact, structurally faithful Markdown, plain text, HTML, or raw bytes with deterministic metadata and exit codes.
+`pleb` acquires public web documents over browser-grade network and offscreen-rendering transports and emits compact, structurally faithful Markdown, plain text, HTML, or raw bytes with deterministic metadata and exit codes.
 
 Key capabilities beyond upstream `wickproject/wick`:
 
 - **Zero telemetry and local-only configuration**: All upstream telemetry pings and remote `site-rules.json` sync calls are removed. Per-site routing rules are bundled statically and optionally overlaid from `<state_dir>/site-rules.json`.
-- **Unified warm transport daemon (`daemon.sock`, protocol `3`)**: Shares persistent Cronet engines and warm CEF renderer processes across invocations, partitioned by proxy configuration, with automatic restart on binary rebuild (`WICK_BUILD_ID`).
+- **Unified warm transport daemon (`daemon.sock`, protocol `3`)**: Shares persistent Cronet engines and warm CEF renderer processes across invocations, partitioned by proxy configuration, with automatic restart on binary rebuild (`PLEB_BUILD_ID`).
 - **CEF `v5-meta` offscreen renderer**: Reports real HTTP status codes, final redirect URLs, and typed transport error kinds over a framed stdio protocol, using subresource and `MutationObserver` quiet-window readiness.
 - **Structured source negotiation and first-class non-HTML parsing**: Rewrites GitHub, GitLab, and Gist pages to raw source, follows advertised Markdown mirrors, negotiates `text/markdown`, converts RSS/Atom/JSON feeds to Markdown digests, extracts YouTube metadata and captions, and cleans WebVTT/SRT transcripts.
 - **Single-parse `O(N)` DOM extraction and zero-fetch resource indexing**: Prunes chrome, rescues code tables, math, and SVG labels, indexes high-salience linked assets without extra requests, and stages binary artifacts on demand with magic-byte verification.
-- **Multi-provider search and local credential storage (`wick auth`)**: Balances queries across `brave`, `tavily`, `serper`, `exa`, `searxng`, `duckduckgo`, and `federated` modes with cooldown tracking, burst pacing, intent routing, and tool-owned credentials.
+- **Multi-provider search and local credential storage (`pleb auth`)**: Balances queries across `brave`, `tavily`, `serper`, `exa`, `searxng`, `duckduckgo`, and `federated` modes with cooldown tracking, burst pacing, intent routing, and tool-owned credentials.
 
 ### Behavioral Boundaries
 
-MeSH-wick does not solve CAPTCHAs, click challenge widgets, or inject anti-bot evasion scripts. When an origin returns an active bot challenge, `wick` classifies it immediately into a challenge error (exit code `2`) without issuing duplicate CEF retries.
+`pleb` does not solve CAPTCHAs, click challenge widgets, or inject anti-bot evasion scripts. When an origin returns an active bot challenge, `pleb` classifies it immediately into a challenge error (exit code `2`) without issuing duplicate CEF retries.
 
 ---
 
@@ -47,7 +47,7 @@ MeSH-wick does not solve CAPTCHAs, click challenge widgets, or inject anti-bot e
 - Rust toolchain `1.89` or newer (`Cargo.toml` sets `rust-version = "1.89"`).
 - C/Objective-C compiler (`clang` on macOS, `gcc` on Linux) when building with Cronet or the optional CEF renderer.
 
-### Building and Installing `wick`
+### Building and Installing `pleb`
 
 With Cronet on macOS Apple Silicon (recommended):
 
@@ -69,25 +69,25 @@ Without Cronet (`reqwest` with `rustls` TLS fallback):
 cargo build --release
 ```
 
-`cargo install --path . --features cronet --locked` builds the `mesh-wick` crate and installs the `wick` binary onto `PATH`. Because `daemon.sock` checks the compile-time `WICK_BUILD_ID` on each connection, an older running daemon restarts automatically after reinstall.
+`cargo install --path . --features cronet --locked` builds the `pleb` crate and installs the `pleb` binary onto `PATH`. Because `daemon.sock` checks the compile-time `PLEB_BUILD_ID` on each connection, an older running daemon restarts automatically after reinstall.
 
 ### Optional CEF Renderer (`v5-meta`)
 
 To render JavaScript-heavy pages and automatically escalate blocked (`403`/`503`) or unhydrated SPA responses in `--render auto` mode, build and install the offscreen CEF `v5-meta` renderer:
 
 ```bash
-# macOS Apple Silicon (installs ~/.mesh-wick/cef/wick-renderer.app)
+# macOS Apple Silicon (installs ~/.pleb/cef/pleb-renderer.app)
 bash scripts/install-cef-mac.sh --force
 
-# Linux x86_64 or aarch64 (installs ~/.mesh-wick/cef/wick-renderer and wick-helper)
+# Linux x86_64 or aarch64 (installs ~/.pleb/cef/pleb-renderer and pleb-helper)
 bash scripts/install-cef-linux.sh --force
 ```
 
-Both installers accept `--prefix <dir>` to install into an isolated directory rather than `${MESH_WICK_HOME:-$HOME/.mesh-wick}/cef`. Before upgrading an existing CEF install while a daemon is running, stop the daemon first (`wick daemon stop || true`).
+Both installers accept `--prefix <dir>` to install into an isolated directory rather than `${PLEB_HOME:-$HOME/.pleb}/cef`. Before upgrading an existing CEF install while a daemon is running, stop the daemon first (`pleb daemon stop || true`).
 
 ### Agent Skill Installation
 
-The repository ships a version-locked agent reference at [skills/mesh-wick/SKILL.md](skills/mesh-wick/SKILL.md), embedded directly into the `wick` binary (`wick skill print`). To symlink it into local agent harness directories (`~/.agents`, `~/.gemini`, `~/.claude`, `~/.codex`, `~/.config/opencode`):
+The repository ships a version-locked agent reference at [skills/pleb/SKILL.md](skills/pleb/SKILL.md), embedded directly into the `pleb` binary (`pleb skill print`). To symlink it into local agent harness directories (`~/.agents`, `~/.gemini`, `~/.claude`, `~/.codex`, `~/.config/opencode`):
 
 ```bash
 bash scripts/install-skill.sh
@@ -96,8 +96,8 @@ bash scripts/install-skill.sh
 ### Verifying the Installation
 
 ```bash
-wick status
-wick status --json
+pleb status
+pleb status --json
 ```
 
 Healthy local installations report `"cronet_enabled": true`, `"cef_renderer": { "status": "ready", "expected_protocol": "v5-meta" }` (when CEF is installed), daemon status, active state directory, and configured search providers.
@@ -140,10 +140,10 @@ CLI / Library Call
 | Path | Responsibility |
 | :--- | :--- |
 | `src/main.rs` | `clap` CLI definition, subcommand dispatch, TTY/stdin secret reading, JSON/text output and error envelopes |
-| `src/lib.rs` | Public Rust library surface (`mesh_wick`) exposing all subsystems |
+| `src/lib.rs` | Public Rust library surface (`pleb`) exposing all subsystems |
 | `src/context.rs` | `RuntimeConfig`, `RuntimeContext`, private directory/lock helpers (`0o700`/`0o600`), atomic writes, and `session clear` |
 | `src/fetch.rs` | Single-URL, raw, direct-stage, and concurrent batch fetch orchestration, resource enrichment, and `FetchError` exit mapping |
-| `src/crawl.rs` | Bounded concurrent wave crawler (`wick crawl`) and sitemap/`robots.txt` URL mapper (`wick map`) |
+| `src/crawl.rs` | Bounded concurrent wave crawler (`pleb crawl`) and sitemap/`robots.txt` URL mapper (`pleb map`) |
 | `src/transport/` | `TransportClient`, Chrome 154 User-Agent and greased `Sec-Ch-Ua` headers, Cronet FFI (`cronet.rs`, `cronet_ffi.rs`), CEF process/probe manager (`cef.rs`), typed `TransportError` |
 | `src/daemon/` | Persistent Unix-socket transport daemon (`protocol.rs`, `server.rs`, `client.rs`) handling `Ping`, `Shutdown`, `HttpGet`, and `CefRender` |
 | `src/policy/` | Response classifier (`classify.rs`), strategy planner (`mod.rs`), host/mirror/raw-source resolver (`source.rs`), `site-rules.json` loader (`rules.rs`), per-site strategy cache (`cache.rs`), and `robots.txt` cache (`robots.rs`) |
@@ -154,7 +154,7 @@ CLI / Library Call
 | `cef/` | C/Objective-C sources for the `v5-meta` offscreen CEF renderer and helper (`protocol.h`, `browser_environment.h`, `renderer_core.h`, `helper_core.h`, macOS `.m` and Linux `.c` entrypoints) |
 | `data/site-rules.json` | Bundled structural host rewrite and mandatory CEF overrides |
 | `scripts/` | Cronet downloaders, CEF build/install scripts, and agent skill symlink installer |
-| `skills/mesh-wick/SKILL.md` | Canonical version-locked skill embedded in `wick skill print` |
+| `skills/pleb/SKILL.md` | Canonical version-locked skill embedded in `pleb skill print` |
 | `docs/` | Milestone architecture specifications (`01` through `05`) |
 | `tests/` | Integration suites, CLI/parity checks, and corpus fixtures (`tests/corpus/`, `tests/corpus_evaluation.rs`) |
 
@@ -164,26 +164,26 @@ CLI / Library Call
 
 ### Primary HTTP Transport (Cronet and `reqwest`)
 
-When compiled with `--features cronet`, `wick` links a prebuilt static/shared Chromium `154.0.8037.49` Cronet library (`darwin_arm64`, `linux_amd64`, or `linux_arm64`) to produce browser-identical TLS, HTTP/2, and QUIC fingerprints, paired with matching Chrome `154` `User-Agent`, greased `Sec-Ch-Ua`, `Accept-Encoding` (`gzip, deflate, br, zstd`), and navigation/subresource `Sec-Fetch-*` headers. Without `--features cronet`, `wick` falls back to `reqwest` (`rustls`).
+When compiled with `--features cronet`, `pleb` links a prebuilt static/shared Chromium `154.0.8037.49` Cronet library (`darwin_arm64`, `linux_amd64`, or `linux_arm64`) to produce browser-identical TLS, HTTP/2, and QUIC fingerprints, paired with matching Chrome `154` `User-Agent`, greased `Sec-Ch-Ua`, `Accept-Encoding` (`gzip, deflate, br, zstd`), and navigation/subresource `Sec-Fetch-*` headers. Without `--features cronet`, `pleb` falls back to `reqwest` (`rustls`).
 
 Both Cronet (`on_redirect_received`) and `reqwest` (`redirect::Policy`) enforce redirect-time SSRF protection: `3xx` hops must remain on `http`/`https`, public origins cannot pivot to loopback, RFC 1918, link-local/IMDS, or `.local`/`.internal` targets, and local origins are restricted to same-host hops. Disallowed redirects cancel immediately with a typed `redirect_blocked` transport error.
 
 ### Offscreen CEF Renderer (`v5-meta`)
 
-When installed at `<state_dir>/cef/wick-renderer.app` (macOS arm64) or `<state_dir>/cef/wick-renderer` (Linux `x86_64` or `aarch64`), or pointed to by `WICK_CEF_RENDERER`, `wick` verifies the embedded `WICK_RENDERER_PROTOCOL=v5-meta` marker before spawning the renderer. The renderer runs offscreen with:
+When installed at `<state_dir>/cef/pleb-renderer.app` (macOS arm64) or `<state_dir>/cef/pleb-renderer` (Linux `x86_64` or `aarch64`), or pointed to by `PLEB_CEF_RENDERER`, `pleb` verifies the embedded `PLEB_RENDERER_PROTOCOL=v5-meta` marker before spawning the renderer. The renderer runs offscreen with:
 
 - Native headless execution without Xvfb on Linux when `DISPLAY` is unset or empty (`--ozone-platform=headless` and `--password-store=basic`; `--use-mock-keychain` on macOS) to avoid X11 and keyring deadlocks.
 - Audio muted (`--mute-audio`) and autoplay suppressed.
 - Subresource completion plus `MutationObserver` quiet-window readiness (and optional `--wait-for-selector <css>`), dumping immediately when a short challenge interstitial is detected.
-- Minimal OSR viewport, screen, language, and optional `MESH_WICK_TIMEZONE` (`Intl.DateTimeFormat`) defaults.
+- Minimal OSR viewport, screen, language, and optional `PLEB_TIMEZONE` (`Intl.DateTimeFormat`) defaults.
 - Framed responses carrying real HTTP status codes, post-redirect final URLs, and typed error kinds (`timeout`, `load_error`, `invalid_selector`, `protocol_mismatch`).
 
 ### Response Classification and Strategy Escalation
 
 In `--render auto` mode (default):
 
-1. `wick` checks bundled and local `site-rules.json` (by default `reddit.com`/`www.reddit.com` rewrite to `old.reddit.com` over Cronet, and `x.com`/`twitter.com` route to CEF waiting for `article`), then consults `<state_dir>/site-cache.json`.
-2. Unless a rule or cached strategy selects CEF first, `wick` fetches via Cronet/`reqwest` and classifies the response:
+1. `pleb` checks bundled and local `site-rules.json` (by default `reddit.com`/`www.reddit.com` rewrite to `old.reddit.com` over Cronet, and `x.com`/`twitter.com` route to CEF waiting for `article`), then consults `<state_dir>/site-cache.json`.
+2. Unless a rule or cached strategy selects CEF first, `pleb` fetches via Cronet/`reqwest` and classifies the response:
    - `403`/`503` without an active bot challenge -> `Blocked` (escalates to CEF if available).
    - `403`/`503` or `200` interstitial matching an active bot challenge -> `Challenge` (fails fast with exit code `2`; no duplicate CEF retry).
    - `200` HTML with low prose volume matching an unhydrated SPA/JS shell -> `JavaScriptShell` (escalates to CEF if available).
@@ -196,21 +196,21 @@ Use `--render cef` (aliases: `browser`, `render`, `js`) to force Chromium render
 
 ### Unified Transport Daemon (`daemon.sock`)
 
-On Unix systems, `wick` automatically starts a background transport daemon bound to `<state_dir>/daemon.sock` (protocol version `3`, locked via `daemon.lock`, logging to `daemon.log`). The daemon:
+On Unix systems, `pleb` automatically starts a background transport daemon bound to `<state_dir>/daemon.sock` (protocol version `3`, locked via `daemon.lock`, logging to `daemon.log`). The daemon:
 
 - Reuses Cronet engines and warm CEF renderer processes across invocations.
 - Partitions persistent storage (`data/` and `cef-cache/`) by proxy configuration (`direct` or `proxy-<hash>`).
 - Serves `Ping`, `Shutdown`, `HttpGet`, and `CefRender` framed operations with up to `256 MiB` response framing, pre-dispatch protocol/build-ID checks, and immediate cancellation of in-flight CEF renders if the client disconnects.
-- Restarts automatically if the client binary's compile-time `WICK_BUILD_ID` differs from the running daemon.
+- Restarts automatically if the client binary's compile-time `PLEB_BUILD_ID` differs from the running daemon.
 - Exits automatically after `--daemon-idle-timeout` seconds of inactivity (default `300`).
 
-Pass `--no-daemon` (or set `MESH_WICK_NO_DAEMON=1`) to run transport in-process. If a daemon already owns `<state_dir>`, `--no-daemon` refuses to share the same state directory until you stop the daemon (`wick daemon stop`) or select an isolated `--state-dir`.
+Pass `--no-daemon` (or set `PLEB_NO_DAEMON=1`) to run transport in-process. If a daemon already owns `<state_dir>`, `--no-daemon` refuses to share the same state directory until you stop the daemon (`pleb daemon stop`) or select an isolated `--state-dir`.
 
 ---
 
 ## Extraction and Source Negotiation
 
-Raw HTML spends most of its bytes on navigation menus, hidden popovers, cookie banners, tracking query parameters, code-gutter tables, and duplicate visual spans that waste context tokens. In its default mode (`--extract clean --source auto --resources none`), `wick fetch` runs a deterministic, single-parse `O(N)` pipeline before emitting Markdown or plain text.
+Raw HTML spends most of its bytes on navigation menus, hidden popovers, cookie banners, tracking query parameters, code-gutter tables, and duplicate visual spans that waste context tokens. In its default mode (`--extract clean --source auto --resources none`), `pleb fetch` runs a deterministic, single-parse `O(N)` pipeline before emitting Markdown or plain text.
 
 ### Structured Source Negotiation (`--source`)
 
@@ -267,7 +267,7 @@ Given a `2,551`-byte HTML page containing skip navigation, a cookie banner, `<na
         <tr><td class="hljs-ln-numbers" data-line-number="3">3</td><td><code>}</code></td></tr>
       </tbody></table>
     </div>
-    <pre><button type="button">Copy</button><code class="language-bash">wick fetch --max-bytes 4096 https://docs.example.com/replication</code></pre>
+    <pre><button type="button">Copy</button><code class="language-bash">pleb fetch --max-bytes 4096 https://docs.example.com/replication</code></pre>
     <button aria-label="Close"><svg class="octicon" width="16" height="16"><text>x</text></svg></button>
     <p><svg role="img" aria-label="Write Path" width="520" height="160">
       <text>Leader</text><text>Quorum</text><text>Commit Log</text>
@@ -284,7 +284,7 @@ Given a `2,551`-byte HTML page containing skip navigation, a cookie banner, `<na
 </html>
 ```
 
-`wick fetch` reduces this to `590` bytes (`76.9%` smaller) on `stdout`, plus a zero-request resource cue on `stderr`:
+`pleb fetch` reduces this to `590` bytes (`76.9%` smaller) on `stdout`, plus a zero-request resource cue on `stderr`:
 
 ````markdown
 # Replication Notes
@@ -300,7 +300,7 @@ pub fn hash(data: &[u8]) -> u64 {
 ```
 
 ```bash
-wick fetch --max-bytes 4096 https://docs.example.com/replication
+pleb fetch --max-bytes 4096 https://docs.example.com/replication
 ```
 
 [Diagram: Write Path — Leader, Quorum, Commit Log]
@@ -334,7 +334,7 @@ Resources: 1 diagram (r1) — pass --resources manifest or --stage-resources <id
 
 ## Resource Indexing and Staging
 
-During its single `O(N)` DOM pass, `wick fetch` indexes linked non-prose resources (`diagram`, `image`, `transcript`, `document`, `dataset`, `schema`) and assigns deterministic IDs (`r1`, `r2`, ...) with `section_heading`, `label`, `dimensions`, and `salience` metadata while making zero subresource network requests. Inline content `<svg>` diagrams also rescue readable `<text>` labels directly into Markdown (`[Diagram: ...]`).
+During its single `O(N)` DOM pass, `pleb fetch` indexes linked non-prose resources (`diagram`, `image`, `transcript`, `document`, `dataset`, `schema`) and assigns deterministic IDs (`r1`, `r2`, ...) with `section_heading`, `label`, `dimensions`, and `salience` metadata while making zero subresource network requests. Inline content `<svg>` diagrams also rescue readable `<text>` labels directly into Markdown (`[Diagram: ...]`).
 
 ### Resource Policies (`--resources`)
 
@@ -354,7 +354,7 @@ During its single `O(N)` DOM pass, `wick fetch` indexes linked non-prose resourc
 
 ### Artifact Store Contract
 
-Staged files are written atomically to `<state_dir>/artifacts/<hash>-<name>.<ext>` (`0o600`, `256 MiB` LRU eviction budget). Before staging a binary asset, `wick` checks magic bytes and rejects disguised HTML soft-404 responses.
+Staged files are written atomically to `<state_dir>/artifacts/<hash>-<name>.<ext>` (`0o600`, `256 MiB` LRU eviction budget). Before staging a binary asset, `pleb` checks magic bytes and rejects disguised HTML soft-404 responses.
 
 ---
 
@@ -362,7 +362,7 @@ Staged files are written atomically to `<state_dir>/artifacts/<hash>-<name>.<ext
 
 ### Search Providers and Routing
 
-`wick search` supports six concrete providers (`brave`, `tavily`, `serper`, `exa`, `searxng`, and zero-key `duckduckgo` / `ddg`) plus two orchestration modes (`auto` and `federated`):
+`pleb search` supports six concrete providers (`brave`, `tavily`, `serper`, `exa`, `searxng`, and zero-key `duckduckgo` / `ddg`) plus two orchestration modes (`auto` and `federated`):
 
 - **`--provider auto` *(default)***: Routes queries to the highest-priority configured and healthy provider according to `--mode`, `--extra-snippets`, and query shape, falling back to `duckduckgo` if no API provider is configured or all configured providers fail:
   - `--mode semantic`: `exa -> tavily -> brave -> serper -> searxng -> duckduckgo`
@@ -373,35 +373,35 @@ Staged files are written atomically to `<state_dir>/artifacts/<hash>-<name>.<ext
 
 Provider health, monthly UTC request counts, error cooldowns, and Brave burst pacing (`1100ms` window, spilling to the next healthy provider in `auto` mode) are tracked in `<state_dir>/search-state.json` under an exclusive `search-state.lock`.
 
-### Credential Storage (`wick auth`)
+### Credential Storage (`pleb auth`)
 
 Store provider API keys or SearXNG URLs locally without exporting secrets in shell profiles or passing them on the command line:
 
 ```bash
-wick auth set brave
-op read "op://Vault/Tavily/credential" | wick auth set tavily --stdin
-wick auth set searxng --stdin --storage file <<< "http://127.0.0.1:8888"
-wick auth status
-wick auth status --json
-wick auth remove tavily
+pleb auth set brave
+op read "op://Vault/Tavily/credential" | pleb auth set tavily --stdin
+pleb auth set searxng --stdin --storage file <<< "http://127.0.0.1:8888"
+pleb auth status
+pleb auth status --json
+pleb auth remove tavily
 ```
 
-- **Resolution precedence**: Environment variable (`BRAVE_API_KEY`, `TAVILY_API_KEY`, `SERPER_API_KEY`, `EXA_API_KEY`, `SEARXNG_URL`) -> macOS Keychain (service `mesh-wick`, skipped when `WICK_NO_KEYCHAIN=1`) -> `<state_dir>/credentials.json` (`0o600`).
-- **Input hygiene**: `wick auth set` never accepts secrets as positional arguments. Interactive mode reads from `/dev/tty` with echo disabled; `--stdin` accepts a single line of printable ASCII up to `4096` bytes. In-memory secret buffers are zeroized on drop, and `wick auth status` never prints secret values, URLs, prefixes, or lengths.
-- **Cooldown reset**: `wick auth set` and `wick auth remove` clear any stale cooldown entry for that provider. `wick auth remove` warns on `stderr` if the provider's environment variable is still set.
+- **Resolution precedence**: Environment variable (`BRAVE_API_KEY`, `TAVILY_API_KEY`, `SERPER_API_KEY`, `EXA_API_KEY`, `SEARXNG_URL`) -> macOS Keychain (service `pleb`, skipped when `PLEB_NO_KEYCHAIN=1`) -> `<state_dir>/credentials.json` (`0o600`).
+- **Input hygiene**: `pleb auth set` never accepts secrets as positional arguments. Interactive mode reads from `/dev/tty` with echo disabled; `--stdin` accepts a single line of printable ASCII up to `4096` bytes. In-memory secret buffers are zeroized on drop, and `pleb auth status` never prints secret values, URLs, prefixes, or lengths.
+- **Cooldown reset**: `pleb auth set` and `pleb auth remove` clear any stale cooldown entry for that provider. `pleb auth remove` warns on `stderr` if the provider's environment variable is still set.
 
 ---
 
 ## Crawl and Map
 
-Both `wick crawl` and `wick map` respect `robots.txt` by default (pass `--no-robots` to override):
+Both `pleb crawl` and `pleb map` respect `robots.txt` by default (pass `--no-robots` to override):
 
-- **`wick crawl`**: Performs breadth-first crawling over same-origin HTML links using bounded concurrency (`4` workers), polite per-origin spacing (`100ms` default, or `robots.txt` `Crawl-delay` when present), post-redirect origin tracking, and deterministic output ordering. Caps `--depth` at `5` (default `2`) and `--max-pages` at `50` (default `10`).
-- **`wick map`**: Discovers site URLs from `robots.txt` `Sitemap:` directives, recursive `<sitemapindex>` trees (up to depth `3`, `64` sitemaps, `32 MiB` decompressed `.xml.gz` cap), and page links unless `--no-sitemap` is set. Caps `--limit` at `5000` (default `100`).
+- **`pleb crawl`**: Performs breadth-first crawling over same-origin HTML links using bounded concurrency (`4` workers), polite per-origin spacing (`100ms` default, or `robots.txt` `Crawl-delay` when present), post-redirect origin tracking, and deterministic output ordering. Caps `--depth` at `5` (default `2`) and `--max-pages` at `50` (default `10`).
+- **`pleb map`**: Discovers site URLs from `robots.txt` `Sitemap:` directives, recursive `<sitemapindex>` trees (up to depth `3`, `64` sitemaps, `32 MiB` decompressed `.xml.gz` cap), and page links unless `--no-sitemap` is set. Caps `--limit` at `5000` (default `100`).
 
 ```bash
-wick crawl https://docs.example.com --depth 2 --max-pages 10 --path-filter /guide
-wick map https://example.com --limit 100
+pleb crawl https://docs.example.com --depth 2 --max-pages 10 --path-filter /guide
+pleb map https://example.com --limit 100
 ```
 
 ---
@@ -412,31 +412,31 @@ wick map https://example.com --limit 100
 
 | Flag | Environment Variable | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `--proxy <URL>` | `MESH_WICK_PROXY` | none | SOCKS5 or HTTP proxy URL |
+| `--proxy <URL>` | `PLEB_PROXY` | none | SOCKS5 or HTTP proxy URL |
 | `--timeout <SECS>` | — | `30` | Network request timeout in seconds |
 | `--max-response-bytes <BYTES>` | — | `16 MiB` doc / `128 MiB` raw | Maximum HTTP response body size |
 | `--cef-timeout <SECS>` | — | `60` | CEF render timeout in seconds |
-| `--state-dir <DIR>` | `MESH_WICK_HOME` | `~/.mesh-wick` | Private (`0o700`) local cache and state directory |
-| `--no-daemon` | `MESH_WICK_NO_DAEMON` | `false` | Bypass `daemon.sock` and run transport in-process |
-| `--daemon-idle-timeout <SECS>` | `MESH_WICK_DAEMON_IDLE_SECONDS` | `300` | Idle exit timeout for the background transport daemon |
-| `-v`, `--verbose` | — | `false` | Enable debug tracing (`mesh_wick=debug`) to `stderr` |
+| `--state-dir <DIR>` | `PLEB_HOME` | `~/.pleb` | Private (`0o700`) local cache and state directory |
+| `--no-daemon` | `PLEB_NO_DAEMON` | `false` | Bypass `daemon.sock` and run transport in-process |
+| `--daemon-idle-timeout <SECS>` | `PLEB_DAEMON_IDLE_SECONDS` | `300` | Idle exit timeout for the background transport daemon |
+| `-v`, `--verbose` | — | `false` | Enable debug tracing (`pleb=debug`) to `stderr` |
 | `-q`, `--quiet` | — | `false` | Suppress non-error status lines on `stderr` |
 | `--json` | — | `false` | Emit structured JSON on `stdout` and JSON error envelopes on `stderr` |
 
-### `wick fetch`
+### `pleb fetch`
 
 Fetch one or more `http`/`https` URLs, or pass `-` to read newline-separated URLs from `stdin` (blank lines and `#` comments are ignored).
 
 ```bash
-wick fetch https://example.com
-wick fetch --extract article --no-images https://example.com/post
-wick fetch --render cef --wait-for-selector "article" https://x.com/user
-wick fetch --format text https://news.ycombinator.com
-wick fetch --format raw --output doc.pdf https://example.com/doc.pdf
-wick fetch --stage --referer https://example.com/guide https://example.com/arch.png
-wick fetch --json --metadata-only https://example.com
-wick fetch --jsonl --concurrency 4 https://example.com https://example.org
-wick search --urls-only "rust async runtime" | wick fetch -
+pleb fetch https://example.com
+pleb fetch --extract article --no-images https://example.com/post
+pleb fetch --render cef --wait-for-selector "article" https://x.com/user
+pleb fetch --format text https://news.ycombinator.com
+pleb fetch --format raw --output doc.pdf https://example.com/doc.pdf
+pleb fetch --stage --referer https://example.com/guide https://example.com/arch.png
+pleb fetch --json --metadata-only https://example.com
+pleb fetch --jsonl --concurrency 4 https://example.com https://example.org
+pleb search --urls-only "rust async runtime" | pleb fetch -
 ```
 
 | Flag | Values / Default | Notes |
@@ -461,16 +461,16 @@ wick search --urls-only "rust async runtime" | wick fetch -
 
 In batch mode (`2+` URLs or `-` on `stdin`), default Markdown output emits numbered `## [i/N]` sections, `--json` emits an input-ordered JSON array, and `--jsonl` streams completion-ordered JSON lines.
 
-### `wick search`
+### `pleb search`
 
 ```bash
-wick search "rust async runtime" -n 8
-wick search --mode exact "E0382 borrow checker"
-wick search --mode semantic "local-first crdt sync architectures"
-wick search --provider federated --json "cronet tls fingerprint"
-wick search --provider duckduckgo --json "cronet tls fingerprint"
-wick search --site docs.rs --freshness month --urls-only "tokio"
-wick search --extra-snippets "cronet http2"
+pleb search "rust async runtime" -n 8
+pleb search --mode exact "E0382 borrow checker"
+pleb search --mode semantic "local-first crdt sync architectures"
+pleb search --provider federated --json "cronet tls fingerprint"
+pleb search --provider duckduckgo --json "cronet tls fingerprint"
+pleb search --site docs.rs --freshness month --urls-only "tokio"
+pleb search --extra-snippets "cronet http2"
 ```
 
 | Flag | Values / Default | Notes |
@@ -483,23 +483,23 @@ wick search --extra-snippets "cronet http2"
 | `--extra-snippets` | flag | Requests additional snippet excerpts from supported providers. |
 | `--urls-only` | flag | Prints one bare URL per line (empty `stdout` on zero results; conflicts with `--json`). |
 
-### `wick auth`
+### `pleb auth`
 
 | Subcommand | Description |
 | :--- | :--- |
-| `wick auth set <brave\|tavily\|serper\|exa\|searxng> [--stdin] [--storage <auto\|keychain\|file>]` | Stores a credential via hidden TTY prompt or `--stdin` and clears stale provider cooldowns. |
-| `wick auth remove <brave\|tavily\|serper\|exa\|searxng> [--storage <auto\|keychain\|file>]` | Deletes stored credentials, clears cooldowns, and warns if an env var still overrides the provider. |
-| `wick auth status` | Reports configuration source, monthly request count, cooldown remaining, and last HTTP error status per provider (supports `--json`). |
+| `pleb auth set <brave\|tavily\|serper\|exa\|searxng> [--stdin] [--storage <auto\|keychain\|file>]` | Stores a credential via hidden TTY prompt or `--stdin` and clears stale provider cooldowns. |
+| `pleb auth remove <brave\|tavily\|serper\|exa\|searxng> [--storage <auto\|keychain\|file>]` | Deletes stored credentials, clears cooldowns, and warns if an env var still overrides the provider. |
+| `pleb auth status` | Reports configuration source, monthly request count, cooldown remaining, and last HTTP error status per provider (supports `--json`). |
 
-### `wick crawl` and `wick map`
+### `pleb crawl` and `pleb map`
 
 | Command / Flag | Default / Limit | Description |
 | :--- | :--- | :--- |
-| `wick crawl <URL>` | — | Crawl same-origin pages into Markdown or JSON (`--json`). |
+| `pleb crawl <URL>` | — | Crawl same-origin pages into Markdown or JSON (`--json`). |
 | `-d`, `--depth <N>` | `2` *(max `5`)* | Maximum link depth from seed URL (`crawl`). |
 | `-n`, `--max-pages <N>` | `10` *(max `50`)* | Maximum pages to fetch (`crawl`). |
 | `--extract <MODE>` | `clean` | Extraction scope (`clean`, `article`, `full`) (`crawl`). |
-| `wick map <URL>` | — | List discovered URLs via sitemap and link discovery (`--json` supported). |
+| `pleb map <URL>` | — | List discovered URLs via sitemap and link discovery (`--json` supported). |
 | `-n`, `--limit <N>` | `100` *(max `5000`)* | Maximum URLs to discover (`map`). |
 | `--no-sitemap` | `false` | Skip `sitemap.xml` / `robots.txt` sitemap discovery (`map`). |
 | `--path-filter <PREFIX>` | none | Restrict to URLs whose path starts with `<PREFIX>` (`crawl`, `map`). |
@@ -508,12 +508,12 @@ wick search --extra-snippets "cronet http2"
 ### Daemon, Session, Status, and Skill Commands
 
 ```bash
-wick status                 # Binary, Cronet, CEF, daemon, state dir, search providers (--json supported)
-wick daemon status          # Transport daemon status (--json supported)
-wick daemon stop            # Stop the running transport daemon (--json supported)
-wick daemon run             # Run daemon in foreground (auto-started on demand; honors --daemon-idle-timeout)
-wick session clear          # Stop daemon and clear caches/artifacts while preserving credentials and rules
-wick skill print            # Emit bundled skills/mesh-wick/SKILL.md (--json supported)
+pleb status                 # Binary, Cronet, CEF, daemon, state dir, search providers (--json supported)
+pleb daemon status          # Transport daemon status (--json supported)
+pleb daemon stop            # Stop the running transport daemon (--json supported)
+pleb daemon run             # Run daemon in foreground (auto-started on demand; honors --daemon-idle-timeout)
+pleb session clear          # Stop daemon and clear caches/artifacts while preserving credentials and rules
+pleb skill print            # Emit bundled skills/pleb/SKILL.md (--json supported)
 ```
 
 ---
@@ -524,21 +524,21 @@ wick skill print            # Emit bundled skills/mesh-wick/SKILL.md (--json sup
 
 | Variable | Effect |
 | :--- | :--- |
-| `MESH_WICK_HOME` | Default path for `--state-dir` (fallback: `~/.mesh-wick`). |
-| `MESH_WICK_PROXY` | Default value for `--proxy` (SOCKS5/HTTP proxy URL). |
-| `MESH_WICK_NO_DAEMON` | Default for `--no-daemon` (bypass `daemon.sock`). |
-| `MESH_WICK_DAEMON_IDLE_SECONDS` | Default for `--daemon-idle-timeout` (seconds, default `300`). |
-| `MESH_WICK_TIMEZONE` | Optional IANA timezone override injected into CEF `Intl.DateTimeFormat`. |
+| `PLEB_HOME` | Default path for `--state-dir` (fallback: `~/.pleb`). |
+| `PLEB_PROXY` | Default value for `--proxy` (SOCKS5/HTTP proxy URL). |
+| `PLEB_NO_DAEMON` | Default for `--no-daemon` (bypass `daemon.sock`). |
+| `PLEB_DAEMON_IDLE_SECONDS` | Default for `--daemon-idle-timeout` (seconds, default `300`). |
+| `PLEB_TIMEZONE` | Optional IANA timezone override injected into CEF `Intl.DateTimeFormat`. |
 | `BRAVE_API_KEY`, `TAVILY_API_KEY`, `SERPER_API_KEY`, `EXA_API_KEY`, `SEARXNG_URL` | Search provider credentials; take precedence over macOS Keychain and `<state_dir>/credentials.json`. |
-| `WICK_NO_KEYCHAIN=1` | Disables macOS Keychain reads/writes (forces `credentials.json` under `--storage auto`; required for hermetic tests). |
-| `WICK_CEF_RENDERER` | Explicit path to a `v5-meta` `wick-renderer` binary (overrides `<state_dir>/cef` discovery). |
-| `WICK_NO_HOME_CEF=1` | Disables fallback discovery of `~/.mesh-wick/cef` (used in hermetic tests). |
-| `WICK_DAEMON_EXECUTABLE` | Explicit path to the `wick` executable spawned when auto-starting the background daemon. |
+| `PLEB_NO_KEYCHAIN=1` | Disables macOS Keychain reads/writes (forces `credentials.json` under `--storage auto`; required for hermetic tests). |
+| `PLEB_CEF_RENDERER` | Explicit path to a `v5-meta` `pleb-renderer` binary (overrides `<state_dir>/cef` discovery). |
+| `PLEB_NO_HOME_CEF=1` | Disables fallback discovery of `~/.pleb/cef` (used in hermetic tests). |
+| `PLEB_DAEMON_EXECUTABLE` | Explicit path to the `pleb` executable spawned when auto-starting the background daemon. |
 | `RUST_LOG` | Overrides default `tracing` filter on `stderr`. |
 
 ### State Directory Layout (`<state_dir>`, mode `0o700`)
 
-| Path | Mode | Cleared by `wick session clear` | Purpose |
+| Path | Mode | Cleared by `pleb session clear` | Purpose |
 | :--- | :--- | :--- | :--- |
 | `data/` | `0o700` | Yes | Proxy-partitioned Cronet HTTP cache and cookies |
 | `cef-cache/` | `0o700` | Yes | Proxy-partitioned CEF browser profile/cache |
@@ -548,7 +548,7 @@ wick skill print            # Emit bundled skills/mesh-wick/SKILL.md (--json sup
 | `search-state.json` | `0o600` | Yes | Search provider cooldowns, burst timestamps, and monthly request counts |
 | `credentials.json` | `0o600` | **Preserved** | File-backed search provider credentials (Keychain items are also preserved) |
 | `site-rules.json` | user-managed | **Preserved** | Optional local host-routing overlay merged over bundled `data/site-rules.json` |
-| `cef/` | `0o700` | **Preserved** | Default install location for `wick-renderer.app` / `wick-renderer` |
+| `cef/` | `0o700` | **Preserved** | Default install location for `pleb-renderer.app` / `pleb-renderer` |
 
 ---
 
@@ -574,9 +574,9 @@ When `--json` or `--jsonl` is passed, CLI errors are emitted on `stderr` as a si
 
 ## JSON Output Schemas
 
-All `--json` and `--jsonl` payloads serialize directly from MeSH-wick's Rust output structs (`src/fetch.rs`, `src/extract/resources.rs`, `src/search/mod.rs`, `src/crawl.rs`, and `src/main.rs`).
+All `--json` and `--jsonl` payloads serialize directly from `pleb`'s Rust output structs (`src/fetch.rs`, `src/extract/resources.rs`, `src/search/mod.rs`, `src/crawl.rs`, and `src/main.rs`).
 
-### `FetchOutput` and `FetchMetadataOutput` (`wick fetch --json`)
+### `FetchOutput` and `FetchMetadataOutput` (`pleb fetch --json`)
 
 | Field | Type | Notes |
 | :--- | :--- | :--- |
@@ -593,14 +593,14 @@ All `--json` and `--jsonl` payloads serialize directly from MeSH-wick's Rust out
 | `timing_ms` | `number` | End-to-end fetch duration in milliseconds |
 | `resources` | `ResourceDescriptor[]` | Indexed linked resources (**omitted** when empty) |
 
-### `BatchItemResult` (`wick fetch --jsonl` and multi-URL `wick fetch --json`)
+### `BatchItemResult` (`pleb fetch --jsonl` and multi-URL `pleb fetch --json`)
 
 Multi-URL and `stdin` (`-`) fetches emit an array (`--json`) or newline-delimited stream (`--jsonl`) of untagged `BatchItemResult` objects discriminated by `ok`:
 
 - **Success (`ok: true`)**: `url`, `ok`, `final_url`, `status_code`, `content_type`, `title`, `strategy`, `escalated`, `truncated`, `timing_ms`, `content_bytes`, plus `content` (omitted with `--metadata-only`) and `resources` (omitted when empty).
 - **Failure (`ok: false`)**: `url`, `ok`, `error`, `kind`, `exit_code`.
 
-### `StagedAssetOutput` (`wick fetch --stage --json`)
+### `StagedAssetOutput` (`pleb fetch --stage --json`)
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
@@ -623,28 +623,28 @@ Multi-URL and `stdin` (`-`) fetches emit an array (`--json`) or newline-delimite
 | `dimensions` | `[number, number]` | Optional `[width, height]` pixels (omitted when absent) |
 | `staged_path`, `byte_count`, `content_type` | `string` / `number` | Populated after staging (omitted when not staged) |
 
-### `SearchResponse` and `SearchResult` (`wick search --json`)
+### `SearchResponse` and `SearchResult` (`pleb search --json`)
 
 - **`SearchResponse`**: `provider` (`string`), `providers_used` (`string[]`, omitted when empty), `results` (`SearchResult[]`).
 - **`SearchResult`**: `title` (`string`), `url` (`string`), `snippet` (`string`), `extra_snippets` (`string[]`, omitted when empty).
 
 ### `StatusJson`, `DaemonStatusJson`, and `SearchProviderStatus`
 
-- **`wick status --json`** (`StatusJson`): `version` (`string`), `cronet_enabled` (`boolean`), `cef_renderer` (`{ status, path, found_protocol, expected_protocol }`), `daemon` (`DaemonStatusJson`), `state_dir` (`string`), `search_providers` (map of provider name to `SearchProviderStatus`).
-- **`wick daemon status --json`** (`DaemonStatusJson`): `supported` (`boolean`), `running` (`boolean`), `pid` (`number | null`), `protocol_version` (`number | null`), `build_id` (`string | null`), `active_requests` (`number`), `cronet_slots` (`number`), `cef_renderers_alive` (`number`).
-- **`wick auth status --json`** (map of provider name to `SearchProviderStatus`): `configured` (`boolean`), `source` (`"environment" | "keychain" | "file" | null`), `cooldown_remaining_secs` (`number`), `month_requests` (`number`), `last_error_status` (`number | null`).
+- **`pleb status --json`** (`StatusJson`): `version` (`string`), `cronet_enabled` (`boolean`), `cef_renderer` (`{ status, path, found_protocol, expected_protocol }`), `daemon` (`DaemonStatusJson`), `state_dir` (`string`), `search_providers` (map of provider name to `SearchProviderStatus`).
+- **`pleb daemon status --json`** (`DaemonStatusJson`): `supported` (`boolean`), `running` (`boolean`), `pid` (`number | null`), `protocol_version` (`number | null`), `build_id` (`string | null`), `active_requests` (`number`), `cronet_slots` (`number`), `cef_renderers_alive` (`number`).
+- **`pleb auth status --json`** (map of provider name to `SearchProviderStatus`): `configured` (`boolean`), `source` (`"environment" | "keychain" | "file" | null`), `cooldown_remaining_secs` (`number`), `month_requests` (`number`), `last_error_status` (`number | null`).
 
 ### `CrawlResult`, `MapResult`, and Control Commands
 
 | Command (`--json`) | Schema Fields |
 | :--- | :--- |
-| `wick crawl` (`CrawlResult`) | `pages` (`[{ url, title, content, depth }]`), `urls_discovered`, `timing_ms` |
-| `wick map` (`MapResult`) | `urls` (`string[]`), `timing_ms`, `from_sitemap` |
-| `wick auth set` | `provider`, `stored`, `source` |
-| `wick auth remove` | `provider`, `removed`, `removed_from`, `env_var_still_set` |
-| `wick daemon stop` | `stopped` |
-| `wick session clear` | `cleared`, `state_dir` |
-| `wick skill print` | `name`, `version`, `content` |
+| `pleb crawl` (`CrawlResult`) | `pages` (`[{ url, title, content, depth }]`), `urls_discovered`, `timing_ms` |
+| `pleb map` (`MapResult`) | `urls` (`string[]`), `timing_ms`, `from_sitemap` |
+| `pleb auth set` | `provider`, `stored`, `source` |
+| `pleb auth remove` | `provider`, `removed`, `removed_from`, `env_var_still_set` |
+| `pleb daemon stop` | `stopped` |
+| `pleb session clear` | `cleared`, `state_dir` |
+| `pleb skill print` | `name`, `version`, `content` |
 
 ---
 
@@ -663,7 +663,7 @@ cargo test --test cef_protocol_tests -- --ignored  # opt-in live v5-meta CEF smo
 ### Corpus Evaluation and Hermetic Test Isolation
 
 - **Extraction corpus**: `tests/corpus/` holds sanitized HTML, Markdown, feed, and transcript fixtures tagged as `"ratchet"` (must pass at `1.000`) or `"frontier"` (tracked open targets), verified together with binary magic-byte guards by `tests/corpus_evaluation.rs`.
-- **Hermetic test boundaries**: Tests never touch `~/.mesh-wick` or macOS Keychain. Each test allocates a short temporary state directory under `/tmp/wick-t-<pid>-<seq>` (`0o700`, staying under the Unix `sun_path` socket length ceiling) and sets `WICK_NO_HOME_CEF=1` and `WICK_NO_KEYCHAIN=1`.
+- **Hermetic test boundaries**: Tests never touch `~/.pleb` or macOS Keychain. Each test allocates a short temporary state directory under `/tmp/pleb-t-<pid>-<seq>` (`0o700`, staying under the Unix `sun_path` socket length ceiling) and sets `PLEB_NO_HOME_CEF=1` and `PLEB_NO_KEYCHAIN=1`.
 
 ### Design Specifications and Contribution Rules
 
@@ -672,7 +672,7 @@ cargo test --test cef_protocol_tests -- --ignored  # opt-in live v5-meta CEF smo
 - [docs/02-swarm-hillclimb-protocol.md](docs/02-swarm-hillclimb-protocol.md) — Corpus evaluation and iterative quality-gate protocol.
 - [docs/03-structured-source-negotiation.md](docs/03-structured-source-negotiation.md) — Forge raw-source resolution, Markdown mirror negotiation, native Markdown, and feed extraction.
 - [docs/04-resource-indexing-and-staging.md](docs/04-resource-indexing-and-staging.md) — Resource salience indexing, SVG/transcript rescue, and content-addressed artifact staging.
-- [docs/05-multi-provider-search-and-auth.md](docs/05-multi-provider-search-and-auth.md) — `wick auth` credential storage and multi-provider search routing/federation.
+- [docs/05-multi-provider-search-and-auth.md](docs/05-multi-provider-search-and-auth.md) — `pleb auth` credential storage and multi-provider search routing/federation.
 
 ---
 

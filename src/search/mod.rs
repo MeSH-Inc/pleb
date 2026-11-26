@@ -589,7 +589,7 @@ async fn search_explicit(
             let resolved =
                 auth::resolve_credential(&ctx.config.state_dir, cp)?.ok_or_else(|| {
                     anyhow::anyhow!(
-                        "{} is not configured (set {} or run `wick auth set {}`)",
+                        "{} is not configured (set {} or run `pleb auth set {}`)",
                         provider.as_str(),
                         cp.env_var(),
                         cp.as_str()
