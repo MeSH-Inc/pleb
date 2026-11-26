@@ -1,3 +1,4 @@
+pub mod axtree;
 pub mod charset;
 pub mod dom;
 pub mod feed;
@@ -6,6 +7,7 @@ pub mod native_markdown;
 pub mod resources;
 pub mod transcript;
 pub mod url;
+pub mod webmcp;
 pub mod youtube;
 
 pub use charset::decode_text_bytes;
@@ -14,6 +16,7 @@ pub use markdown::truncate_markdown;
 pub use resources::{
     format_resource_manifest_markdown, ResourceDescriptor, ResourceKind, ResourceSalience,
 };
+pub use webmcp::{WebMcpToolAnnotations, WebMcpToolDescriptor, WebMcpToolSource};
 
 use anyhow::{bail, Result};
 
@@ -27,6 +30,8 @@ pub enum OutputFormat {
     Html,
     #[value(alias = "txt")]
     Text,
+    #[value(alias = "ax")]
+    Axtree,
     Raw,
 }
 
@@ -65,6 +70,7 @@ pub struct ExtractedDocument {
     pub content: String,
     pub truncated: bool,
     pub resources: Vec<ResourceDescriptor>,
+    pub tools: Vec<WebMcpToolDescriptor>,
 }
 
 pub fn format_page_section(
@@ -102,6 +108,7 @@ pub fn wrap_raw_code_document(
             content,
             truncated,
             resources: Vec::new(),
+            tools: Vec::new(),
         };
     }
 
@@ -111,10 +118,11 @@ pub fn wrap_raw_code_document(
         content,
         truncated,
         resources: Vec::new(),
+        tools: Vec::new(),
     }
 }
 
-fn longest_backtick_run(s: &str) -> usize {
+pub(crate) fn longest_backtick_run(s: &str) -> usize {
     let mut best = 0usize;
     let mut current = 0usize;
     for b in s.bytes() {
@@ -159,6 +167,9 @@ pub fn extract_document_parsed(
     if options.format == OutputFormat::Raw {
         bail!("OutputFormat::Raw must use raw byte passthrough, not extract_document");
     }
+    if options.format == OutputFormat::Axtree {
+        bail!("OutputFormat::Axtree requires CDP Accessibility.getFullAXTree");
+    }
 
     let mime = extract_mime(content_type);
     if native_markdown::is_markdown_mime(mime.as_deref()) {
@@ -186,6 +197,7 @@ pub fn extract_document_parsed(
             content,
             truncated,
             resources: Vec::new(),
+            tools: Vec::new(),
         });
     }
 
@@ -193,6 +205,7 @@ pub fn extract_document_parsed(
         let doc = parsed.unwrap_or_else(|| ParsedHtml::parse(body));
         let title = doc.title();
         let effective_base = doc.effective_base_url(page_url);
+        let tools = doc.extract_webmcp_tools(page_url);
         let resources = doc.extract_resources(options.mode, &effective_base);
         let (content, truncated) = apply_utf8_limit(body, options.max_bytes);
         return Ok(ExtractedDocument {
@@ -200,12 +213,14 @@ pub fn extract_document_parsed(
             content,
             truncated,
             resources,
+            tools,
         });
     }
 
     let doc = parsed.unwrap_or_else(|| ParsedHtml::parse(body));
     let title = doc.title();
     let effective_base = doc.effective_base_url(page_url);
+    let tools = doc.extract_webmcp_tools(page_url);
 
     match options.format {
         OutputFormat::Text => {
@@ -220,6 +235,7 @@ pub fn extract_document_parsed(
                 content,
                 truncated,
                 resources,
+                tools,
             })
         }
         OutputFormat::Markdown => {
@@ -251,9 +267,10 @@ pub fn extract_document_parsed(
                 content,
                 truncated,
                 resources,
+                tools,
             })
         }
-        OutputFormat::Html | OutputFormat::Raw => unreachable!(),
+        OutputFormat::Html | OutputFormat::Raw | OutputFormat::Axtree => unreachable!(),
     }
 }
 

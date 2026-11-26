@@ -714,7 +714,7 @@ async fn transport_captures_multiple_link_headers_and_accept_markdown_direct_and
 
 #[tokio::test]
 async fn daemon_restarts_automatically_on_protocol_version_mismatch() {
-    assert_eq!(PROTOCOL_VERSION, 3);
+    assert_eq!(PROTOCOL_VERSION, 4);
     let (base, _, _) = spawn_daemon_test_server().await;
     let dir = TempStateDir::new();
     let sock = socket_path(dir.path());
@@ -774,8 +774,8 @@ async fn daemon_restarts_automatically_on_protocol_version_mismatch() {
     assert_eq!(resp.text(), "alpha");
     let status = daemon_ping(dir.path())
         .await
-        .expect("v3 daemon should be running");
-    assert_eq!(status.protocol_version, 3);
+        .expect("v4 daemon should be running");
+    assert_eq!(status.protocol_version, 4);
 
     let _ = mock_task.await;
     let _ = daemon_stop(dir.path()).await;
@@ -881,7 +881,7 @@ async fn transport_subresource_headers_and_referer_direct_and_daemon() {
         IMAGE_ACCEPT_HEADER,
     };
 
-    assert_eq!(PROTOCOL_VERSION, 3);
+    assert_eq!(PROTOCOL_VERSION, 4);
     let base = spawn_link_and_accept_server().await;
     let echo_url = format!("{base}/echo-accept");
 
@@ -897,6 +897,7 @@ async fn transport_subresource_headers_and_referer_direct_and_daemon() {
                     accept_markdown: false,
                     referer: Some(same_origin_ref.clone()),
                     subresource_dest: Some(SubresourceDest::Image),
+                    ..Default::default()
                 },
             )
             .await
@@ -930,6 +931,7 @@ async fn transport_subresource_headers_and_referer_direct_and_daemon() {
                     accept_markdown: false,
                     referer: Some(cross_site_ref.clone()),
                     subresource_dest: Some(SubresourceDest::Image),
+                    ..Default::default()
                 },
             )
             .await
@@ -952,6 +954,7 @@ async fn transport_subresource_headers_and_referer_direct_and_daemon() {
                     accept_markdown: false,
                     referer: None,
                     subresource_dest: Some(SubresourceDest::Asset),
+                    ..Default::default()
                 },
             )
             .await
@@ -994,7 +997,7 @@ async fn transport_subresource_headers_and_referer_direct_and_daemon() {
         .expect("direct transport should initialize");
     assert_client_subresource_headers(&direct, &base, &echo_url).await;
 
-    // Daemon-backed TransportClient over daemon.sock (PROTOCOL_VERSION == 3)
+    // Daemon-backed TransportClient over daemon.sock (PROTOCOL_VERSION == 4)
     let daemon_dir = TempStateDir::new();
     let daemon_dir_clone = daemon_dir.to_path_buf();
     let handle =
@@ -1103,6 +1106,7 @@ async fn adversarial_subresource_ssrf_referer_and_image_accept_precedence() {
                 accept_markdown: true,
                 referer: Some("https://docs.example.com/".to_string()),
                 subresource_dest: Some(SubresourceDest::Image),
+                ..Default::default()
             },
         )
         .await

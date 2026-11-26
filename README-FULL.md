@@ -31,7 +31,7 @@
 Key capabilities beyond upstream `wickproject/wick`:
 
 - **Zero telemetry and local-only configuration**: All upstream telemetry pings and remote `site-rules.json` sync calls are removed. Per-site routing rules are bundled statically and optionally overlaid from `<state_dir>/site-rules.json`.
-- **Unified warm transport daemon (`daemon.sock`, protocol `3`)**: Shares persistent Cronet engines and warm CEF renderer processes across invocations, partitioned by proxy configuration, with automatic restart on binary rebuild (`PLEB_BUILD_ID`).
+- **Unified warm transport daemon (`daemon.sock`, protocol `4`)**: Shares persistent Cronet engines and warm CEF renderer processes across invocations, partitioned by proxy configuration, with automatic restart on binary rebuild (`PLEB_BUILD_ID`).
 - **CEF `v5-meta` offscreen renderer**: Reports real HTTP status codes, final redirect URLs, and typed transport error kinds over a framed stdio protocol, using subresource and `MutationObserver` quiet-window readiness.
 - **Structured source negotiation and first-class non-HTML parsing**: Rewrites GitHub, GitLab, and Gist pages to raw source, follows advertised Markdown mirrors, negotiates `text/markdown`, converts RSS/Atom/JSON feeds to Markdown digests, extracts YouTube metadata and captions, and cleans WebVTT/SRT transcripts.
 - **Single-parse `O(N)` DOM extraction and zero-fetch resource indexing**: Prunes chrome, rescues code tables, math, and SVG labels, indexes high-salience linked assets without extra requests, and stages binary artifacts on demand with magic-byte verification.
@@ -177,7 +177,7 @@ CLI / Library Call
   │     • Select initial transport (Cronet vs. CEF via rules + site-cache.json)
   │
   ├─► Transport Layer (src/transport/ & src/daemon/)
-  │     • Unix-socket daemon (daemon.sock, protocol 3) or --no-daemon in-process
+  │     • Unix-socket daemon (daemon.sock, protocol 4) or --no-daemon in-process
   │     • Primary HTTP: Cronet (Chromium 154) or reqwest fallback
   │     • Classify response -> auto-escalate blocks / JS shells to CEF v5-meta
   │     • Follow advertised Markdown mirrors / optional <path>.md negotiation
@@ -258,7 +258,7 @@ Use `--render cef` (aliases: `browser`, `render`, `js`) to force Chromium render
 
 ### Unified Transport Daemon (`daemon.sock`)
 
-On Unix systems, `pleb` automatically starts a background transport daemon bound to `<state_dir>/daemon.sock` (protocol version `3`, locked via `daemon.lock`, logging to `daemon.log`). The daemon:
+On Unix systems, `pleb` automatically starts a background transport daemon bound to `<state_dir>/daemon.sock` (protocol version `4`, locked via `daemon.lock`, logging to `daemon.log`). The daemon:
 
 - Reuses Cronet engines and warm CEF renderer processes across invocations.
 - Partitions persistent storage (`data/` and `cef-cache/`) by proxy configuration (`direct` or `proxy-<hash>`).

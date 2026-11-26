@@ -1,6 +1,6 @@
 ---
 name: pleb
-description: Reference for the local pleb CLI (Cronet TLS, `v5-meta` CEF renderer, unified `daemon.sock` v3, structured source negotiation, feed/transcript extraction, and selective resource staging). Use when fetching pages that resist built-in web fetch, batch-fetching search results, inspecting or staging diagrams/PDFs/transcripts, or debugging `pleb` daemon and CEF behavior.
+description: Reference for the local pleb CLI (Cronet TLS, `v5-meta` CEF renderer, unified `daemon.sock` v4, structured source negotiation, feed/transcript extraction, and selective resource staging). Use when fetching pages that resist built-in web fetch, batch-fetching search results, inspecting or staging diagrams/PDFs/transcripts, or debugging `pleb` daemon and CEF behavior.
 metadata:
   author: Memory Sync Hub LLC
   repository: https://github.com/MeSH-Inc/pleb
@@ -19,7 +19,7 @@ Verify the active `pleb` binary is genuine (and not an unrelated tool) before re
 pleb status --json
 ```
 
-Expected markers: `"cronet_enabled": true`, `"cef_renderer": { "expected_protocol": "v5-meta" }`, and unified daemon (`daemon.sock`, `protocol_version: 3`). All upstream telemetry pings and remote `site-rules.json` sync calls from `wickproject/wick` are removed.
+Expected markers: `"cronet_enabled": true`, `"cef_renderer": { "expected_protocol": "v5-meta" }`, and unified daemon (`daemon.sock`, `protocol_version: 4`). All upstream telemetry pings and remote `site-rules.json` sync calls from `wickproject/wick` are removed.
 
 ---
 

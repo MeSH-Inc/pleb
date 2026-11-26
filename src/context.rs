@@ -9,7 +9,7 @@ use crate::transport::{cef::CefRenderer, TransportClient};
 
 static ATOMIC_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RuntimeConfig {
     pub state_dir: PathBuf,
     pub proxy: Option<String>,
@@ -21,6 +21,35 @@ pub struct RuntimeConfig {
     pub verbose: bool,
     pub daemon_executable: Option<PathBuf>,
     pub cef_renderer_executable: Option<PathBuf>,
+    pub no_web_bot_auth: bool,
+    pub cdp_url: Option<String>,
+    pub cdp_timeout: Duration,
+    pub prefer_cdp: bool,
+}
+
+impl std::fmt::Debug for RuntimeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_cdp = self
+            .cdp_url
+            .as_deref()
+            .map(crate::transport::cdp::sanitize_cdp_url_for_display);
+        f.debug_struct("RuntimeConfig")
+            .field("state_dir", &self.state_dir)
+            .field("proxy", &self.proxy)
+            .field("timeout", &self.timeout)
+            .field("max_response_bytes", &self.max_response_bytes)
+            .field("cef_timeout", &self.cef_timeout)
+            .field("daemon_idle_timeout", &self.daemon_idle_timeout)
+            .field("use_daemon", &self.use_daemon)
+            .field("verbose", &self.verbose)
+            .field("daemon_executable", &self.daemon_executable)
+            .field("cef_renderer_executable", &self.cef_renderer_executable)
+            .field("no_web_bot_auth", &self.no_web_bot_auth)
+            .field("cdp_url", &redacted_cdp)
+            .field("cdp_timeout", &self.cdp_timeout)
+            .field("prefer_cdp", &self.prefer_cdp)
+            .finish()
+    }
 }
 
 impl Default for RuntimeConfig {
@@ -36,6 +65,10 @@ impl Default for RuntimeConfig {
             verbose: false,
             daemon_executable: None,
             cef_renderer_executable: None,
+            no_web_bot_auth: false,
+            cdp_url: None,
+            cdp_timeout: Duration::from_secs(60),
+            prefer_cdp: false,
         }
     }
 }

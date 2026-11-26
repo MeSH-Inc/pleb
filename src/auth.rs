@@ -61,13 +61,18 @@ impl Drop for SecretString {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, clap::ValueEnum)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 pub enum CredentialProvider {
     Brave,
     Tavily,
     Serper,
     Exa,
     Searxng,
+    WebBotAuthJwk,
+    WebBotAuthAgent,
+    CdpAccessClientId,
+    CdpAccessClientSecret,
+    CdpAccessHost,
 }
 
 impl CredentialProvider {
@@ -77,7 +82,27 @@ impl CredentialProvider {
         Self::Serper,
         Self::Exa,
         Self::Searxng,
+        Self::WebBotAuthJwk,
+        Self::WebBotAuthAgent,
+        Self::CdpAccessClientId,
+        Self::CdpAccessClientSecret,
+        Self::CdpAccessHost,
     ];
+
+    pub const SEARCH_PROVIDERS: &'static [Self] = &[
+        Self::Brave,
+        Self::Tavily,
+        Self::Serper,
+        Self::Exa,
+        Self::Searxng,
+    ];
+
+    pub const fn is_search_provider(self) -> bool {
+        matches!(
+            self,
+            Self::Brave | Self::Tavily | Self::Serper | Self::Exa | Self::Searxng
+        )
+    }
 
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -86,6 +111,11 @@ impl CredentialProvider {
             Self::Serper => "serper",
             Self::Exa => "exa",
             Self::Searxng => "searxng",
+            Self::WebBotAuthJwk => "web-bot-auth-jwk",
+            Self::WebBotAuthAgent => "web-bot-auth-agent",
+            Self::CdpAccessClientId => "cdp-access-client-id",
+            Self::CdpAccessClientSecret => "cdp-access-client-secret",
+            Self::CdpAccessHost => "cdp-access-host",
         }
     }
 
@@ -96,8 +126,37 @@ impl CredentialProvider {
             Self::Serper => "SERPER_API_KEY",
             Self::Exa => "EXA_API_KEY",
             Self::Searxng => "SEARXNG_URL",
+            Self::WebBotAuthJwk => "PLEB_WEB_BOT_AUTH_JWK",
+            Self::WebBotAuthAgent => "PLEB_WEB_BOT_AUTH_AGENT",
+            Self::CdpAccessClientId => "PLEB_CDP_ACCESS_CLIENT_ID",
+            Self::CdpAccessClientSecret => "PLEB_CDP_ACCESS_CLIENT_SECRET",
+            Self::CdpAccessHost => "PLEB_CDP_ACCESS_HOST",
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AgentIdentityStatus {
+    pub web_bot_auth_enabled: bool,
+    pub jwk_configured: bool,
+    pub jwk_source: Option<CredentialSource>,
+    pub agent_configured: bool,
+    pub agent_source: Option<CredentialSource>,
+    pub keyid: Option<String>,
+    pub status_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CdpAccessStatus {
+    pub configured: bool,
+    pub client_id_configured: bool,
+    pub client_id_source: Option<CredentialSource>,
+    pub client_secret_configured: bool,
+    pub client_secret_source: Option<CredentialSource>,
+    pub host_configured: bool,
+    pub host_source: Option<CredentialSource>,
+    pub access_host: Option<String>,
+    pub status_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -583,35 +642,56 @@ pub fn remove_credential(
     }
 }
 
+pub fn resolve_credentials(
+    state_dir: &Path,
+    providers: &[CredentialProvider],
+) -> Result<BTreeMap<CredentialProvider, ResolvedCredential>> {
+    let entries = if !keychain_enabled() {
+        let mut out = Vec::with_capacity(providers.len());
+        for &provider in providers {
+            out.push((provider, resolve_credential(state_dir, provider)?));
+        }
+        out
+    } else {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = providers
+                .iter()
+                .copied()
+                .map(|provider| {
+                    scope.spawn(move || (provider, resolve_credential(state_dir, provider)))
+                })
+                .collect();
+
+            let mut out = Vec::with_capacity(handles.len());
+            for handle in handles {
+                let (provider, res) = handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("credential resolution worker panicked"))?;
+                out.push((provider, res?));
+            }
+            Result::<_>::Ok(out)
+        })?
+    };
+
+    let mut map = BTreeMap::new();
+    for (provider, cred_opt) in entries {
+        if let Some(cred) = cred_opt {
+            map.insert(provider, cred);
+        }
+    }
+    Ok(map)
+}
+
 pub fn resolve_all_credentials(
     state_dir: &Path,
 ) -> Result<Vec<(CredentialProvider, Option<ResolvedCredential>)>> {
-    if !keychain_enabled() {
-        let mut out = Vec::with_capacity(CredentialProvider::ALL.len());
-        for &provider in CredentialProvider::ALL {
-            out.push((provider, resolve_credential(state_dir, provider)?));
-        }
-        return Ok(out);
-    }
-
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = CredentialProvider::ALL
-            .iter()
-            .copied()
-            .map(|provider| {
-                scope.spawn(move || (provider, resolve_credential(state_dir, provider)))
-            })
-            .collect();
-
-        let mut out = Vec::with_capacity(handles.len());
-        for handle in handles {
-            let (provider, res) = handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("credential resolution worker panicked"))?;
-            out.push((provider, res?));
-        }
-        Ok(out)
-    })
+    let resolved = resolve_credentials(state_dir, CredentialProvider::ALL)?;
+    let mut map = resolved;
+    Ok(CredentialProvider::ALL
+        .iter()
+        .copied()
+        .map(|provider| (provider, map.remove(&provider)))
+        .collect())
 }
 
 pub fn all_credential_statuses(state_dir: &Path) -> Result<Vec<CredentialStatus>> {
@@ -624,4 +704,18 @@ pub fn all_credential_statuses(state_dir: &Path) -> Result<Vec<CredentialStatus>
             source: cred.map(|r| r.source),
         })
         .collect())
+}
+
+pub fn resolve_agent_identity_status(
+    _state_dir: &Path,
+    no_web_bot_auth: bool,
+) -> AgentIdentityStatus {
+    AgentIdentityStatus {
+        web_bot_auth_enabled: !no_web_bot_auth,
+        ..Default::default()
+    }
+}
+
+pub fn resolve_cdp_access_status(_state_dir: &Path) -> CdpAccessStatus {
+    CdpAccessStatus::default()
 }

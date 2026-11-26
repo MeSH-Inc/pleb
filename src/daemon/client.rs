@@ -149,6 +149,8 @@ pub async fn daemon_http_get_with_request_options(
         accept_markdown: opts.accept_markdown,
         referer: opts.referer.clone(),
         subresource_dest: opts.subresource_dest,
+        web_bot_auth: opts.web_bot_auth.clone(),
+        disable_redirects: opts.disable_redirects,
         expected_protocol_version: Some(PROTOCOL_VERSION),
         expected_build_id: Some(BUILD_ID.to_string()),
     };
@@ -169,6 +171,7 @@ pub async fn daemon_http_get_with_request_options(
             final_url: hdr.final_url.unwrap_or_else(|| url.to_string()),
             content_type: hdr.content_type,
             link_header: hdr.link_header,
+            location_header: hdr.location_header,
             body,
         })
     } else {

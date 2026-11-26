@@ -325,6 +325,8 @@ struct FetchMetadataOutput<'a> {
     content_bytes: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     resources: Vec<pleb::extract::ResourceDescriptor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<pleb::extract::WebMcpToolDescriptor>,
 }
 
 impl<'a> From<&'a FetchOutput> for FetchMetadataOutput<'a> {
@@ -341,6 +343,7 @@ impl<'a> From<&'a FetchOutput> for FetchMetadataOutput<'a> {
             timing_ms: res.timing_ms,
             content_bytes: res.content_bytes,
             resources: res.resources.clone(),
+            tools: res.tools.clone(),
         }
     }
 }
@@ -427,8 +430,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
         daemon_idle_timeout: Duration::from_secs(cli.daemon_idle_timeout.max(1)),
         use_daemon: !cli.no_daemon,
         verbose: cli.verbose,
-        daemon_executable: None,
-        cef_renderer_executable: None,
+        ..Default::default()
     };
 
     match cli.command {
@@ -760,6 +762,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 wait_for_selector,
                 respect_robots,
                 apply_rewrites: !no_rewrite,
+                ..Default::default()
             };
 
             if !batch_mode {
@@ -917,8 +920,10 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     auth::set_credential(&config.state_dir, provider, secret.as_str(), storage)
                         .map_err(|e| CliError::runtime("auth_error", e))?;
                 drop(secret);
-                search::clear_provider_cooldown(&config.state_dir, provider)
-                    .map_err(|e| CliError::runtime("auth_error", e))?;
+                if provider.is_search_provider() {
+                    search::clear_provider_cooldown(&config.state_dir, provider)
+                        .map_err(|e| CliError::runtime("auth_error", e))?;
+                }
                 if json {
                     print_json(&serde_json::json!({
                         "provider": provider.as_str(),
@@ -937,8 +942,10 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             AuthAction::Remove { provider, storage } => {
                 let removed = auth::remove_credential(&config.state_dir, provider, storage)
                     .map_err(|e| CliError::runtime("auth_error", e))?;
-                search::clear_provider_cooldown(&config.state_dir, provider)
-                    .map_err(|e| CliError::runtime("auth_error", e))?;
+                if provider.is_search_provider() {
+                    search::clear_provider_cooldown(&config.state_dir, provider)
+                        .map_err(|e| CliError::runtime("auth_error", e))?;
+                }
                 let env_var_still_set = std::env::var(provider.env_var())
                     .map(|v| !v.trim().is_empty())
                     .unwrap_or(false);

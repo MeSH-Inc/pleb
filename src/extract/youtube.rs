@@ -133,6 +133,7 @@ pub fn extract_youtube_watch(
         content,
         truncated,
         resources,
+        tools: Vec::new(),
     })
 }
 

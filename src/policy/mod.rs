@@ -11,9 +11,10 @@ pub use classify::{
 };
 pub use rules::{parent_domain, SiteRule, SiteRules};
 pub use source::{
-    compute_safe_referer, is_markdown_content_type, is_mirror_acceptable_content_type,
-    is_safe_alternate_url, is_safe_redirect_url, is_safe_subresource_url,
-    parse_markdown_link_header, resolve_raw_source_candidate, RawSourceCandidate, RawSourceKind,
+    compute_safe_referer, is_local_or_private_host, is_loopback_host, is_markdown_content_type,
+    is_mirror_acceptable_content_type, is_safe_alternate_url, is_safe_redirect_url,
+    is_safe_subresource_url, parse_markdown_link_header, resolve_raw_source_candidate,
+    RawSourceCandidate, RawSourceKind,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -27,11 +28,20 @@ pub enum ResourcePolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ToolPolicy {
+    #[default]
+    None,
+    Manifest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum RenderMode {
     #[default]
     Auto,
     #[value(aliases = ["browser", "render", "js"])]
     Cef,
+    #[value(aliases = ["kitesurf", "remote"])]
+    Cdp,
     #[value(aliases = ["network", "fast", "no-js", "nojs"])]
     Cronet,
 }
@@ -48,12 +58,20 @@ pub enum SourceMode {
 pub enum PrimaryTransport {
     Cronet,
     Cef,
+    Cdp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EscalationBackend {
+    None,
+    Cef,
+    Cdp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StrategyPlan {
     pub primary: PrimaryTransport,
-    pub allow_cef_escalation: bool,
+    pub escalation: EscalationBackend,
     pub allow_cronet_fallback: bool,
 }
 
@@ -62,54 +80,101 @@ pub fn plan_strategy(
     rule: Option<&SiteRule>,
     cached: Option<&SiteCacheEntry>,
     cef_available: bool,
+    cdp_available: bool,
+    prefer_cdp: bool,
 ) -> StrategyPlan {
+    let default_escalation = if prefer_cdp && cdp_available {
+        EscalationBackend::Cdp
+    } else if cef_available {
+        EscalationBackend::Cef
+    } else if cdp_available {
+        EscalationBackend::Cdp
+    } else {
+        EscalationBackend::None
+    };
+
     match render_mode {
         RenderMode::Cronet => StrategyPlan {
             primary: PrimaryTransport::Cronet,
-            allow_cef_escalation: false,
+            escalation: EscalationBackend::None,
             allow_cronet_fallback: false,
         },
         RenderMode::Cef => StrategyPlan {
             primary: PrimaryTransport::Cef,
-            allow_cef_escalation: false,
+            escalation: EscalationBackend::None,
+            allow_cronet_fallback: false,
+        },
+        RenderMode::Cdp => StrategyPlan {
+            primary: PrimaryTransport::Cdp,
+            escalation: EscalationBackend::None,
             allow_cronet_fallback: false,
         },
         RenderMode::Auto => {
-            if !cef_available {
-                return StrategyPlan {
-                    primary: PrimaryTransport::Cronet,
-                    allow_cef_escalation: false,
-                    allow_cronet_fallback: false,
-                };
-            }
-
             let rule_render = rule.and_then(|r| r.render.as_deref());
             match rule_render {
-                Some("cef") => StrategyPlan {
-                    primary: PrimaryTransport::Cef,
-                    allow_cef_escalation: false,
-                    allow_cronet_fallback: true,
-                },
-                Some("cronet") => StrategyPlan {
-                    primary: PrimaryTransport::Cronet,
-                    allow_cef_escalation: true,
-                    allow_cronet_fallback: false,
-                },
-                _ => {
-                    if cached.map(|c| c.strategy.as_str()) == Some("cef") {
+                Some("cdp") => {
+                    if cdp_available {
                         StrategyPlan {
-                            primary: PrimaryTransport::Cef,
-                            allow_cef_escalation: false,
+                            primary: PrimaryTransport::Cdp,
+                            escalation: EscalationBackend::None,
                             allow_cronet_fallback: true,
                         }
                     } else {
                         StrategyPlan {
                             primary: PrimaryTransport::Cronet,
-                            allow_cef_escalation: true,
+                            escalation: default_escalation,
                             allow_cronet_fallback: false,
                         }
                     }
                 }
+                Some("cef") => {
+                    if prefer_cdp && cdp_available {
+                        StrategyPlan {
+                            primary: PrimaryTransport::Cdp,
+                            escalation: EscalationBackend::None,
+                            allow_cronet_fallback: true,
+                        }
+                    } else if cef_available {
+                        StrategyPlan {
+                            primary: PrimaryTransport::Cef,
+                            escalation: EscalationBackend::None,
+                            allow_cronet_fallback: true,
+                        }
+                    } else {
+                        StrategyPlan {
+                            primary: PrimaryTransport::Cronet,
+                            escalation: default_escalation,
+                            allow_cronet_fallback: false,
+                        }
+                    }
+                }
+                Some("cronet") => StrategyPlan {
+                    primary: PrimaryTransport::Cronet,
+                    escalation: default_escalation,
+                    allow_cronet_fallback: false,
+                },
+                _ => match cached.map(|c| c.strategy.as_str()) {
+                    Some("cdp") if cdp_available => StrategyPlan {
+                        primary: PrimaryTransport::Cdp,
+                        escalation: EscalationBackend::None,
+                        allow_cronet_fallback: true,
+                    },
+                    Some("cef") if prefer_cdp && cdp_available => StrategyPlan {
+                        primary: PrimaryTransport::Cdp,
+                        escalation: EscalationBackend::None,
+                        allow_cronet_fallback: true,
+                    },
+                    Some("cef") if cef_available => StrategyPlan {
+                        primary: PrimaryTransport::Cef,
+                        escalation: EscalationBackend::None,
+                        allow_cronet_fallback: true,
+                    },
+                    _ => StrategyPlan {
+                        primary: PrimaryTransport::Cronet,
+                        escalation: default_escalation,
+                        allow_cronet_fallback: false,
+                    },
+                },
             }
         }
     }

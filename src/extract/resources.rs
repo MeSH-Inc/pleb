@@ -585,6 +585,6 @@ pub fn format_resource_manifest_markdown(resources: &[ResourceDescriptor]) -> St
     out.trim_end_matches('\n').to_string()
 }
 
-fn escape_table_cell(raw: &str) -> String {
+pub(crate) fn escape_table_cell(raw: &str) -> String {
     collapse_inline_whitespace(raw).trim().replace('|', "\\|")
 }

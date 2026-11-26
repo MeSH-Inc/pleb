@@ -248,7 +248,7 @@ impl ProviderAttempt {
 pub fn search_provider_statuses(
     state_dir: &Path,
 ) -> Result<BTreeMap<String, SearchProviderStatus>> {
-    let resolved = auth::resolve_all_credentials(state_dir)?;
+    let resolved = auth::resolve_credentials(state_dir, CredentialProvider::SEARCH_PROVIDERS)?;
     let health = provider_health_summary(state_dir)?;
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -256,12 +256,13 @@ pub fn search_provider_statuses(
         .as_secs();
 
     let mut statuses = BTreeMap::new();
-    for (provider, cred) in resolved {
+    for &provider in CredentialProvider::SEARCH_PROVIDERS {
+        let cred = resolved.get(&provider);
         let name = provider.as_str();
         let entry = health.get(name);
         let cooldown_remaining_secs = match entry {
             Some(e) if e.cooldown_until_epoch_secs > now_secs => {
-                let current_fp = cred.as_ref().map(|r| key_fingerprint(r.value.as_str()));
+                let current_fp = cred.map(|r| key_fingerprint(r.value.as_str()));
                 if is_cooldown_active(e, current_fp.as_deref(), now_secs) {
                     e.cooldown_until_epoch_secs.saturating_sub(now_secs)
                 } else {
@@ -526,18 +527,19 @@ fn resolve_all_credentials(
 )> {
     let mut creds = BTreeMap::new();
     let mut fingerprints = BTreeMap::new();
-    for (cp, resolved_opt) in auth::resolve_all_credentials(state_dir)? {
-        if let Some(resolved) = resolved_opt {
-            let provider = match cp {
-                CredentialProvider::Brave => ConcreteProvider::Brave,
-                CredentialProvider::Tavily => ConcreteProvider::Tavily,
-                CredentialProvider::Serper => ConcreteProvider::Serper,
-                CredentialProvider::Exa => ConcreteProvider::Exa,
-                CredentialProvider::Searxng => ConcreteProvider::Searxng,
-            };
-            fingerprints.insert(provider, key_fingerprint(resolved.value.as_str()));
-            creds.insert(provider, resolved);
-        }
+    for (cp, resolved) in
+        auth::resolve_credentials(state_dir, CredentialProvider::SEARCH_PROVIDERS)?
+    {
+        let provider = match cp {
+            CredentialProvider::Brave => ConcreteProvider::Brave,
+            CredentialProvider::Tavily => ConcreteProvider::Tavily,
+            CredentialProvider::Serper => ConcreteProvider::Serper,
+            CredentialProvider::Exa => ConcreteProvider::Exa,
+            CredentialProvider::Searxng => ConcreteProvider::Searxng,
+            _ => continue,
+        };
+        fingerprints.insert(provider, key_fingerprint(resolved.value.as_str()));
+        creds.insert(provider, resolved);
     }
     Ok((creds, fingerprints))
 }

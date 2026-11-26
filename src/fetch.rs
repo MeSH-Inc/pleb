@@ -15,9 +15,9 @@ use crate::extract::{
 use crate::policy::{
     classify_response_with_context, compute_safe_referer, detect_interstitial_challenge,
     is_markdown_content_type, is_mirror_acceptable_content_type, is_safe_subresource_url,
-    parse_markdown_link_header, plan_strategy, resolve_raw_source_candidate, PrimaryTransport,
-    RawSourceCandidate, RawSourceKind, RenderMode, ResourcePolicy, ResponseClassification,
-    SourceMode,
+    parse_markdown_link_header, plan_strategy, resolve_raw_source_candidate, EscalationBackend,
+    PrimaryTransport, RawSourceCandidate, RawSourceKind, RenderMode, ResourcePolicy,
+    ResponseClassification, SourceMode, ToolPolicy,
 };
 use crate::transport::cef::{CefRenderOptions, CefRenderResult, CefRenderer};
 use crate::transport::{
@@ -67,6 +67,9 @@ pub enum FetchError {
     #[error("CEF renderer unavailable: {0}")]
     CefUnavailable(String),
 
+    #[error("CDP renderer unavailable: {0}")]
+    CdpUnavailable(String),
+
     #[error("timed out fetching {url}: {detail}")]
     Timeout { url: String, detail: String },
 
@@ -85,6 +88,7 @@ impl FetchError {
             Self::UnsupportedContentType { .. } => 5,
             Self::InvalidUrl(_)
             | Self::CefUnavailable(_)
+            | Self::CdpUnavailable(_)
             | Self::Timeout { .. }
             | Self::ResponseTooLarge { .. }
             | Self::Transport(_) => 1,
@@ -100,6 +104,7 @@ impl FetchError {
             Self::HttpError { .. } => "http_error",
             Self::UnsupportedContentType { .. } => "unsupported_content_type",
             Self::CefUnavailable(_) => "cef_unavailable",
+            Self::CdpUnavailable(_) => "cdp_unavailable",
             Self::Timeout { .. } => "timeout",
             Self::ResponseTooLarge { .. } => "response_too_large",
             Self::Transport(_) => "transport",
@@ -113,6 +118,7 @@ pub struct FetchOptions {
     pub render: RenderMode,
     pub source: SourceMode,
     pub resources: ResourcePolicy,
+    pub tools: ToolPolicy,
     pub stage_resources: Vec<String>,
     pub referer: Option<String>,
     pub wait_for_selector: Option<String>,
@@ -127,6 +133,7 @@ impl Default for FetchOptions {
             render: RenderMode::Auto,
             source: SourceMode::Auto,
             resources: ResourcePolicy::None,
+            tools: ToolPolicy::None,
             stage_resources: Vec::new(),
             referer: None,
             wait_for_selector: None,
@@ -151,6 +158,8 @@ pub struct FetchOutput {
     pub timing_ms: u64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub resources: Vec<crate::extract::ResourceDescriptor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<crate::extract::WebMcpToolDescriptor>,
 }
 
 pub struct FetchHtmlResult {
@@ -294,6 +303,7 @@ pub async fn fetch_document(
         truncated: extracted.truncated,
         timing_ms: start.elapsed().as_millis() as u64,
         resources: extracted.resources,
+        tools: extracted.tools,
     })
 }
 
@@ -380,6 +390,7 @@ pub async fn fetch_staged_asset(
         accept_markdown: false,
         referer: safe_referer,
         subresource_dest: Some(infer_subresource_dest(&parsed)),
+        ..Default::default()
     };
 
     let max_bytes = ctx
@@ -656,6 +667,7 @@ async fn enrich_document_resources(
                         ResourceKind::Diagram | ResourceKind::Image => SubresourceDest::Image,
                         _ => SubresourceDest::Asset,
                     }),
+                    ..Default::default()
                 };
                 match ctx
                     .client
@@ -861,6 +873,7 @@ async fn try_fetch_raw_source(
         truncated: extracted.truncated,
         timing_ms,
         resources: extracted.resources,
+        tools: extracted.tools,
     })
 }
 
@@ -973,8 +986,20 @@ async fn acquire_page(
             "render=cef requested but pleb-renderer was not found".to_string(),
         ));
     }
+    if render_mode == RenderMode::Cdp {
+        return Err(FetchError::CdpUnavailable(
+            "CDP renderer is not yet configured".to_string(),
+        ));
+    }
 
-    let plan = plan_strategy(render_mode, rule, cached.as_ref(), cef_available);
+    let plan = plan_strategy(
+        render_mode,
+        rule,
+        cached.as_ref(),
+        cef_available,
+        false,
+        ctx.config.prefer_cdp,
+    );
 
     let mut cef_fallback = false;
     if plan.primary == PrimaryTransport::Cef {
@@ -1155,7 +1180,7 @@ async fn acquire_page(
             ))
         }
         ResponseClassification::JavaScriptShell { reason } => {
-            if plan.allow_cef_escalation {
+            if plan.escalation == EscalationBackend::Cef {
                 match try_cef_escalation(ctx, host, start, &final_url, effective_selector).await {
                     CefEscalation::Completed(res) => return *res,
                     CefEscalation::Unavailable(err) => return Err(err),
@@ -1179,7 +1204,7 @@ async fn acquire_page(
             ))
         }
         ResponseClassification::Blocked { status } => {
-            if plan.allow_cef_escalation {
+            if plan.escalation == EscalationBackend::Cef {
                 match try_cef_escalation(ctx, host, start, &final_url, effective_selector).await {
                     CefEscalation::Completed(res) => return *res,
                     CefEscalation::Unavailable(err) => return Err(err),
@@ -1437,6 +1462,8 @@ pub struct BatchItemSuccess {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub resources: Vec<crate::extract::ResourceDescriptor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<crate::extract::WebMcpToolDescriptor>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1476,6 +1503,7 @@ impl BatchItemResult {
                 content_bytes: out.content_bytes,
                 content: (!metadata_only).then_some(out.content),
                 resources: out.resources,
+                tools: out.tools,
             }),
             Err(err) => Self::Failure(BatchItemFailure {
                 url: url.to_string(),

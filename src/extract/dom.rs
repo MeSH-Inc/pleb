@@ -204,6 +204,13 @@ impl ParsedHtml {
             .unwrap_or_else(|| page_url.clone())
     }
 
+    pub fn extract_webmcp_tools(
+        &self,
+        _page_url: &Url,
+    ) -> Vec<super::webmcp::WebMcpToolDescriptor> {
+        Vec::new()
+    }
+
     /// Compute bottom-up `NodeMetrics` in a single `O(N)` post-order pass over the DOM,
     /// returning `(metrics_by_node, visited_node_count)`.
     pub fn compute_node_metrics(&self) -> (HashMap<NodeId, NodeMetrics>, usize) {
@@ -654,7 +661,7 @@ fn collect_link_density_prune_ids(
     }
 }
 
-fn is_inline_hidden_style(style: &str) -> bool {
+pub(crate) fn is_inline_hidden_style(style: &str) -> bool {
     style.split(';').any(|decl| {
         let Some((prop, raw_val)) = decl.split_once(':') else {
             return false;
@@ -672,7 +679,7 @@ fn is_inline_hidden_style(style: &str) -> bool {
     })
 }
 
-fn collapsed_node_text(node: NodeRef<'_, Node>) -> Option<String> {
+pub(crate) fn collapsed_node_text(node: NodeRef<'_, Node>) -> Option<String> {
     let mut raw = String::new();
     collect_raw_text(node, &mut raw);
     let collapsed = collapse_inline_whitespace(&raw);

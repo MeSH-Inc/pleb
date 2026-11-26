@@ -29,6 +29,7 @@ pub fn extract_transcript(body: &str, options: &ExtractOptions) -> Result<Extrac
             content,
             truncated,
             resources: Vec::new(),
+            tools: Vec::new(),
         });
     }
 
@@ -40,6 +41,7 @@ pub fn extract_transcript(body: &str, options: &ExtractOptions) -> Result<Extrac
         content,
         truncated,
         resources: Vec::new(),
+        tools: Vec::new(),
     })
 }
 

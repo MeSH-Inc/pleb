@@ -844,7 +844,7 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "name: pleb",
         "v5-meta",
         "daemon.sock",
-        "protocol_version: 3",
+        "protocol_version: 4",
         "--source",
         "raw_source",
         "markdown_mirror",

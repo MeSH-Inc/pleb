@@ -1,7 +1,8 @@
 use pleb::extract::ParsedHtml;
 use pleb::policy::{
-    classify_response, classify_response_with_parsed, plan_strategy, PrimaryTransport, RenderMode,
-    ResponseClassification, SiteCache, SiteCacheEntry, SiteRule, SiteRules,
+    classify_response, classify_response_with_parsed, plan_strategy, EscalationBackend,
+    PrimaryTransport, RenderMode, ResponseClassification, SiteCache, SiteCacheEntry, SiteRule,
+    SiteRules,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use url::Url;
@@ -44,22 +45,35 @@ fn strategy_router_precedence() {
     };
 
     // Forced modes win over rules and cache.
-    let p_forced_cronet =
-        plan_strategy(RenderMode::Cronet, Some(&cef_rule), Some(&cef_cached), true);
+    let p_forced_cronet = plan_strategy(
+        RenderMode::Cronet,
+        Some(&cef_rule),
+        Some(&cef_cached),
+        true,
+        true,
+        true,
+    );
     assert_eq!(p_forced_cronet.primary, PrimaryTransport::Cronet);
-    assert!(!p_forced_cronet.allow_cef_escalation);
+    assert_eq!(p_forced_cronet.escalation, EscalationBackend::None);
 
-    let p_forced_cef = plan_strategy(RenderMode::Cef, Some(&cronet_rule), None, true);
+    let p_forced_cef = plan_strategy(RenderMode::Cef, Some(&cronet_rule), None, true, true, true);
     assert_eq!(p_forced_cef.primary, PrimaryTransport::Cef);
     assert!(!p_forced_cef.allow_cronet_fallback);
 
-    // Auto without CEF installed never picks CEF.
-    let p_no_cef = plan_strategy(RenderMode::Auto, Some(&cef_rule), Some(&cef_cached), false);
+    // Auto without CEF or CDP installed never picks CEF or CDP.
+    let p_no_cef = plan_strategy(
+        RenderMode::Auto,
+        Some(&cef_rule),
+        Some(&cef_cached),
+        false,
+        false,
+        false,
+    );
     assert_eq!(p_no_cef.primary, PrimaryTransport::Cronet);
-    assert!(!p_no_cef.allow_cef_escalation);
+    assert_eq!(p_no_cef.escalation, EscalationBackend::None);
 
     // Auto: curated rule beats local cache.
-    let p_rule_cef = plan_strategy(RenderMode::Auto, Some(&cef_rule), None, true);
+    let p_rule_cef = plan_strategy(RenderMode::Auto, Some(&cef_rule), None, true, false, false);
     assert_eq!(p_rule_cef.primary, PrimaryTransport::Cef);
     assert!(p_rule_cef.allow_cronet_fallback);
 
@@ -68,17 +82,33 @@ fn strategy_router_precedence() {
         Some(&cronet_rule),
         Some(&cef_cached),
         true,
+        false,
+        false,
     );
     assert_eq!(p_rule_cronet.primary, PrimaryTransport::Cronet);
-    assert!(p_rule_cronet.allow_cef_escalation);
+    assert_eq!(p_rule_cronet.escalation, EscalationBackend::Cef);
 
     // Auto with no rule uses cache ("cef" -> Cef, "cef_timeout" -> Cronet).
-    let p_cached_cef = plan_strategy(RenderMode::Auto, None, Some(&cef_cached), true);
+    let p_cached_cef = plan_strategy(
+        RenderMode::Auto,
+        None,
+        Some(&cef_cached),
+        true,
+        false,
+        false,
+    );
     assert_eq!(p_cached_cef.primary, PrimaryTransport::Cef);
 
-    let p_cached_timeout = plan_strategy(RenderMode::Auto, None, Some(&timeout_cached), true);
+    let p_cached_timeout = plan_strategy(
+        RenderMode::Auto,
+        None,
+        Some(&timeout_cached),
+        true,
+        false,
+        false,
+    );
     assert_eq!(p_cached_timeout.primary, PrimaryTransport::Cronet);
-    assert!(p_cached_timeout.allow_cef_escalation);
+    assert_eq!(p_cached_timeout.escalation, EscalationBackend::Cef);
 }
 
 #[test]

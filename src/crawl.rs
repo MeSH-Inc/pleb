@@ -266,6 +266,7 @@ async fn fetch_and_extract_page(
         title: None,
         truncated: false,
         resources: Vec::new(),
+        tools: Vec::new(),
     });
 
     Some(FetchedCrawlPage {

@@ -1,8 +1,10 @@
+pub mod cdp;
 pub mod cef;
 #[cfg(feature = "cronet")]
 pub mod cronet;
 #[cfg(feature = "cronet")]
 pub mod cronet_ffi;
+pub mod web_bot_auth;
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -25,6 +27,13 @@ pub enum SubresourceDest {
     Asset,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WebBotAuthHeaders {
+    pub signature: String,
+    pub signature_input: String,
+    pub signature_agent: String,
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct RequestHeaderOptions {
     #[serde(default)]
@@ -33,6 +42,10 @@ pub struct RequestHeaderOptions {
     pub referer: Option<String>,
     #[serde(default)]
     pub subresource_dest: Option<SubresourceDest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_bot_auth: Option<WebBotAuthHeaders>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disable_redirects: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -92,6 +105,7 @@ pub struct HttpResponse {
     pub final_url: String,
     pub content_type: Option<String>,
     pub link_header: Option<String>,
+    pub location_header: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -268,6 +282,7 @@ impl TransportClient {
                         final_url: resp.final_url,
                         content_type: resp.content_type,
                         link_header: resp.link_header,
+                        location_header: resp.location_header,
                         body: resp.body,
                     })
                 }
@@ -315,6 +330,7 @@ impl TransportClient {
                             final_url,
                             content_type,
                             link_header,
+                            location_header: None,
                             body,
                         })
                     };

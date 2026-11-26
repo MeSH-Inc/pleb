@@ -437,6 +437,8 @@ async fn handle_connection(
             accept_markdown,
             referer,
             subresource_dest,
+            web_bot_auth,
+            disable_redirects,
             expected_protocol_version,
             expected_build_id,
         } => {
@@ -465,6 +467,8 @@ async fn handle_connection(
                 accept_markdown,
                 referer,
                 subresource_dest,
+                web_bot_auth,
+                disable_redirects,
             };
             let get_fut =
                 slot.client
@@ -482,6 +486,7 @@ async fn handle_connection(
                             hdr.final_url = Some(resp.final_url);
                             hdr.content_type = resp.content_type;
                             hdr.link_header = resp.link_header;
+                            hdr.location_header = resp.location_header;
                             hdr.body_bytes = resp.body.len();
                             let _ = write_frame(&mut write_half, &hdr, &resp.body).await;
                         }

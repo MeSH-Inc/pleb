@@ -410,15 +410,42 @@ fn unquote_param(val: &str) -> &str {
 }
 
 fn is_private_v4(v4: std::net::Ipv4Addr) -> bool {
+    let octets = v4.octets();
     v4.is_loopback()
         || v4.is_private()
         || v4.is_link_local()
         || v4.is_unspecified()
         || v4.is_broadcast()
-        || (v4.octets()[0] == 100 && (v4.octets()[1] & 0b1100_0000) == 64)
+        || v4.is_multicast()
+        || octets[0] == 0
+        || octets[0] >= 224
+        || (octets[0] == 100 && (octets[1] & 0b1100_0000) == 64)
 }
 
-fn is_local_or_private_host(host: &str) -> bool {
+pub fn is_loopback_host(host: &str) -> bool {
+    let normalized = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if normalized == "localhost" || normalized.ends_with(".localhost") {
+        return true;
+    }
+    if let Ok(ip) = normalized.parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(v4) => v4.is_loopback(),
+            IpAddr::V6(v6) => {
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    return v4.is_loopback();
+                }
+                v6.is_loopback()
+            }
+        };
+    }
+    false
+}
+
+pub fn is_local_or_private_host(host: &str) -> bool {
     let normalized = host
         .trim_start_matches('[')
         .trim_end_matches(']')
@@ -435,13 +462,17 @@ fn is_local_or_private_host(host: &str) -> bool {
         return match ip {
             IpAddr::V4(v4) => is_private_v4(v4),
             IpAddr::V6(v6) => {
-                if let Some(v4) = v6.to_ipv4_mapped() {
+                if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                    return true;
+                }
+                if let Some(v4) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
                     return is_private_v4(v4);
                 }
-                v6.is_loopback()
-                    || v6.is_unspecified()
-                    || (v6.segments()[0] & 0xfe00) == 0xfc00
-                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+                let segs = v6.segments();
+                (segs[0] & 0xfe00) == 0xfc00
+                    || (segs[0] & 0xffc0) == 0xfe80
+                    || (segs[0] & 0xffc0) == 0xfec0
+                    || (segs[0] == 0x0064 && segs[1] == 0xff9b)
             }
         };
     }

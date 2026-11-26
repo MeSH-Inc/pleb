@@ -119,6 +119,7 @@ pub struct CronetResponse {
     pub final_url: String,
     pub content_type: Option<String>,
     pub link_header: Option<String>,
+    pub location_header: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -563,6 +564,7 @@ unsafe extern "C" fn on_succeeded(
             final_url,
             content_type,
             link_header,
+            location_header: None,
             body,
         }),
     );

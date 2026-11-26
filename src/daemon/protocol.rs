@@ -3,9 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::transport::{SubresourceDest, TransportErrorKind};
+use crate::transport::{SubresourceDest, TransportErrorKind, WebBotAuthHeaders};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const BUILD_ID: &str = env!("PLEB_BUILD_ID");
 pub const SOCKET_NAME: &str = "daemon.sock";
 pub const LOCK_NAME: &str = "daemon.lock";
@@ -65,6 +65,10 @@ pub enum DaemonRequest {
         #[serde(default)]
         subresource_dest: Option<SubresourceDest>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        web_bot_auth: Option<WebBotAuthHeaders>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        disable_redirects: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         expected_protocol_version: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expected_build_id: Option<String>,
@@ -104,6 +108,8 @@ pub struct DaemonResponseHeader {
     pub content_type: Option<String>,
     #[serde(default)]
     pub link_header: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location_header: Option<String>,
     #[serde(default)]
     pub body_bytes: usize,
     #[serde(default)]
@@ -128,6 +134,7 @@ impl DaemonResponseHeader {
             final_url: None,
             content_type: None,
             link_header: None,
+            location_header: None,
             body_bytes: 0,
             error: None,
             error_kind: None,
@@ -152,6 +159,7 @@ impl DaemonResponseHeader {
             final_url: None,
             content_type: None,
             link_header: None,
+            location_header: None,
             body_bytes: 0,
             error: Some(message.into()),
             error_kind: kind,

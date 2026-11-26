@@ -29,6 +29,7 @@ pub fn extract_native_markdown(
             content,
             truncated,
             resources: Vec::new(),
+            tools: Vec::new(),
         });
     }
 
@@ -95,6 +96,7 @@ pub fn extract_native_markdown(
                 content,
                 truncated,
                 resources: Vec::new(),
+                tools: Vec::new(),
             })
         }
         OutputFormat::Text => {
@@ -115,9 +117,10 @@ pub fn extract_native_markdown(
                 content,
                 truncated,
                 resources: Vec::new(),
+                tools: Vec::new(),
             })
         }
-        OutputFormat::Html | OutputFormat::Raw => unreachable!(),
+        OutputFormat::Html | OutputFormat::Raw | OutputFormat::Axtree => unreachable!(),
     }
 }
 
