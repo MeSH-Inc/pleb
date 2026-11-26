@@ -1002,3 +1002,77 @@ fn feed_extraction_handles_rss_atom_json_feed_and_full_passthrough() {
     .unwrap();
     assert_eq!(xml_doc.content, plain_xml);
 }
+
+#[test]
+fn adversarial_m3_base_hijack_unclosed_frontmatter_five_tick_fence_and_feed_cap() {
+    let page = Url::parse("https://docs.example.com/guide").unwrap();
+
+    // 1. `<base href="https://evil.com/">` cannot hijack relative `<link rel="alternate" type="text/markdown">`
+    //    past the same-origin / registrable-domain SSRF guard.
+    let hijack_html = r#"<html><head>
+        <base href="https://evil.com/">
+        <link rel="alternate" type="text/markdown" href="/secret.md">
+    </head><body><p>Body</p></body></html>"#;
+    assert!(
+        ParsedHtml::parse(hijack_html)
+            .markdown_alternate_url(&page)
+            .is_none(),
+        "<base> redirect to third-party host must be rejected by markdown_alternate_url"
+    );
+
+    // 2. Leading `---` without a closing delimiter must NOT swallow the document as YAML frontmatter.
+    let unclosed_hr = "---\n\n# Real Title\n\nUnclosed horizontal rule prose survives.\n";
+    let md_doc = extract_document(
+        unclosed_hr,
+        &page,
+        Some("text/markdown"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert!(
+        md_doc
+            .content
+            .contains("Unclosed horizontal rule prose survives."),
+        "unclosed leading --- swallowed document body: {}",
+        md_doc.content
+    );
+
+    // 3. Raw code containing 4-backtick fences must be wrapped in a 5-backtick outer fence.
+    let four_tick_code = "````markdown\n# Nested\n````\n";
+    let wrapped = wrap_raw_code_document(
+        "nested.md",
+        four_tick_code,
+        Some("markdown"),
+        &ExtractOptions::default(),
+    );
+    assert!(
+        wrapped.content.contains("`````markdown\n"),
+        "expected 5-backtick outer fence: {}",
+        wrapped.content
+    );
+    assert!(open_fence_at(&wrapped.content, wrapped.content.len()).is_none());
+
+    // 4. Feed extraction caps oversized feeds at <= 50 items.
+    let mut big_rss = String::from(
+        "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel><title>Big Feed</title>",
+    );
+    for i in 1..=60 {
+        big_rss.push_str(&format!(
+            "<item><title>Entry {i}</title><link>https://docs.example.com/e/{i}</link><description>Item {i}</description></item>"
+        ));
+    }
+    big_rss.push_str("</channel></rss>");
+    let big_doc = extract_document(
+        &big_rss,
+        &page,
+        Some("application/rss+xml"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert!(big_doc.content.contains("Entry 1"));
+    assert!(big_doc.content.contains("Entry 50"));
+    assert!(
+        !big_doc.content.contains("Entry 55"),
+        "feed should cap items at <= 50"
+    );
+}
