@@ -20,8 +20,23 @@ pub fn is_feed_document(mime: Option<&str>, body: &str) -> bool {
             | "application/feed+json",
         ) => true,
         Some("application/xml" | "text/xml") => detect_xml_feed_root(body).is_some(),
+        Some("application/json") => looks_like_json_feed(body),
         _ => false,
     }
+}
+
+fn looks_like_json_feed(body: &str) -> bool {
+    body.contains("jsonfeed.org/version/1")
+        && serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| {
+                let obj = v.as_object()?;
+                let ver = obj.get("version")?.as_str()?;
+                let valid = ver.starts_with("https://jsonfeed.org/version/1")
+                    || ver.starts_with("http://jsonfeed.org/version/1");
+                Some(valid && obj.get("items").is_some_and(serde_json::Value::is_array))
+            })
+            .unwrap_or(false)
 }
 
 pub fn extract_feed(
@@ -40,7 +55,7 @@ pub fn extract_feed(
         });
     }
 
-    let parsed = if mime == Some("application/feed+json") {
+    let parsed = if matches!(mime, Some("application/feed+json" | "application/json")) {
         parse_json_feed(body)
     } else {
         parse_xml_feed(body)

@@ -1,0 +1,16 @@
+<!-- wick-fixture: {"tier":"ratchet","url":"https://qa.example.org/questions/101/branch-prediction","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"Why does sorting speed up a conditional loop?","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["Sorting makes branch outcomes predictable for the CPU pipeline.","Visible architecture diagram"],"expected_images":["https://qa.example.org/img/pipeline.png"],"forbidden_substrings":["1x1-pixel.png","Hidden ad telemetry overlay","Invisible modal copy"],"minimum_output_bytes":100,"maximum_output_bytes":1200,"expected_structure":{"minimum_headings":1}}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Why does sorting speed up a conditional loop?</title></head>
+<body>
+  <main>
+    <h1>Why does sorting speed up a conditional loop?</h1>
+    <p>Sorting makes branch outcomes predictable for the CPU pipeline.</p>
+    <p style="display: block">Visible architecture diagram: <img src="/img/pipeline.png" width="480" height="240" alt="Pipeline diagram"></p>
+    <div style="display: none; height: 0px;">Hidden ad telemetry overlay</div>
+    <div style="visibility: hidden;">Invisible modal copy</div>
+    <img width="0" height="0" src="https://tracker.example.net/1x1-pixel.png?id=abc" alt="." style="height: 0px; width: 0px; border: 0px; display: none;">
+    <img width="1" height="1" src="https://tracker.example.net/beacon.gif" alt="pixel">
+  </main>
+</body>
+</html>

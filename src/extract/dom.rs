@@ -41,6 +41,7 @@ const BOILERPLATE_ATTR_PATTERNS: &[&str] = &[
     "skipnav",
     "mw-jump-link",
     "mw-editsection",
+    "mw-hidden-catlinks",
     "wbc-editpage",
     "printfooter",
 ];
@@ -95,6 +96,11 @@ static MAIN_SEL: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("main, [role=\"main\"]").unwrap());
 static BLOCK_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("section, div").unwrap());
 static A_HREF_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("a[href]").unwrap());
+static STYLE_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("[style]").unwrap());
+static IMG_DIM_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("img[width], img[height]").unwrap());
+static CHECKBOX_POPUP_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("input[type=\"checkbox\"][aria-haspopup=\"true\"]").unwrap());
 
 /// HTML document parsed once via `scraper` (`atomic` tendrils) for metrics,
 /// link discovery, and pruned extraction.
@@ -302,7 +308,7 @@ impl ParsedHtml {
         let mut out = String::new();
         let mut resources = Vec::new();
         if let Some(root) = self.doc.tree.get(root_id) {
-            resources = index_resources_in_subtree(root, base_url);
+            resources = index_resources_in_subtree(&self.doc, root, base_url);
             serialize_pruned_html(root, false, &mut out);
         }
         (out, resources)
@@ -330,7 +336,7 @@ impl ParsedHtml {
         let mut raw = String::new();
         let mut resources = Vec::new();
         if let Some(root) = self.doc.tree.get(root_id) {
-            resources = index_resources_in_subtree(root, base_url);
+            resources = index_resources_in_subtree(&self.doc, root, base_url);
             collect_plain_text(root, false, false, &mut raw);
         }
         (normalize_plain_text(&raw), resources)
@@ -346,7 +352,7 @@ impl ParsedHtml {
         self.doc
             .tree
             .get(root_id)
-            .map(|root| index_resources_in_subtree(root, base_url))
+            .map(|root| index_resources_in_subtree(&self.doc, root, base_url))
             .unwrap_or_default()
     }
 }
@@ -601,10 +607,46 @@ fn prune_dom(doc: &mut Html, mode: ExtractMode) -> HashMap<NodeId, NodeMetrics> 
             }
         }
 
-        // Strip heading permalink anchors (#, §, ¶, 🔗, or empty) inside h1..=h6 or .headerlink/.anchor.
+        for el in doc.select(&STYLE_SEL) {
+            if !matches!(el.value().name(), "html" | "body")
+                && el.value().attr("style").is_some_and(is_inline_hidden_style)
+                && find_tex_annotation(*el).is_none()
+            {
+                to_detach.push(el.id());
+            }
+        }
+        for el in doc.select(&IMG_DIM_SEL) {
+            if ["width", "height"].iter().any(|a| {
+                el.value()
+                    .attr(a)
+                    .and_then(parse_html_dimension)
+                    .is_some_and(|n| n <= 1)
+            }) {
+                to_detach.push(el.id());
+            }
+        }
+        for el in doc.select(&CHECKBOX_POPUP_SEL) {
+            if el.value().attr("checked").is_none() {
+                if let Some(parent) = el.parent() {
+                    let is_safe_box = matches!(
+                        parent.value(),
+                        Node::Element(p) if !matches!(p.name(), "html" | "body" | "main" | "article" | "header" | "form" | "section")
+                    );
+                    if is_safe_box
+                        && !parent.descendants().any(|d| {
+                            matches!(d.value(), Node::Element(e) if e.name() == "h1" || is_landmark_element(e))
+                        })
+                    {
+                        to_detach.push(parent.id());
+                    }
+                }
+            }
+        }
         for el in doc.select(&A_HREF_SEL) {
             if is_heading_permalink_anchor(*el) {
                 to_detach.push(el.id());
+            } else if let Some(skip_target) = standalone_skip_link_detach_target(*el) {
+                to_detach.push(skip_target);
             }
         }
     }
@@ -684,6 +726,91 @@ fn collect_link_density_prune_ids(
 
     for child in node.children() {
         collect_link_density_prune_ids(child, now_protected, now_header, metrics, out);
+    }
+}
+
+fn is_inline_hidden_style(style: &str) -> bool {
+    style.split(';').any(|decl| {
+        let Some((prop, raw_val)) = decl.split_once(':') else {
+            return false;
+        };
+        let (prop, val) = (
+            prop.trim(),
+            raw_val
+                .trim()
+                .strip_suffix("!important")
+                .unwrap_or(raw_val.trim())
+                .trim(),
+        );
+        (prop.eq_ignore_ascii_case("display") && val.eq_ignore_ascii_case("none"))
+            || (prop.eq_ignore_ascii_case("visibility") && val.eq_ignore_ascii_case("hidden"))
+    })
+}
+
+fn is_skip_fragment_link(node: NodeRef<'_, Node>) -> bool {
+    let Node::Element(el) = node.value() else {
+        return false;
+    };
+    if !el
+        .attr("href")
+        .is_some_and(|h| h.trim().starts_with('#') && h.trim().len() > 1)
+    {
+        return false;
+    }
+    let mut raw = String::new();
+    collect_raw_text(node, &mut raw);
+    let collapsed = collapse_inline_whitespace(&raw);
+    let trimmed = collapsed.trim();
+    trimmed.len() <= 48 && trimmed.to_ascii_lowercase().starts_with("skip to ")
+}
+
+fn container_only_skip_links(node: NodeRef<'_, Node>) -> bool {
+    let mut saw_skip = false;
+    for desc in node.descendants() {
+        match desc.value() {
+            Node::Element(el) if el.name() == "a" => {
+                if !is_skip_fragment_link(desc) {
+                    return false;
+                }
+                saw_skip = true;
+            }
+            Node::Text(t)
+                if !t.trim().is_empty()
+                    && !desc
+                        .ancestors()
+                        .take_while(|a| a.id() != node.id())
+                        .any(|a| matches!(a.value(), Node::Element(e) if e.name() == "a")) =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    saw_skip
+}
+
+fn standalone_skip_link_detach_target(anchor: NodeRef<'_, Node>) -> Option<NodeId> {
+    if !is_skip_fragment_link(anchor) {
+        return None;
+    }
+    let parent = anchor.parent()?;
+    let Node::Element(parent_el) = parent.value() else {
+        return None;
+    };
+    if !container_only_skip_links(parent) {
+        return None;
+    }
+    match parent_el.name() {
+        "li" => parent
+            .parent()
+            .filter(|list| {
+                matches!(list.value(), Node::Element(e) if matches!(e.name(), "ul" | "ol"))
+                    && container_only_skip_links(*list)
+            })
+            .map(|list| list.id())
+            .or_else(|| Some(parent.id())),
+        "div" | "p" | "span" => Some(parent.id()),
+        _ => None,
     }
 }
 
@@ -880,17 +1007,24 @@ fn serialize_pruned_html(node: NodeRef<'_, Node>, in_interactive: bool, out: &mu
                 return;
             }
 
+            if tag == "pre" && !has_descendant_tag(node, "code") {
+                let mut code = String::new();
+                collect_raw_text(node, &mut code);
+                if !code.trim().is_empty() {
+                    let lang = std::iter::once(node)
+                        .chain(node.ancestors().take(2))
+                        .find_map(|n| match n.value() {
+                            Node::Element(e) => extract_lang_from_element(e),
+                            _ => None,
+                        });
+                    emit_code_block(lang.as_deref(), &code, out);
+                    return;
+                }
+            }
+
             if tag == "table" {
                 if let Some((lang, code)) = try_extract_code_gutter_table(node) {
-                    out.push_str("<pre><code");
-                    if let Some(lang) = lang {
-                        out.push_str(" class=\"language-");
-                        push_escaped_attr(&lang, out);
-                        out.push('"');
-                    }
-                    out.push('>');
-                    push_escaped_text(&code, out);
-                    out.push_str("</code></pre>");
+                    emit_code_block(lang.as_deref(), &code, out);
                     return;
                 }
             }
@@ -965,6 +1099,24 @@ fn push_escaped(val: &str, escape_quote: bool, out: &mut String) {
             _ => out.push(ch),
         }
     }
+}
+
+fn emit_code_block(lang: Option<&str>, code: &str, out: &mut String) {
+    out.push_str("<pre><code");
+    if let Some(lang) = lang {
+        out.push_str(" class=\"language-");
+        push_escaped_attr(lang, out);
+        out.push('"');
+    }
+    out.push('>');
+    push_escaped_text(code, out);
+    out.push_str("</code></pre>");
+}
+
+fn has_descendant_tag(node: NodeRef<'_, Node>, target: &str) -> bool {
+    node.descendants()
+        .skip(1)
+        .any(|d| matches!(d.value(), Node::Element(el) if el.name() == target))
 }
 
 fn emit_img_tag(src: &str, alt: Option<&str>, title: Option<&str>, out: &mut String) {

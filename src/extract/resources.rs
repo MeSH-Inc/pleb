@@ -1,7 +1,8 @@
 use ego_tree::NodeRef;
-use scraper::Node;
+use scraper::{Html, Node, Selector};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::sync::LazyLock;
 use url::Url;
 
 use super::dom::{
@@ -99,7 +100,11 @@ const TECHNICAL_VISUAL_CUES: &[&str] = &[
     "flamegraph",
 ];
 
+static HEAD_META_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("head meta[name][content]").unwrap());
+
 pub(crate) fn index_resources_in_subtree(
+    doc: &Html,
     root: NodeRef<'_, Node>,
     base_url: &Url,
 ) -> Vec<ResourceDescriptor> {
@@ -110,7 +115,40 @@ pub(crate) fn index_resources_in_subtree(
         resources: Vec::new(),
     };
     walk_for_resources(root, false, None, &mut ctx);
+    index_head_citation_pdf(doc, &mut ctx);
     ctx.resources
+}
+
+fn index_head_citation_pdf(doc: &Html, ctx: &mut ResourceIndexContext<'_>) {
+    let (mut pdf_url, mut citation_title) = (None, None);
+    for el in doc.select(&HEAD_META_SEL) {
+        let (Some(name), Some(content)) = (
+            el.value().attr("name").map(str::trim),
+            el.value()
+                .attr("content")
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+        ) else {
+            continue;
+        };
+        if pdf_url.is_none() && name.eq_ignore_ascii_case("citation_pdf_url") {
+            pdf_url = Some(content);
+        } else if citation_title.is_none() && name.eq_ignore_ascii_case("citation_title") {
+            citation_title = clean_optional_text(content);
+        }
+    }
+    let Some(resolved_url) = pdf_url.and_then(|raw| resolve_http_url(raw, ctx.base_url)) else {
+        return;
+    };
+    ctx.current_heading = None;
+    ctx.push(
+        ResourceKind::Document,
+        resolved_url.to_string(),
+        Some("application/pdf".to_string()),
+        citation_title.or_else(|| Some("PDF".to_string())),
+        None,
+        ResourceSalience::High,
+    );
 }
 
 struct ResourceIndexContext<'a> {

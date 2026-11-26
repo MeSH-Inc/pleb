@@ -1450,3 +1450,66 @@ fn adversarial_m4_svg_cap_non_http_resources_and_vtt_angle_brackets() {
     .unwrap();
     assert_eq!(plain_doc.content, not_vtt);
 }
+
+#[test]
+fn adversarial_canary_inverse_false_positives_preserve_valid_content() {
+    let url = Url::parse("https://docs.example.org/guide").unwrap();
+
+    // 1. Ordinary application/json API payloads with version+items are NOT treated as JSON Feeds.
+    let api_json = r#"{"version":"1.0","items":[{"id":1,"title":"Not a feed"}]}"#;
+    let json_doc = extract_document(
+        api_json,
+        &url,
+        Some("application/json"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(json_doc.content, api_json);
+    assert!(json_doc.title.is_none());
+
+    // 2. Visible inline styles, normal images, KaTeX inside display:none, regular checkboxes,
+    // checked checkbox popups, inline prose skip links, and deduplicated/unsafe citation_pdf_url.
+    let html = r##"<!DOCTYPE html><html><head>
+      <title>Inverse Guard</title>
+      <meta name="citation_title" content="Paper Title">
+      <meta name="citation_pdf_url" content="https://docs.example.org/files/spec.pdf">
+      <meta name="citation_pdf_url" content="javascript:alert(1)">
+    </head><body><main>
+      <h1>Inverse Guard</h1>
+      <p style="display: block; visibility: visible;">Visible styled prose stays intact.</p>
+      <p>Read the <a href="#appendix">Skip to appendix</a> note inside this sentence.</p>
+      <img src="/img/chart.png" width="240" height="120" alt="Latency chart">
+      <span style="display: none"><math><annotation encoding="application/x-tex">E = mc^2</annotation></math></span>
+      <div class="checklist"><input type="checkbox"> Plain task item stays</div>
+      <div class="open-menu"><input type="checkbox" aria-haspopup="true" checked> Checked panel stays</div>
+      <form><input type="checkbox" aria-haspopup="true"> Form checkbox stays</form>
+      <a href="/files/spec.pdf">Spec PDF</a>
+      <pre>   </pre>
+    </main></body></html>"##;
+    let doc = extract_document(html, &url, Some("text/html"), &ExtractOptions::default()).unwrap();
+    assert!(doc.content.contains("Visible styled prose stays intact."));
+    assert!(doc.content.contains("Skip to appendix"));
+    assert!(doc
+        .content
+        .contains("https://docs.example.org/img/chart.png"));
+    assert!(doc.content.contains("$E = mc^2$"));
+    assert!(doc.content.contains("Plain task item stays"));
+    assert!(doc.content.contains("Checked panel stays"));
+    assert!(doc.content.contains("Form checkbox stays"));
+    assert!(
+        !doc.content.contains("```"),
+        "whitespace-only <pre> must not emit an empty fence"
+    );
+
+    let pdf_resources: Vec<&str> = doc
+        .resources
+        .iter()
+        .filter(|r| r.kind == ResourceKind::Document)
+        .map(|r| r.url.as_str())
+        .collect();
+    assert_eq!(
+        pdf_resources,
+        vec!["https://docs.example.org/files/spec.pdf"],
+        "citation_pdf_url must deduplicate against body link and reject javascript:"
+    );
+}
