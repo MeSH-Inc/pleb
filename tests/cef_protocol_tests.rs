@@ -2,26 +2,51 @@ use mesh_wick::context::{RuntimeConfig, RuntimeContext};
 use mesh_wick::fetch::{fetch_document, FetchError, FetchOptions};
 use mesh_wick::policy::RenderMode;
 use mesh_wick::transport::cef::{
-    probe_renderer_binary, probe_renderer_in, CefProtocolError, CefRenderOptions, CefRenderer,
-    RendererProbe, EXPECTED_PROTOCOL,
+    find_renderer_in, probe_renderer_binary, probe_renderer_in, CefProtocolError, CefRenderOptions,
+    CefRenderer, RendererProbe, EXPECTED_PROTOCOL,
 };
 use std::fs;
-use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
-fn temp_state_dir(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "mesh-wick-cef-proto-{}-{}-{}",
-        tag,
-        std::process::id(),
-        nanos
-    ));
-    fs::create_dir_all(dir.join("cef")).unwrap();
-    dir
+static DIR_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+struct TempStateDir(PathBuf);
+
+impl TempStateDir {
+    fn new() -> Self {
+        let seq = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = PathBuf::from(format!("/tmp/wick-t-{}-{}", std::process::id(), seq));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        Self(dir)
+    }
+
+    fn with_cef_dir() -> Self {
+        let dir = Self::new();
+        fs::create_dir_all(dir.0.join("cef")).unwrap();
+        dir
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn to_path_buf(&self) -> PathBuf {
+        self.0.clone()
+    }
+}
+
+impl Drop for TempStateDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 #[cfg(unix)]
@@ -34,10 +59,10 @@ fn write_executable(path: &std::path::Path, content: &str) {
 #[cfg(unix)]
 #[tokio::test]
 async fn v4_meta_mock_renderer_handles_metadata_selectors_and_errors() {
-    let state_dir = temp_state_dir("mock");
-    let custom_cache = state_dir.join("custom-cache");
-    let renderer_bin = state_dir.join("cef").join("wick-renderer");
-    let log_file = state_dir.join("requests.log");
+    let state_dir = TempStateDir::with_cef_dir();
+    let custom_cache = state_dir.path().join("custom-cache");
+    let renderer_bin = state_dir.path().join("cef").join("wick-renderer");
+    let log_file = state_dir.path().join("requests.log");
 
     let script = format!(
         r#"#!/usr/bin/env python3
@@ -91,13 +116,13 @@ for raw in sys.stdin:
     write_executable(&renderer_bin, &script);
 
     assert_eq!(
-        probe_renderer_in(&state_dir),
+        probe_renderer_in(state_dir.path()),
         RendererProbe::Ready(renderer_bin.clone())
     );
 
     // Verify direct CefRenderer passes --cache-dir and preserves process across logical errors.
-    let renderer =
-        CefRenderer::new_direct(state_dir.clone(), None, false).with_cache_dir(custom_cache.clone());
+    let renderer = CefRenderer::new_direct(state_dir.to_path_buf(), None, false)
+        .with_cache_dir(custom_cache.clone());
     let opts = CefRenderOptions {
         wait_for_selector: Some("[data-testid='tweet']".to_string()),
     };
@@ -112,7 +137,11 @@ for raw in sys.stdin:
 
     // Logical renderer error leaves the warm renderer process alive for subsequent requests.
     let err = renderer
-        .render("https://mock.example/load-fail", &opts, Duration::from_secs(5))
+        .render(
+            "https://mock.example/load-fail",
+            &opts,
+            Duration::from_secs(5),
+        )
         .await
         .unwrap_err();
     assert!(err.to_string().contains("load error -105"));
@@ -127,7 +156,7 @@ for raw in sys.stdin:
 
     // Verify fetch_document propagates real 404 from CEF and does not blindly double-render <2KB pages.
     let ctx = RuntimeContext::new(RuntimeConfig {
-        state_dir: state_dir.clone(),
+        state_dir: state_dir.to_path_buf(),
         timeout: Duration::from_secs(5),
         cef_timeout: Duration::from_secs(5),
         use_daemon: false,
@@ -171,14 +200,13 @@ for raw in sys.stdin:
 
     drop(renderer);
     drop(ctx);
-    let _ = fs::remove_dir_all(&state_dir);
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn outdated_v3_renderer_fails_loudly_with_rebuild_hint() {
-    let state_dir = temp_state_dir("stale");
-    let renderer_bin = state_dir.join("cef").join("wick-renderer");
+    let state_dir = TempStateDir::with_cef_dir();
+    let renderer_bin = state_dir.path().join("cef").join("wick-renderer");
     write_executable(
         &renderer_bin,
         "#!/bin/sh\n# WICK_RENDERER_PROTOCOL=v3-cf-aware\nexit 1\n",
@@ -193,7 +221,7 @@ async fn outdated_v3_renderer_fails_loudly_with_rebuild_hint() {
         }
     );
 
-    let renderer = CefRenderer::new_direct(state_dir.clone(), None, false);
+    let renderer = CefRenderer::new_direct(state_dir.to_path_buf(), None, false);
     let err = renderer
         .render(
             "https://example.com",
@@ -207,8 +235,31 @@ async fn outdated_v3_renderer_fails_loudly_with_rebuild_hint() {
     assert!(msg.contains("v3-cf-aware"));
     assert!(msg.contains("v4-meta"));
     assert!(msg.contains("install-cef-"));
+}
 
-    let _ = fs::remove_dir_all(&state_dir);
+#[cfg(unix)]
+#[test]
+fn renderer_override_and_no_home_cef_isolation() {
+    let empty_state = TempStateDir::new();
+    if std::env::var("WICK_NO_HOME_CEF").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")) {
+        assert_eq!(find_renderer_in(empty_state.path()), None);
+        assert_eq!(
+            probe_renderer_in(empty_state.path()),
+            RendererProbe::NotInstalled
+        );
+    }
+
+    let custom_dir = TempStateDir::new();
+    let custom_bin = custom_dir.path().join("custom-renderer");
+    write_executable(
+        &custom_bin,
+        "#!/bin/sh\n# WICK_RENDERER_PROTOCOL=v4-meta\nexit 0\n",
+    );
+
+    let renderer = CefRenderer::new_direct(empty_state.to_path_buf(), None, false)
+        .with_renderer_executable(Some(custom_bin.clone()));
+    assert_eq!(renderer.renderer_path(), Some(custom_bin.clone()));
+    assert_eq!(renderer.probe(), RendererProbe::Ready(custom_bin));
 }
 
 #[test]
@@ -277,9 +328,9 @@ int main(void) {
     return 0;
 }
 "#;
-    let dir = temp_state_dir("c-proto");
-    let src = dir.join("test_proto.c");
-    let bin = dir.join("test_proto");
+    let dir = TempStateDir::new();
+    let src = dir.path().join("test_proto.c");
+    let bin = dir.path().join("test_proto");
     fs::write(&src, c_harness).unwrap();
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -301,6 +352,4 @@ int main(void) {
         .status()
         .expect("failed to execute C protocol harness");
     assert!(run.success(), "C protocol harness assertions failed");
-
-    let _ = fs::remove_dir_all(&dir);
 }

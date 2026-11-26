@@ -2,34 +2,46 @@
 
 use mesh_wick::context::{RuntimeConfig, RuntimeContext};
 use mesh_wick::daemon::{
-    daemon_http_get, daemon_ping, daemon_stop, lock_path, run_daemon, socket_path, storage_key,
-    DaemonResponseHeader, BUILD_ID, PROTOCOL_VERSION,
+    daemon_http_get, daemon_http_get_with_executable, daemon_ping, daemon_stop, lock_path,
+    resolve_daemon_executable, run_daemon, socket_path, storage_key, DaemonResponseHeader,
+    BUILD_ID, PROTOCOL_VERSION,
 };
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::Notify;
 
 static DIR_SEQ: AtomicUsize = AtomicUsize::new(0);
 
-fn short_temp_dir(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let seq = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = PathBuf::from(format!(
-        "/tmp/mw-d-{}-{}-{}-{}",
-        tag,
-        std::process::id(),
-        seq,
-        nanos
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+struct TempStateDir(PathBuf);
+
+impl TempStateDir {
+    fn new() -> Self {
+        let seq = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = PathBuf::from(format!("/tmp/wick-t-{}-{}", std::process::id(), seq));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        Self(dir)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn to_path_buf(&self) -> PathBuf {
+        self.0.clone()
+    }
+}
+
+impl Drop for TempStateDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 async fn wait_for_ping(dir: &Path) -> mesh_wick::daemon::DaemonStatus {
@@ -114,19 +126,18 @@ async fn spawn_daemon_test_server() -> (String, Arc<AtomicUsize>, Arc<Notify>) {
 #[tokio::test]
 async fn daemon_concurrent_http_ping_during_slow_and_disconnect_cancel() {
     let (base, _active_slow, slow_started) = spawn_daemon_test_server().await;
-    let dir = short_temp_dir("conc");
-    let dir_clone = dir.clone();
-    let handle = tokio::spawn(async move {
-        run_daemon(dir_clone, Duration::from_secs(30), false).await
-    });
+    let dir = TempStateDir::new();
+    let dir_clone = dir.to_path_buf();
+    let handle =
+        tokio::spawn(async move { run_daemon(dir_clone, Duration::from_secs(30), false).await });
 
-    let init_status = wait_for_ping(&dir).await;
+    let init_status = wait_for_ping(dir.path()).await;
     assert_eq!(init_status.pid, std::process::id());
     assert_eq!(init_status.protocol_version, PROTOCOL_VERSION);
     assert_eq!(init_status.build_id, BUILD_ID);
 
     // Launch a slow HttpGet in the background and wait for it to reach the server.
-    let dir_slow = dir.clone();
+    let dir_slow = dir.to_path_buf();
     let slow_url = format!("{base}/slow");
     let slow_task = tokio::spawn(async move {
         daemon_http_get(
@@ -146,7 +157,7 @@ async fn daemon_concurrent_http_ping_during_slow_and_disconnect_cancel() {
         .expect("slow request should reach mock server");
 
     // Ping must return immediately while slow request is active, reporting active_requests >= 1.
-    let mid_ping = tokio::time::timeout(Duration::from_millis(400), daemon_ping(&dir))
+    let mid_ping = tokio::time::timeout(Duration::from_millis(400), daemon_ping(dir.path()))
         .await
         .expect("ping must not block on slow request")
         .expect("ping should succeed");
@@ -157,7 +168,7 @@ async fn daemon_concurrent_http_ping_during_slow_and_disconnect_cancel() {
     let url_b = format!("{base}/fast-b");
     let (r_a, r_b) = tokio::join!(
         daemon_http_get(
-            &dir,
+            dir.path(),
             None,
             Duration::from_secs(5),
             1024 * 1024,
@@ -166,7 +177,7 @@ async fn daemon_concurrent_http_ping_during_slow_and_disconnect_cancel() {
             &url_a,
         ),
         daemon_http_get(
-            &dir,
+            dir.path(),
             None,
             Duration::from_secs(5),
             1024 * 1024,
@@ -184,7 +195,7 @@ async fn daemon_concurrent_http_ping_during_slow_and_disconnect_cancel() {
 
     let mut settled = false;
     for _ in 0..40 {
-        if let Some(st) = daemon_ping(&dir).await {
+        if let Some(st) = daemon_ping(dir.path()).await {
             if st.active_requests == 0 {
                 settled = true;
                 break;
@@ -192,11 +203,14 @@ async fn daemon_concurrent_http_ping_during_slow_and_disconnect_cancel() {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert!(settled, "active_requests should drop to 0 after client disconnect");
+    assert!(
+        settled,
+        "active_requests should drop to 0 after client disconnect"
+    );
 
     // --no-daemon refuses to run against a state_dir owned by a live daemon.
     let no_daemon_err = RuntimeContext::new(RuntimeConfig {
-        state_dir: dir.clone(),
+        state_dir: dir.to_path_buf(),
         use_daemon: false,
         ..Default::default()
     })
@@ -204,40 +218,38 @@ async fn daemon_concurrent_http_ping_during_slow_and_disconnect_cancel() {
     .expect("--no-daemon should fail when daemon owns state_dir");
     assert!(no_daemon_err.to_string().contains("daemon stop"));
 
-    assert!(daemon_stop(&dir).await.unwrap());
+    assert!(daemon_stop(dir.path()).await.unwrap());
     tokio::time::timeout(Duration::from_secs(3), handle)
         .await
         .unwrap()
         .unwrap()
         .unwrap();
 
-    assert!(!socket_path(&dir).exists());
-    assert!(!daemon_stop(&dir).await.unwrap());
-    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!socket_path(dir.path()).exists());
+    assert!(!daemon_stop(dir.path()).await.unwrap());
 }
 
 #[tokio::test]
 async fn daemon_proxy_partitioning_stop_restart_idle_and_legacy_cleanup() {
     let (base, _, _) = spawn_daemon_test_server().await;
-    let dir = short_temp_dir("part");
+    let dir = TempStateDir::new();
 
     // Seed legacy cef.sock and cef.lock to verify run_daemon cleans them up.
-    let legacy_sock = dir.join("cef.sock");
-    let legacy_lock = dir.join("cef.lock");
+    let legacy_sock = dir.path().join("cef.sock");
+    let legacy_lock = dir.path().join("cef.lock");
     std::fs::write(&legacy_sock, b"").unwrap();
     std::fs::write(&legacy_lock, b"").unwrap();
 
-    let dir_clone = dir.clone();
-    let handle = tokio::spawn(async move {
-        run_daemon(dir_clone, Duration::from_secs(30), false).await
-    });
-    let _ = wait_for_ping(&dir).await;
+    let dir_clone = dir.to_path_buf();
+    let handle =
+        tokio::spawn(async move { run_daemon(dir_clone, Duration::from_secs(30), false).await });
+    let _ = wait_for_ping(dir.path()).await;
     assert!(!legacy_sock.exists());
     assert!(!legacy_lock.exists());
 
     // Direct request creates data/direct; proxy key creates separate proxy-* slot directory.
     let direct = daemon_http_get(
-        &dir,
+        dir.path(),
         None,
         Duration::from_secs(5),
         1024 * 1024,
@@ -251,7 +263,7 @@ async fn daemon_proxy_partitioning_stop_restart_idle_and_legacy_cleanup() {
 
     let proxy = "http://127.0.0.1:9";
     let _ = daemon_http_get(
-        &dir,
+        dir.path(),
         Some(proxy),
         Duration::from_millis(500),
         1024 * 1024,
@@ -261,39 +273,40 @@ async fn daemon_proxy_partitioning_stop_restart_idle_and_legacy_cleanup() {
     )
     .await;
 
-    let ping = daemon_ping(&dir).await.unwrap();
+    let ping = daemon_ping(dir.path()).await.unwrap();
     assert_eq!(ping.cronet_slots, 2);
-    assert!(dir.join("data").join(storage_key(None)).exists());
-    assert!(dir.join("data").join(storage_key(Some(proxy))).exists());
+    assert!(dir.path().join("data").join(storage_key(None)).exists());
+    assert!(dir
+        .path()
+        .join("data")
+        .join(storage_key(Some(proxy)))
+        .exists());
 
     // Stop and immediately restart (testing 2s lock retry).
-    assert!(daemon_stop(&dir).await.unwrap());
+    assert!(daemon_stop(dir.path()).await.unwrap());
     let _ = handle.await;
 
-    let dir_idle = dir.clone();
-    let handle2 = tokio::spawn(async move {
-        run_daemon(dir_idle, Duration::from_millis(250), false).await
-    });
-    let _ = wait_for_ping(&dir).await;
+    let dir_idle = dir.to_path_buf();
+    let handle2 =
+        tokio::spawn(async move { run_daemon(dir_idle, Duration::from_millis(250), false).await });
+    let _ = wait_for_ping(dir.path()).await;
     tokio::time::timeout(Duration::from_secs(3), handle2)
         .await
         .expect("daemon should exit after idle timeout")
         .unwrap()
         .unwrap();
-    assert!(!socket_path(&dir).exists());
-
-    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!socket_path(dir.path()).exists());
 }
 
 #[tokio::test]
 async fn daemon_restarts_automatically_on_build_id_mismatch() {
     let (base, _, _) = spawn_daemon_test_server().await;
-    let dir = short_temp_dir("build-id");
-    let sock = socket_path(&dir);
+    let dir = TempStateDir::new();
+    let sock = socket_path(dir.path());
 
     // Create a mock daemon listener returning a stale build_id and recording Shutdown.
     let listener = UnixListener::bind(&sock).unwrap();
-    let lp = lock_path(&dir);
+    let lp = lock_path(dir.path());
     let _lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -340,18 +353,18 @@ async fn daemon_restarts_automatically_on_build_id_mismatch() {
         }
     });
 
-    // Drop mock lock when mock_task shuts down; run client with WICK_DAEMON_EXE pointing to wick bin.
+    // Drop mock lock when mock_task shuts down; pass explicit CARGO_BIN_EXE_wick path.
     drop(_lock);
-    std::env::set_var("WICK_DAEMON_EXE", env!("CARGO_BIN_EXE_wick"));
 
-    let resp = daemon_http_get(
-        &dir,
+    let resp = daemon_http_get_with_executable(
+        dir.path(),
         None,
         Duration::from_secs(5),
         1024 * 1024,
         Duration::from_secs(5),
         false,
         &format!("{base}/fast-a"),
+        Some(Path::new(env!("CARGO_BIN_EXE_wick"))),
     )
     .await
     .unwrap();
@@ -360,6 +373,39 @@ async fn daemon_restarts_automatically_on_build_id_mismatch() {
     assert_eq!(resp.text(), "alpha");
 
     let _ = mock_task.await;
-    let _ = daemon_stop(&dir).await;
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = daemon_stop(dir.path()).await;
+}
+
+#[test]
+fn resolve_daemon_executable_rejects_cargo_test_runner_and_accepts_override() {
+    let explicit = Path::new(env!("CARGO_BIN_EXE_wick"));
+    assert_eq!(resolve_daemon_executable(Some(explicit)).unwrap(), explicit);
+
+    if std::env::var_os("WICK_DAEMON_EXECUTABLE").is_none() {
+        let err = resolve_daemon_executable(None)
+            .expect_err("Cargo test runner under deps/ must not be spawned as daemon");
+        assert!(err.to_string().contains("WICK_DAEMON_EXECUTABLE"));
+    }
+}
+
+#[tokio::test]
+async fn run_daemon_exits_immediately_when_live_daemon_responds_to_ping() {
+    let dir = TempStateDir::new();
+    let dir_clone = dir.to_path_buf();
+    let handle =
+        tokio::spawn(async move { run_daemon(dir_clone, Duration::from_secs(30), false).await });
+    let _ = wait_for_ping(dir.path()).await;
+
+    let started = Instant::now();
+    run_daemon(dir.to_path_buf(), Duration::from_secs(30), false)
+        .await
+        .expect("second concurrent run_daemon should exit cleanly");
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "second run_daemon spun for {:?} instead of exiting immediately on live ping",
+        started.elapsed()
+    );
+
+    assert!(daemon_stop(dir.path()).await.unwrap());
+    let _ = handle.await;
 }

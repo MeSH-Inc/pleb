@@ -184,8 +184,11 @@ pub async fn stop_legacy_cef_daemon(state_dir: &Path) {
     let legacy_sock = state_dir.join("cef.sock");
     let legacy_lock = state_dir.join("cef.lock");
     if legacy_sock.exists() {
-        if let Ok(Ok(mut stream)) =
-            tokio::time::timeout(Duration::from_millis(500), UnixStream::connect(&legacy_sock)).await
+        if let Ok(Ok(mut stream)) = tokio::time::timeout(
+            Duration::from_millis(500),
+            UnixStream::connect(&legacy_sock),
+        )
+        .await
         {
             let _ = stream.write_all(b"{\"op\":\"shutdown\"}\n").await;
             let _ = stream.flush().await;
@@ -224,6 +227,18 @@ pub async fn run_daemon(state_dir: PathBuf, idle_timeout: Duration, verbose: boo
         match lock_file.try_lock() {
             Ok(()) => break,
             Err(std::fs::TryLockError::WouldBlock) => {
+                if socket_path(&state_dir).exists()
+                    && tokio::time::timeout(
+                        Duration::from_millis(200),
+                        super::client::daemon_ping(&state_dir),
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    return Ok(());
+                }
                 if tokio::time::Instant::now() >= lock_deadline {
                     return Ok(());
                 }
@@ -327,10 +342,11 @@ pub async fn run_daemon(state_dir: PathBuf, idle_timeout: Duration, verbose: boo
     drop(sock_guard);
     drop(listener);
 
-    let drain_fut = async {
-        while tasks.join_next().await.is_some() {}
-    };
-    if tokio::time::timeout(DRAIN_TIMEOUT, drain_fut).await.is_err() {
+    let drain_fut = async { while tasks.join_next().await.is_some() {} };
+    if tokio::time::timeout(DRAIN_TIMEOUT, drain_fut)
+        .await
+        .is_err()
+    {
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
     }

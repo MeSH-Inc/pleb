@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -89,6 +89,30 @@ pub async fn daemon_http_get(
     verbose: bool,
     url: &str,
 ) -> Result<HttpResponse> {
+    daemon_http_get_with_executable(
+        state_dir,
+        proxy,
+        timeout,
+        max_body_bytes,
+        idle_timeout,
+        verbose,
+        url,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn daemon_http_get_with_executable(
+    state_dir: &Path,
+    proxy: Option<&str>,
+    timeout: Duration,
+    max_body_bytes: usize,
+    idle_timeout: Duration,
+    verbose: bool,
+    url: &str,
+    daemon_executable: Option<&Path>,
+) -> Result<HttpResponse> {
     let req = DaemonRequest::HttpGet {
         url: url.to_string(),
         proxy: proxy.map(str::to_string),
@@ -96,7 +120,15 @@ pub async fn daemon_http_get(
         max_body_bytes,
     };
     let io_timeout = timeout.saturating_add(CLIENT_IO_GRACE);
-    let (hdr, body) = send_daemon_rpc(state_dir, &req, io_timeout, idle_timeout, verbose).await?;
+    let (hdr, body) = send_daemon_rpc(
+        state_dir,
+        &req,
+        io_timeout,
+        idle_timeout,
+        verbose,
+        daemon_executable,
+    )
+    .await?;
 
     if hdr.ok {
         Ok(HttpResponse {
@@ -120,6 +152,30 @@ pub async fn daemon_cef_render(
     url: &str,
     opts: &CefRenderOptions,
 ) -> Result<CefRenderResult> {
+    daemon_cef_render_with_executable(
+        state_dir,
+        proxy,
+        timeout,
+        idle_timeout,
+        verbose,
+        url,
+        opts,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn daemon_cef_render_with_executable(
+    state_dir: &Path,
+    proxy: Option<&str>,
+    timeout: Duration,
+    idle_timeout: Duration,
+    verbose: bool,
+    url: &str,
+    opts: &CefRenderOptions,
+    daemon_executable: Option<&Path>,
+) -> Result<CefRenderResult> {
     let req = DaemonRequest::CefRender {
         url: url.to_string(),
         wait_for_selector: opts.wait_for_selector.clone(),
@@ -127,7 +183,15 @@ pub async fn daemon_cef_render(
         timeout_ms: timeout.as_millis().min(u128::from(u64::MAX)) as u64,
     };
     let io_timeout = timeout.saturating_add(CLIENT_IO_GRACE);
-    let (hdr, body) = send_daemon_rpc(state_dir, &req, io_timeout, idle_timeout, verbose).await?;
+    let (hdr, body) = send_daemon_rpc(
+        state_dir,
+        &req,
+        io_timeout,
+        idle_timeout,
+        verbose,
+        daemon_executable,
+    )
+    .await?;
 
     if hdr.ok {
         let html = String::from_utf8_lossy(&body).into_owned();
@@ -159,13 +223,14 @@ async fn send_daemon_rpc(
     io_timeout: Duration,
     idle_timeout: Duration,
     verbose: bool,
+    daemon_executable: Option<&Path>,
 ) -> Result<(DaemonResponseHeader, Vec<u8>)> {
     let sock = socket_path(state_dir);
     let (hdr, body) = match try_send_once(&sock, req, io_timeout).await {
         Ok(res) => res,
         Err(err) if is_retryable_pre_response_error(&err) => {
             if !is_daemon_running(state_dir) {
-                spawn_detached_daemon(state_dir, idle_timeout, verbose)?;
+                spawn_detached_daemon(state_dir, idle_timeout, verbose, daemon_executable)?;
             }
             send_with_start_retry(&sock, req, io_timeout).await?
         }
@@ -174,7 +239,7 @@ async fn send_daemon_rpc(
 
     if hdr.protocol_version != PROTOCOL_VERSION || hdr.build_id != BUILD_ID {
         let _ = daemon_stop(state_dir).await;
-        spawn_detached_daemon(state_dir, idle_timeout, verbose)?;
+        spawn_detached_daemon(state_dir, idle_timeout, verbose, daemon_executable)?;
         let (restarted_hdr, restarted_body) = send_with_start_retry(&sock, req, io_timeout).await?;
         if restarted_hdr.protocol_version != PROTOCOL_VERSION || restarted_hdr.build_id != BUILD_ID
         {
@@ -214,12 +279,39 @@ async fn send_with_start_retry(
     }
 }
 
-fn spawn_detached_daemon(state_dir: &Path, idle_timeout: Duration, verbose: bool) -> Result<()> {
+pub fn resolve_daemon_executable(override_exe: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = override_exe {
+        if !path.as_os_str().is_empty() {
+            return Ok(path.to_path_buf());
+        }
+    }
+    if let Some(path) = std::env::var_os("WICK_DAEMON_EXECUTABLE") {
+        if !path.is_empty() {
+            return Ok(PathBuf::from(path));
+        }
+    }
+    let exe = std::env::current_exe().context("failed to resolve current executable")?;
+    if exe
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "deps")
+    {
+        bail!(
+            "refusing to spawn Cargo test binary {} as wick daemon; set RuntimeConfig::daemon_executable or WICK_DAEMON_EXECUTABLE",
+            exe.display()
+        );
+    }
+    Ok(exe)
+}
+
+fn spawn_detached_daemon(
+    state_dir: &Path,
+    idle_timeout: Duration,
+    verbose: bool,
+    daemon_executable: Option<&Path>,
+) -> Result<()> {
     ensure_private_dir(state_dir)?;
-    let exe = match std::env::var_os("WICK_DAEMON_EXE") {
-        Some(path) if !path.is_empty() => path.into(),
-        _ => std::env::current_exe()?,
-    };
+    let exe = resolve_daemon_executable(daemon_executable)?;
     let idle_secs = idle_timeout.as_secs().max(1).to_string();
 
     let log_file = OpenOptions::new()

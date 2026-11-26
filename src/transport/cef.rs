@@ -93,6 +93,8 @@ impl Drop for KillOnDrop {
 pub struct CefRenderer {
     state_dir: PathBuf,
     cache_dir: Option<PathBuf>,
+    daemon_executable: Option<PathBuf>,
+    renderer_executable: Option<PathBuf>,
     proxy: Option<String>,
     idle_timeout: Duration,
     use_daemon: bool,
@@ -111,6 +113,8 @@ impl CefRenderer {
         Self {
             state_dir,
             cache_dir: None,
+            daemon_executable: None,
+            renderer_executable: None,
             proxy,
             idle_timeout,
             use_daemon,
@@ -128,8 +132,18 @@ impl CefRenderer {
         self
     }
 
+    pub fn with_daemon_executable(mut self, daemon_executable: Option<PathBuf>) -> Self {
+        self.daemon_executable = daemon_executable;
+        self
+    }
+
+    pub fn with_renderer_executable(mut self, renderer_executable: Option<PathBuf>) -> Self {
+        self.renderer_executable = renderer_executable;
+        self
+    }
+
     pub fn probe(&self) -> RendererProbe {
-        probe_renderer_in(&self.state_dir)
+        probe_renderer_with_override(&self.state_dir, self.renderer_executable.as_deref())
     }
 
     pub fn is_available(&self) -> bool {
@@ -137,7 +151,7 @@ impl CefRenderer {
     }
 
     pub fn renderer_path(&self) -> Option<PathBuf> {
-        find_renderer_in(&self.state_dir)
+        find_renderer_with_override(&self.state_dir, self.renderer_executable.as_deref())
     }
 
     pub fn has_live_process(&self) -> bool {
@@ -158,7 +172,7 @@ impl CefRenderer {
     ) -> Result<CefRenderResult> {
         #[cfg(unix)]
         if self.use_daemon {
-            return crate::daemon::daemon_cef_render(
+            return crate::daemon::daemon_cef_render_with_executable(
                 &self.state_dir,
                 self.proxy.as_deref(),
                 timeout,
@@ -166,6 +180,7 @@ impl CefRenderer {
                 self.verbose,
                 url,
                 opts,
+                self.daemon_executable.as_deref(),
             )
             .await;
         }
@@ -253,7 +268,10 @@ impl CefRenderer {
             }
             Ok(Ok((_, _, Err(e)))) => {
                 drop(kill_guard);
-                Err(anyhow::anyhow!(append_stderr_tail(e.to_string(), &stderr_tail)))
+                Err(anyhow::anyhow!(append_stderr_tail(
+                    e.to_string(),
+                    &stderr_tail
+                )))
             }
             Ok(Err(_)) => {
                 drop(kill_guard);
@@ -271,7 +289,10 @@ impl CefRenderer {
             Err(_) => {
                 drop(kill_guard);
                 let msg = append_stderr_tail(
-                    format!("CEF render timed out after {:?} for {}", timeout, url_for_err),
+                    format!(
+                        "CEF render timed out after {:?} for {}",
+                        timeout, url_for_err
+                    ),
                     &stderr_tail,
                 );
                 Err(anyhow::Error::new(CefTimeoutError(msg)))
@@ -405,7 +426,10 @@ impl CefRenderer {
             }
             Ok(Ok((_, Err(e)))) => {
                 drop(kill_guard);
-                Err(anyhow::anyhow!(append_stderr_tail(e.to_string(), &stderr_tail)))
+                Err(anyhow::anyhow!(append_stderr_tail(
+                    e.to_string(),
+                    &stderr_tail
+                )))
             }
             Ok(Err(_)) => {
                 drop(kill_guard);
@@ -506,14 +530,8 @@ fn perform_render(
         bail!("wick-renderer closed stdout without a response");
     }
 
-    let header: RendererResponseHeader =
-        serde_json::from_str(header_line.trim()).map_err(|e| {
-            anyhow::anyhow!(
-                "bad CEF response header '{}': {}",
-                header_line.trim(),
-                e
-            )
-        })?;
+    let header: RendererResponseHeader = serde_json::from_str(header_line.trim())
+        .map_err(|e| anyhow::anyhow!("bad CEF response header '{}': {}", header_line.trim(), e))?;
 
     if header.html_bytes > MAX_HTML_BYTES {
         bail!(
@@ -599,7 +617,14 @@ pub fn rebuild_command_hint() -> &'static str {
 }
 
 pub fn probe_renderer_in(state_dir: &Path) -> RendererProbe {
-    match find_renderer_in(state_dir) {
+    probe_renderer_with_override(state_dir, None)
+}
+
+pub fn probe_renderer_with_override(
+    state_dir: &Path,
+    renderer_executable: Option<&Path>,
+) -> RendererProbe {
+    match find_renderer_with_override(state_dir, renderer_executable) {
         Some(path) => probe_renderer_binary(&path),
         None => RendererProbe::NotInstalled,
     }
@@ -630,7 +655,12 @@ fn extract_protocol_version(bytes: &[u8]) -> Option<String> {
             let end = tail
                 .iter()
                 .position(|&b| {
-                    b == 0 || b == b'\n' || b == b'\r' || b == b'"' || b == b'\'' || b.is_ascii_whitespace()
+                    b == 0
+                        || b == b'\n'
+                        || b == b'\r'
+                        || b == b'"'
+                        || b == b'\''
+                        || b.is_ascii_whitespace()
                 })
                 .unwrap_or(tail.len());
             let ver = std::str::from_utf8(&tail[..end]).ok()?.trim();
@@ -638,13 +668,41 @@ fn extract_protocol_version(bytes: &[u8]) -> Option<String> {
         })
 }
 
+fn is_no_home_cef_enabled() -> bool {
+    std::env::var("WICK_NO_HOME_CEF")
+        .is_ok_and(|val| val == "1" || val.eq_ignore_ascii_case("true"))
+}
+
 pub fn find_renderer_in(state_dir: &Path) -> Option<PathBuf> {
+    find_renderer_with_override(state_dir, None)
+}
+
+pub fn find_renderer_with_override(
+    state_dir: &Path,
+    renderer_executable: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(explicit) = renderer_executable {
+        if !explicit.as_os_str().is_empty() {
+            return explicit.exists().then(|| explicit.to_path_buf());
+        }
+    }
+
+    if let Some(env_path) = std::env::var_os("WICK_CEF_RENDERER") {
+        if !env_path.is_empty() {
+            let path = PathBuf::from(env_path);
+            return path.exists().then_some(path);
+        }
+    }
+
+    let no_home_cef = is_no_home_cef_enabled();
     let mut candidates = Vec::new();
 
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("wick-renderer.app/Contents/MacOS/wick-renderer"));
-            candidates.push(dir.join("wick-renderer"));
+    if !no_home_cef {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                candidates.push(dir.join("wick-renderer.app/Contents/MacOS/wick-renderer"));
+                candidates.push(dir.join("wick-renderer"));
+            }
         }
     }
 
@@ -652,13 +710,15 @@ pub fn find_renderer_in(state_dir: &Path) -> Option<PathBuf> {
     candidates.push(state_cef.join("wick-renderer.app/Contents/MacOS/wick-renderer"));
     candidates.push(state_cef.join("wick-renderer"));
 
-    if let Some(home) = std::env::var_os("HOME") {
-        let mesh_cef = PathBuf::from(home).join(".mesh-wick").join("cef");
-        candidates.push(mesh_cef.join("wick-renderer.app/Contents/MacOS/wick-renderer"));
-        candidates.push(mesh_cef.join("wick-renderer"));
-    }
+    if !no_home_cef {
+        if let Some(home) = std::env::var_os("HOME") {
+            let mesh_cef = PathBuf::from(home).join(".mesh-wick").join("cef");
+            candidates.push(mesh_cef.join("wick-renderer.app/Contents/MacOS/wick-renderer"));
+            candidates.push(mesh_cef.join("wick-renderer"));
+        }
 
-    candidates.push(PathBuf::from("/opt/mesh-wick/wick-renderer"));
+        candidates.push(PathBuf::from("/opt/mesh-wick/wick-renderer"));
+    }
 
     candidates.into_iter().find(|path| path.exists())
 }

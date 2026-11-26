@@ -50,6 +50,7 @@ enum TransportBackend {
         proxy: Option<String>,
         idle_timeout: Duration,
         verbose: bool,
+        daemon_executable: Option<PathBuf>,
     },
 }
 
@@ -110,9 +111,22 @@ impl TransportClient {
                 proxy,
                 idle_timeout,
                 verbose,
+                daemon_executable: None,
             },
             default_timeout: timeout,
         }
+    }
+
+    #[cfg(unix)]
+    pub fn with_daemon_executable(mut self, daemon_executable: Option<PathBuf>) -> Self {
+        if let TransportBackend::Daemon {
+            daemon_executable: ref mut slot,
+            ..
+        } = self.backend
+        {
+            *slot = daemon_executable;
+        }
+        self
     }
 
     pub fn transport_name(&self) -> &'static str {
@@ -124,8 +138,12 @@ impl TransportClient {
     }
 
     pub async fn get(&self, url: &str) -> Result<HttpResponse> {
-        self.get_with_limits(url, self.default_timeout, DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES)
-            .await
+        self.get_with_limits(
+            url,
+            self.default_timeout,
+            DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES,
+        )
+        .await
     }
 
     pub async fn get_with_limits(
@@ -141,8 +159,9 @@ impl TransportClient {
                 proxy,
                 idle_timeout,
                 verbose,
+                daemon_executable,
             } => {
-                crate::daemon::daemon_http_get(
+                crate::daemon::daemon_http_get_with_executable(
                     state_dir,
                     proxy.as_deref(),
                     timeout,
@@ -150,6 +169,7 @@ impl TransportClient {
                     *idle_timeout,
                     *verbose,
                     url,
+                    daemon_executable.as_deref(),
                 )
                 .await
             }
