@@ -178,11 +178,42 @@ pub fn is_safe_alternate_url(base: &Url, target: &Url) -> bool {
 }
 
 pub fn is_safe_subresource_url(parent: &Url, target: &Url) -> bool {
-    is_safe_alternate_url(parent, target)
+    if !matches!(parent.scheme(), "http" | "https") || !matches!(target.scheme(), "http" | "https")
+    {
+        return false;
+    }
+    if parent.scheme() == "https" && target.scheme() != "https" {
+        return false;
+    }
+    let (Some(parent_host), Some(target_host)) = (parent.host_str(), target.host_str()) else {
+        return false;
+    };
+
+    if is_local_or_private_host(parent_host) {
+        return parent_host.eq_ignore_ascii_case(target_host)
+            && parent.port_or_known_default() == target.port_or_known_default();
+    }
+
+    !is_local_or_private_host(target_host)
 }
 
-pub fn compute_safe_referer(_parent: &Url, _target: &Url) -> Option<String> {
-    None
+pub fn compute_safe_referer(parent: &Url, target: &Url) -> Option<String> {
+    if !matches!(parent.scheme(), "http" | "https") || !matches!(target.scheme(), "http" | "https")
+    {
+        return None;
+    }
+    if parent.scheme() == "https" && target.scheme() == "http" {
+        return None;
+    }
+    if parent.origin() == target.origin() {
+        let mut sanitized = parent.clone();
+        let _ = sanitized.set_username("");
+        let _ = sanitized.set_password(None);
+        sanitized.set_fragment(None);
+        Some(sanitized.into())
+    } else {
+        Some(format!("{}/", parent.origin().ascii_serialization()))
+    }
 }
 
 fn classify_filename(filename: &str) -> Option<RawSourceKind> {
@@ -413,7 +444,7 @@ fn is_local_or_private_host(host: &str) -> bool {
     false
 }
 
-fn same_origin_or_parent_domain(base_host: &str, target_host: &str) -> bool {
+pub(crate) fn same_origin_or_parent_domain(base_host: &str, target_host: &str) -> bool {
     let a = base_host.trim_end_matches('.').to_ascii_lowercase();
     let b = target_host.trim_end_matches('.').to_ascii_lowercase();
     if a == b {
@@ -564,5 +595,120 @@ mod tests {
             &base,
         )
         .is_none());
+    }
+
+    #[test]
+    fn subresource_url_allows_public_cdns_and_blocks_ssrf_and_downgrades() {
+        let public_parent = Url::parse("https://docs.example.com/architecture").unwrap();
+
+        // Public cross-origin CDNs allowed
+        for ok in [
+            "https://docs.example.com/img/arch.png",
+            "https://cdn.example.com/diagrams/pipeline.webp",
+            "https://user-images.githubusercontent.com/42/diagram.png",
+            "https://100.128.0.1/public-asset.png",
+        ] {
+            let target = Url::parse(ok).unwrap();
+            assert!(
+                is_safe_subresource_url(&public_parent, &target),
+                "expected allowed: {ok}"
+            );
+        }
+
+        // Private, loopback, link-local, CGNAT, IPv4-mapped IPv6, downgrade, non-HTTP blocked
+        for blocked in [
+            "http://cdn.example.com/downgrade.png",
+            "file:///etc/passwd",
+            "data:image/png;base64,AAAA",
+            "https://127.0.0.1/secret.png",
+            "https://localhost/secret.png",
+            "https://sub.localhost/secret.png",
+            "https://internal.local/secret.png",
+            "https://metadata.internal/secret.png",
+            "https://10.0.0.5/secret.png",
+            "https://172.16.0.1/secret.png",
+            "https://192.168.1.10/secret.png",
+            "https://169.254.169.254/latest/meta-data",
+            "https://100.64.0.1/cgnat.png",
+            "https://100.127.255.254/cgnat.png",
+            "https://[::1]/secret.png",
+            "https://[fe80::1]/secret.png",
+            "https://[fc00::1]/secret.png",
+            "https://[::ffff:127.0.0.1]/secret.png",
+            "https://[::ffff:10.0.0.1]/secret.png",
+            "https://[::ffff:100.64.0.1]/secret.png",
+        ] {
+            let target = Url::parse(blocked).unwrap();
+            assert!(
+                !is_safe_subresource_url(&public_parent, &target),
+                "expected blocked: {blocked}"
+            );
+        }
+
+        // HTTP parent -> HTTPS CDN upgrade allowed
+        let http_parent = Url::parse("http://blog.example.com/post").unwrap();
+        assert!(is_safe_subresource_url(
+            &http_parent,
+            &Url::parse("https://cdn.example.org/fig1.png").unwrap()
+        ));
+
+        // Local loopback parent requires exact same host and port
+        let local_parent = Url::parse("http://127.0.0.1:8080/page").unwrap();
+        assert!(is_safe_subresource_url(
+            &local_parent,
+            &Url::parse("http://127.0.0.1:8080/img/arch.png").unwrap()
+        ));
+        assert!(!is_safe_subresource_url(
+            &local_parent,
+            &Url::parse("http://127.0.0.1:9090/img/arch.png").unwrap()
+        ));
+        assert!(!is_safe_subresource_url(
+            &local_parent,
+            &Url::parse("http://localhost:8080/img/arch.png").unwrap()
+        ));
+    }
+
+    #[test]
+    fn compute_safe_referer_implements_strict_origin_when_cross_origin() {
+        let parent =
+            Url::parse("https://user:secret@docs.example.com/guide/arch?tab=1#section-2").unwrap();
+
+        // Same origin: full URL with credentials and fragment stripped
+        let same = Url::parse("https://docs.example.com/assets/diagram.png").unwrap();
+        assert_eq!(
+            compute_safe_referer(&parent, &same).as_deref(),
+            Some("https://docs.example.com/guide/arch?tab=1")
+        );
+
+        // Cross origin: origin-only with trailing slash
+        let cross_cdn = Url::parse("https://cdn.example.com/assets/diagram.png").unwrap();
+        assert_eq!(
+            compute_safe_referer(&parent, &cross_cdn).as_deref(),
+            Some("https://docs.example.com/")
+        );
+
+        // Cross port: origin-only with trailing slash
+        let cross_port = Url::parse("https://docs.example.com:8443/assets/diagram.png").unwrap();
+        assert_eq!(
+            compute_safe_referer(&parent, &cross_port).as_deref(),
+            Some("https://docs.example.com/")
+        );
+
+        // HTTPS -> HTTP downgrade: None
+        let downgrade = Url::parse("http://docs.example.com/assets/diagram.png").unwrap();
+        assert_eq!(compute_safe_referer(&parent, &downgrade), None);
+
+        // HTTP -> HTTPS cross origin: origin-only
+        let http_parent = Url::parse("http://blog.example.com/post#top").unwrap();
+        let https_target = Url::parse("https://cdn.example.com/img.png").unwrap();
+        assert_eq!(
+            compute_safe_referer(&http_parent, &https_target).as_deref(),
+            Some("http://blog.example.com/")
+        );
+
+        // Non-HTTP(S) schemes: None
+        let file_url = Url::parse("file:///tmp/test.html").unwrap();
+        assert_eq!(compute_safe_referer(&file_url, &same), None);
+        assert_eq!(compute_safe_referer(&parent, &file_url), None);
     }
 }

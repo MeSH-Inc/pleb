@@ -18,7 +18,8 @@ use super::protocol::{
 use crate::context::ensure_private_dir;
 use crate::transport::cef::{CefRenderOptions, CefRenderer};
 use crate::transport::{
-    transport_error_kind, ResponseTooLargeError, TransportClient, TransportErrorKind,
+    transport_error_kind, RequestHeaderOptions, ResponseTooLargeError, TransportClient,
+    TransportErrorKind,
 };
 
 const MAX_PROXY_SLOTS: usize = 4;
@@ -434,8 +435,8 @@ async fn handle_connection(
             timeout_ms,
             max_body_bytes,
             accept_markdown,
-            referer: _,
-            subresource_dest: _,
+            referer,
+            subresource_dest,
         } => {
             let _active = ActiveRequestGuard::new(active_requests, idle_notify);
             let timeout = Duration::from_millis(timeout_ms.max(1));
@@ -449,9 +450,14 @@ async fn handle_connection(
                 }
             };
 
+            let opts = RequestHeaderOptions {
+                accept_markdown,
+                referer,
+                subresource_dest,
+            };
             let get_fut =
                 slot.client
-                    .get_with_options(&url, timeout, max_body_bytes, accept_markdown);
+                    .get_with_request_options(&url, timeout, max_body_bytes, &opts);
             tokio::select! {
                 biased;
                 _ = wait_for_client_disconnect(&mut reader) => {

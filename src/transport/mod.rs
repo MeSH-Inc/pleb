@@ -12,6 +12,9 @@ const CHROME_MAJOR: &str = "143";
 const CHROME_FULL: &str = "143.0.7499.109";
 pub const MARKDOWN_ACCEPT_HEADER: &str =
     "text/markdown, text/x-markdown;q=0.95, text/html;q=0.9, application/xhtml+xml;q=0.8, */*;q=0.7";
+pub const IMAGE_ACCEPT_HEADER: &str =
+    "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8";
+pub const ASSET_ACCEPT_HEADER: &str = "*/*";
 pub const DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_RAW_MAX_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
 
@@ -143,7 +146,6 @@ impl TransportClient {
             let _ = storage_path;
             let mut builder = reqwest::Client::builder()
                 .user_agent(chrome_user_agent())
-                .default_headers(chrome_headers_reqwest()?)
                 .gzip(true)
                 .brotli(true)
                 .deflate(true);
@@ -227,17 +229,6 @@ impl TransportClient {
         max_body_bytes: usize,
         opts: &RequestHeaderOptions,
     ) -> Result<HttpResponse> {
-        self.get_with_options(url, timeout, max_body_bytes, opts.accept_markdown)
-            .await
-    }
-
-    pub async fn get_with_options(
-        &self,
-        url: &str,
-        timeout: Duration,
-        max_body_bytes: usize,
-        accept_markdown: bool,
-    ) -> Result<HttpResponse> {
         match &self.backend {
             #[cfg(unix)]
             TransportBackend::Daemon {
@@ -247,12 +238,12 @@ impl TransportClient {
                 verbose,
                 daemon_executable,
             } => {
-                crate::daemon::client::daemon_http_get_with_options(
+                crate::daemon::client::daemon_http_get_with_request_options(
                     state_dir,
                     proxy.as_deref(),
                     timeout,
                     max_body_bytes,
-                    accept_markdown,
+                    opts,
                     *idle_timeout,
                     *verbose,
                     url,
@@ -268,7 +259,7 @@ impl TransportClient {
             } => {
                 #[cfg(feature = "cronet")]
                 {
-                    let headers = request_header_pairs(true, accept_markdown);
+                    let headers = request_header_pairs(true, url, opts);
                     let resp = engine.get(url, &headers, timeout, max_body_bytes).await?;
                     Ok(HttpResponse {
                         status: resp.status_code,
@@ -280,12 +271,14 @@ impl TransportClient {
                 }
                 #[cfg(not(feature = "cronet"))]
                 {
+                    let headers = request_headers_reqwest(url, opts)?;
                     let fut = async {
-                        let mut req = inner.get(url).timeout(timeout);
-                        if accept_markdown {
-                            req = req.header(reqwest::header::ACCEPT, MARKDOWN_ACCEPT_HEADER);
-                        }
-                        let mut resp = req.send().await?;
+                        let mut resp = inner
+                            .get(url)
+                            .headers(headers)
+                            .timeout(timeout)
+                            .send()
+                            .await?;
                         let final_url = resp.url().to_string();
                         let status = resp.status().as_u16();
                         let content_type = resp
@@ -334,6 +327,21 @@ impl TransportClient {
             }
         }
     }
+
+    pub async fn get_with_options(
+        &self,
+        url: &str,
+        timeout: Duration,
+        max_body_bytes: usize,
+        accept_markdown: bool,
+    ) -> Result<HttpResponse> {
+        let opts = RequestHeaderOptions {
+            accept_markdown,
+            ..Default::default()
+        };
+        self.get_with_request_options(url, timeout, max_body_bytes, &opts)
+            .await
+    }
 }
 
 pub fn chrome_user_agent() -> String {
@@ -366,13 +374,68 @@ fn sec_ch_ua_platform() -> &'static str {
     }
 }
 
-#[cfg(feature = "cronet")]
-fn request_header_pairs(include_zstd: bool, accept_markdown: bool) -> Vec<(&'static str, String)> {
-    let mut pairs = chrome_header_pairs(include_zstd);
-    if accept_markdown {
-        if let Some((_, value)) = pairs.iter_mut().find(|(name, _)| *name == "Accept") {
-            *value = MARKDOWN_ACCEPT_HEADER.to_string();
+fn compute_sec_fetch_site(referer: Option<&str>, target_url: &str) -> &'static str {
+    let Some(referer_str) = referer.filter(|s| !s.is_empty()) else {
+        return "none";
+    };
+    let (Ok(ref_url), Ok(tgt_url)) = (url::Url::parse(referer_str), url::Url::parse(target_url))
+    else {
+        return "none";
+    };
+    if ref_url.origin() == tgt_url.origin() {
+        return "same-origin";
+    }
+    if ref_url.scheme() == tgt_url.scheme() {
+        if let (Some(ref_host), Some(tgt_host)) = (ref_url.host_str(), tgt_url.host_str()) {
+            if crate::policy::source::same_origin_or_parent_domain(ref_host, tgt_host) {
+                return "same-site";
+            }
         }
+    }
+    "cross-site"
+}
+
+fn request_header_pairs(
+    include_zstd: bool,
+    url: &str,
+    opts: &RequestHeaderOptions,
+) -> Vec<(&'static str, String)> {
+    let accept_encoding = if include_zstd {
+        "gzip, deflate, br, zstd"
+    } else {
+        "gzip, deflate, br"
+    };
+    let mut pairs = if let Some(dest) = opts.subresource_dest {
+        let (accept, sec_fetch_dest) = match dest {
+            SubresourceDest::Image => (IMAGE_ACCEPT_HEADER, "image"),
+            SubresourceDest::Asset => (ASSET_ACCEPT_HEADER, "empty"),
+        };
+        vec![
+            ("Accept", accept.to_string()),
+            ("Accept-Language", "en-US,en;q=0.9".to_string()),
+            ("Accept-Encoding", accept_encoding.to_string()),
+            ("Sec-Ch-Ua", sec_ch_ua_value()),
+            ("Sec-Ch-Ua-Mobile", "?0".to_string()),
+            ("Sec-Ch-Ua-Platform", sec_ch_ua_platform().to_string()),
+            ("Sec-Fetch-Dest", sec_fetch_dest.to_string()),
+            ("Sec-Fetch-Mode", "no-cors".to_string()),
+            (
+                "Sec-Fetch-Site",
+                compute_sec_fetch_site(opts.referer.as_deref(), url).to_string(),
+            ),
+        ]
+    } else {
+        let mut nav = chrome_header_pairs(include_zstd);
+        if opts.accept_markdown {
+            if let Some((_, value)) = nav.iter_mut().find(|(name, _)| *name == "Accept") {
+                *value = MARKDOWN_ACCEPT_HEADER.to_string();
+            }
+        }
+        nav
+    };
+
+    if let Some(referer) = opts.referer.as_deref().filter(|s| !s.is_empty()) {
+        pairs.push(("Referer", referer.to_string()));
     }
     pairs
 }
@@ -404,14 +467,65 @@ fn chrome_header_pairs(include_zstd: bool) -> Vec<(&'static str, String)> {
 }
 
 #[cfg(not(feature = "cronet"))]
-fn chrome_headers_reqwest() -> Result<reqwest::header::HeaderMap> {
+fn request_headers_reqwest(
+    url: &str,
+    opts: &RequestHeaderOptions,
+) -> Result<reqwest::header::HeaderMap> {
     use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
     let mut headers = HeaderMap::new();
-    for (name, value) in chrome_header_pairs(false) {
+    for (name, value) in request_header_pairs(false, url, opts) {
         headers.insert(
             HeaderName::from_bytes(name.as_bytes())?,
             HeaderValue::from_str(&value)?,
         );
     }
     Ok(headers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn computes_sec_fetch_site_for_same_origin_same_site_cross_site_and_none() {
+        assert_eq!(
+            compute_sec_fetch_site(None, "https://cdn.example.com/a.png"),
+            "none"
+        );
+        assert_eq!(
+            compute_sec_fetch_site(
+                Some("https://docs.example.com/guide"),
+                "https://docs.example.com/img/arch.png"
+            ),
+            "same-origin"
+        );
+        assert_eq!(
+            compute_sec_fetch_site(
+                Some("https://docs.example.com/"),
+                "https://cdn.example.com/img/arch.png"
+            ),
+            "same-site"
+        );
+        assert_eq!(
+            compute_sec_fetch_site(
+                Some("http://docs.example.com/"),
+                "https://cdn.example.com/img/arch.png"
+            ),
+            "cross-site"
+        );
+        assert_eq!(
+            compute_sec_fetch_site(
+                Some("https://a.github.io/"),
+                "https://b.github.io/diagram.png"
+            ),
+            "cross-site"
+        );
+        assert_eq!(
+            compute_sec_fetch_site(
+                Some("https://example.com/"),
+                "https://user-images.githubusercontent.com/123/arch.png"
+            ),
+            "cross-site"
+        );
+    }
 }

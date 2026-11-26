@@ -544,16 +544,32 @@ async fn spawn_link_and_accept_server() -> String {
                     .unwrap_or("/");
 
                 let mut accept_val = String::new();
+                let mut referer_val = String::new();
+                let mut sec_fetch_dest = String::new();
                 let mut sec_fetch_mode = String::new();
+                let mut sec_fetch_site = String::new();
+                let mut sec_fetch_user = String::new();
+                let mut upgrade_insecure = String::new();
                 for line in lines {
                     if line.is_empty() {
                         break;
                     }
                     if let Some((name, val)) = line.split_once(':') {
+                        let v = val.trim().to_string();
                         if name.eq_ignore_ascii_case("accept") {
-                            accept_val = val.trim().to_string();
+                            accept_val = v;
+                        } else if name.eq_ignore_ascii_case("referer") {
+                            referer_val = v;
+                        } else if name.eq_ignore_ascii_case("sec-fetch-dest") {
+                            sec_fetch_dest = v;
                         } else if name.eq_ignore_ascii_case("sec-fetch-mode") {
-                            sec_fetch_mode = val.trim().to_string();
+                            sec_fetch_mode = v;
+                        } else if name.eq_ignore_ascii_case("sec-fetch-site") {
+                            sec_fetch_site = v;
+                        } else if name.eq_ignore_ascii_case("sec-fetch-user") {
+                            sec_fetch_user = v;
+                        } else if name.eq_ignore_ascii_case("upgrade-insecure-requests") {
+                            upgrade_insecure = v;
                         }
                     }
                 }
@@ -569,7 +585,9 @@ async fn spawn_link_and_accept_server() -> String {
                         let _ = socket.write_all(body).await;
                     }
                     "/echo-accept" => {
-                        let body = format!("accept={accept_val}\nsec-fetch-mode={sec_fetch_mode}");
+                        let body = format!(
+                            "accept={accept_val}\nreferer={referer_val}\nsec-fetch-dest={sec_fetch_dest}\nsec-fetch-mode={sec_fetch_mode}\nsec-fetch-site={sec_fetch_site}\nsec-fetch-user={sec_fetch_user}\nupgrade-insecure-requests={upgrade_insecure}"
+                        );
                         let hdr = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                             body.len()
@@ -850,6 +868,148 @@ async fn adversarial_accept_markdown_no_sticky_leak_and_absent_link_is_none() {
             && !d2_text.contains("text/markdown"),
         "accept_markdown leaked into subsequent daemon request: {d2_text}"
     );
+
+    assert!(daemon_stop(daemon_dir.path()).await.unwrap());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn transport_subresource_headers_and_referer_direct_and_daemon() {
+    use mesh_wick::transport::{
+        RequestHeaderOptions, SubresourceDest, TransportClient, ASSET_ACCEPT_HEADER,
+        IMAGE_ACCEPT_HEADER,
+    };
+
+    assert_eq!(PROTOCOL_VERSION, 3);
+    let base = spawn_link_and_accept_server().await;
+    let echo_url = format!("{base}/echo-accept");
+
+    async fn assert_client_subresource_headers(client: &TransportClient, base: &str, url: &str) {
+        // 1. SubresourceDest::Image with same-origin Referer
+        let same_origin_ref = format!("{base}/docs/page");
+        let img_same = client
+            .get_with_request_options(
+                url,
+                Duration::from_secs(5),
+                64 * 1024,
+                &RequestHeaderOptions {
+                    accept_markdown: false,
+                    referer: Some(same_origin_ref.clone()),
+                    subresource_dest: Some(SubresourceDest::Image),
+                },
+            )
+            .await
+            .unwrap()
+            .text();
+        assert!(
+            img_same.contains(&format!("accept={IMAGE_ACCEPT_HEADER}")),
+            "expected image Accept, got: {img_same}"
+        );
+        assert!(img_same.contains(&format!("referer={same_origin_ref}")));
+        assert!(img_same.contains("sec-fetch-dest=image"));
+        assert!(img_same.contains("sec-fetch-mode=no-cors"));
+        assert!(img_same.contains("sec-fetch-site=same-origin"));
+        assert!(
+            img_same.contains("sec-fetch-user=\n"),
+            "Sec-Fetch-User must be omitted on subresources: {img_same}"
+        );
+        assert!(
+            img_same.ends_with("upgrade-insecure-requests="),
+            "Upgrade-Insecure-Requests must be omitted on subresources: {img_same}"
+        );
+
+        // 2. SubresourceDest::Image with cross-site Referer
+        let cross_site_ref = "https://docs.example.com/".to_string();
+        let img_cross = client
+            .get_with_request_options(
+                url,
+                Duration::from_secs(5),
+                64 * 1024,
+                &RequestHeaderOptions {
+                    accept_markdown: false,
+                    referer: Some(cross_site_ref.clone()),
+                    subresource_dest: Some(SubresourceDest::Image),
+                },
+            )
+            .await
+            .unwrap()
+            .text();
+        assert!(img_cross.contains(&format!("referer={cross_site_ref}")));
+        assert!(img_cross.contains("sec-fetch-dest=image"));
+        assert!(img_cross.contains("sec-fetch-mode=no-cors"));
+        assert!(img_cross.contains("sec-fetch-site=cross-site"));
+        assert!(img_cross.contains("sec-fetch-user=\n"));
+        assert!(img_cross.ends_with("upgrade-insecure-requests="));
+
+        // 3. SubresourceDest::Asset with no Referer
+        let asset_none = client
+            .get_with_request_options(
+                url,
+                Duration::from_secs(5),
+                64 * 1024,
+                &RequestHeaderOptions {
+                    accept_markdown: false,
+                    referer: None,
+                    subresource_dest: Some(SubresourceDest::Asset),
+                },
+            )
+            .await
+            .unwrap()
+            .text();
+        assert!(
+            asset_none.contains(&format!("accept={ASSET_ACCEPT_HEADER}")),
+            "expected asset Accept, got: {asset_none}"
+        );
+        assert!(asset_none.contains("referer=\n"));
+        assert!(asset_none.contains("sec-fetch-dest=empty"));
+        assert!(asset_none.contains("sec-fetch-mode=no-cors"));
+        assert!(asset_none.contains("sec-fetch-site=none"));
+        assert!(asset_none.contains("sec-fetch-user=\n"));
+        assert!(asset_none.ends_with("upgrade-insecure-requests="));
+
+        // 4. Subsequent navigation request restores Chrome navigation headers with zero leakage
+        let nav_after = client
+            .get_with_request_options(
+                url,
+                Duration::from_secs(5),
+                64 * 1024,
+                &RequestHeaderOptions::default(),
+            )
+            .await
+            .unwrap()
+            .text();
+        assert!(nav_after.contains("accept=text/html,application/xhtml+xml"));
+        assert!(nav_after.contains("referer=\n"));
+        assert!(nav_after.contains("sec-fetch-dest=document"));
+        assert!(nav_after.contains("sec-fetch-mode=navigate"));
+        assert!(nav_after.contains("sec-fetch-site=none"));
+        assert!(nav_after.contains("sec-fetch-user=?1"));
+        assert!(nav_after.ends_with("upgrade-insecure-requests=1"));
+    }
+
+    // Direct (non-daemon) TransportClient
+    let direct_dir = TempStateDir::new();
+    let direct = TransportClient::new_direct(direct_dir.path(), None, Duration::from_secs(5))
+        .expect("direct transport should initialize");
+    assert_client_subresource_headers(&direct, &base, &echo_url).await;
+
+    // Daemon-backed TransportClient over daemon.sock (PROTOCOL_VERSION == 3)
+    let daemon_dir = TempStateDir::new();
+    let daemon_dir_clone = daemon_dir.to_path_buf();
+    let handle =
+        tokio::spawn(
+            async move { run_daemon(daemon_dir_clone, Duration::from_secs(30), false).await },
+        );
+    let _ = wait_for_ping(daemon_dir.path()).await;
+
+    let daemon_client = TransportClient::new_daemon(
+        daemon_dir.to_path_buf(),
+        None,
+        Duration::from_secs(5),
+        Duration::from_secs(30),
+        false,
+    );
+    assert_client_subresource_headers(&daemon_client, &base, &echo_url).await;
 
     assert!(daemon_stop(daemon_dir.path()).await.unwrap());
     let _ = handle.await;

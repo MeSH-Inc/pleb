@@ -15,7 +15,9 @@ use super::protocol::{
 use super::server::stop_legacy_cef_daemon;
 use crate::context::ensure_private_dir;
 use crate::transport::cef::{CefProtocolError, CefRenderOptions, CefRenderResult, CefTimeoutError};
-use crate::transport::{HttpResponse, ResponseTooLargeError, TransportError, TransportErrorKind};
+use crate::transport::{
+    HttpResponse, RequestHeaderOptions, ResponseTooLargeError, TransportError, TransportErrorKind,
+};
 
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(3);
 const CLIENT_IO_GRACE: Duration = Duration::from_secs(5);
@@ -139,14 +141,44 @@ pub async fn daemon_http_get_with_options(
     url: &str,
     daemon_executable: Option<&Path>,
 ) -> Result<HttpResponse> {
+    let opts = RequestHeaderOptions {
+        accept_markdown,
+        ..Default::default()
+    };
+    daemon_http_get_with_request_options(
+        state_dir,
+        proxy,
+        timeout,
+        max_body_bytes,
+        &opts,
+        idle_timeout,
+        verbose,
+        url,
+        daemon_executable,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn daemon_http_get_with_request_options(
+    state_dir: &Path,
+    proxy: Option<&str>,
+    timeout: Duration,
+    max_body_bytes: usize,
+    opts: &RequestHeaderOptions,
+    idle_timeout: Duration,
+    verbose: bool,
+    url: &str,
+    daemon_executable: Option<&Path>,
+) -> Result<HttpResponse> {
     let req = DaemonRequest::HttpGet {
         url: url.to_string(),
         proxy: proxy.map(str::to_string),
         timeout_ms: timeout.as_millis().min(u128::from(u64::MAX)) as u64,
         max_body_bytes,
-        accept_markdown,
-        referer: None,
-        subresource_dest: None,
+        accept_markdown: opts.accept_markdown,
+        referer: opts.referer.clone(),
+        subresource_dest: opts.subresource_dest,
     };
     let io_timeout = timeout.saturating_add(CLIENT_IO_GRACE);
     let (hdr, body) = send_daemon_rpc(
