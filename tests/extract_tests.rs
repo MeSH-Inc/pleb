@@ -462,3 +462,41 @@ fn charset_decoding_handles_windows1252_latin1_meta_and_boms() {
     assert!(doc.content.contains("€5 “ok”"));
     assert!(!doc.content.contains('\u{FFFD}'));
 }
+
+#[test]
+fn adversarial_charset_and_four_backtick_utf8_fence_boundaries() {
+    use mesh_wick::extract::markdown::open_fence_at;
+
+    // Odd-byte UTF-16LE/BE payloads after BOM emit U+FFFD cleanly without panicking.
+    let odd_le = decode_text_bytes(b"\xFF\xFEa\x00\x42", None);
+    assert_eq!(odd_le, "a\u{FFFD}");
+    let odd_be = decode_text_bytes(b"\xFE\xFF\x00a\x42", None);
+    assert_eq!(odd_be, "a\u{FFFD}");
+
+    // Content-Type charset parameter with surrounding spaces, quotes, and prior params.
+    let spaced_ct = decode_text_bytes(
+        b"<p>Caf\xe9 \x97 \x93ok\x94</p>",
+        Some("text/html; version=1; charset = \"Windows-1252\""),
+    );
+    assert_eq!(spaced_ct, "<p>Café — “ok”</p>");
+
+    // Unclosed HTML comment before <meta> must not panic or hang.
+    let unclosed_comment = decode_text_bytes(b"<!-- unclosed comment \xe9", Some("text/html"));
+    assert!(unclosed_comment.contains('\u{FFFD}'));
+
+    // 4-backtick fence starting at byte 0 with multibyte UTF-8 characters: exhaustive sweep.
+    let md = "````rust\nlet price = \"€12 — café 🚀\";\nprintln!(\"{price}\");\n````\n";
+    for max_bytes in 0..=md.len() {
+        let (out, truncated) = truncate_markdown(md, max_bytes);
+        assert!(
+            out.len() <= max_bytes,
+            "max_bytes={max_bytes}: out.len()={} exceeded budget",
+            out.len()
+        );
+        assert_eq!(truncated, max_bytes < md.len());
+        assert!(
+            open_fence_at(&out, out.len()).is_none(),
+            "max_bytes={max_bytes}: unclosed 4-backtick fence in {out:?}"
+        );
+    }
+}
