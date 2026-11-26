@@ -1,14 +1,14 @@
-# Homebrew tap formula template for pleb (https://github.com/MeSH-Inc/mesh-wick).
+# Homebrew tap formula template for pleb (https://github.com/MeSH-Inc/pleb).
 # Copy into your Homebrew tap repository as Formula/pleb.rb when cutting a tagged release
 # and replace VERSION / SHA256 with the values from the tagged source tarball.
 class Pleb < Formula
   desc "Local, zero-telemetry web acquisition and search CLI for AI agents"
-  homepage "https://github.com/MeSH-Inc/mesh-wick"
-  url "https://github.com/MeSH-Inc/mesh-wick/archive/refs/tags/v0.1.0.tar.gz"
+  homepage "https://github.com/MeSH-Inc/pleb"
+  url "https://github.com/MeSH-Inc/pleb/archive/refs/tags/v0.1.0.tar.gz"
   # Replace with: shasum -a 256 v0.1.0.tar.gz
   sha256 "REPLACE_WITH_TAG_TARBALL_SHA256"
   license "MIT"
-  head "https://github.com/MeSH-Inc/mesh-wick.git", branch: "main"
+  head "https://github.com/MeSH-Inc/pleb.git", branch: "main"
 
   depends_on "rust" => :build
 

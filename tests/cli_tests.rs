@@ -548,7 +548,7 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "name = \"pleb\"",
         "authors = [\"Memory Sync Hub LLC\"]",
         "readme = \"README.md\"",
-        "repository = \"https://github.com/MeSH-Inc/mesh-wick\"",
+        "repository = \"https://github.com/MeSH-Inc/pleb\"",
     ] {
         assert!(
             cargo_toml.contains(required_meta),
@@ -808,6 +808,7 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "cef.sock",
         "v4-meta",
         "MeSH-wick",
+        "MeSH-Inc/mesh-wick",
         "MESH_WICK_HOME",
         "MESH_WICK_PROXY",
         "MESH_WICK_NO_DAEMON",

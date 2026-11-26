@@ -3,7 +3,7 @@ name: pleb
 description: Reference for the local pleb CLI (Cronet TLS, `v5-meta` CEF renderer, unified `daemon.sock` v3, structured source negotiation, feed/transcript extraction, and selective resource staging). Use when fetching pages that resist built-in web fetch, batch-fetching search results, inspecting or staging diagrams/PDFs/transcripts, or debugging `pleb` daemon and CEF behavior.
 metadata:
   author: Memory Sync Hub LLC
-  repository: https://github.com/MeSH-Inc/mesh-wick
+  repository: https://github.com/MeSH-Inc/pleb
   scope: user
 ---
 
