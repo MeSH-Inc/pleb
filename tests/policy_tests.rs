@@ -413,3 +413,30 @@ fn classify_response_with_context_gates_http200_on_prose_and_detects_soft_blocks
         ResponseClassification::HttpError { status: 404 }
     );
 }
+
+#[test]
+fn adversarial_auth_path_segment_boundary_does_not_flag_login_guide_or_oauth2_docs() {
+    use mesh_wick::policy::classify_response_with_context;
+
+    let short_doc = "<html><head><title>Migration Guide</title></head><body><main><p>Short technical guide with no password form.</p></main></body></html>";
+
+    // Redirecting to `/login-guide` or `/oauth2/docs` must NOT match `/login` or `/oauth`.
+    for final_url in [
+        "https://docs.example.com/login-guide",
+        "https://docs.example.com/oauth2/docs",
+    ] {
+        let mut parsed = None;
+        assert_eq!(
+            classify_response_with_context(
+                200,
+                true,
+                Some("https://docs.example.com/old"),
+                Some(final_url),
+                short_doc,
+                &mut parsed
+            ),
+            ResponseClassification::Ok,
+            "path boundary false positive for {final_url}"
+        );
+    }
+}
