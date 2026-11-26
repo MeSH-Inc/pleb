@@ -1,6 +1,6 @@
-use ego_tree::NodeId;
-use scraper::{ElementRef, Html, Node, Selector};
-use std::collections::HashSet;
+use ego_tree::{NodeId, NodeRef};
+use scraper::{Html, Node, Selector};
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use url::Url;
 
@@ -10,8 +10,21 @@ use super::ExtractMode;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DomTextMetrics {
     pub visible_text_len: usize,
+    pub prose_bytes: usize,
     pub script_count: usize,
     pub has_empty_spa_root: bool,
+    pub has_password_input: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NodeMetrics {
+    pub prose_bytes: usize,
+    pub link_text_bytes: usize,
+    pub link_count: usize,
+    pub code_bytes: usize,
+    pub heading_count: usize,
+    pub form_count: usize,
+    pub has_landmark: bool,
 }
 
 const BOILERPLATE_ATTR_PATTERNS: &[&str] = &[
@@ -26,17 +39,23 @@ const BOILERPLATE_ATTR_PATTERNS: &[&str] = &[
     "skipnav",
 ];
 
+const CODE_GUTTER_CLASSES: &[&str] = &[
+    "hljs-ln",
+    "hljs-ln-numbers",
+    "blob-num",
+    "linenos",
+    "gutter",
+    "highlighttable",
+    "rouge-table",
+];
+
 static TITLE_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("title").unwrap());
 static BASE_HREF_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("base[href]").unwrap());
-static SCRIPT_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("script").unwrap());
 static BODY_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("body").unwrap());
-static SPA_ROOT_SEL: LazyLock<Selector> =
-    LazyLock::new(|| Selector::parse("#root, #app, #__next, #__nuxt, app-root").unwrap());
 static ALWAYS_STRIP_SEL: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("script, style, noscript, template").unwrap());
-static IMG_SRC_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("img[src]").unwrap());
 static BOILERPLATE_TAG_SEL: LazyLock<Selector> =
-    LazyLock::new(|| Selector::parse("svg, nav, footer, aside").unwrap());
+    LazyLock::new(|| Selector::parse("nav, footer, aside").unwrap());
 static ARIA_BOILERPLATE_SEL: LazyLock<Selector> = LazyLock::new(|| {
     Selector::parse(concat!(
         "[role=\"navigation\"],",
@@ -48,6 +67,9 @@ static ARIA_BOILERPLATE_SEL: LazyLock<Selector> = LazyLock::new(|| {
     ))
     .unwrap()
 });
+static PRE_NOISE_SEL: LazyLock<Selector> = LazyLock::new(|| {
+    Selector::parse("pre button, pre [role=\"button\"], pre .line-numbers-rows").unwrap()
+});
 static HEADER_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("header").unwrap());
 static H1_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("h1").unwrap());
 static ATTR_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("[id], [class]").unwrap());
@@ -55,7 +77,6 @@ static ARTICLE_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("artic
 static MAIN_SEL: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("main, [role=\"main\"]").unwrap());
 static BLOCK_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("section, div").unwrap());
-static A_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("a").unwrap());
 static A_HREF_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("a[href]").unwrap());
 
 /// HTML document parsed once via `scraper` (`atomic` tendrils) for metrics,
@@ -100,25 +121,59 @@ impl ParsedHtml {
             .unwrap_or_else(|| page_url.clone())
     }
 
+    /// Compute bottom-up `NodeMetrics` in a single `O(N)` post-order pass over the DOM,
+    /// returning `(metrics_by_node, visited_node_count)`.
+    pub fn compute_node_metrics(&self) -> (HashMap<NodeId, NodeMetrics>, usize) {
+        let root_id = self.doc.root_element().id();
+        let mut map = HashMap::new();
+        let mut visits = 0usize;
+        if let Some(root) = self.doc.tree.get(root_id) {
+            walk_node_metrics(root, false, false, &mut map, &mut visits);
+        }
+        (map, visits)
+    }
+
     pub fn text_metrics(&self) -> DomTextMetrics {
-        let script_count = self.doc.select(&SCRIPT_SEL).count();
+        let root_id = self.doc.root_element().id();
         let body_id = self
             .doc
             .select(&BODY_SEL)
             .next()
             .map(|el| el.id())
-            .unwrap_or_else(|| self.doc.root_element().id());
+            .unwrap_or(root_id);
 
-        let visible_text_len = visible_text_len_of(self.doc.tree.get(body_id));
-        let has_empty_spa_root = self
-            .doc
-            .select(&SPA_ROOT_SEL)
-            .any(|el| visible_text_len_of(Some(*el)) < 50);
+        let mut script_count = 0usize;
+        let mut has_password_input = false;
+        let mut spa_root_ids = Vec::new();
+        let mut map = HashMap::new();
+        let mut visits = 0usize;
+
+        if let Some(root) = self.doc.tree.get(root_id) {
+            walk_dom_text_metrics(
+                root,
+                false,
+                false,
+                &mut map,
+                &mut visits,
+                &mut script_count,
+                &mut has_password_input,
+                &mut spa_root_ids,
+            );
+        }
+
+        let body_metrics = map.get(&body_id).copied().unwrap_or_default();
+        let visible_text_len = body_metrics.prose_bytes + body_metrics.code_bytes;
+        let has_empty_spa_root = spa_root_ids.into_iter().any(|id| {
+            let m = map.get(&id).copied().unwrap_or_default();
+            m.prose_bytes + m.code_bytes < 50
+        });
 
         DomTextMetrics {
             visible_text_len,
+            prose_bytes: body_metrics.prose_bytes,
             script_count,
             has_empty_spa_root,
+            has_password_input,
         }
     }
 
@@ -152,23 +207,22 @@ impl ParsedHtml {
     }
 
     pub fn into_pruned_html(mut self, mode: ExtractMode) -> String {
-        prune_dom(&mut self.doc, mode);
-        let root_id = select_root_id(&self.doc, mode);
-        self.doc
-            .tree
-            .get(root_id)
-            .and_then(ElementRef::wrap)
-            .map(|el| el.html())
-            .unwrap_or_default()
+        let metrics = prune_dom(&mut self.doc, mode);
+        let root_id = select_root_id(&self.doc, mode, &metrics);
+        let mut out = String::new();
+        if let Some(root) = self.doc.tree.get(root_id) {
+            serialize_pruned_html(root, false, &mut out);
+        }
+        out
     }
 
     pub fn into_plain_text(mut self, mode: ExtractMode) -> String {
-        prune_dom(&mut self.doc, mode);
-        let root_id = select_root_id(&self.doc, mode);
+        let metrics = prune_dom(&mut self.doc, mode);
+        let root_id = select_root_id(&self.doc, mode, &metrics);
 
         let mut raw = String::new();
         if let Some(root) = self.doc.tree.get(root_id) {
-            collect_plain_text(root, false, &mut raw);
+            collect_plain_text(root, false, false, &mut raw);
         }
         normalize_plain_text(&raw)
     }
@@ -190,23 +244,216 @@ pub fn extract_plain_text(html: &str, mode: ExtractMode) -> String {
     ParsedHtml::parse(html).into_plain_text(mode)
 }
 
-fn prune_dom(doc: &mut Html, mode: ExtractMode) {
+fn is_spa_root(el: &scraper::node::Element) -> bool {
+    if el.name() == "app-root" || el.attr("data-reactroot").is_some() {
+        return true;
+    }
+    matches!(el.attr("id"), Some("root" | "app" | "__next" | "__nuxt"))
+}
+
+fn is_landmark_element(el: &scraper::node::Element) -> bool {
+    matches!(el.name(), "main" | "article")
+        || el
+            .attr("role")
+            .is_some_and(|r| r.eq_ignore_ascii_case("main"))
+}
+
+fn walk_node_metrics(
+    node: NodeRef<'_, Node>,
+    in_link: bool,
+    in_code: bool,
+    map: &mut HashMap<NodeId, NodeMetrics>,
+    visits: &mut usize,
+) -> NodeMetrics {
+    *visits += 1;
+    match node.value() {
+        Node::Text(text) => {
+            let bytes: usize = text.split_whitespace().map(str::len).sum();
+            let mut m = NodeMetrics::default();
+            if in_code {
+                m.code_bytes = bytes;
+            } else {
+                m.prose_bytes = bytes;
+                if in_link {
+                    m.link_text_bytes = bytes;
+                }
+            }
+            m
+        }
+        Node::Element(el) => {
+            let tag = el.name();
+            if matches!(tag, "script" | "style" | "noscript" | "template" | "svg") {
+                return NodeMetrics::default();
+            }
+
+            let entering_link = tag == "a" && !in_link;
+            let child_in_link = in_link || tag == "a";
+            let child_in_code = in_code || matches!(tag, "pre" | "code");
+
+            let mut acc = NodeMetrics {
+                link_count: usize::from(entering_link),
+                heading_count: usize::from(matches!(tag, "h1" | "h2" | "h3" | "h4" | "h5" | "h6")),
+                form_count: usize::from(tag == "form"),
+                has_landmark: is_landmark_element(el),
+                ..Default::default()
+            };
+
+            for child in node.children() {
+                let cm = walk_node_metrics(child, child_in_link, child_in_code, map, visits);
+                acc.prose_bytes += cm.prose_bytes;
+                acc.link_text_bytes += cm.link_text_bytes;
+                acc.link_count += cm.link_count;
+                acc.code_bytes += cm.code_bytes;
+                acc.heading_count += cm.heading_count;
+                acc.form_count += cm.form_count;
+                acc.has_landmark |= cm.has_landmark;
+            }
+
+            map.insert(node.id(), acc);
+            acc
+        }
+        _ => {
+            let mut acc = NodeMetrics::default();
+            for child in node.children() {
+                let cm = walk_node_metrics(child, in_link, in_code, map, visits);
+                acc.prose_bytes += cm.prose_bytes;
+                acc.link_text_bytes += cm.link_text_bytes;
+                acc.link_count += cm.link_count;
+                acc.code_bytes += cm.code_bytes;
+                acc.heading_count += cm.heading_count;
+                acc.form_count += cm.form_count;
+                acc.has_landmark |= cm.has_landmark;
+            }
+            acc
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_dom_text_metrics(
+    node: NodeRef<'_, Node>,
+    in_link: bool,
+    in_code: bool,
+    map: &mut HashMap<NodeId, NodeMetrics>,
+    visits: &mut usize,
+    script_count: &mut usize,
+    has_password_input: &mut bool,
+    spa_root_ids: &mut Vec<NodeId>,
+) -> NodeMetrics {
+    *visits += 1;
+    match node.value() {
+        Node::Text(text) => {
+            let bytes: usize = text.split_whitespace().map(str::len).sum();
+            let mut m = NodeMetrics::default();
+            if in_code {
+                m.code_bytes = bytes;
+            } else {
+                m.prose_bytes = bytes;
+                if in_link {
+                    m.link_text_bytes = bytes;
+                }
+            }
+            m
+        }
+        Node::Element(el) => {
+            let tag = el.name();
+            if tag == "script" {
+                *script_count += 1;
+                return NodeMetrics::default();
+            }
+            if matches!(tag, "style" | "noscript" | "template" | "svg") {
+                return NodeMetrics::default();
+            }
+            if tag == "input"
+                && el
+                    .attr("type")
+                    .is_some_and(|t| t.trim().eq_ignore_ascii_case("password"))
+            {
+                *has_password_input = true;
+            }
+            if is_spa_root(el) {
+                spa_root_ids.push(node.id());
+            }
+
+            let entering_link = tag == "a" && !in_link;
+            let child_in_link = in_link || tag == "a";
+            let child_in_code = in_code || matches!(tag, "pre" | "code");
+
+            let mut acc = NodeMetrics {
+                link_count: usize::from(entering_link),
+                heading_count: usize::from(matches!(tag, "h1" | "h2" | "h3" | "h4" | "h5" | "h6")),
+                form_count: usize::from(tag == "form"),
+                has_landmark: is_landmark_element(el),
+                ..Default::default()
+            };
+
+            for child in node.children() {
+                let cm = walk_dom_text_metrics(
+                    child,
+                    child_in_link,
+                    child_in_code,
+                    map,
+                    visits,
+                    script_count,
+                    has_password_input,
+                    spa_root_ids,
+                );
+                acc.prose_bytes += cm.prose_bytes;
+                acc.link_text_bytes += cm.link_text_bytes;
+                acc.link_count += cm.link_count;
+                acc.code_bytes += cm.code_bytes;
+                acc.heading_count += cm.heading_count;
+                acc.form_count += cm.form_count;
+                acc.has_landmark |= cm.has_landmark;
+            }
+
+            map.insert(node.id(), acc);
+            acc
+        }
+        _ => {
+            let mut acc = NodeMetrics::default();
+            for child in node.children() {
+                let cm = walk_dom_text_metrics(
+                    child,
+                    in_link,
+                    in_code,
+                    map,
+                    visits,
+                    script_count,
+                    has_password_input,
+                    spa_root_ids,
+                );
+                acc.prose_bytes += cm.prose_bytes;
+                acc.link_text_bytes += cm.link_text_bytes;
+                acc.link_count += cm.link_count;
+                acc.code_bytes += cm.code_bytes;
+                acc.heading_count += cm.heading_count;
+                acc.form_count += cm.form_count;
+                acc.has_landmark |= cm.has_landmark;
+            }
+            acc
+        }
+    }
+}
+
+fn prune_dom(doc: &mut Html, mode: ExtractMode) -> HashMap<NodeId, NodeMetrics> {
     let mut to_detach: Vec<NodeId> = Vec::new();
 
     collect_selector_ids(doc, &ALWAYS_STRIP_SEL, &mut to_detach);
-
-    // Drop inline data: URI images that bloat markdown output without adding value.
-    for el in doc.select(&IMG_SRC_SEL) {
-        if let Some(src) = el.value().attr("src") {
-            if src.trim_start().to_ascii_lowercase().starts_with("data:") {
-                to_detach.push(el.id());
-            }
-        }
-    }
+    collect_selector_ids(doc, &PRE_NOISE_SEL, &mut to_detach);
 
     if matches!(mode, ExtractMode::Clean | ExtractMode::Article) {
         collect_selector_ids(doc, &BOILERPLATE_TAG_SEL, &mut to_detach);
-        collect_selector_ids(doc, &ARIA_BOILERPLATE_SEL, &mut to_detach);
+
+        for el in doc.select(&ARIA_BOILERPLATE_SEL) {
+            let name = el.value().name();
+            if matches!(name, "html" | "body") {
+                continue;
+            }
+            if !contains_tex_annotation(*el) {
+                to_detach.push(el.id());
+            }
+        }
 
         for el in doc.select(&HEADER_SEL) {
             if el.select(&H1_SEL).next().is_none() {
@@ -223,15 +470,137 @@ fn prune_dom(doc: &mut Html, mode: ExtractMode) {
                 to_detach.push(el.id());
             }
         }
+
+        // Strip heading permalink anchors (#, §, ¶, 🔗, or empty) inside h1..=h6 or .headerlink/.anchor.
+        for el in doc.select(&A_HREF_SEL) {
+            if is_heading_permalink_anchor(*el) {
+                to_detach.push(el.id());
+            }
+        }
     }
 
-    for id in to_detach {
+    detach_nodes(doc, to_detach);
+
+    // Single-pass O(N) metrics for landmark-protected link-density pruning & root selection.
+    let root_id = doc.root_element().id();
+    let mut metrics = HashMap::new();
+    let mut visits = 0usize;
+    if let Some(root) = doc.tree.get(root_id) {
+        walk_node_metrics(root, false, false, &mut metrics, &mut visits);
+    }
+
+    if matches!(mode, ExtractMode::Clean | ExtractMode::Article) {
+        let mut density_detach = Vec::new();
+        if let Some(root) = doc.tree.get(root_id) {
+            collect_link_density_prune_ids(root, false, false, &metrics, &mut density_detach);
+        }
+        if !density_detach.is_empty() {
+            detach_nodes(doc, density_detach);
+            metrics.clear();
+            visits = 0;
+            if let Some(root) = doc.tree.get(root_id) {
+                walk_node_metrics(root, false, false, &mut metrics, &mut visits);
+            }
+        }
+    }
+
+    metrics
+}
+
+fn detach_nodes(doc: &mut Html, ids: Vec<NodeId>) {
+    for id in ids {
         if let Some(mut node) = doc.tree.get_mut(id) {
             if node.parent().is_some() {
                 node.detach();
             }
         }
     }
+}
+
+fn collect_link_density_prune_ids(
+    node: NodeRef<'_, Node>,
+    in_protected: bool,
+    in_header: bool,
+    metrics: &HashMap<NodeId, NodeMetrics>,
+    out: &mut Vec<NodeId>,
+) {
+    let Node::Element(el) = node.value() else {
+        for child in node.children() {
+            collect_link_density_prune_ids(child, in_protected, in_header, metrics, out);
+        }
+        return;
+    };
+
+    let tag = el.name();
+    let now_protected = in_protected || is_landmark_element(el) || tag == "table";
+    let now_header = in_header || tag == "header";
+
+    if !now_protected && !matches!(tag, "html" | "body" | "head" | "header") {
+        if let Some(m) = metrics.get(&node.id()) {
+            let min_links = if in_header { 2 } else { 3 };
+            if !m.has_landmark
+                && m.heading_count == 0
+                && m.code_bytes == 0
+                && m.link_count >= min_links
+                && m.prose_bytes > 0
+                && m.link_text_bytes * 100 > m.prose_bytes * 65
+                && (m.link_text_bytes / m.link_count) <= 32
+            {
+                out.push(node.id());
+                return;
+            }
+        }
+    }
+
+    for child in node.children() {
+        collect_link_density_prune_ids(child, now_protected, now_header, metrics, out);
+    }
+}
+
+fn is_heading_permalink_anchor(node: NodeRef<'_, Node>) -> bool {
+    let Node::Element(el) = node.value() else {
+        return false;
+    };
+    let Some(href) = el.attr("href").map(str::trim) else {
+        return false;
+    };
+    if !href.starts_with('#') {
+        return false;
+    }
+
+    let has_permalink_class = el.attr("class").is_some_and(|cls| {
+        cls.split_whitespace().any(|tok| {
+            tok.eq_ignore_ascii_case("headerlink")
+                || tok.eq_ignore_ascii_case("anchor")
+                || tok.eq_ignore_ascii_case("anchor-link")
+                || tok.eq_ignore_ascii_case("heading-anchor")
+        })
+    });
+
+    let inside_heading = node.ancestors().any(|anc| {
+        matches!(
+            anc.value(),
+            Node::Element(e) if matches!(e.name(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
+        )
+    });
+
+    if !has_permalink_class && !inside_heading {
+        return false;
+    }
+
+    let mut text = String::new();
+    collect_raw_text(node, &mut text);
+    let cleaned: String = text
+        .chars()
+        .filter(|&c| {
+            !c.is_whitespace()
+                && !matches!(
+                    c,
+                    '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' | '\u{2060}'
+                )
+        })
+        .collect();
+    matches!(cleaned.as_str(), "" | "#" | "§" | "¶" | "🔗")
 }
 
 fn collect_selector_ids(doc: &Html, selector: &Selector, out: &mut Vec<NodeId>) {
@@ -269,7 +638,7 @@ fn is_boilerplate_attr(id: Option<&str>, class: Option<&str>) -> bool {
         .any(|tok| tok.eq_ignore_ascii_case("sr-only"))
 }
 
-fn select_root_id(doc: &Html, mode: ExtractMode) -> NodeId {
+fn select_root_id(doc: &Html, mode: ExtractMode, metrics: &HashMap<NodeId, NodeMetrics>) -> NodeId {
     let body_id = doc
         .select(&BODY_SEL)
         .next()
@@ -280,9 +649,16 @@ fn select_root_id(doc: &Html, mode: ExtractMode) -> NodeId {
         return body_id;
     }
 
+    let node_text_len = |id: NodeId| {
+        metrics
+            .get(&id)
+            .map(|m| m.prose_bytes + m.code_bytes)
+            .unwrap_or(0)
+    };
+
     let articles: Vec<(NodeId, usize)> = doc
         .select(&ARTICLE_SEL)
-        .map(|el| (el.id(), visible_text_len_of(Some(*el))))
+        .map(|el| (el.id(), node_text_len(el.id())))
         .filter(|(_, len)| *len >= 100)
         .collect();
 
@@ -300,22 +676,21 @@ fn select_root_id(doc: &Html, mode: ExtractMode) -> NodeId {
 
     if let Some(main_el) = doc
         .select(&MAIN_SEL)
-        .find(|el| visible_text_len_of(Some(**el)) >= 100)
+        .find(|el| node_text_len(el.id()) >= 100)
     {
         return main_el.id();
     }
 
     let mut best: Option<(NodeId, usize)> = None;
     for el in doc.select(&BLOCK_SEL) {
-        let text_len = visible_text_len_of(Some(*el));
+        let Some(m) = metrics.get(&el.id()) else {
+            continue;
+        };
+        let text_len = m.prose_bytes + m.code_bytes;
         if text_len < 150 {
             continue;
         }
-        let link_len: usize = el
-            .select(&A_SEL)
-            .map(|a| visible_text_len_of(Some(*a)))
-            .sum();
-        let score = text_len.saturating_sub(link_len);
+        let score = text_len.saturating_sub(m.link_text_bytes);
         if score >= 150 && best.is_none_or(|(_, b)| score > b) {
             best = Some((el.id(), score));
         }
@@ -327,38 +702,541 @@ fn select_root_id(doc: &Html, mode: ExtractMode) -> NodeId {
     body_id
 }
 
-fn visible_text_len_of(node: Option<ego_tree::NodeRef<'_, Node>>) -> usize {
-    let Some(node) = node else {
-        return 0;
-    };
-    let mut len = 0usize;
-    accumulate_visible_len(node, &mut len);
-    len
-}
-
-fn accumulate_visible_len(node: ego_tree::NodeRef<'_, Node>, len: &mut usize) {
+fn serialize_pruned_html(node: NodeRef<'_, Node>, in_interactive: bool, out: &mut String) {
     match node.value() {
-        Node::Text(text) => {
-            *len += text.split_whitespace().map(str::len).sum::<usize>();
-        }
+        Node::Text(text) => push_escaped_text(text, out),
         Node::Element(el) => {
             let tag = el.name();
-            if matches!(tag, "script" | "style" | "noscript" | "template" | "svg") {
+            if matches!(tag, "script" | "style" | "noscript" | "template") {
                 return;
             }
-            for child in node.children() {
-                accumulate_visible_len(child, len);
+
+            if tag == "svg" {
+                if !in_interactive {
+                    if let Some(label) = extract_svg_label(node, el) {
+                        out.push_str("<svg aria-label=\"");
+                        push_escaped_attr(&label, out);
+                        out.push_str("\"></svg>");
+                    }
+                }
+                return;
             }
+
+            if tag == "math" {
+                if let Some(tex) = find_tex_annotation(node) {
+                    let display = is_display_math(node, el);
+                    out.push_str("<math data-tex=\"");
+                    push_escaped_attr(&tex, out);
+                    out.push_str(if display {
+                        "\" data-display=\"1\"></math>"
+                    } else {
+                        "\" data-display=\"0\"></math>"
+                    });
+                    return;
+                }
+            }
+
+            if tag == "picture" {
+                if let Some((src, alt, title)) = resolve_picture_image(node) {
+                    emit_img_tag(&src, alt.as_deref(), title.as_deref(), out);
+                }
+                return;
+            }
+
+            if tag == "img" {
+                if let Some(src) = resolve_img_src(el) {
+                    emit_img_tag(&src, el.attr("alt"), el.attr("title"), out);
+                }
+                return;
+            }
+
+            if tag == "table" {
+                if let Some((lang, code)) = try_extract_code_gutter_table(node) {
+                    out.push_str("<pre><code");
+                    if let Some(lang) = lang {
+                        out.push_str(" class=\"language-");
+                        push_escaped_attr(&lang, out);
+                        out.push('"');
+                    }
+                    out.push('>');
+                    push_escaped_text(&code, out);
+                    out.push_str("</code></pre>");
+                    return;
+                }
+            }
+
+            out.push('<');
+            out.push_str(tag);
+            for (name, value) in el.attrs() {
+                out.push(' ');
+                out.push_str(name);
+                out.push_str("=\"");
+                push_escaped_attr(value, out);
+                out.push('"');
+            }
+            out.push('>');
+
+            if is_void_element(tag) {
+                return;
+            }
+
+            let child_interactive = in_interactive || matches!(tag, "button" | "nav" | "a");
+            for child in node.children() {
+                serialize_pruned_html(child, child_interactive, out);
+            }
+
+            out.push_str("</");
+            out.push_str(tag);
+            out.push('>');
         }
         _ => {
             for child in node.children() {
-                accumulate_visible_len(child, len);
+                serialize_pruned_html(child, in_interactive, out);
             }
         }
     }
 }
 
-fn collect_plain_text(node: ego_tree::NodeRef<'_, Node>, in_pre: bool, out: &mut String) {
+fn is_void_element(tag: &str) -> bool {
+    matches!(
+        tag,
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
+}
+
+fn push_escaped_text(text: &str, out: &mut String) {
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+}
+
+fn push_escaped_attr(val: &str, out: &mut String) {
+    for ch in val.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+}
+
+fn emit_img_tag(src: &str, alt: Option<&str>, title: Option<&str>, out: &mut String) {
+    out.push_str("<img src=\"");
+    push_escaped_attr(src, out);
+    out.push('"');
+    if let Some(alt) = alt {
+        out.push_str(" alt=\"");
+        push_escaped_attr(alt, out);
+        out.push('"');
+    }
+    if let Some(title) = title {
+        out.push_str(" title=\"");
+        push_escaped_attr(title, out);
+        out.push('"');
+    }
+    out.push('>');
+}
+
+fn is_data_uri(url: &str) -> bool {
+    url.trim_start().to_ascii_lowercase().starts_with("data:")
+}
+
+fn resolve_img_src(el: &scraper::node::Element) -> Option<String> {
+    for attr in ["data-src", "data-lazy-src", "data-original"] {
+        if let Some(val) = el.attr(attr).map(str::trim) {
+            if !val.is_empty() && !is_data_uri(val) {
+                return Some(val.to_string());
+            }
+        }
+    }
+    if let Some(srcset) = el.attr("srcset") {
+        if let Some(best) = parse_best_srcset_url(srcset) {
+            if !is_data_uri(&best) {
+                return Some(best);
+            }
+        }
+    }
+    if let Some(src) = el.attr("src").map(str::trim) {
+        if !src.is_empty() && !is_data_uri(src) {
+            return Some(src.to_string());
+        }
+    }
+    None
+}
+
+fn resolve_picture_image(
+    picture: NodeRef<'_, Node>,
+) -> Option<(String, Option<String>, Option<String>)> {
+    let mut best_source: Option<String> = None;
+    let mut img_src: Option<String> = None;
+    let mut alt: Option<String> = None;
+    let mut title: Option<String> = None;
+
+    for child in picture.children() {
+        let Node::Element(el) = child.value() else {
+            continue;
+        };
+        match el.name() {
+            "source" if best_source.is_none() => {
+                if let Some(srcset) = el.attr("srcset") {
+                    if let Some(url) = parse_best_srcset_url(srcset) {
+                        if !is_data_uri(&url) {
+                            best_source = Some(url);
+                        }
+                    }
+                }
+            }
+            "img" => {
+                alt = el.attr("alt").map(str::to_string);
+                title = el.attr("title").map(str::to_string);
+                img_src = resolve_img_src(el);
+            }
+            _ => {}
+        }
+    }
+
+    let chosen = best_source.or(img_src)?;
+    Some((chosen, alt, title))
+}
+
+/// WHATWG descriptor-aware `srcset` parser that preserves commas inside URLs
+/// (such as `/cdn-cgi/image/width=800,quality=80/...`) by splitting candidates
+/// only on commas following a descriptor or trailing a URL token.
+pub fn parse_best_srcset_url(srcset: &str) -> Option<String> {
+    let bytes = srcset.as_bytes();
+    let mut i = 0usize;
+    let mut best: Option<(String, f64)> = None;
+
+    while i < bytes.len() {
+        // 1. Skip leading ASCII whitespace and commas.
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+
+        // 2. Collect URL token up to first ASCII whitespace.
+        let url_start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let mut url = &srcset[url_start..i];
+        let mut score = 1.0f64;
+
+        if url.ends_with(',') {
+            url = url.trim_end_matches(',');
+        } else {
+            // 3. Collect descriptor up to the next top-level comma.
+            let desc_start = i;
+            let mut paren_depth = 0usize;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'(' => paren_depth += 1,
+                    b')' => paren_depth = paren_depth.saturating_sub(1),
+                    b',' if paren_depth == 0 => break,
+                    _ => {}
+                }
+                i += 1;
+            }
+            let desc = srcset[desc_start..i].trim();
+            if i < bytes.len() && bytes[i] == b',' {
+                i += 1;
+            }
+            if let Some(parsed) = parse_srcset_descriptor(desc) {
+                score = parsed;
+            }
+        }
+
+        if !url.is_empty()
+            && best
+                .as_ref()
+                .is_none_or(|(_, best_score)| score >= *best_score)
+        {
+            best = Some((url.to_string(), score));
+        }
+    }
+
+    best.map(|(url, _)| url)
+}
+
+fn parse_srcset_descriptor(desc: &str) -> Option<f64> {
+    let token = desc.split_whitespace().next()?;
+    if let Some(w) = token.strip_suffix('w').or_else(|| token.strip_suffix('W')) {
+        return w.parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0);
+    }
+    if let Some(x) = token.strip_suffix('x').or_else(|| token.strip_suffix('X')) {
+        return x
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(|v| v * 1000.0);
+    }
+    None
+}
+
+fn contains_tex_annotation(node: NodeRef<'_, Node>) -> bool {
+    find_tex_annotation(node).is_some()
+}
+
+fn find_tex_annotation(node: NodeRef<'_, Node>) -> Option<String> {
+    for desc in node.descendants() {
+        if let Node::Element(el) = desc.value() {
+            if el.name() == "annotation"
+                && el.attr("encoding").is_some_and(|enc| {
+                    enc.eq_ignore_ascii_case("application/x-tex")
+                        || enc.eq_ignore_ascii_case("application/x-latex")
+                })
+            {
+                let mut raw = String::new();
+                collect_raw_text(desc, &mut raw);
+                let trimmed = raw.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn is_display_math(node: NodeRef<'_, Node>, el: &scraper::node::Element) -> bool {
+    if el
+        .attr("display")
+        .is_some_and(|d| d.eq_ignore_ascii_case("block"))
+    {
+        return true;
+    }
+    node.ancestors().take(4).any(|anc| {
+        matches!(
+            anc.value(),
+            Node::Element(e) if e.attr("class").is_some_and(|c| {
+                c.split_whitespace().any(|tok| {
+                    tok.eq_ignore_ascii_case("katex-display")
+                        || tok.eq_ignore_ascii_case("mjx-display")
+                })
+            })
+        )
+    })
+}
+
+fn extract_svg_label(node: NodeRef<'_, Node>, el: &scraper::node::Element) -> Option<String> {
+    if let Some(label) = el.attr("aria-label") {
+        let collapsed = collapse_inline_whitespace(label);
+        let trimmed = collapsed.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    for child in node.children() {
+        if let Node::Element(child_el) = child.value() {
+            if child_el.name() == "title" {
+                let mut raw = String::new();
+                collect_raw_text(child, &mut raw);
+                let collapsed = collapse_inline_whitespace(&raw);
+                let trimmed = collapsed.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn try_extract_code_gutter_table(table: NodeRef<'_, Node>) -> Option<(Option<String>, String)> {
+    // Never unwrap tables that contain <thead> or <th> headers.
+    for desc in table.descendants() {
+        if let Node::Element(el) = desc.value() {
+            if matches!(el.name(), "thead" | "th") {
+                return None;
+            }
+        }
+    }
+
+    let mut rows: Vec<(NodeRef<'_, Node>, NodeRef<'_, Node>)> = Vec::new();
+    collect_table_rows(table, &mut rows)?;
+    if rows.is_empty() {
+        return None;
+    }
+
+    let table_has_gutter_class = matches!(
+        table.value(),
+        Node::Element(el) if has_gutter_marker(el)
+    );
+
+    let mut explicit_gutter = table_has_gutter_class;
+    let mut sequential_ints = rows.len() >= 3;
+    let mut all_code_cells = true;
+
+    for (idx, (col0, col1)) in rows.iter().enumerate() {
+        if matches!(col0.value(), Node::Element(el) if has_gutter_marker(el)) {
+            explicit_gutter = true;
+        }
+        if sequential_ints {
+            let mut n_text = String::new();
+            collect_raw_text(*col0, &mut n_text);
+            if n_text.trim().parse::<usize>().ok() != Some(idx + 1) {
+                sequential_ints = false;
+            }
+        }
+        if !subtree_has_code_tag(*col1) {
+            all_code_cells = false;
+        }
+    }
+
+    if !explicit_gutter && !(sequential_ints && all_code_cells) {
+        return None;
+    }
+
+    let lang = detect_code_language(table, &rows);
+    let code = if rows.len() == 1 {
+        let mut buf = String::new();
+        collect_raw_text(rows[0].1, &mut buf);
+        buf.trim_end_matches(['\r', '\n']).to_string()
+    } else {
+        let mut lines = Vec::with_capacity(rows.len());
+        for (_, col1) in &rows {
+            let mut buf = String::new();
+            collect_raw_text(*col1, &mut buf);
+            lines.push(buf.trim_end_matches(['\r', '\n']).to_string());
+        }
+        lines.join("\n")
+    };
+
+    Some((lang, code))
+}
+
+fn collect_table_rows<'a>(
+    table: NodeRef<'a, Node>,
+    rows: &mut Vec<(NodeRef<'a, Node>, NodeRef<'a, Node>)>,
+) -> Option<()> {
+    for child in table.children() {
+        let Node::Element(el) = child.value() else {
+            continue;
+        };
+        match el.name() {
+            "tbody" => collect_table_rows(child, rows)?,
+            "tr" => {
+                let mut tds = Vec::new();
+                for cell in child.children() {
+                    if matches!(cell.value(), Node::Element(e) if e.name() == "td") {
+                        tds.push(cell);
+                    }
+                }
+                if tds.len() != 2 {
+                    return None;
+                }
+                rows.push((tds[0], tds[1]));
+            }
+            _ => {}
+        }
+    }
+    Some(())
+}
+
+fn has_gutter_marker(el: &scraper::node::Element) -> bool {
+    if el.attr("data-line-number").is_some() {
+        return true;
+    }
+    el.attr("class").is_some_and(|cls| {
+        cls.split_whitespace().any(|tok| {
+            CODE_GUTTER_CLASSES
+                .iter()
+                .any(|pat| tok.eq_ignore_ascii_case(pat))
+        })
+    })
+}
+
+fn subtree_has_code_tag(node: NodeRef<'_, Node>) -> bool {
+    node.descendants().any(|d| {
+        matches!(
+            d.value(),
+            Node::Element(el) if matches!(el.name(), "pre" | "code")
+        )
+    })
+}
+
+fn detect_code_language(
+    table: NodeRef<'_, Node>,
+    rows: &[(NodeRef<'_, Node>, NodeRef<'_, Node>)],
+) -> Option<String> {
+    if let Some((_, first_col1)) = rows.first() {
+        for desc in first_col1.descendants() {
+            if let Node::Element(el) = desc.value() {
+                if let Some(lang) = extract_lang_from_element(el) {
+                    return Some(lang);
+                }
+            }
+        }
+    }
+    if let Node::Element(el) = table.value() {
+        if let Some(lang) = extract_lang_from_element(el) {
+            return Some(lang);
+        }
+    }
+    for anc in table.ancestors().take(3) {
+        if let Node::Element(el) = anc.value() {
+            if let Some(lang) = extract_lang_from_element(el) {
+                return Some(lang);
+            }
+        }
+    }
+    None
+}
+
+fn extract_lang_from_element(el: &scraper::node::Element) -> Option<String> {
+    let cls = el.attr("class")?;
+    for tok in cls.split_whitespace() {
+        for prefix in ["language-", "lang-", "highlight-source-"] {
+            if let Some(rest) = tok.strip_prefix(prefix) {
+                let cleaned = rest.trim();
+                if !cleaned.is_empty() {
+                    return Some(cleaned.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn collect_raw_text(node: NodeRef<'_, Node>, out: &mut String) {
+    match node.value() {
+        Node::Text(text) => out.push_str(text),
+        _ => {
+            for child in node.children() {
+                collect_raw_text(child, out);
+            }
+        }
+    }
+}
+
+fn collect_plain_text(
+    node: NodeRef<'_, Node>,
+    in_pre: bool,
+    in_interactive: bool,
+    out: &mut String,
+) {
     match node.value() {
         Node::Text(text) => {
             if in_pre {
@@ -376,8 +1254,32 @@ fn collect_plain_text(node: ego_tree::NodeRef<'_, Node>, in_pre: bool, out: &mut
         }
         Node::Element(el) => {
             let tag = el.name();
-            if matches!(tag, "script" | "style" | "noscript" | "template" | "svg") {
+            if matches!(tag, "script" | "style" | "noscript" | "template") {
                 return;
+            }
+            if tag == "svg" {
+                if !in_interactive {
+                    if let Some(label) = extract_svg_label(node, el) {
+                        if !out.is_empty() && !out.ends_with([' ', '\n']) {
+                            out.push(' ');
+                        }
+                        out.push_str("[Diagram: ");
+                        out.push_str(&label);
+                        out.push(']');
+                    }
+                }
+                return;
+            }
+            if tag == "math" {
+                if let Some(tex) = find_tex_annotation(node) {
+                    if !out.is_empty() && !out.ends_with([' ', '\n']) {
+                        out.push(' ');
+                    }
+                    out.push('$');
+                    out.push_str(&tex);
+                    out.push('$');
+                    return;
+                }
             }
             if tag == "br" {
                 trim_trailing_spaces(out);
@@ -411,6 +1313,8 @@ fn collect_plain_text(node: ego_tree::NodeRef<'_, Node>, in_pre: bool, out: &mut
                     | "dd"
                     | "figcaption"
                     | "figure"
+                    | "details"
+                    | "summary"
                     | "hr"
             );
             let is_cell = matches!(tag, "td" | "th");
@@ -421,8 +1325,9 @@ fn collect_plain_text(node: ego_tree::NodeRef<'_, Node>, in_pre: bool, out: &mut
             }
 
             let child_pre = in_pre || tag == "pre";
+            let child_interactive = in_interactive || matches!(tag, "button" | "nav" | "a");
             for child in node.children() {
-                collect_plain_text(child, child_pre, out);
+                collect_plain_text(child, child_pre, child_interactive, out);
             }
 
             if is_cell && !out.is_empty() && !out.ends_with([' ', '\n']) {
@@ -434,7 +1339,7 @@ fn collect_plain_text(node: ego_tree::NodeRef<'_, Node>, in_pre: bool, out: &mut
         }
         _ => {
             for child in node.children() {
-                collect_plain_text(child, in_pre, out);
+                collect_plain_text(child, in_pre, in_interactive, out);
             }
         }
     }

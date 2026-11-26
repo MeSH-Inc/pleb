@@ -500,3 +500,90 @@ fn adversarial_charset_and_four_backtick_utf8_fence_boundaries() {
         );
     }
 }
+
+#[test]
+fn node_metrics_scales_linearly_with_dom_size() {
+    let build_doc = |count: usize| -> String {
+        let mut html = String::from("<html><body><main>");
+        for i in 0..count {
+            html.push_str(&format!("<p><a href=\"/p/{i}\">item {i}</a> text</p>"));
+        }
+        html.push_str("</main></body></html>");
+        html
+    };
+
+    let small = ParsedHtml::parse(&build_doc(250));
+    let (_, visits_small) = small.compute_node_metrics();
+
+    let large = ParsedHtml::parse(&build_doc(2_500));
+    let (_, visits_large) = large.compute_node_metrics();
+
+    let ratio = visits_large as f64 / visits_small.max(1) as f64;
+    assert!(
+        ratio <= 12.0,
+        "expected O(N) scaling (ratio <= 12.0), got {ratio:.2} ({visits_large} / {visits_small})"
+    );
+}
+
+#[test]
+fn wave1_extraction_preserves_data_tables_prose_links_svg_diagrams_code_pipes_and_title_dedup() {
+    let html = r##"<!DOCTYPE html>
+<html>
+<head><title>Quickstart | Acme Docs</title></head>
+<body>
+  <main>
+    <h1>Quickstart</h1>
+    <p>Learn <a href="#csharp">C#</a> and inspect the architecture:</p>
+    <svg aria-label="Request Pipeline"><path d="M0 0 L10 10"/></svg>
+    <button><svg aria-label="Ignored Icon"><path d="M0 0"/></svg>Click</button>
+    <details><summary>More info</summary><p>Hidden detail text.</p></details>
+    <table>
+      <tr><th>Line</th><th>Code</th></tr>
+      <tr><td>1</td><td><code>a | b</code></td></tr>
+      <tr><td>2</td><td><code>c | d</code></td></tr>
+      <tr><td>3</td><td><code>e | f</code></td></tr>
+    </table>
+  </main>
+</body>
+</html>"##;
+
+    let url = Url::parse("https://docs.example.com/quickstart").unwrap();
+    let doc = extract_document(html, &url, Some("text/html"), &ExtractOptions::default()).unwrap();
+
+    // Title prefix deduplication: only one `# Quickstart`, no `# Quickstart | Acme Docs`.
+    assert!(!doc.content.contains("# Quickstart | Acme Docs"));
+    assert_eq!(doc.content.matches("# Quickstart").count(), 1);
+
+    // Prose `[C#](#csharp)` link is NOT stripped.
+    assert!(doc.content.contains("[C#](#csharp)"));
+
+    // Labeled SVG outside interactive controls becomes `[Diagram: Request Pipeline]`.
+    assert!(doc.content.contains("[Diagram: Request Pipeline]"));
+    assert!(!doc.content.contains("[Diagram: Ignored Icon]"));
+
+    // 2-column data table WITH `<th>` stays a Markdown table (not unwrapped as code gutter).
+    assert!(doc.content.contains("| Line | Code |"));
+    assert!(doc.content.contains("| 1 |"));
+    assert!(!doc.content.contains("```"));
+
+    // `split_table_cells` ignores `|` inside inline backtick code spans during compaction.
+    let raw_pipe_table = "| Col A      | Col B          |\n| ---------- | -------------- |\n| 1          | `a | b`        |";
+    assert_eq!(
+        compact_markdown(raw_pipe_table),
+        "| Col A | Col B |\n| --- | --- |\n| 1 | `a | b` |"
+    );
+
+    // `<details>` / `<summary>` emit block breaks in plain text mode.
+    let txt = extract_document(
+        html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions {
+            format: OutputFormat::Text,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(txt.content.contains("More info\nHidden detail text."));
+    assert!(txt.content.contains("[Diagram: Request Pipeline]"));
+}

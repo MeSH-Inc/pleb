@@ -279,10 +279,22 @@ pub(crate) fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
 
 fn starts_with_title_heading(md: &str, title: &str) -> bool {
     let first_line = md.lines().next().unwrap_or("").trim();
-    first_line
-        .strip_prefix("# ")
-        .map(|h| h.trim().eq_ignore_ascii_case(title.trim()))
-        .unwrap_or(false)
+    let Some(heading) = first_line.strip_prefix("# ").map(str::trim) else {
+        return false;
+    };
+    let title_trimmed = title.trim();
+    if heading.eq_ignore_ascii_case(title_trimmed) {
+        return true;
+    }
+    for sep in [" | ", " - ", " — ", " – ", " :: ", " · "] {
+        if let Some((prefix, _)) = title_trimmed.split_once(sep) {
+            let p = prefix.trim();
+            if !p.is_empty() && heading.eq_ignore_ascii_case(p) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub fn extract_mime(content_type: Option<&str>) -> Option<String> {

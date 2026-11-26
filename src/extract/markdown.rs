@@ -11,11 +11,45 @@ pub fn html_to_compact_markdown(
     include_images: bool,
     include_links: bool,
 ) -> Result<String> {
-    let mut tags_to_skip = vec!["script", "style", "noscript", "template", "svg"];
+    let mut tags_to_skip = vec!["script", "style", "noscript", "template"];
     if !include_images {
         tags_to_skip.extend(["img", "picture", "source"]);
     }
     let mut builder = HtmlToMarkdown::builder().skip_tags(tags_to_skip);
+
+    builder = builder.add_handler(vec!["svg"], |_handlers: &dyn Handlers, element: Element| {
+        for attr in element.attrs.iter() {
+            if attr.name.local.as_ref() == "aria-label" {
+                let label = attr.value.trim();
+                if !label.is_empty() {
+                    return Some(format!("[Diagram: {label}]").into());
+                }
+            }
+        }
+        Some(String::new().into())
+    });
+
+    builder = builder.add_handler(
+        vec!["math"],
+        |_handlers: &dyn Handlers, element: Element| {
+            let mut tex: Option<&str> = None;
+            let mut display = false;
+            for attr in element.attrs.iter() {
+                let name: &str = attr.name.local.as_ref();
+                if name == "data-tex" {
+                    tex = Some(attr.value.trim());
+                } else if name == "data-display" && attr.value.as_ref() == "1" {
+                    display = true;
+                }
+            }
+            let tex = tex.filter(|s| !s.is_empty())?;
+            if display {
+                Some(format!("\n\n$$\n{tex}\n$$\n\n").into())
+            } else {
+                Some(format!("${tex}$").into())
+            }
+        },
+    );
 
     let anchor_base = base_url.clone();
     builder = builder.add_handler(
@@ -404,19 +438,38 @@ fn split_table_cells(inner: &str) -> Vec<&str> {
     let mut cells = Vec::new();
     let mut start = 0usize;
     let mut escaped = false;
-    for (idx, ch) in inner.char_indices() {
+    let mut code_ticks: Option<usize> = None;
+    let bytes = inner.as_bytes();
+    let mut idx = 0usize;
+
+    while idx < bytes.len() {
+        let ch = inner[idx..].chars().next().unwrap();
         if escaped {
             escaped = false;
+            idx += ch.len_utf8();
             continue;
         }
-        match ch {
-            '\\' => escaped = true,
-            '|' => {
-                cells.push(&inner[start..idx]);
-                start = idx + ch.len_utf8();
+        if ch == '`' {
+            let run = bytes[idx..].iter().take_while(|&&b| b == b'`').count();
+            match code_ticks {
+                None => code_ticks = Some(run),
+                Some(open) if open == run => code_ticks = None,
+                Some(_) => {}
             }
-            _ => {}
+            idx += run;
+            continue;
         }
+        if code_ticks.is_none() {
+            match ch {
+                '\\' => escaped = true,
+                '|' => {
+                    cells.push(&inner[start..idx]);
+                    start = idx + 1;
+                }
+                _ => {}
+            }
+        }
+        idx += ch.len_utf8();
     }
     cells.push(&inner[start..]);
     cells

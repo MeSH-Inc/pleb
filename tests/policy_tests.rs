@@ -356,3 +356,60 @@ fn site_cache_eight_subprocess_contention_preserves_all_entries() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn classify_response_with_context_gates_http200_on_prose_and_detects_soft_blocks() {
+    use mesh_wick::policy::classify_response_with_context;
+
+    // Long technical article (>= 600 prose bytes) quoting challenge text must stay Ok.
+    let long_prose =
+        "Detailed engineering explanation of reverse proxy behavior and authentication headers. "
+            .repeat(12);
+    let article = format!(
+        "<html><head><title>Debugging</title></head><body><main><p>Just a moment... checking your browser</p><p>{long_prose}</p></main></body></html>"
+    );
+    let mut parsed = None;
+    assert_eq!(
+        classify_response_with_context(
+            200,
+            true,
+            Some("https://docs.example.com/guide"),
+            Some("https://docs.example.com/guide"),
+            &article,
+            &mut parsed
+        ),
+        ResponseClassification::Ok
+    );
+
+    // Login redirect (non-auth -> /login) with low prose classifies as Blocked.
+    let login_page = "<html><head><title>Sign in</title></head><body><main><p>Please sign in.</p></main></body></html>";
+    let mut parsed_login = None;
+    assert_eq!(
+        classify_response_with_context(
+            200,
+            true,
+            Some("https://app.example.com/dashboard"),
+            Some("https://app.example.com/login?next=/dashboard"),
+            login_page,
+            &mut parsed_login
+        ),
+        ResponseClassification::Blocked { status: 200 }
+    );
+
+    // Password-form wall without redirect and prose < 400 classifies as Blocked.
+    let form_wall = "<html><body><form><input type=\"password\" name=\"pw\"></form></body></html>";
+    let mut parsed_form = None;
+    assert_eq!(
+        classify_response_with_context(200, true, None, None, form_wall, &mut parsed_form),
+        ResponseClassification::Blocked { status: 200 }
+    );
+
+    // Low-prose soft-404 title classifies as HttpError { status: 404 }.
+    let soft_404 =
+        "<html><head><title>404 - Page Not Found</title></head><body><p>Missing.</p></body></html>";
+    let mut parsed_404 = None;
+    assert_eq!(
+        classify_response_with_context(200, true, None, None, soft_404, &mut parsed_404),
+        ResponseClassification::HttpError { status: 404 }
+    );
+}

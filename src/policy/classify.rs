@@ -26,8 +26,8 @@ pub fn classify_response_with_parsed(
 pub fn classify_response_with_context(
     status: u16,
     is_html: bool,
-    _requested_url: Option<&str>,
-    _final_url: Option<&str>,
+    requested_url: Option<&str>,
+    final_url: Option<&str>,
     body: &str,
     parsed: &mut Option<dom::ParsedHtml>,
 ) -> ResponseClassification {
@@ -44,6 +44,23 @@ pub fn classify_response_with_context(
     }
 
     if is_html {
+        if body.len() > 2_000_000 {
+            return ResponseClassification::Ok;
+        }
+
+        // Gate HTTP-200 challenge/shell/soft-block detection on post-strip prose volume.
+        // Bodies under 600 raw bytes cannot reach 600 prose bytes, preserving lazy parsing.
+        let metrics_if_large = if body.len() >= 600 {
+            let doc = parsed.get_or_insert_with(|| dom::ParsedHtml::parse(body));
+            let m = doc.text_metrics();
+            if m.prose_bytes >= 600 {
+                return ResponseClassification::Ok;
+            }
+            Some(m)
+        } else {
+            None
+        };
+
         let lower = body.to_ascii_lowercase();
         if let Some(reason) = detect_interstitial_challenge_lower(&lower, body.len()) {
             return ResponseClassification::Challenge { status, reason };
@@ -51,9 +68,69 @@ pub fn classify_response_with_context(
         if let Some(reason) = detect_js_shell_with_parsed_lower(body, &lower, parsed) {
             return ResponseClassification::JavaScriptShell { reason };
         }
+
+        let metrics = metrics_if_large.unwrap_or_else(|| {
+            let doc = parsed.get_or_insert_with(|| dom::ParsedHtml::parse(body));
+            doc.text_metrics()
+        });
+
+        if metrics.prose_bytes < 600 && is_login_redirect(requested_url, final_url) {
+            return ResponseClassification::Blocked { status };
+        }
+        if metrics.prose_bytes < 400 && (metrics.has_password_input || is_cookie_wall_lower(&lower))
+        {
+            return ResponseClassification::Blocked { status };
+        }
+        if metrics.prose_bytes < 300 {
+            let title = parsed.as_ref().and_then(dom::ParsedHtml::title);
+            if title.as_deref().is_some_and(is_soft_404_title) {
+                return ResponseClassification::HttpError { status: 404 };
+            }
+        }
     }
 
     ResponseClassification::Ok
+}
+
+fn is_auth_path(raw_url: &str) -> bool {
+    let path = url::Url::parse(raw_url)
+        .map(|u| u.path().to_ascii_lowercase())
+        .unwrap_or_else(|_| raw_url.to_ascii_lowercase());
+    ["/login", "/signin", "/sign-in", "/sso", "/auth", "/oauth"]
+        .iter()
+        .any(|seg| {
+            path == *seg
+                || path.starts_with(&format!("{seg}/"))
+                || path.contains(&format!("{seg}?"))
+        })
+}
+
+fn is_login_redirect(requested_url: Option<&str>, final_url: Option<&str>) -> bool {
+    let (Some(req), Some(fin)) = (requested_url, final_url) else {
+        return false;
+    };
+    !is_auth_path(req) && is_auth_path(fin)
+}
+
+fn is_cookie_wall_lower(lower: &str) -> bool {
+    [
+        "before you continue to",
+        "accept cookies to continue",
+        "enable cookies to continue",
+    ]
+    .iter()
+    .any(|sig| lower.contains(sig))
+}
+
+fn is_soft_404_title(title: &str) -> bool {
+    let lower = title.trim().to_ascii_lowercase();
+    lower == "404"
+        || lower == "not found"
+        || lower.starts_with("404 ")
+        || lower.starts_with("404:")
+        || lower.starts_with("404 -")
+        || lower.contains("404 not found")
+        || lower.contains("page not found")
 }
 
 pub fn detect_challenge(body: &str) -> Option<String> {
@@ -62,7 +139,10 @@ pub fn detect_challenge(body: &str) -> Option<String> {
 
 fn detect_challenge_lower(lower: &str) -> Option<String> {
     let signals = [
-        ("challenges.cloudflare.com", "Cloudflare Turnstile/challenge"),
+        (
+            "challenges.cloudflare.com",
+            "Cloudflare Turnstile/challenge",
+        ),
         ("cf-browser-verification", "Cloudflare browser verification"),
         ("just a moment...", "Cloudflare challenge interstitial"),
         ("checking your browser", "Browser verification challenge"),
@@ -132,9 +212,7 @@ fn detect_js_shell_with_parsed_lower(
 
     let doc = parsed.get_or_insert_with(|| dom::ParsedHtml::parse(body));
     let metrics = doc.text_metrics();
-    if metrics.visible_text_len < 200
-        && (metrics.has_empty_spa_root || metrics.script_count >= 3)
-    {
+    if metrics.visible_text_len < 200 && (metrics.has_empty_spa_root || metrics.script_count >= 3) {
         return Some(format!(
             "empty SPA shell (visible_text_len={}, scripts={}, empty_root={})",
             metrics.visible_text_len, metrics.script_count, metrics.has_empty_spa_root
