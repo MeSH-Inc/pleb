@@ -2,7 +2,8 @@ use mesh_wick::extract::markdown::{compact_markdown, open_fence_at};
 use mesh_wick::extract::url::{clean_url, resolve_and_clean_url, ResolvedUrl};
 use mesh_wick::extract::{
     decode_text_bytes, detect_binary_content, extract_document, extract_document_bytes,
-    truncate_markdown, truncate_utf8, ExtractMode, ExtractOptions, OutputFormat, ParsedHtml,
+    truncate_markdown, truncate_utf8, wrap_raw_code_document, ExtractMode, ExtractOptions,
+    OutputFormat, ParsedHtml,
 };
 use url::Url;
 
@@ -637,4 +638,367 @@ fn adversarial_wave1_heading_link_code_span_and_thead_table_false_positives() {
     // 4-row 2-column table with `<thead>`/`<th>` stays a Markdown table.
     assert!(doc.content.contains("| Step | Snippet |"));
     assert!(doc.content.contains("| 4 | `cargo fmt --check` |"));
+}
+
+#[test]
+fn html_markdown_alternate_link_discovery_and_ssrf_guard() {
+    let page = Url::parse("https://docs.example.com/guide/intro").unwrap();
+
+    // Standard relative alternate markdown link.
+    let html_rel = r#"<html><head>
+        <link rel="Alternate" type="text/markdown; charset=utf-8" href="./intro.md">
+    </head><body><p>Hello</p></body></html>"#;
+    assert_eq!(
+        ParsedHtml::parse(html_rel)
+            .markdown_alternate_url(&page)
+            .map(|u| u.to_string())
+            .as_deref(),
+        Some("https://docs.example.com/guide/intro.md")
+    );
+
+    // Same registrable parent domain (subdomain sibling) is allowed.
+    let html_sub = r#"<html><head>
+        <link rel="alternate" type="text/x-markdown" href="https://raw.example.com/guide/intro.md">
+    </head><body></body></html>"#;
+    assert_eq!(
+        ParsedHtml::parse(html_sub)
+            .markdown_alternate_url(&page)
+            .map(|u| u.to_string())
+            .as_deref(),
+        Some("https://raw.example.com/guide/intro.md")
+    );
+
+    // Multi-part ccTLD registrable domain check (`co.uk`).
+    let uk_page = Url::parse("https://docs.acme.co.uk/api").unwrap();
+    let uk_same = r#"<html><head><link rel="alternate" type="text/markdown" href="https://raw.acme.co.uk/api.md"></head></html>"#;
+    let uk_other = r#"<html><head><link rel="alternate" type="text/markdown" href="https://raw.evil.co.uk/api.md"></head></html>"#;
+    assert!(ParsedHtml::parse(uk_same)
+        .markdown_alternate_url(&uk_page)
+        .is_some());
+    assert!(ParsedHtml::parse(uk_other)
+        .markdown_alternate_url(&uk_page)
+        .is_none());
+
+    // Blocked targets: third-party host, HTTPS->HTTP downgrade, self-link, loopback/private IPs, non-HTTP scheme.
+    for blocked_href in [
+        "https://evil.com/intro.md",
+        "https://example.com.evil.com/intro.md",
+        "http://docs.example.com/guide/intro.md",
+        "https://docs.example.com/guide/intro",
+        "https://localhost/intro.md",
+        "https://127.0.0.1/intro.md",
+        "https://[::1]/intro.md",
+        "https://10.0.0.1/intro.md",
+        "https://172.16.0.5/intro.md",
+        "https://192.168.1.10/intro.md",
+        "https://169.254.169.254/latest/meta-data/",
+        "file:///etc/passwd",
+        "javascript:alert(1)",
+    ] {
+        let html = format!(
+            r#"<html><head><link rel="alternate" type="text/markdown" href="{blocked_href}"></head><body></body></html>"#
+        );
+        assert!(
+            ParsedHtml::parse(&html)
+                .markdown_alternate_url(&page)
+                .is_none(),
+            "expected {blocked_href} to be rejected"
+        );
+    }
+
+    // Loopback page URL allows same-origin loopback alternate link.
+    let loopback_page = Url::parse("http://127.0.0.1:8080/docs").unwrap();
+    let html_loopback =
+        r#"<html><head><link rel="alternate" type="text/markdown" href="/docs.md"></head></html>"#;
+    assert_eq!(
+        ParsedHtml::parse(html_loopback)
+            .markdown_alternate_url(&loopback_page)
+            .map(|u| u.to_string())
+            .as_deref(),
+        Some("http://127.0.0.1:8080/docs.md")
+    );
+
+    // `<link>` inside `<body>` is ignored.
+    let html_body_link = r#"<html><head></head><body><link rel="alternate" type="text/markdown" href="/body.md"></body></html>"#;
+    assert!(ParsedHtml::parse(html_body_link)
+        .markdown_alternate_url(&page)
+        .is_none());
+}
+
+#[test]
+fn native_markdown_frontmatter_horizontal_rules_links_and_truncation() {
+    let url = Url::parse("https://docs.example.com/guides/start.md").unwrap();
+    let md = "---\r\ntitle: \"Getting Started\"\r\ndescription: Quick guide\r\n---\r\n\r\nSee [Install](./install.md?utm_source=nav&tab=1) and ![Arch](/img/arch.png?fbclid=9).\r\n\r\nInline code `[keep](./raw.md)` and `![keep](/raw.png)` stay untouched.\r\n\r\n```rust\n// [code](./ignored.md) and # Not Title\nlet x = 1;\n```\n\n---\n\nFooter section.\n";
+
+    // Clean mode: strips frontmatter, extracts title, injects `# Getting Started`, resolves links/images.
+    let clean =
+        extract_document(md, &url, Some("text/markdown"), &ExtractOptions::default()).unwrap();
+    assert_eq!(clean.title.as_deref(), Some("Getting Started"));
+    assert!(clean.content.starts_with("# Getting Started\n\n"));
+    assert!(!clean.content.contains("description: Quick guide"));
+    assert!(clean
+        .content
+        .contains("[Install](https://docs.example.com/guides/install.md?tab=1)"));
+    assert!(clean
+        .content
+        .contains("![Arch](https://docs.example.com/img/arch.png)"));
+    assert!(clean.content.contains("`[keep](./raw.md)`"));
+    assert!(clean.content.contains("// [code](./ignored.md)"));
+    assert!(clean.content.contains("\n---\n\nFooter section."));
+
+    // Full mode: preserves YAML frontmatter.
+    let full = extract_document(
+        md,
+        &url,
+        Some("text/x-markdown; charset=utf-8"),
+        &ExtractOptions {
+            mode: ExtractMode::Full,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(full.title.as_deref(), Some("Getting Started"));
+    assert!(full
+        .content
+        .starts_with("---\r\ntitle: \"Getting Started\""));
+    assert!(full.content.contains("description: Quick guide"));
+
+    // `--no-images` and `--no-links` in native Markdown.
+    let stripped = extract_document(
+        md,
+        &url,
+        Some("text/markdown"),
+        &ExtractOptions {
+            include_images: false,
+            include_links: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(stripped.content.contains("See Install and ."));
+    assert!(!stripped.content.contains("install.md"));
+    assert!(!stripped.content.contains("arch.png"));
+
+    // HTML output format keeps native Markdown verbatim.
+    let as_html = extract_document(
+        md,
+        &url,
+        Some("text/markdown"),
+        &ExtractOptions {
+            format: OutputFormat::Html,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(as_html.content, md);
+
+    // Text output format strips Markdown syntax cleanly.
+    let as_text = extract_document(
+        md,
+        &url,
+        Some("text/markdown"),
+        &ExtractOptions {
+            format: OutputFormat::Text,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(as_text.title.as_deref(), Some("Getting Started"));
+    assert!(as_text.content.contains("See Install and Arch."));
+    assert!(!as_text.content.contains("```rust"));
+
+    // Mid-document `---` horizontal rules are NEVER mistaken for frontmatter; fallback title skips code fences.
+    let hr_md = "```sh\n# Shell Comment\n```\n\n# Real Heading\n\n---\n\nBody paragraph.\n\n---\n";
+    let hr_doc = extract_document(
+        hr_md,
+        &url,
+        Some("text/markdown"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(hr_doc.title.as_deref(), Some("Real Heading"));
+    assert!(hr_doc.content.contains("# Shell Comment"));
+    assert!(hr_doc.content.contains("Body paragraph."));
+
+    // Fence-safe truncation under `--max-bytes`.
+    let trunc = extract_document(
+        md,
+        &url,
+        Some("text/markdown"),
+        &ExtractOptions {
+            max_bytes: Some(260),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(trunc.truncated);
+    assert!(trunc.content.len() <= 260);
+    assert!(open_fence_at(&trunc.content, trunc.content.len()).is_none());
+}
+
+#[test]
+fn wrap_raw_code_document_escapes_backtick_fences_and_handles_formats() {
+    let code_with_ticks = "let doc = \"```rust\\nfn hi() {}\\n```\";\n";
+    let md_doc = wrap_raw_code_document(
+        "example.rs",
+        code_with_ticks,
+        Some("rust"),
+        &ExtractOptions::default(),
+    );
+    assert_eq!(md_doc.title.as_deref(), Some("example.rs"));
+    assert!(md_doc.content.starts_with("# example.rs\n\n````rust\n"));
+    assert!(md_doc.content.ends_with("\n````"));
+    assert!(open_fence_at(&md_doc.content, md_doc.content.len()).is_none());
+
+    // Truncated markdown code fence remains balanced.
+    let trunc_md = wrap_raw_code_document(
+        "example.rs",
+        code_with_ticks,
+        Some("rust"),
+        &ExtractOptions {
+            max_bytes: Some(50),
+            ..Default::default()
+        },
+    );
+    assert!(trunc_md.truncated);
+    assert!(trunc_md.content.len() <= 50);
+    assert!(open_fence_at(&trunc_md.content, trunc_md.content.len()).is_none());
+
+    // Text format returns raw code verbatim.
+    let txt_doc = wrap_raw_code_document(
+        "example.rs",
+        code_with_ticks,
+        Some("rust"),
+        &ExtractOptions {
+            format: OutputFormat::Text,
+            ..Default::default()
+        },
+    );
+    assert_eq!(txt_doc.title.as_deref(), Some("example.rs"));
+    assert_eq!(txt_doc.content, code_with_ticks);
+}
+
+#[test]
+fn feed_extraction_handles_rss_atom_json_feed_and_full_passthrough() {
+    let url = Url::parse("https://blog.example.com/feed.xml").unwrap();
+
+    // RSS 2.0 via `application/xml` with BOM, XML decl, and comment before `<rss>`.
+    let rss = "\u{FEFF}<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!-- feed -->\n<rss version=\"2.0\" xmlns:content=\"http://purl.org/rss/1.0/modules/content/\">\
+        <channel>\
+          <title>Acme &amp; Co Blog</title>\
+          <description>Release notes</description>\
+          <item>\
+            <title>Release 1.0</title>\
+            <link>/posts/v1?utm_source=rss&amp;id=7</link>\
+            <pubDate>Thu, 26 Nov 2026 10:00:00 GMT</pubDate>\
+            <description><![CDATA[<p>Short summary</p>]]></description>\
+            <content:encoded><![CDATA[<p>Full <strong>HTML</strong> with <a href=\"/changelog?fbclid=1\">changelog</a> and <img src=\"/pic.png\" alt=\"Pic\"></p>]]></content:encoded>\
+          </item>\
+        </channel>\
+      </rss>";
+
+    let rss_clean = extract_document(
+        rss,
+        &url,
+        Some("application/xml"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(rss_clean.title.as_deref(), Some("Acme & Co Blog"));
+    assert!(rss_clean.content.contains("# Acme & Co Blog"));
+    assert!(rss_clean
+        .content
+        .contains("## [Release 1.0](https://blog.example.com/posts/v1?id=7)"));
+    assert!(rss_clean
+        .content
+        .contains("*Thu, 26 Nov 2026 10:00:00 GMT*"));
+    assert!(rss_clean
+        .content
+        .contains("[changelog](https://blog.example.com/changelog)"));
+    assert!(rss_clean
+        .content
+        .contains("![Pic](https://blog.example.com/pic.png)"));
+
+    // RSS Full mode preserves raw XML verbatim.
+    let rss_full = extract_document(
+        rss,
+        &url,
+        Some("application/rss+xml"),
+        &ExtractOptions {
+            mode: ExtractMode::Full,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(rss_full.content, rss);
+
+    // Atom 1.0 via `application/atom+xml`.
+    let atom = r#"<?xml version="1.0" encoding="utf-8"?>
+      <feed xmlns="http://www.w3.org/2005/Atom">
+        <title>Rust Releases</title>
+        <subtitle>Official updates</subtitle>
+        <entry>
+          <title>Rust 1.90</title>
+          <link rel="self" href="https://blog.example.com/self" />
+          <link rel="alternate" href="/rust-1-90?utm_medium=feed" />
+          <published>2026-11-26T00:00:00Z</published>
+          <summary type="html">&lt;p&gt;Faster &lt;em&gt;builds&lt;/em&gt;.&lt;/p&gt;</summary>
+        </entry>
+      </feed>"#;
+    let atom_doc = extract_document(
+        atom,
+        &url,
+        Some("application/atom+xml"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(atom_doc.title.as_deref(), Some("Rust Releases"));
+    assert!(atom_doc
+        .content
+        .contains("## [Rust 1.90](https://blog.example.com/rust-1-90)"));
+    assert!(atom_doc.content.contains("*2026-11-26T00:00:00Z*"));
+    assert!(atom_doc.content.contains("Faster *builds*."));
+
+    // JSON Feed 1.1 with `--no-links` and `--no-images`.
+    let json_feed = r#"{
+        "version": "https://jsonfeed.org/version/1.1",
+        "title": "JSON News",
+        "items": [
+            {
+                "id": "1",
+                "title": "Hello JSON Feed",
+                "url": "/news/1?utm_campaign=launch",
+                "date_published": "2026-11-26T12:00:00Z",
+                "content_html": "<p>Read <a href=\"/more\">more</a><img src=\"/hero.png\" alt=\"Hero\"></p>"
+            }
+        ]
+    }"#;
+    let jf_doc = extract_document(
+        json_feed,
+        &url,
+        Some("application/feed+json"),
+        &ExtractOptions {
+            include_links: false,
+            include_images: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(jf_doc.title.as_deref(), Some("JSON News"));
+    assert!(jf_doc.content.contains("# JSON News"));
+    assert!(jf_doc.content.contains("## Hello JSON Feed"));
+    assert!(!jf_doc.content.contains("blog.example.com/news/1"));
+    assert!(!jf_doc.content.contains("hero.png"));
+    assert!(jf_doc.content.contains("Read more"));
+
+    // Non-feed XML still passes through verbatim.
+    let plain_xml = "<?xml version=\"1.0\"?><catalog><item>A</item></catalog>";
+    let xml_doc = extract_document(
+        plain_xml,
+        &url,
+        Some("application/xml"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(xml_doc.content, plain_xml);
 }

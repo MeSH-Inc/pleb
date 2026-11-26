@@ -156,7 +156,7 @@ fn has_unbalanced_parens(s: &str) -> bool {
     depth != 0
 }
 
-fn format_destination(dest: &str) -> String {
+pub(crate) fn format_destination(dest: &str) -> String {
     if dest
         .chars()
         .any(|c| c.is_ascii_whitespace() || c.is_ascii_control() || c == '<' || c == '>')
@@ -505,7 +505,7 @@ fn collapse_spaces(s: &str) -> String {
     out
 }
 
-fn parse_opening_fence(line: &str) -> Option<(char, usize)> {
+pub(crate) fn parse_opening_fence(line: &str) -> Option<(char, usize)> {
     let trimmed = line.trim_start();
     let first = trimmed.chars().next()?;
     if first != '`' && first != '~' {
@@ -519,7 +519,7 @@ fn parse_opening_fence(line: &str) -> Option<(char, usize)> {
     }
 }
 
-fn is_closing_fence(line: &str, fence_char: char, min_len: usize) -> bool {
+pub(crate) fn is_closing_fence(line: &str, fence_char: char, min_len: usize) -> bool {
     let trimmed = line.trim();
     if trimmed.len() < min_len {
         return false;

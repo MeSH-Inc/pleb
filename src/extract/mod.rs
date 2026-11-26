@@ -1,6 +1,8 @@
 pub mod charset;
 pub mod dom;
+pub mod feed;
 pub mod markdown;
+pub mod native_markdown;
 pub mod url;
 
 pub use charset::decode_text_bytes;
@@ -75,15 +77,48 @@ pub fn format_page_section(
 pub fn wrap_raw_code_document(
     filename: &str,
     code: &str,
-    _language: Option<&str>,
+    language: Option<&str>,
     options: &ExtractOptions,
 ) -> ExtractedDocument {
+    if options.format == OutputFormat::Markdown {
+        let fence_len = (longest_backtick_run(code) + 1).max(3);
+        let fence = "`".repeat(fence_len);
+        let lang = language.unwrap_or("");
+        let trimmed_code = code.trim_end_matches('\n');
+        let raw = format!("# {filename}\n\n{fence}{lang}\n{trimmed_code}\n{fence}");
+        let (content, truncated) = match options.max_bytes {
+            Some(max) => markdown::truncate_markdown(&raw, max),
+            None => (raw, false),
+        };
+        return ExtractedDocument {
+            title: Some(filename.to_string()),
+            content,
+            truncated,
+        };
+    }
+
     let (content, truncated) = apply_utf8_limit(code, options.max_bytes);
     ExtractedDocument {
         title: Some(filename.to_string()),
         content,
         truncated,
     }
+}
+
+fn longest_backtick_run(s: &str) -> usize {
+    let mut best = 0usize;
+    let mut current = 0usize;
+    for b in s.bytes() {
+        if b == b'`' {
+            current += 1;
+            if current > best {
+                best = current;
+            }
+        } else {
+            current = 0;
+        }
+    }
+    best
 }
 
 pub fn extract_document_bytes(
@@ -114,6 +149,15 @@ pub fn extract_document_parsed(
 ) -> Result<ExtractedDocument> {
     if options.format == OutputFormat::Raw {
         bail!("OutputFormat::Raw must use raw byte passthrough, not extract_document");
+    }
+
+    let mime = extract_mime(content_type);
+    if native_markdown::is_markdown_mime(mime.as_deref()) {
+        return native_markdown::extract_native_markdown(body, page_url, options);
+    }
+
+    if feed::is_feed_document(mime.as_deref(), body) {
+        return feed::extract_feed(body, page_url, mime.as_deref(), options);
     }
 
     if is_passthrough_non_html(content_type) {
@@ -244,7 +288,7 @@ fn looks_like_binary_bytes(body: &[u8]) -> bool {
     inspect.contains(&0)
 }
 
-fn apply_utf8_limit(text: &str, max_bytes: Option<usize>) -> (String, bool) {
+pub(crate) fn apply_utf8_limit(text: &str, max_bytes: Option<usize>) -> (String, bool) {
     match max_bytes {
         Some(max) => truncate_utf8(text, max),
         None => (text.to_string(), false),
@@ -291,7 +335,7 @@ pub(crate) fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
     end
 }
 
-fn starts_with_title_heading(md: &str, title: &str) -> bool {
+pub(crate) fn starts_with_title_heading(md: &str, title: &str) -> bool {
     let first_line = md.lines().next().unwrap_or("").trim();
     let Some(heading) = first_line.strip_prefix("# ").map(str::trim) else {
         return false;
