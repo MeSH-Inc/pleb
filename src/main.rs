@@ -1,4 +1,7 @@
 use clap::{Parser, Subcommand};
+use mesh_wick::auth::{
+    self, CredentialProvider, CredentialSource, CredentialStorage, SecretString,
+};
 use mesh_wick::context::{clear_state_dir, default_state_dir, RuntimeConfig, RuntimeContext};
 use mesh_wick::crawl;
 #[cfg(unix)]
@@ -14,9 +17,10 @@ use mesh_wick::search::{
 use mesh_wick::transport::cef::{self, RendererProbe};
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{compiler_fence, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -148,6 +152,9 @@ enum Command {
         /// Search provider
         #[arg(long, value_enum, default_value_t = SearchProvider::Auto, ignore_case = true)]
         provider: SearchProvider,
+        /// Search routing intent mode
+        #[arg(long, value_enum, default_value_t = SearchMode::Auto, ignore_case = true)]
+        mode: SearchMode,
         /// Print only one bare URL per line (nothing on empty results)
         #[arg(long, conflicts_with = "json")]
         urls_only: bool,
@@ -157,9 +164,14 @@ enum Command {
         /// Restrict search results to a domain (prepends site:<domain>)
         #[arg(long)]
         site: Option<String>,
-        /// Request additional snippet excerpts from Brave Search
+        /// Request additional snippet excerpts from supported search providers
         #[arg(long)]
         extra_snippets: bool,
+    },
+    /// Manage stored search provider credentials
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
     },
     /// Crawl a website starting from a URL
     Crawl {
@@ -215,6 +227,33 @@ enum Command {
         #[command(subcommand)]
         action: SkillAction,
     },
+}
+
+#[derive(Subcommand)]
+enum AuthAction {
+    /// Store a search provider credential (hidden TTY prompt, or read from --stdin)
+    Set {
+        /// Search provider credential to store
+        #[arg(value_enum, ignore_case = true)]
+        provider: CredentialProvider,
+        /// Read credential from stdin (single line, <= 4096 bytes)
+        #[arg(long)]
+        stdin: bool,
+        /// Credential storage backend
+        #[arg(long, value_enum, default_value_t = CredentialStorage::Auto, ignore_case = true)]
+        storage: CredentialStorage,
+    },
+    /// Remove a stored search provider credential
+    Remove {
+        /// Search provider credential to remove
+        #[arg(value_enum, ignore_case = true)]
+        provider: CredentialProvider,
+        /// Credential storage backend to remove from
+        #[arg(long, value_enum, default_value_t = CredentialStorage::Auto, ignore_case = true)]
+        storage: CredentialStorage,
+    },
+    /// Show search provider credential and cooldown status
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -641,7 +680,6 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             }
 
             let target_urls = if is_stdin {
-                use std::io::Read;
                 let mut stdin_buf = String::new();
                 std::io::stdin()
                     .read_to_string(&mut stdin_buf)
@@ -836,6 +874,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             query,
             limit,
             provider,
+            mode,
             urls_only,
             freshness,
             site,
@@ -846,7 +885,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             let opts = SearchOptions {
                 limit,
                 provider,
-                mode: SearchMode::Auto,
+                mode,
                 freshness,
                 site,
                 extra_snippets,
@@ -865,6 +904,88 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Auth { action } => match action {
+            AuthAction::Set {
+                provider,
+                stdin,
+                storage,
+            } => {
+                let secret = if stdin {
+                    read_secret_from_stdin()?
+                } else {
+                    read_secret_from_tty(provider)?
+                };
+                let source =
+                    auth::set_credential(&config.state_dir, provider, secret.as_str(), storage)
+                        .map_err(|e| CliError::runtime("auth_error", e))?;
+                drop(secret);
+                search::clear_provider_cooldown(&config.state_dir, provider)
+                    .map_err(|e| CliError::runtime("auth_error", e))?;
+                if json {
+                    print_json(&serde_json::json!({
+                        "provider": provider.as_str(),
+                        "stored": true,
+                        "source": source,
+                    }))?;
+                } else if !quiet {
+                    println!(
+                        "Stored {} credential ({})",
+                        provider.as_str(),
+                        credential_source_label(source)
+                    );
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+            AuthAction::Remove { provider, storage } => {
+                let removed = auth::remove_credential(&config.state_dir, provider, storage)
+                    .map_err(|e| CliError::runtime("auth_error", e))?;
+                search::clear_provider_cooldown(&config.state_dir, provider)
+                    .map_err(|e| CliError::runtime("auth_error", e))?;
+                let env_var_still_set = std::env::var(provider.env_var())
+                    .map(|v| !v.trim().is_empty())
+                    .unwrap_or(false);
+                if env_var_still_set {
+                    eprintln!(
+                        "warning: {} is still set in the environment and will continue to take precedence",
+                        provider.env_var()
+                    );
+                }
+                if json {
+                    print_json(&serde_json::json!({
+                        "provider": provider.as_str(),
+                        "removed": !removed.is_empty(),
+                        "removed_from": removed,
+                        "env_var_still_set": env_var_still_set,
+                    }))?;
+                } else if !quiet {
+                    if removed.is_empty() {
+                        println!("No stored {} credential found", provider.as_str());
+                    } else {
+                        let stores: Vec<&'static str> = removed
+                            .iter()
+                            .copied()
+                            .map(credential_source_label)
+                            .collect();
+                        println!(
+                            "Removed {} credential ({})",
+                            provider.as_str(),
+                            stores.join(", ")
+                        );
+                    }
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+            AuthAction::Status => {
+                let statuses = search::search_provider_statuses(&config.state_dir)
+                    .map_err(|e| CliError::runtime("auth_error", e))?;
+                if json {
+                    print_json(&statuses)?;
+                } else {
+                    print_auth_statuses(&statuses);
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+        },
         Command::Crawl {
             url,
             depth,
@@ -994,14 +1115,249 @@ async fn daemon_status_json(state_dir: &std::path::Path) -> DaemonStatusJson {
     }
 }
 
-fn init_tracing(verbose: bool) {
-    let default_level = if verbose {
-        tracing::Level::DEBUG
-    } else {
-        tracing::Level::WARN
+const MAX_SECRET_INPUT_BYTES: usize = 4096;
+
+fn zeroize_bytes(bytes: &mut [u8]) {
+    for byte in bytes {
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
+fn validate_secret_input(raw: &mut [u8]) -> Result<SecretString, CliError> {
+    if raw.len() > MAX_SECRET_INPUT_BYTES {
+        zeroize_bytes(raw);
+        return Err(CliError::invalid_input(
+            "credential input exceeds 4096-byte limit",
+        ));
+    }
+    let result = match std::str::from_utf8(raw) {
+        Ok(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                Err(CliError::invalid_input("credential cannot be empty"))
+            } else if trimmed
+                .bytes()
+                .any(|b| !b.is_ascii() || b.is_ascii_control())
+            {
+                Err(CliError::invalid_input(
+                    "credential must be a single line of printable ASCII characters",
+                ))
+            } else {
+                Ok(SecretString::new(trimmed.to_string()))
+            }
+        }
+        Err(_) => Err(CliError::invalid_input(
+            "credential must be printable ASCII",
+        )),
     };
-    let filter =
-        tracing_subscriber::EnvFilter::from_default_env().add_directive(default_level.into());
+    zeroize_bytes(raw);
+    result
+}
+
+fn read_secret_from_stdin() -> Result<SecretString, CliError> {
+    let mut buf = Vec::new();
+    let mut limited = std::io::stdin().take((MAX_SECRET_INPUT_BYTES + 1) as u64);
+    if let Err(err) = limited.read_to_end(&mut buf) {
+        zeroize_bytes(&mut buf);
+        return Err(CliError::runtime("io_error", err));
+    }
+    validate_secret_input(&mut buf)
+}
+
+#[cfg(unix)]
+fn read_secret_from_tty(provider: CredentialProvider) -> Result<SecretString, CliError> {
+    use std::fs::OpenOptions;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::atomic::AtomicBool;
+
+    static TTY_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn handle_tty_interrupt(_sig: libc::c_int) {
+        TTY_INTERRUPTED.store(true, Ordering::SeqCst);
+    }
+
+    struct EchoGuard {
+        fd: libc::c_int,
+        orig_termios: libc::termios,
+        prev_sigint: libc::sigaction,
+        prev_sigterm: libc::sigaction,
+    }
+
+    impl Drop for EchoGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.orig_termios);
+                libc::sigaction(libc::SIGINT, &self.prev_sigint, std::ptr::null_mut());
+                libc::sigaction(libc::SIGTERM, &self.prev_sigterm, std::ptr::null_mut());
+            }
+            let _ = writeln!(std::io::stderr());
+        }
+    }
+
+    if !std::io::stdin().is_terminal() {
+        return Err(CliError::invalid_input(
+            "stdin is not a terminal; pass --stdin to read a credential from a pipe",
+        ));
+    }
+
+    let tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open("/dev/tty")
+        .map_err(|e| CliError::runtime("io_error", e))?;
+    let fd = tty.as_raw_fd();
+
+    let mut orig_termios: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut orig_termios) } != 0 {
+        return Err(CliError::runtime(
+            "io_error",
+            std::io::Error::last_os_error(),
+        ));
+    }
+
+    TTY_INTERRUPTED.store(false, Ordering::SeqCst);
+
+    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    sa.sa_sigaction = handle_tty_interrupt as *const () as libc::sighandler_t;
+    sa.sa_flags = 0; // Explicitly omit SA_RESTART so Ctrl-C interrupts read() with EINTR.
+    unsafe {
+        libc::sigemptyset(&mut sa.sa_mask);
+    }
+
+    let mut prev_sigint: libc::sigaction = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sigaction(libc::SIGINT, &sa, &mut prev_sigint) } != 0 {
+        return Err(CliError::runtime(
+            "io_error",
+            std::io::Error::last_os_error(),
+        ));
+    }
+
+    let mut prev_sigterm: libc::sigaction = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sigaction(libc::SIGTERM, &sa, &mut prev_sigterm) } != 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            libc::sigaction(libc::SIGINT, &prev_sigint, std::ptr::null_mut());
+        }
+        return Err(CliError::runtime("io_error", err));
+    }
+
+    let mut noecho = orig_termios;
+    noecho.c_lflag &= !(libc::ECHO | libc::ECHONL);
+    if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &noecho) } != 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            libc::sigaction(libc::SIGINT, &prev_sigint, std::ptr::null_mut());
+            libc::sigaction(libc::SIGTERM, &prev_sigterm, std::ptr::null_mut());
+        }
+        return Err(CliError::runtime("io_error", err));
+    }
+
+    let guard = EchoGuard {
+        fd,
+        orig_termios,
+        prev_sigint,
+        prev_sigterm,
+    };
+
+    eprint!("Enter {} ({}): ", provider.as_str(), provider.env_var());
+    let _ = std::io::stderr().flush();
+
+    let mut buf = Vec::new();
+    let mut byte = 0u8;
+    loop {
+        let n = unsafe { libc::read(fd, (&mut byte as *mut u8).cast::<libc::c_void>(), 1) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) || TTY_INTERRUPTED.load(Ordering::SeqCst) {
+                zeroize_bytes(&mut buf);
+                drop(guard);
+                return Err(CliError {
+                    message: "interrupted".to_string(),
+                    kind: "interrupted",
+                    exit_code: 130,
+                });
+            }
+            zeroize_bytes(&mut buf);
+            drop(guard);
+            return Err(CliError::runtime("io_error", err));
+        }
+        if n == 0 || byte == b'\n' {
+            break;
+        }
+        buf.push(byte);
+        if buf.len() > MAX_SECRET_INPUT_BYTES {
+            break;
+        }
+    }
+
+    drop(guard);
+    if TTY_INTERRUPTED.load(Ordering::SeqCst) {
+        zeroize_bytes(&mut buf);
+        return Err(CliError {
+            message: "interrupted".to_string(),
+            kind: "interrupted",
+            exit_code: 130,
+        });
+    }
+
+    validate_secret_input(&mut buf)
+}
+
+#[cfg(not(unix))]
+fn read_secret_from_tty(_provider: CredentialProvider) -> Result<SecretString, CliError> {
+    if !std::io::stdin().is_terminal() {
+        return Err(CliError::invalid_input(
+            "stdin is not a terminal; pass --stdin to read a credential from a pipe",
+        ));
+    }
+    Err(CliError::invalid_input(
+        "interactive TTY credential prompts are only supported on Unix; pass --stdin",
+    ))
+}
+
+fn credential_source_label(source: CredentialSource) -> &'static str {
+    match source {
+        CredentialSource::Environment => "environment",
+        CredentialSource::Keychain => "keychain",
+        CredentialSource::File => "file",
+    }
+}
+
+fn print_auth_statuses(statuses: &BTreeMap<String, SearchProviderStatus>) {
+    for (provider, status) in statuses {
+        let mut line = if status.configured {
+            let source = status
+                .source
+                .map(credential_source_label)
+                .unwrap_or("configured");
+            format!("{provider}: configured ({source})")
+        } else {
+            format!("{provider}: not configured")
+        };
+        if status.month_requests > 0 {
+            line.push_str(&format!(" | month_requests: {}", status.month_requests));
+        }
+        if status.cooldown_remaining_secs > 0 {
+            line.push_str(&format!(" | cooldown: {}s", status.cooldown_remaining_secs));
+        }
+        if let Some(code) = status.last_error_status {
+            line.push_str(&format!(" | last_error: HTTP {code}"));
+        }
+        println!("{line}");
+    }
+}
+
+fn init_tracing(verbose: bool) {
+    let default_spec = if verbose {
+        "warn,mesh_wick=debug,reqwest=warn,hyper=warn,hyper_util=warn,h2=warn,rustls=warn"
+    } else {
+        "warn,reqwest=warn,hyper=warn,hyper_util=warn,h2=warn,rustls=warn"
+    };
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_spec));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)

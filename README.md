@@ -2,7 +2,7 @@
 
 Local, zero-telemetry web fetch and search CLI (`wick`) for AI agents, forked from [wickproject/wick](https://github.com/wickproject/wick).
 
-Uses Chrome's network stack (Cronet) for browser-identical TLS/HTTP2/QUIC fingerprinting, an optional embedded Chromium (CEF `v5-meta`) renderer for JS-heavy pages, structured source negotiation (GitHub/GitLab/Gist raw source rewrites, advertised Markdown mirrors, native `text/markdown` extraction, and RSS 2.0 / Atom 1.0 / JSON Feed 1.1 conversion), single-parse `O(N)` DOM-pruned compact markdown extraction with charset-aware decoding, and Brave Search API / DuckDuckGo search.
+Uses Chrome's network stack (Cronet) for browser-identical TLS/HTTP2/QUIC fingerprinting, an optional embedded Chromium (CEF `v5-meta`) renderer for JS-heavy pages, structured source negotiation (GitHub/GitLab/Gist raw source rewrites, advertised Markdown mirrors, native `text/markdown` extraction, and RSS 2.0 / Atom 1.0 / JSON Feed 1.1 conversion), single-parse `O(N)` DOM-pruned compact markdown extraction with charset-aware decoding, and multi-provider search balancing (`brave`, `tavily`, `serper`, `exa`, `searxng`, `duckduckgo`, `federated`) with tool-owned credential storage (`wick auth`).
 
 ## Build & Install
 
@@ -89,10 +89,13 @@ Native `text/markdown` responses extract/strip YAML frontmatter in `clean`/`arti
 
 ### Search
 
-Uses the Brave Search API when `BRAVE_API_KEY` is set (`--provider auto`), falling back to DuckDuckGo HTML search:
+Balances queries across configured providers (`brave`, `tavily`, `serper`, `exa`, `searxng`) with health-aware cooldowns, burst pacing, intent routing (`--mode`), Reciprocal Rank Fusion (`--provider federated`), and DuckDuckGo HTML fallback:
 
 ```bash
 wick search "rust async runtime" -n 8
+wick search --mode exact "E0382 borrow checker"
+wick search --mode semantic "local-first crdt sync architectures"
+wick search --provider federated --json "cronet tls fingerprint"
 wick search --provider duckduckgo --json "cronet tls fingerprint"
 wick search --site docs.rs --freshness month --urls-only "tokio"
 wick search --extra-snippets "cronet http2"
@@ -101,11 +104,33 @@ wick search --extra-snippets "cronet http2"
 Key `search` flags:
 
 - `-n` / `--limit <N>` (`1..=20`, default `8`)
-- `--provider <auto|brave|duckduckgo>` (alias `ddg`)
+- `--provider <auto|brave|tavily|serper|exa|searxng|duckduckgo|federated>` (alias `ddg`)
+- `--mode <auto|exact|semantic>` (default: `auto`; steers intent routing in `--provider auto`)
 - `--freshness <day|week|month|year>`
 - `--site <domain>` (prepends `site:<domain>` after stripping scheme/trailing slash)
-- `--extra-snippets` (Brave Search extra excerpts)
+- `--extra-snippets` (additional snippet excerpts from supported providers)
 - `--urls-only` (one URL per line, empty stdout on zero results; conflicts with `--json`)
+
+### Search Credentials (`wick auth`)
+
+Store search provider credentials locally without exporting keys in shell profiles or passing secrets in command-line arguments:
+
+```bash
+wick auth set brave
+op read "op://Vault/Tavily/credential" | wick auth set tavily --stdin
+wick auth set searxng --stdin --storage file <<< "http://127.0.0.1:8888"
+wick auth status
+wick auth status --json
+wick auth remove tavily
+```
+
+Subcommands:
+
+- `wick auth set <brave|tavily|serper|exa|searxng> [--stdin] [--storage <auto|keychain|file>]` (prompts with echo disabled on `/dev/tty`, or reads a single-line `<= 4096`-byte secret from `--stdin`; clears any stale provider cooldown)
+- `wick auth remove <brave|tavily|serper|exa|searxng> [--storage <auto|keychain|file>]` (removes stored credentials, clears cooldown, and warns on `stderr` if the provider's environment variable is still set)
+- `wick auth status` (inherits global `--json`; reports provider configuration source, monthly request count, cooldown remaining, and last HTTP error status without printing secret values, URLs, prefixes, or lengths)
+
+Resolution precedence: environment variable (`BRAVE_API_KEY`, `TAVILY_API_KEY`, `SERPER_API_KEY`, `EXA_API_KEY`, `SEARXNG_URL`) -> macOS Keychain (skipped when `WICK_NO_KEYCHAIN=1`) -> `<state_dir>/credentials.json` (`0o600`).
 
 ### Crawl and Map
 
@@ -135,10 +160,11 @@ bash scripts/install-skill.sh
 
 ## Configuration
 
-- `MESH_WICK_HOME` / `--state-dir`: private (`0o700`) state directory for proxy-partitioned HTTP cache/cookies (`data/`), CEF `cef-cache/`, content-addressed staged artifacts (`artifacts/`, `256 MiB` LRU cap), unified transport daemon socket (`daemon.sock`), daemon logs (`daemon.log`), `site-cache.json` (`0o600`), and optional local `site-rules.json` overlay over bundled structural rules (`reddit.com` -> `old.reddit.com`, `x.com`/`twitter.com`) (default: `~/.mesh-wick`; `wick session clear` stops any running daemon and clears `data/`, `cef-cache/`, `artifacts/`, and `site-cache.json`)
+- `MESH_WICK_HOME` / `--state-dir`: private (`0o700`) state directory for proxy-partitioned HTTP cache/cookies (`data/`), CEF `cef-cache/`, content-addressed staged artifacts (`artifacts/`, `256 MiB` LRU cap), unified transport daemon socket (`daemon.sock`), daemon logs (`daemon.log`), `site-cache.json` (`0o600`), `search-state.json` (`0o600`), `credentials.json` (`0o600`), and optional local `site-rules.json` overlay over bundled structural rules (`reddit.com` -> `old.reddit.com`, `x.com`/`twitter.com`) (default: `~/.mesh-wick`; `wick session clear` stops any running daemon and clears `data/`, `cef-cache/`, `artifacts/`, `site-cache.json`, and `search-state.json` while preserving `credentials.json`, `site-rules.json`, and Keychain entries)
 - `MESH_WICK_PROXY` / `--proxy`: SOCKS5/HTTP proxy URL
 - `MESH_WICK_TIMEZONE`: optional IANA timezone override injected into CEF `Intl.DateTimeFormat`
-- `BRAVE_API_KEY`: enables Brave Search API in `search`
+- `BRAVE_API_KEY`, `TAVILY_API_KEY`, `SERPER_API_KEY`, `EXA_API_KEY`, `SEARXNG_URL`: environment overrides for search provider credentials (take precedence over `wick auth` Keychain and file storage)
+- `WICK_NO_KEYCHAIN=1`: disables macOS Keychain lookups/writes (forces `<state_dir>/credentials.json` for `--storage auto`; required for hermetic tests)
 - `--timeout <SECS>`: network request timeout (default: `30`)
 - `--max-response-bytes <BYTES>`: maximum HTTP response body size (defaults: `16 MiB` document, `128 MiB` raw)
 - `--cef-timeout <SECS>`: CEF render timeout (default: `60`)

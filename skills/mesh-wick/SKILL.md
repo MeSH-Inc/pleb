@@ -70,12 +70,19 @@ Expected markers: `"cronet_enabled": true`, `"cef_renderer": { "expected_protoco
 
 ---
 
-## Decision Tree 3 — Search, Batch Fetch, and Crawl Pipelines
+## Decision Tree 3 — Search, Credentials, Batch Fetch, and Crawl Pipelines
 
-- **Search (Brave Search API via `BRAVE_API_KEY` first, DuckDuckGo fallback):**
+- **Multi-provider search (`auto` balances configured providers with cooldown/burst pacing and intent routing; DuckDuckGo HTML fallback):**
   ```bash
-  wick search -n 8 [--provider auto|brave|duckduckgo] [--freshness day|week|month|year] [--site <domain>] [--extra-snippets] "<query>"
+  wick search -n 8 [--provider auto|brave|tavily|serper|exa|searxng|duckduckgo|federated] [--mode auto|exact|semantic] [--freshness day|week|month|year] [--site <domain>] [--extra-snippets] "<query>"
   ```
+- **Tool-owned credential storage (`env -> macOS Keychain -> <state_dir>/credentials.json`):**
+  ```bash
+  wick auth set <brave|tavily|serper|exa|searxng> [--stdin] [--storage auto|keychain|file]
+  wick auth remove <brave|tavily|serper|exa|searxng> [--storage auto|keychain|file]
+  wick auth status [--json]
+  ```
+  Environment overrides: `BRAVE_API_KEY`, `TAVILY_API_KEY`, `SERPER_API_KEY`, `EXA_API_KEY`, `SEARXNG_URL`. Set `WICK_NO_KEYCHAIN=1` to bypass macOS Keychain in hermetic/headless runs. Secrets are never accepted as positional CLI args or printed in status/error output.
 - **Search-to-Batch Fetch pipeline:**
   ```bash
   wick search --urls-only -n 5 "<query>" | wick fetch - --jsonl --concurrency 4
@@ -105,7 +112,7 @@ Expected markers: `"cronet_enabled": true`, `"cef_renderer": { "expected_protoco
 
 ## Daemon, State, CEF `v5-meta`, and Skill Maintenance
 
-- **State directory (`MESH_WICK_HOME` / `--state-dir`, default `~/.mesh-wick`, `0o700`):** holds `data/`, `cef-cache/`, `artifacts/`, `daemon.sock`, `daemon.log`, `site-cache.json`, and optional local `site-rules.json`.
-- **Daemon controls:** auto-starts `daemon.sock` (idle exit `--daemon-idle-timeout` / `MESH_WICK_DAEMON_IDLE_SECONDS`, default `300`; bypass via `--no-daemon` / `MESH_WICK_NO_DAEMON`). Manage with `wick daemon status`, `wick daemon stop`, and `wick session clear` (stops daemon and clears `data/`, `cef-cache/`, `artifacts/`, `site-cache.json`).
+- **State directory (`MESH_WICK_HOME` / `--state-dir`, default `~/.mesh-wick`, `0o700`):** holds `data/`, `cef-cache/`, `artifacts/`, `daemon.sock`, `daemon.log`, `site-cache.json`, `search-state.json`, `credentials.json` (`0o600`), and optional local `site-rules.json`.
+- **Daemon controls:** auto-starts `daemon.sock` (idle exit `--daemon-idle-timeout` / `MESH_WICK_DAEMON_IDLE_SECONDS`, default `300`; bypass via `--no-daemon` / `MESH_WICK_NO_DAEMON`). Manage with `wick daemon status`, `wick daemon stop`, and `wick session clear` (stops daemon and clears `data/`, `cef-cache/`, `artifacts/`, `site-cache.json`, and `search-state.json` while preserving `credentials.json` and Keychain items).
 - **CEF `v5-meta` installer & overrides:** rebuild via `bash ~/apps/mesh-wick/scripts/install-cef-mac.sh --force` (supports `--prefix <dir>`). Override binaries in tests/scripts with `WICK_CEF_RENDERER`, `WICK_DAEMON_EXECUTABLE`, and `WICK_NO_HOME_CEF=1`.
 - **Emit this exact version-locked skill from any machine with `wick` installed:** `wick skill print`.

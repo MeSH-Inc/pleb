@@ -539,6 +539,18 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "<svg>",
         ".vtt",
         ".srt",
+        "wick auth set",
+        "wick auth remove",
+        "wick auth status",
+        "WICK_NO_KEYCHAIN=1",
+        "TAVILY_API_KEY",
+        "SERPER_API_KEY",
+        "EXA_API_KEY",
+        "SEARXNG_URL",
+        "federated",
+        "--mode",
+        "exact",
+        "semantic",
     ] {
         assert!(
             readme.contains(required),
@@ -578,6 +590,18 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "WICK_NO_HOME_CEF",
         "wick skill print",
         "artifacts/",
+        "wick auth set",
+        "wick auth remove",
+        "wick auth status",
+        "WICK_NO_KEYCHAIN=1",
+        "TAVILY_API_KEY",
+        "SERPER_API_KEY",
+        "EXA_API_KEY",
+        "SEARXNG_URL",
+        "federated",
+        "--mode",
+        "exact",
+        "semantic",
     ] {
         assert!(
             skill_md.contains(required),
@@ -759,4 +783,281 @@ async fn cli_direct_stage_rejects_disguised_html_conflicts_and_clears_artifacts(
         .unwrap();
     assert_eq!(clear_out.status.code(), Some(0));
     assert!(!state_dir.path().join("artifacts").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_auth_subcommands_help_and_zero_secret_leakage() {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt as _;
+
+    let state_dir = temp_dir();
+    let wick_bin = env!("CARGO_BIN_EXE_wick");
+
+    // 1. Help parity for `wick search --help`, `wick auth --help`, and `wick auth set --help`.
+    let search_help = Command::new(wick_bin)
+        .args(["search", "--help"])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(search_help.status.code(), Some(0));
+    let search_help_txt = String::from_utf8_lossy(&search_help.stdout);
+    for expected in [
+        "--provider",
+        "--mode",
+        "brave",
+        "tavily",
+        "serper",
+        "exa",
+        "searxng",
+        "duckduckgo",
+        "federated",
+        "auto",
+        "exact",
+        "semantic",
+    ] {
+        assert!(
+            search_help_txt.contains(expected),
+            "`wick search --help` missing {expected}"
+        );
+    }
+
+    let auth_help = Command::new(wick_bin)
+        .args(["auth", "--help"])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(auth_help.status.code(), Some(0));
+    let auth_help_txt = String::from_utf8_lossy(&auth_help.stdout);
+    for expected in ["set", "remove", "status"] {
+        assert!(
+            auth_help_txt.contains(expected),
+            "`wick auth --help` missing {expected}"
+        );
+    }
+
+    let auth_set_help = Command::new(wick_bin)
+        .args(["auth", "set", "--help"])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(auth_set_help.status.code(), Some(0));
+    let auth_set_help_txt = String::from_utf8_lossy(&auth_set_help.stdout);
+    for expected in ["--stdin", "--storage", "auto", "keychain", "file"] {
+        assert!(
+            auth_set_help_txt.contains(expected),
+            "`wick auth set --help` missing {expected}"
+        );
+    }
+
+    // 2. Non-TTY `wick auth set` without `--stdin` must fail loudly with exit 1.
+    let non_tty = Command::new(wick_bin)
+        .env("WICK_NO_KEYCHAIN", "1")
+        .env("WICK_NO_HOME_CEF", "1")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args(["--json", "auth", "set", "brave"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(non_tty.status.code(), Some(1));
+    let non_tty_err: serde_json::Value = serde_json::from_slice(&non_tty.stderr).unwrap();
+    assert_eq!(non_tty_err["kind"], "invalid_input");
+    assert!(non_tty_err["error"].as_str().unwrap().contains("--stdin"));
+
+    // 3. Invalid `--stdin` inputs (empty, oversized > 4096 bytes, multi-line) fail loudly without echoing secrets.
+    let oversized_secret = "A".repeat(4097);
+    for (label, payload, needle) in [
+        ("empty", "   \n", ""),
+        ("oversized", oversized_secret.as_str(), "AAAA"),
+        (
+            "multiline",
+            "secret-line-1\nsecret-line-2\n",
+            "secret-line-1",
+        ),
+    ] {
+        let mut child = Command::new(wick_bin)
+            .env("WICK_NO_KEYCHAIN", "1")
+            .env("WICK_NO_HOME_CEF", "1")
+            .args(["--state-dir"])
+            .arg(&state_dir)
+            .args([
+                "--json",
+                "auth",
+                "set",
+                "brave",
+                "--stdin",
+                "--storage",
+                "file",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(payload.as_bytes())
+            .await
+            .unwrap();
+        let out = child.wait_with_output().await.unwrap();
+        assert_eq!(out.status.code(), Some(1), "case {label} should exit 1");
+        let err_json: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+        assert_eq!(err_json["kind"], "invalid_input", "case {label}");
+        if !needle.is_empty() {
+            assert!(!String::from_utf8_lossy(&out.stdout).contains(needle));
+            assert!(!String::from_utf8_lossy(&out.stderr).contains(needle));
+        }
+    }
+
+    // 4. `wick auth status --json` and plain text with env vars report source without leaking secret or URL.
+    let env_secret = "wick-env-secret-9f8e7d6c";
+    let env_searxng = "http://127.0.0.1:18888";
+    let env_status_json = Command::new(wick_bin)
+        .env("WICK_NO_KEYCHAIN", "1")
+        .env("WICK_NO_HOME_CEF", "1")
+        .env("BRAVE_API_KEY", env_secret)
+        .env("SEARXNG_URL", env_searxng)
+        .env_remove("TAVILY_API_KEY")
+        .env_remove("SERPER_API_KEY")
+        .env_remove("EXA_API_KEY")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args(["auth", "status", "--json"])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(env_status_json.status.code(), Some(0));
+    let stdout_str = String::from_utf8_lossy(&env_status_json.stdout);
+    let stderr_str = String::from_utf8_lossy(&env_status_json.stderr);
+    for forbidden in [env_secret, "9f8e7d6c", env_searxng, "18888"] {
+        assert!(
+            !stdout_str.contains(forbidden),
+            "leaked {forbidden} on stdout"
+        );
+        assert!(
+            !stderr_str.contains(forbidden),
+            "leaked {forbidden} on stderr"
+        );
+    }
+    let val: serde_json::Value = serde_json::from_str(&stdout_str).unwrap();
+    assert_eq!(val["brave"]["configured"], true);
+    assert_eq!(val["brave"]["source"], "environment");
+    assert_eq!(val["searxng"]["configured"], true);
+    assert_eq!(val["searxng"]["source"], "environment");
+    assert_eq!(val["tavily"]["configured"], false);
+    assert!(val["tavily"]["source"].is_null());
+
+    let env_status_plain = Command::new(wick_bin)
+        .env("WICK_NO_KEYCHAIN", "1")
+        .env("WICK_NO_HOME_CEF", "1")
+        .env("BRAVE_API_KEY", env_secret)
+        .env("SEARXNG_URL", env_searxng)
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args(["auth", "status"])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(env_status_plain.status.code(), Some(0));
+    let plain_out = String::from_utf8_lossy(&env_status_plain.stdout);
+    assert!(plain_out.contains("brave: configured (environment)"));
+    assert!(plain_out.contains("searxng: configured (environment)"));
+    assert!(!plain_out.contains(env_secret));
+    assert!(!plain_out.contains(env_searxng));
+
+    // 5. `wick auth set --stdin --storage file` -> `wick auth status --json` -> `wick auth remove`.
+    let file_secret = "wick-file-secret-a1b2c3d4";
+    let mut set_child = Command::new(wick_bin)
+        .env("WICK_NO_KEYCHAIN", "1")
+        .env("WICK_NO_HOME_CEF", "1")
+        .env_remove("BRAVE_API_KEY")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args(["auth", "set", "brave", "--stdin", "--storage", "file"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    set_child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(format!("{file_secret}\n").as_bytes())
+        .await
+        .unwrap();
+    let set_out = set_child.wait_with_output().await.unwrap();
+    let set_stdout = String::from_utf8_lossy(&set_out.stdout);
+    let set_stderr = String::from_utf8_lossy(&set_out.stderr);
+    assert!(!set_stdout.contains(file_secret));
+    assert!(!set_stderr.contains(file_secret));
+
+    if set_out.status.code() == Some(1) && set_stderr.contains("not yet implemented") {
+        // Wave-header stub in src/auth.rs before auth-store lands: verify remove routes cleanly too.
+        let remove_out = Command::new(wick_bin)
+            .env("WICK_NO_KEYCHAIN", "1")
+            .env("WICK_NO_HOME_CEF", "1")
+            .env_remove("BRAVE_API_KEY")
+            .args(["--state-dir"])
+            .arg(&state_dir)
+            .args(["auth", "remove", "brave", "--storage", "file"])
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(remove_out.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&remove_out.stderr).contains("not yet implemented"));
+    } else {
+        assert_eq!(set_out.status.code(), Some(0), "stderr: {set_stderr}");
+        let file_status = Command::new(wick_bin)
+            .env("WICK_NO_KEYCHAIN", "1")
+            .env("WICK_NO_HOME_CEF", "1")
+            .env_remove("BRAVE_API_KEY")
+            .args(["--state-dir"])
+            .arg(&state_dir)
+            .args(["auth", "status", "--json"])
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(file_status.status.code(), Some(0));
+        let file_status_str = String::from_utf8_lossy(&file_status.stdout);
+        assert!(!file_status_str.contains(file_secret));
+        let file_status_json: serde_json::Value = serde_json::from_str(&file_status_str).unwrap();
+        assert_eq!(file_status_json["brave"]["configured"], true);
+        assert_eq!(file_status_json["brave"]["source"], "file");
+
+        // Removing while BRAVE_API_KEY is set emits a warning on stderr without leaking the key.
+        let remove_with_env = Command::new(wick_bin)
+            .env("WICK_NO_KEYCHAIN", "1")
+            .env("WICK_NO_HOME_CEF", "1")
+            .env("BRAVE_API_KEY", env_secret)
+            .args(["--state-dir"])
+            .arg(&state_dir)
+            .args(["auth", "remove", "brave", "--storage", "file"])
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(remove_with_env.status.code(), Some(0));
+        let remove_stderr = String::from_utf8_lossy(&remove_with_env.stderr);
+        assert!(remove_stderr.contains("BRAVE_API_KEY"));
+        assert!(!remove_stderr.contains(env_secret));
+
+        // After removal without env var, brave is no longer configured.
+        let after_remove = Command::new(wick_bin)
+            .env("WICK_NO_KEYCHAIN", "1")
+            .env("WICK_NO_HOME_CEF", "1")
+            .env_remove("BRAVE_API_KEY")
+            .args(["--state-dir"])
+            .arg(&state_dir)
+            .args(["auth", "status", "--json"])
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(after_remove.status.code(), Some(0));
+        let after_json: serde_json::Value = serde_json::from_slice(&after_remove.stdout).unwrap();
+        assert_eq!(after_json["brave"]["configured"], false);
+        assert!(after_json["brave"]["source"].is_null());
+    }
 }
