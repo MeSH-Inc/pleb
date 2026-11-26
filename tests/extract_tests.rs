@@ -1862,7 +1862,7 @@ fn webmcp_declarative_forms_extract_schemas_prune_chrome_and_preserve_normal_for
     let manifest = format_webmcp_manifest_markdown(&doc.tools);
     assert!(manifest.starts_with("## Page Tools (WebMCP)\n\n"));
     assert!(manifest.contains("| nav_search | declarative | POST | https://hijack.example.org/search | Docs Search | Search documentation |"));
-    assert!(manifest.contains("```json\n"));
+    assert!(manifest.contains("```json\n{\n  "));
     assert_eq!(format_webmcp_manifest_markdown(&[]), "");
 
     let cue = format_webmcp_cue(&doc.tools).unwrap();

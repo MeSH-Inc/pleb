@@ -711,7 +711,10 @@ pub fn format_webmcp_manifest_markdown(tools: &[WebMcpToolDescriptor]) -> String
         let Ok(pretty_raw) = serde_json::to_string_pretty(schema) else {
             continue;
         };
-        let pretty = strip_controls_and_bidi(&pretty_raw);
+        let pretty: String = pretty_raw
+            .chars()
+            .filter(|&ch| ch == '\n' || !is_stripped_control(ch))
+            .collect();
         let fence = "`".repeat((longest_backtick_run(&pretty) + 1).max(3));
         out.push_str(&format!(
             "\n### {} schema\n\n{fence}json\n{pretty}\n{fence}\n",
