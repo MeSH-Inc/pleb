@@ -55,6 +55,7 @@ impl RuntimeContext {
             config.timeout,
         )?;
         let cef = CefRenderer::new(
+            config.state_dir.clone(),
             config.proxy.clone(),
             config.cef_timeout,
             config.verbose,
@@ -86,6 +87,10 @@ pub fn clear_state_dir(state_dir: &Path) -> Result<()> {
         std::fs::remove_dir_all(&data_dir)?;
     }
     std::fs::create_dir_all(&data_dir)?;
+    let cef_cache_dir = state_dir.join("cef-cache");
+    if cef_cache_dir.exists() {
+        std::fs::remove_dir_all(&cef_cache_dir)?;
+    }
     let cache_file = state_dir.join("site-cache.json");
     if cache_file.exists() {
         std::fs::remove_file(&cache_file)?;

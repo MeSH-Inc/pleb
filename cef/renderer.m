@@ -615,15 +615,19 @@ int main(int argc, char* argv[]) {
         cef_string_utf8_to_utf16(bundle_real, strlen(bundle_real), &settings.main_bundle_path);
     }
 
+    const char* state_home = getenv("MESH_WICK_HOME");
     char cache_path[4096];
-    snprintf(cache_path, sizeof(cache_path), "%s/.wick/cef-cache",
-             getenv("HOME") ? getenv("HOME") : "/tmp");
+    if (state_home && state_home[0]) {
+        snprintf(cache_path, sizeof(cache_path), "%s/cef-cache", state_home);
+    } else {
+        snprintf(cache_path, sizeof(cache_path), "%s/.mesh-wick/cef-cache",
+                 getenv("HOME") ? getenv("HOME") : "/tmp");
+    }
     cef_string_utf8_to_utf16(cache_path, strlen(cache_path), &settings.root_cache_path);
 
     // Profile cache path — required for cookie persistence (AWS WAF, etc.)
     char profile_path[4096];
-    snprintf(profile_path, sizeof(profile_path), "%s/.wick/cef-cache/Default",
-             getenv("HOME") ? getenv("HOME") : "/tmp");
+    snprintf(profile_path, sizeof(profile_path), "%s/Default", cache_path);
     cef_string_utf8_to_utf16(profile_path, strlen(profile_path), &settings.cache_path);
 
     if (!cef_initialize(&main_args, &settings, NULL, NULL)) {

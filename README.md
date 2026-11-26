@@ -28,12 +28,18 @@ cargo build --release --features cronet
 
 ## CEF Renderer (Optional)
 
-When installed at `~/.mesh-wick/cef/wick-renderer.app` or `~/.wick/cef/wick-renderer.app`, `mesh-wick` automatically escalates blocked responses (`403`/`503`) and JS-only shells to CEF in `--render auto` mode.
+When installed at `~/.mesh-wick/cef/wick-renderer.app` (or `$MESH_WICK_HOME/cef`), `mesh-wick` automatically escalates blocked responses (`403`/`503`) and JS-only shells to CEF in `--render auto` mode.
 
-To build/install the CEF renderer on macOS from this checkout:
+To build and install the CEF renderer on macOS from this checkout:
 
 ```bash
 bash scripts/install-cef-mac.sh
+```
+
+On Linux:
+
+```bash
+bash scripts/install-cef-linux.sh
 ```
 
 ## Usage
@@ -87,7 +93,7 @@ mesh-wick session clear
 
 ## Configuration
 
-- `MESH_WICK_HOME` / `--state-dir`: state directory for cookies, HTTP cache, `site-cache.json`, and optional local `site-rules.json` overlay (default: `~/.mesh-wick`)
+- `MESH_WICK_HOME` / `--state-dir`: state directory for cookies, HTTP cache, CEF `cef-cache`, `site-cache.json`, and optional local `site-rules.json` overlay (default: `~/.mesh-wick`; `mesh-wick session clear` clears cookies, HTTP cache, `cef-cache`, and `site-cache.json`)
 - `MESH_WICK_PROXY` / `WICK_PROXY` / `--proxy`: SOCKS5/HTTP proxy URL
 - `BRAVE_API_KEY`: enables Brave Search API in `search`
 - `--timeout <SECS>`: network request timeout (default: `30`)

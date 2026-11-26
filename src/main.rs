@@ -187,7 +187,7 @@ async fn main() -> Result<()> {
             }
         },
         Command::Status => {
-            let renderer_path = cef::find_renderer();
+            let renderer_path = cef::find_renderer_in(&config.state_dir);
             println!("mesh-wick {}", env!("CARGO_PKG_VERSION"));
             println!(
                 "Cronet: {}",

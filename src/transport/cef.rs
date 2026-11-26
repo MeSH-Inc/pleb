@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -33,6 +33,7 @@ impl Drop for KillOnDrop {
 
 /// Manages a persistent `wick-renderer` CEF daemon scoped to a runtime context.
 pub struct CefRenderer {
+    state_dir: PathBuf,
     proxy: Option<String>,
     timeout: Duration,
     verbose: bool,
@@ -40,8 +41,9 @@ pub struct CefRenderer {
 }
 
 impl CefRenderer {
-    pub fn new(proxy: Option<String>, timeout: Duration, verbose: bool) -> Self {
+    pub fn new(state_dir: PathBuf, proxy: Option<String>, timeout: Duration, verbose: bool) -> Self {
         Self {
+            state_dir,
             proxy,
             timeout,
             verbose,
@@ -50,11 +52,11 @@ impl CefRenderer {
     }
 
     pub fn is_available(&self) -> bool {
-        find_renderer().is_some()
+        find_renderer_in(&self.state_dir).is_some()
     }
 
     pub fn renderer_path(&self) -> Option<PathBuf> {
-        find_renderer()
+        find_renderer_in(&self.state_dir)
     }
 
     pub async fn render(&self, url: &str, opts: &CefRenderOptions) -> Result<String> {
@@ -147,7 +149,8 @@ impl CefRenderer {
             }
         }
 
-        let renderer_path = find_renderer().ok_or_else(|| anyhow::anyhow!("wick-renderer not found"))?;
+        let renderer_path = find_renderer_in(&self.state_dir)
+            .ok_or_else(|| anyhow::anyhow!("wick-renderer not found"))?;
         let renderer_dir = renderer_path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("renderer path has no parent directory"))?
@@ -157,6 +160,7 @@ impl CefRenderer {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .env("MESH_WICK_HOME", &self.state_dir)
             .env_remove("WICK_PROXY");
 
         if let Some(ref proxy) = self.proxy {
@@ -313,7 +317,7 @@ fn read_stderr_tail(tail: &Arc<Mutex<Vec<u8>>>) -> String {
         .unwrap_or_default()
 }
 
-pub fn find_renderer() -> Option<PathBuf> {
+pub fn find_renderer_in(state_dir: &Path) -> Option<PathBuf> {
     let mut candidates = Vec::new();
 
     if let Ok(exe) = std::env::current_exe() {
@@ -323,23 +327,17 @@ pub fn find_renderer() -> Option<PathBuf> {
         }
     }
 
-    if let Some(home) = std::env::var_os("MESH_WICK_HOME") {
-        let base = PathBuf::from(home).join("cef");
-        candidates.push(base.join("wick-renderer.app/Contents/MacOS/wick-renderer"));
-        candidates.push(base.join("wick-renderer"));
-    }
+    let state_cef = state_dir.join("cef");
+    candidates.push(state_cef.join("wick-renderer.app/Contents/MacOS/wick-renderer"));
+    candidates.push(state_cef.join("wick-renderer"));
 
     if let Some(home) = std::env::var_os("HOME") {
-        let mesh_cef = PathBuf::from(&home).join(".mesh-wick").join("cef");
+        let mesh_cef = PathBuf::from(home).join(".mesh-wick").join("cef");
         candidates.push(mesh_cef.join("wick-renderer.app/Contents/MacOS/wick-renderer"));
         candidates.push(mesh_cef.join("wick-renderer"));
-
-        let wick_cef = PathBuf::from(home).join(".wick").join("cef");
-        candidates.push(wick_cef.join("wick-renderer.app/Contents/MacOS/wick-renderer"));
-        candidates.push(wick_cef.join("wick-renderer"));
     }
 
-    candidates.push(PathBuf::from("/opt/wick/wick-renderer"));
+    candidates.push(PathBuf::from("/opt/mesh-wick/wick-renderer"));
 
     candidates.into_iter().find(|path| path.exists())
 }

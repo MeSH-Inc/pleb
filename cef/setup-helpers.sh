@@ -45,7 +45,7 @@ HELPERS=(
 for entry in "${HELPERS[@]}"; do
     IFS=: read -r suffix bid_suffix <<< "$entry"
     name="wick Helper${suffix}"
-    bundle_id="dev.getwick.renderer.helper${bid_suffix}"
+    bundle_id="io.mesh-wick.renderer.helper${bid_suffix}"
     bundle_dir="$DEST/${name}.app/Contents"
 
     echo "  Creating ${name}.app (${bundle_id})"
