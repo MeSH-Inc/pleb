@@ -977,3 +977,83 @@ async fn adversarial_fetch_document_decodes_windows1252_over_http() {
     assert!(out.content.contains("Price €12 — “ok”"));
     assert!(!out.content.contains('\u{FFFD}'));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cef_challenge_interstitial_fails_fast_without_retry() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state_dir = temp_state_dir();
+    let cef_dir = state_dir.path().join("cef");
+    std::fs::create_dir_all(&cef_dir).unwrap();
+    let renderer_bin = cef_dir.join("wick-renderer");
+    let count_file = state_dir.path().join("invocations.log");
+
+    let script = format!(
+        r#"#!/usr/bin/env python3
+# WICK_RENDERER_PROTOCOL=v5-meta
+import json, sys
+
+count_path = {count_path:?}
+sys.stdout.write(json.dumps({{"ready": True, "protocol": "v5-meta", "error": None}}) + "\n")
+sys.stdout.flush()
+
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        break
+    req = json.loads(line)
+    with open(count_path, "a") as f:
+        f.write(req["url"] + "\n")
+    html = b"<html><head><title>Just a moment...</title></head><body><div id='cf-challenge-running'>Checking your browser before accessing</div></body></html>"
+    hdr = {{
+        "status_code": 403,
+        "final_url": req["url"],
+        "html_bytes": len(html),
+        "error": None,
+        "error_kind": None,
+    }}
+    sys.stdout.write(json.dumps(hdr) + "\n")
+    sys.stdout.flush()
+    sys.stdout.buffer.write(html)
+    sys.stdout.buffer.flush()
+"#,
+        count_path = count_file
+    );
+
+    std::fs::write(&renderer_bin, script).unwrap();
+    std::fs::set_permissions(&renderer_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let ctx = RuntimeContext::new(RuntimeConfig {
+        state_dir: state_dir.path().to_path_buf(),
+        timeout: Duration::from_secs(10),
+        cef_timeout: Duration::from_secs(10),
+        cef_renderer_executable: Some(renderer_bin),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let err = fetch_document(
+        &ctx,
+        "https://protected.example/challenge",
+        &FetchOptions {
+            render: RenderMode::Cef,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(err, FetchError::Challenge { status: 403, .. }),
+        "expected FetchError::Challenge, got {err:?}"
+    );
+    assert_eq!(err.exit_code(), 2);
+
+    let invocations = std::fs::read_to_string(&count_file).unwrap();
+    assert_eq!(
+        invocations.lines().count(),
+        1,
+        "CEF must fail fast on challenge interstitial without retrying"
+    );
+}

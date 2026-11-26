@@ -16,7 +16,8 @@ use crate::transport::cef::{
     CefProtocolError, CefRenderOptions, CefRenderResult, CefRenderer, CefTimeoutError,
 };
 use crate::transport::{
-    ResponseTooLargeError, DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES, DEFAULT_RAW_MAX_RESPONSE_BYTES,
+    ResponseTooLargeError, TransportError, TransportErrorKind, DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES,
+    DEFAULT_RAW_MAX_RESPONSE_BYTES,
 };
 
 #[derive(Debug, Error)]
@@ -241,7 +242,7 @@ pub async fn fetch_raw(
         .client
         .get_with_limits(parsed.as_str(), ctx.config.timeout, max_bytes)
         .await
-        .map_err(|e| map_transport_error(parsed.as_str(), e))?;
+        .map_err(|e| map_transport_error(parsed.as_str(), e, max_bytes))?;
     let timing_ms = start.elapsed().as_millis() as u64;
 
     if resp.status >= 400 {
@@ -350,7 +351,7 @@ async fn acquire_page(
         .client
         .get_with_limits(url_str, ctx.config.timeout, max_bytes)
         .await
-        .map_err(|e| map_transport_error(url_str, e))?;
+        .map_err(|e| map_transport_error(url_str, e, max_bytes))?;
     let status = resp.status;
     let final_url = resp.final_url.clone();
     let content_type = resp.content_type.clone();
@@ -563,19 +564,25 @@ async fn render_cef_checked(
 
     let first_attempt = cef.render(url, &opts, timeout).await;
     let result = match first_attempt {
-        Ok(first) if is_acceptable_cef_render(&first) => first,
         Ok(first) => {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining > Duration::from_secs(2) {
-                cef.render(url, &opts, remaining)
-                    .await
-                    .map_err(|err| map_cef_error(url, err))?
-            } else {
+            if let Some(reason) = detect_interstitial_challenge(&first.html) {
+                return Err(challenge_error_from_cef(first, reason));
+            }
+            if is_acceptable_cef_render(&first) {
                 first
+            } else {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining > Duration::from_secs(2) {
+                    cef.render(url, &opts, remaining)
+                        .await
+                        .map_err(|err| map_cef_error(url, err))?
+                } else {
+                    first
+                }
             }
         }
         Err(err) => {
-            if err.is::<CefProtocolError>() || err.is::<CefTimeoutError>() {
+            if is_non_retryable_cef_error(&err) {
                 return Err(map_cef_error(url, err));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -590,33 +597,65 @@ async fn render_cef_checked(
     };
 
     if let Some(reason) = detect_interstitial_challenge(&result.html) {
-        let status = if result.status_code != 0 {
-            result.status_code
-        } else {
-            403
-        };
-        return Err(FetchError::Challenge {
-            url: result.final_url,
-            status,
-            reason,
-        });
+        return Err(challenge_error_from_cef(result, reason));
     }
 
     Ok(result)
 }
 
-fn map_transport_error(url: &str, err: anyhow::Error) -> FetchError {
-    if let Some(too_large) = err.downcast_ref::<ResponseTooLargeError>() {
-        FetchError::ResponseTooLarge {
-            url: url.to_string(),
-            limit_bytes: too_large.limit_bytes,
-        }
+fn challenge_error_from_cef(result: CefRenderResult, reason: String) -> FetchError {
+    let status = if result.status_code != 0 {
+        result.status_code
     } else {
-        FetchError::Transport(err)
+        403
+    };
+    FetchError::Challenge {
+        url: result.final_url,
+        status,
+        reason,
     }
 }
 
-fn map_cef_error(url: &str, err: anyhow::Error) -> FetchError {
+fn is_non_retryable_cef_error(err: &anyhow::Error) -> bool {
+    if err.is::<CefProtocolError>() || err.is::<CefTimeoutError>() {
+        return true;
+    }
+    err.downcast_ref::<TransportError>().is_some_and(|te| {
+        matches!(
+            te.kind,
+            TransportErrorKind::Timeout
+                | TransportErrorKind::ProtocolMismatch
+                | TransportErrorKind::InvalidSelector
+                | TransportErrorKind::Canceled
+                | TransportErrorKind::ResponseTooLarge
+        )
+    })
+}
+
+fn map_transport_error(url: &str, err: anyhow::Error, max_response_bytes: usize) -> FetchError {
+    if let Some(too_large) = err.downcast_ref::<ResponseTooLargeError>() {
+        return FetchError::ResponseTooLarge {
+            url: url.to_string(),
+            limit_bytes: too_large.limit_bytes,
+        };
+    }
+    if let Some(te) = err.downcast_ref::<TransportError>() {
+        return match te.kind {
+            TransportErrorKind::Timeout => FetchError::Timeout {
+                url: url.to_string(),
+                detail: te.message.clone(),
+            },
+            TransportErrorKind::ResponseTooLarge => FetchError::ResponseTooLarge {
+                url: url.to_string(),
+                limit_bytes: max_response_bytes,
+            },
+            TransportErrorKind::ProtocolMismatch => FetchError::CefUnavailable(te.message.clone()),
+            TransportErrorKind::LoadError
+            | TransportErrorKind::InvalidSelector
+            | TransportErrorKind::Canceled
+            | TransportErrorKind::Network => FetchError::Transport(err),
+        };
+    }
     if err.is::<CefProtocolError>() {
         FetchError::CefUnavailable(err.to_string())
     } else if err.is::<CefTimeoutError>() {
@@ -629,10 +668,12 @@ fn map_cef_error(url: &str, err: anyhow::Error) -> FetchError {
     }
 }
 
+fn map_cef_error(url: &str, err: anyhow::Error) -> FetchError {
+    map_transport_error(url, err, DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES)
+}
+
 fn is_acceptable_cef_render(res: &CefRenderResult) -> bool {
-    !res.html.trim().is_empty()
-        && res.status_code != 0
-        && detect_interstitial_challenge(&res.html).is_none()
+    !res.html.trim().is_empty() && res.status_code != 0
 }
 
 fn parse_http_url(url: &str) -> std::result::Result<url::Url, FetchError> {
@@ -828,4 +869,57 @@ fn batch_host_key(ctx: &RuntimeContext, raw_url: &str, apply_rewrites: bool) -> 
         .host_str()
         .map(str::to_ascii_lowercase)
         .unwrap_or_else(|| "__invalid__".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_error_kind_maps_directly_to_fetch_error() {
+        let timeout = map_transport_error(
+            "https://example.com",
+            anyhow::Error::new(TransportError::new(
+                TransportErrorKind::Timeout,
+                "timed out after 5s",
+            )),
+            1024,
+        );
+        assert!(matches!(timeout, FetchError::Timeout { .. }));
+        assert_eq!(timeout.kind(), "timeout");
+
+        let too_large = map_transport_error(
+            "https://example.com",
+            anyhow::Error::new(TransportError::new(
+                TransportErrorKind::ResponseTooLarge,
+                "limit exceeded",
+            )),
+            2048,
+        );
+        assert!(matches!(
+            too_large,
+            FetchError::ResponseTooLarge {
+                limit_bytes: 2048,
+                ..
+            }
+        ));
+
+        let mismatch = map_transport_error(
+            "https://example.com",
+            anyhow::Error::new(TransportError::new(
+                TransportErrorKind::ProtocolMismatch,
+                "expected v5-meta",
+            )),
+            1024,
+        );
+        assert!(matches!(mismatch, FetchError::CefUnavailable(_)));
+
+        let invalid_selector_err = anyhow::Error::new(TransportError::new(
+            TransportErrorKind::InvalidSelector,
+            "bad css selector",
+        ));
+        assert!(is_non_retryable_cef_error(&invalid_selector_err));
+        let mapped = map_transport_error("https://example.com", invalid_selector_err, 1024);
+        assert!(matches!(mapped, FetchError::Transport(_)));
+    }
 }
