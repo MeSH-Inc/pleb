@@ -313,6 +313,18 @@ pub(crate) fn apply_utf8_limit(text: &str, max_bytes: Option<usize>) -> (String,
     }
 }
 
+pub(crate) fn apply_format_limit(
+    content: &str,
+    format: OutputFormat,
+    max_bytes: Option<usize>,
+) -> (String, bool) {
+    match max_bytes {
+        Some(max) if format == OutputFormat::Markdown => markdown::truncate_markdown(content, max),
+        Some(max) => truncate_utf8(content, max),
+        None => (content.to_string(), false),
+    }
+}
+
 pub fn truncate_utf8(text: &str, max_bytes: usize) -> (String, bool) {
     if text.len() <= max_bytes {
         return (text.to_string(), false);

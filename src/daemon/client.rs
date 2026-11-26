@@ -115,42 +115,12 @@ pub async fn daemon_http_get_with_executable(
     url: &str,
     daemon_executable: Option<&Path>,
 ) -> Result<HttpResponse> {
-    daemon_http_get_with_options(
-        state_dir,
-        proxy,
-        timeout,
-        max_body_bytes,
-        false,
-        idle_timeout,
-        verbose,
-        url,
-        daemon_executable,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn daemon_http_get_with_options(
-    state_dir: &Path,
-    proxy: Option<&str>,
-    timeout: Duration,
-    max_body_bytes: usize,
-    accept_markdown: bool,
-    idle_timeout: Duration,
-    verbose: bool,
-    url: &str,
-    daemon_executable: Option<&Path>,
-) -> Result<HttpResponse> {
-    let opts = RequestHeaderOptions {
-        accept_markdown,
-        ..Default::default()
-    };
     daemon_http_get_with_request_options(
         state_dir,
         proxy,
         timeout,
         max_body_bytes,
-        &opts,
+        &RequestHeaderOptions::default(),
         idle_timeout,
         verbose,
         url,

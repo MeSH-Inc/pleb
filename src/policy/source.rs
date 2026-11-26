@@ -154,25 +154,12 @@ pub fn is_mirror_acceptable_content_type(content_type: Option<&str>) -> bool {
 }
 
 pub fn is_safe_alternate_url(base: &Url, target: &Url) -> bool {
-    if !matches!(target.scheme(), "http" | "https") {
-        return false;
-    }
-    if base.scheme() == "https" && target.scheme() != "https" {
+    if !is_safe_subresource_url(base, target) {
         return false;
     }
     let (Some(base_host), Some(target_host)) = (base.host_str(), target.host_str()) else {
         return false;
     };
-
-    if is_local_or_private_host(base_host) {
-        return base_host.eq_ignore_ascii_case(target_host)
-            && base.port_or_known_default() == target.port_or_known_default();
-    }
-
-    if is_local_or_private_host(target_host) {
-        return false;
-    }
-
     same_origin_or_parent_domain(base_host, target_host)
         && base.port_or_known_default() == target.port_or_known_default()
 }

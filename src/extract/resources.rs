@@ -393,28 +393,6 @@ fn maybe_index_anchor(
 fn classify_linked_artifact_url(url: &Url) -> Option<(ResourceKind, &'static str)> {
     let path_lower = url.path().to_ascii_lowercase();
     let filename = path_lower.rsplit('/').next().unwrap_or("");
-
-    if path_lower.ends_with(".pdf") {
-        return Some((ResourceKind::Document, "application/pdf"));
-    }
-    if path_lower.ends_with(".csv") {
-        return Some((ResourceKind::Dataset, "text/csv"));
-    }
-    if path_lower.ends_with(".tsv") {
-        return Some((ResourceKind::Dataset, "text/tab-separated-values"));
-    }
-    if path_lower.ends_with(".parquet") {
-        return Some((ResourceKind::Dataset, "application/vnd.apache.parquet"));
-    }
-    if path_lower.ends_with(".jsonl") {
-        return Some((ResourceKind::Dataset, "application/x-ndjson"));
-    }
-    if path_lower.ends_with(".proto") {
-        return Some((ResourceKind::Schema, "text/plain"));
-    }
-    if path_lower.ends_with(".sql") {
-        return Some((ResourceKind::Schema, "application/sql"));
-    }
     if matches!(filename, "openapi.yaml" | "openapi.yml") {
         return Some((ResourceKind::Schema, "application/yaml"));
     }
@@ -424,7 +402,16 @@ fn classify_linked_artifact_url(url: &Url) -> Option<(ResourceKind, &'static str
     if matches!(filename, "llms.txt" | "llms-full.txt") {
         return Some((ResourceKind::Schema, "text/plain"));
     }
-    None
+    match filename.rsplit_once('.')?.1 {
+        "pdf" => Some((ResourceKind::Document, "application/pdf")),
+        "csv" => Some((ResourceKind::Dataset, "text/csv")),
+        "tsv" => Some((ResourceKind::Dataset, "text/tab-separated-values")),
+        "parquet" => Some((ResourceKind::Dataset, "application/vnd.apache.parquet")),
+        "jsonl" => Some((ResourceKind::Dataset, "application/x-ndjson")),
+        "proto" => Some((ResourceKind::Schema, "text/plain")),
+        "sql" => Some((ResourceKind::Schema, "application/sql")),
+        _ => None,
+    }
 }
 
 fn resolve_http_url(raw: &str, base_url: &Url) -> Option<Url> {
@@ -479,20 +466,15 @@ fn has_technical_visual_cue(label: Option<&str>, path: &str) -> bool {
 
 fn infer_image_mime(path: &str) -> Option<String> {
     let lower = path.to_ascii_lowercase();
-    let mime = if lower.ends_with(".png") {
-        "image/png"
-    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-        "image/jpeg"
-    } else if lower.ends_with(".webp") {
-        "image/webp"
-    } else if lower.ends_with(".gif") {
-        "image/gif"
-    } else if lower.ends_with(".svg") {
-        "image/svg+xml"
-    } else if lower.ends_with(".avif") {
-        "image/avif"
-    } else {
-        return None;
+    let ext = lower.rsplit('/').next()?.rsplit_once('.')?.1;
+    let mime = match ext {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "avif" => "image/avif",
+        _ => return None,
     };
     Some(mime.to_string())
 }

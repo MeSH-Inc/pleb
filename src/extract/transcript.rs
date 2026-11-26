@@ -1,7 +1,8 @@
 use anyhow::Result;
 
 use super::{
-    apply_utf8_limit, markdown, ExtractMode, ExtractOptions, ExtractedDocument, OutputFormat,
+    apply_format_limit, apply_utf8_limit, dom::collapse_inline_whitespace, ExtractMode,
+    ExtractOptions, ExtractedDocument, OutputFormat,
 };
 
 pub fn is_transcript_document(mime: Option<&str>, body: &str) -> bool {
@@ -31,13 +32,8 @@ pub fn extract_transcript(body: &str, options: &ExtractOptions) -> Result<Extrac
         });
     }
 
-    let is_markdown = options.format == OutputFormat::Markdown;
-    let cleaned = clean_transcript_text(body, is_markdown);
-    let (content, truncated) = match options.max_bytes {
-        Some(max) if is_markdown => markdown::truncate_markdown(&cleaned, max),
-        Some(max) => super::truncate_utf8(&cleaned, max),
-        None => (cleaned, false),
-    };
+    let cleaned = clean_transcript_text(body, options.format == OutputFormat::Markdown);
+    let (content, truncated) = apply_format_limit(&cleaned, options.format, options.max_bytes);
 
     Ok(ExtractedDocument {
         title: None,
@@ -123,7 +119,7 @@ fn clean_transcript_text(body: &str, is_markdown: bool) -> String {
         let (speaker, without_voice) = extract_voice_tag(trimmed);
         let stripped_tags = strip_inline_cue_tags(&without_voice);
         let decoded = decode_basic_entities(&stripped_tags);
-        let normalized = collapse_whitespace(&decoded);
+        let normalized = collapse_inline_whitespace(&decoded);
         let text = normalized.trim();
 
         if text.is_empty() {
@@ -294,22 +290,5 @@ fn decode_basic_entities(input: &str) -> String {
         }
     }
     out.push_str(rest);
-    out
-}
-
-fn collapse_whitespace(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut prev_ws = false;
-    for ch in input.chars() {
-        if ch.is_whitespace() {
-            if !prev_ws {
-                out.push(' ');
-                prev_ws = true;
-            }
-        } else {
-            out.push(ch);
-            prev_ws = false;
-        }
-    }
     out
 }

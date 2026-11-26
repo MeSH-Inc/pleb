@@ -29,7 +29,7 @@ pub fn stage_artifact(
         bail!("refusing to stage empty artifact from {source_url}");
     }
 
-    let declared_mime = normalize_mime(content_type);
+    let declared_mime = crate::extract::extract_mime(content_type);
     let url_ext = extract_url_extension(source_url);
     let magic = detect_magic(bytes);
 
@@ -235,13 +235,6 @@ fn looks_like_html(bytes: &[u8]) -> bool {
     let head = &trimmed[..trimmed.len().min(32)];
     let lower: Vec<u8> = head.iter().map(u8::to_ascii_lowercase).collect();
     lower.starts_with(b"<!doctype html") || lower.starts_with(b"<html")
-}
-
-fn normalize_mime(content_type: Option<&str>) -> Option<String> {
-    content_type
-        .and_then(|ct| ct.split(';').next())
-        .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|s| !s.is_empty())
 }
 
 fn mime_to_ext(mime: &str) -> Option<&'static str> {

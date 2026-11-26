@@ -271,9 +271,12 @@ pub async fn fetch_document(
             options,
         )
         .await;
-        if let Some(max_bytes) = options.extract.max_bytes {
-            let (truncated_content, did_truncate) =
-                truncate_for_format(&extracted.content, options.extract.format, max_bytes);
+        if options.extract.max_bytes.is_some() {
+            let (truncated_content, did_truncate) = extract::apply_format_limit(
+                &extracted.content,
+                options.extract.format,
+                options.extract.max_bytes,
+            );
             extracted.content = truncated_content;
             extracted.truncated |= did_truncate;
         }
@@ -470,33 +473,23 @@ fn infer_subresource_dest(url: &url::Url) -> SubresourceDest {
     }
 }
 
-fn resource_kind_label(kind: ResourceKind) -> &'static str {
-    match kind {
-        ResourceKind::Diagram => "diagram",
-        ResourceKind::Image => "image",
-        ResourceKind::Transcript => "transcript",
-        ResourceKind::Document => "document",
-        ResourceKind::Dataset => "dataset",
-        ResourceKind::Schema => "schema",
-    }
-}
-
-fn truncate_for_format(content: &str, format: OutputFormat, max_bytes: usize) -> (String, bool) {
-    if content.len() <= max_bytes {
-        return (content.to_string(), false);
-    }
-    if format == OutputFormat::Markdown {
-        return extract::truncate_markdown(content, max_bytes);
-    }
-    let suffix = "\n\n[... truncated]";
-    let budget = max_bytes.saturating_sub(suffix.len());
-    let mut end = budget.min(content.len());
-    while end > 0 && !content.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut out = content[..end].trim_end().to_string();
-    out.push_str(suffix);
-    (out, true)
+fn record_staged_artifact(
+    res: &mut ResourceDescriptor,
+    staged: crate::artifacts::StagedArtifact,
+    staged_lines: &mut Vec<String>,
+) -> String {
+    let staged_path = staged.path.display().to_string();
+    res.staged_path = Some(staged_path.clone());
+    res.byte_count = Some(staged.byte_count);
+    res.content_type = staged.content_type;
+    staged_lines.push(format!(
+        "- **{}** ({}, {} bytes): `{}`",
+        res.identifier,
+        res.kind.as_str(),
+        staged.byte_count,
+        staged_path
+    ));
+    staged_path
 }
 
 async fn join_all_futures<T, F>(futs: Vec<F>) -> Vec<T>
@@ -742,18 +735,7 @@ async fn enrich_document_resources(
                     &resp.body,
                     Some(ResourceKind::Transcript),
                 ) {
-                    let staged_path = staged.path.display().to_string();
-                    let res = &mut resources[item.index];
-                    res.staged_path = Some(staged_path.clone());
-                    res.byte_count = Some(staged.byte_count);
-                    res.content_type = staged.content_type;
-                    staged_lines.push(format!(
-                        "- **{}** ({}, {} bytes): `{}`",
-                        res.identifier,
-                        resource_kind_label(res.kind),
-                        staged.byte_count,
-                        staged_path
-                    ));
+                    record_staged_artifact(&mut resources[item.index], staged, &mut staged_lines);
                 }
             }
             continue;
@@ -767,25 +749,14 @@ async fn enrich_document_resources(
             Some(item.kind),
         ) {
             Ok(staged) => {
-                let staged_path = staged.path.display().to_string();
                 let res = &mut resources[item.index];
+                let staged_path = record_staged_artifact(res, staged, &mut staged_lines);
                 if options.extract.format == OutputFormat::Markdown {
                     let needle = format!("({})", res.url);
-                    let replacement = format!("({staged_path})");
                     if content.contains(&needle) {
-                        *content = content.replace(&needle, &replacement);
+                        *content = content.replace(&needle, &format!("({staged_path})"));
                     }
                 }
-                res.staged_path = Some(staged_path.clone());
-                res.byte_count = Some(staged.byte_count);
-                res.content_type = staged.content_type;
-                staged_lines.push(format!(
-                    "- **{}** ({}, {} bytes): `{}`",
-                    res.identifier,
-                    resource_kind_label(res.kind),
-                    staged.byte_count,
-                    staged_path
-                ));
             }
             Err(err) => {
                 tracing::debug!("Skipping staging for {}: {}", item.url, err);
