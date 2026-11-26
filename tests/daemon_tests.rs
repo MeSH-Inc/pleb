@@ -479,3 +479,44 @@ async fn daemon_round_trips_structured_transport_error_kinds() {
 
     server.await.unwrap();
 }
+
+#[test]
+fn adversarial_zero_untyped_error_matches_in_transport_and_daemon() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dirs = [manifest.join("src/transport"), manifest.join("src/daemon")];
+    let forbidden = [
+        ".to_string().contains(",
+        ".to_string().starts_with(",
+        ".to_string().ends_with(",
+        "err.starts_with(",
+        "error.starts_with(",
+        "msg.starts_with(",
+    ];
+    let mut violations = Vec::new();
+    for dir in dirs {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap();
+            let non_test = src.split("#[cfg(test)]").next().unwrap_or(&src);
+            for (idx, line) in non_test.lines().enumerate() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                for pat in forbidden {
+                    if trimmed.contains(pat) {
+                        violations.push(format!("{}:{}: {}", path.display(), idx + 1, trimmed));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "untyped_error_matches must be 0 in src/transport & src/daemon:\n{}",
+        violations.join("\n")
+    );
+}
