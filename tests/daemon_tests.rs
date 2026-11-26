@@ -1014,3 +1014,101 @@ async fn transport_subresource_headers_and_referer_direct_and_daemon() {
     assert!(daemon_stop(daemon_dir.path()).await.unwrap());
     let _ = handle.await;
 }
+
+#[tokio::test]
+async fn adversarial_subresource_ssrf_referer_and_image_accept_precedence() {
+    use mesh_wick::policy::source::{compute_safe_referer, is_safe_subresource_url};
+    use mesh_wick::transport::{
+        RequestHeaderOptions, SubresourceDest, TransportClient, IMAGE_ACCEPT_HEADER,
+    };
+    use url::Url;
+
+    let public_parent =
+        Url::parse("https://alice:s3cr3t@docs.example.com/priv?tok=9#frag").unwrap();
+
+    // CGNAT (100.64.0.0/10), IMDS (169.254.169.254), IPv4-mapped IPv6 IMDS, unspecified/broadcast
+    for blocked in [
+        "https://100.64.0.1/cgnat.png",
+        "https://100.127.255.254/cgnat-high.png",
+        "https://169.254.169.254/latest/meta-data",
+        "https://[::ffff:169.254.169.254]/latest/meta-data",
+        "https://0.0.0.0/unspecified.png",
+        "https://255.255.255.255/broadcast.png",
+        "http://cdn.example.com/downgrade.png",
+    ] {
+        let tgt = Url::parse(blocked).unwrap();
+        assert!(
+            !is_safe_subresource_url(&public_parent, &tgt),
+            "SSRF/downgrade target must be blocked: {blocked}"
+        );
+    }
+
+    // Boundary public IPs immediately outside CGNAT 100.64.0.0/10 remain allowed
+    for allowed in [
+        "https://100.63.255.255/below-cgnat.png",
+        "https://100.128.0.0/above-cgnat.png",
+        "https://cdn.example.net/diagram.webp",
+    ] {
+        let tgt = Url::parse(allowed).unwrap();
+        assert!(
+            is_safe_subresource_url(&public_parent, &tgt),
+            "public target should be allowed: {allowed}"
+        );
+    }
+
+    // Loopback HTTPS -> HTTP downgrade must be rejected even on identical host+port
+    let local_https = Url::parse("https://127.0.0.1:8443/page").unwrap();
+    assert!(!is_safe_subresource_url(
+        &local_https,
+        &Url::parse("http://127.0.0.1:8443/img.png").unwrap()
+    ));
+
+    // Referer policy: zero HTTPS->HTTP leak, userinfo/fragment stripped same-origin, origin-only cross-origin
+    assert_eq!(
+        compute_safe_referer(
+            &public_parent,
+            &Url::parse("http://docs.example.com/a.png").unwrap()
+        ),
+        None
+    );
+    assert_eq!(
+        compute_safe_referer(
+            &public_parent,
+            &Url::parse("https://docs.example.com/a.png").unwrap()
+        )
+        .as_deref(),
+        Some("https://docs.example.com/priv?tok=9")
+    );
+    assert_eq!(
+        compute_safe_referer(
+            &public_parent,
+            &Url::parse("https://cdn.example.net/a.png").unwrap()
+        )
+        .as_deref(),
+        Some("https://docs.example.com/")
+    );
+
+    // SubresourceDest::Image must take precedence over accept_markdown=true (no text/markdown leak)
+    let base = spawn_link_and_accept_server().await;
+    let direct_dir = TempStateDir::new();
+    let direct = TransportClient::new_direct(direct_dir.path(), None, Duration::from_secs(5))
+        .expect("direct transport should initialize");
+    let body = direct
+        .get_with_request_options(
+            &format!("{base}/echo-accept"),
+            Duration::from_secs(5),
+            64 * 1024,
+            &RequestHeaderOptions {
+                accept_markdown: true,
+                referer: Some("https://docs.example.com/".to_string()),
+                subresource_dest: Some(SubresourceDest::Image),
+            },
+        )
+        .await
+        .unwrap()
+        .text();
+    assert!(
+        body.contains(&format!("accept={IMAGE_ACCEPT_HEADER}")) && !body.contains("text/markdown"),
+        "SubresourceDest::Image must not leak markdown Accept header: {body}"
+    );
+}
