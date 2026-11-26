@@ -40,10 +40,10 @@ pub fn extract_native_markdown(
         None => ("", body),
     };
 
-    let title = frontmatter
-        .as_ref()
-        .and_then(|fm| fm.title.clone())
-        .or_else(|| first_atx_h1(markdown_body));
+    let frontmatter_title = frontmatter.as_ref().and_then(|fm| fm.title.clone());
+    let title = frontmatter_title
+        .clone()
+        .or_else(|| first_markdown_h1(markdown_body));
 
     let rewritten_body = rewrite_markdown_links(
         markdown_body,
@@ -67,7 +67,7 @@ pub fn extract_native_markdown(
                 }
             } else {
                 let trimmed = compacted_body.trim();
-                match &title {
+                match &frontmatter_title {
                     Some(t) if !starts_with_title_heading(trimmed, t) => {
                         if trimmed.is_empty() {
                             format!("# {t}")
@@ -216,28 +216,66 @@ fn unquote_yaml_scalar(val: &str) -> String {
     val.to_string()
 }
 
-fn first_atx_h1(md: &str) -> Option<String> {
+fn first_markdown_h1(md: &str) -> Option<String> {
     let mut fence: Option<(char, usize)> = None;
+    let mut prev_para: Option<&str> = None;
     for raw_line in md.lines() {
         if let Some((fc, fl)) = fence {
             if is_closing_fence(raw_line, fc, fl) {
                 fence = None;
             }
+            prev_para = None;
             continue;
         }
         if let Some(f) = parse_opening_fence(raw_line) {
             fence = Some(f);
+            prev_para = None;
             continue;
         }
-        let trimmed = raw_line.trim_start();
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            prev_para = None;
+            continue;
+        }
+        if let Some(prev) =
+            prev_para.filter(|_| trimmed.len() >= 2 && trimmed.bytes().all(|b| b == b'='))
+        {
+            return Some(prev.to_string());
+        }
         if let Some(rest) = trimmed.strip_prefix("# ") {
             let heading = strip_trailing_atx_hashes(rest.trim());
             if !heading.is_empty() {
                 return Some(heading.to_string());
             }
         }
+        if let Some(html_h1) = extract_inline_html_h1(trimmed) {
+            return Some(html_h1);
+        }
+        let non_para = trimmed.starts_with(['#', '>', '<', '-'])
+            || trimmed.starts_with("* ")
+            || trimmed.starts_with("+ ");
+        prev_para = (!non_para).then_some(trimmed);
     }
     None
+}
+
+fn extract_inline_html_h1(line: &str) -> Option<String> {
+    let lower = line.to_ascii_lowercase();
+    let start = lower.find("<h1")?;
+    matches!(lower.as_bytes().get(start + 3), Some(b'>' | b' ' | b'\t')).then_some(())?;
+    let open_end = start + lower[start..].find('>')? + 1;
+    let close = open_end + lower[open_end..].find("</h1>")?;
+    let (mut text, mut in_tag) = (String::new(), false);
+    for ch in line[open_end..close].chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => text.push(ch),
+            _ => {}
+        }
+    }
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!collapsed.is_empty()).then_some(collapsed)
 }
 
 fn strip_trailing_atx_hashes(s: &str) -> &str {
@@ -286,11 +324,80 @@ fn rewrite_markdown_links(
             continue;
         }
 
+        if let Some(rewritten_def) =
+            rewrite_link_ref_definition(line, base_url, include_images, include_links)
+        {
+            if !rewritten_def.is_empty() {
+                out.push_str(&rewritten_def);
+                out.push_str(newline);
+            }
+            continue;
+        }
+
         rewrite_inline_segment(line, base_url, include_images, include_links, &mut out);
         out.push_str(newline);
     }
 
     out
+}
+
+fn rewrite_link_ref_definition(
+    line: &str,
+    base_url: &Url,
+    include_images: bool,
+    include_links: bool,
+) -> Option<String> {
+    let indent = line.bytes().take_while(|&b| b == b' ').count();
+    if indent > 3 || line.as_bytes().get(indent) != Some(&b'[') {
+        return None;
+    }
+    let close = find_matching_bracket(line, indent)?;
+    let label = &line[indent + 1..close];
+    let rest = line
+        .get(close + 1..)?
+        .strip_prefix(':')?
+        .trim_start_matches([' ', '\t']);
+    if label.trim().is_empty() || label.starts_with('^') || rest.is_empty() {
+        return None;
+    }
+    let (dest, after_dest, angle) = if let Some(inner) = rest.strip_prefix('<') {
+        let end = inner.find('>')?;
+        (&inner[..end], &inner[end + 1..], true)
+    } else {
+        let end = rest
+            .find(|c: char| c.is_ascii_whitespace())
+            .unwrap_or(rest.len());
+        (&rest[..end], &rest[end..], false)
+    };
+    let title = after_dest.trim();
+    let valid_title = title.is_empty()
+        || (title.len() >= 2
+            && matches!(
+                (title.as_bytes()[0], title.as_bytes()[title.len() - 1]),
+                (b'"', b'"') | (b'\'', b'\'') | (b'(', b')')
+            ));
+    if dest.is_empty() || (!angle && !dest.contains(['/', '.', '#', '?', ':'])) || !valid_title {
+        return None;
+    }
+    if !include_links && !include_images {
+        return Some(String::new());
+    }
+    match resolve_and_clean_url(dest, base_url) {
+        ResolvedUrl::Resolved(cleaned) => Some(if title.is_empty() {
+            format!(
+                "{}[{label}]: {}",
+                &line[..indent],
+                format_destination(&cleaned)
+            )
+        } else {
+            format!(
+                "{}[{label}]: {} {title}",
+                &line[..indent],
+                format_destination(&cleaned)
+            )
+        }),
+        ResolvedUrl::Drop | ResolvedUrl::UnwrapText => Some(String::new()),
+    }
 }
 
 fn rewrite_inline_segment(

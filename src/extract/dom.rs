@@ -42,6 +42,9 @@ const BOILERPLATE_ATTR_PATTERNS: &[&str] = &[
     "mw-jump-link",
     "mw-editsection",
     "mw-hidden-catlinks",
+    "cs1-maint",
+    "cs1-hidden-error",
+    "mdbook-help-container",
     "wbc-editpage",
     "printfooter",
 ];
@@ -70,6 +73,7 @@ static BOILERPLATE_TAG_SEL: LazyLock<Selector> =
 static ARIA_BOILERPLATE_SEL: LazyLock<Selector> = LazyLock::new(|| {
     Selector::parse(concat!(
         "[role=\"navigation\"],",
+        "[role=\"search\"],",
         "[role=\"banner\"],",
         "[role=\"contentinfo\"],",
         "[role=\"complementary\"],",

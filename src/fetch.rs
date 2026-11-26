@@ -854,7 +854,7 @@ async fn try_fetch_raw_source(
         final_url: resp.final_url,
         status_code: resp.status,
         content_type: resp.content_type,
-        title: extracted.title,
+        title: extracted.title.or_else(|| Some(candidate.filename.clone())),
         content: extracted.content,
         content_bytes,
         strategy: "raw_source".to_string(),

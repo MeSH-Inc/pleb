@@ -1512,4 +1512,52 @@ fn adversarial_canary_inverse_false_positives_preserve_valid_content() {
         vec!["https://docs.example.org/files/spec.pdf"],
         "citation_pdf_url must deduplicate against body link and reject javascript:"
     );
+
+    // 3. Native Markdown HTML <h1> title, Setext H2 non-promotion, prose [Note]: safety, and --no-links/--no-images ref drop.
+    let md_url = Url::parse("https://raw.example.org/org/repo/main/README.md").unwrap();
+    let html_h1_md = "<div align=\"center\"><h1 class=\"title\">Mesh <code>Core</code></h1></div>\n\nSection Heading\n---\n\n[Note]: this is plain prose, not a link ref.\n[Guide]: ./GUIDE.md\n";
+    let md_doc = extract_document(
+        html_h1_md,
+        &md_url,
+        Some("text/markdown"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(md_doc.title.as_deref(), Some("Mesh Core"));
+    assert!(
+        !md_doc.content.starts_with("# Mesh Core"),
+        "body HTML <h1> must not synthesize a duplicate ATX heading"
+    );
+    assert!(md_doc
+        .content
+        .contains("[Note]: this is plain prose, not a link ref."));
+    assert!(md_doc
+        .content
+        .contains("[Guide]: https://raw.example.org/org/repo/main/GUIDE.md"));
+
+    let h2_only_md = "Subheading Only\n---\n\nBody text.\n";
+    let h2_doc = extract_document(
+        h2_only_md,
+        &md_url,
+        Some("text/markdown"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        h2_doc.title, None,
+        "Setext H2 (---) must not become H1 title"
+    );
+
+    let no_refs = extract_document(
+        html_h1_md,
+        &md_url,
+        Some("text/markdown"),
+        &ExtractOptions {
+            include_images: false,
+            include_links: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(!no_refs.content.contains("GUIDE.md"));
 }
