@@ -1,18 +1,27 @@
+pub mod providers;
 pub mod state;
 
 use anyhow::{bail, Result};
-use scraper::{Html, Selector};
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use serde::Serialize;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
-use std::sync::LazyLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::task::JoinSet;
 
-use crate::auth::{self, CredentialProvider, CredentialSource};
+use crate::auth::{self, CredentialProvider, CredentialSource, ResolvedCredential};
 use crate::context::RuntimeContext;
+use crate::extract::url::normalize_crawl_url;
 
+pub use providers::{clean_ddg_url, parse_brave_json, parse_ddg_html};
 pub use state::{
-    clear_provider_cooldown, clear_search_state, provider_health_summary, ProviderHealthEntry,
+    civil_from_days, clear_provider_cooldown, clear_search_state, days_from_civil,
+    parse_retry_after, provider_health_summary, ProviderHealthEntry,
+};
+
+use providers::{execute_json_provider, search_ddg, ProviderFailure};
+use state::{
+    is_cooldown_active, key_fingerprint, record_outcome, reserve_dispatch, reserve_explicit,
+    reserve_federated, DispatchDecision, DispatchOutcome, SkippedProvider,
 };
 
 const BRAVE_SEARCH_ENDPOINT: &str = "https://api.search.brave.com/res/v1/web/search";
@@ -20,6 +29,8 @@ const TAVILY_SEARCH_ENDPOINT: &str = "https://api.tavily.com/search";
 const SERPER_SEARCH_ENDPOINT: &str = "https://google.serper.dev/search";
 const EXA_SEARCH_ENDPOINT: &str = "https://api.exa.ai/search";
 const DDG_SEARCH_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
+const MAX_EXTRA_SNIPPETS: usize = 5;
+const RRF_K: f64 = 60.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum SearchProvider {
@@ -33,6 +44,49 @@ pub enum SearchProvider {
     #[value(name = "duckduckgo", alias = "ddg")]
     DuckDuckGo,
     Federated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum ConcreteProvider {
+    Brave,
+    Tavily,
+    Serper,
+    Exa,
+    Searxng,
+    DuckDuckGo,
+}
+
+impl ConcreteProvider {
+    pub(crate) const ALL: &'static [Self] = &[
+        Self::Brave,
+        Self::Tavily,
+        Self::Serper,
+        Self::Exa,
+        Self::Searxng,
+        Self::DuckDuckGo,
+    ];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Brave => "brave",
+            Self::Tavily => "tavily",
+            Self::Serper => "serper",
+            Self::Exa => "exa",
+            Self::Searxng => "searxng",
+            Self::DuckDuckGo => "duckduckgo",
+        }
+    }
+
+    pub(crate) const fn credential_provider(self) -> Option<CredentialProvider> {
+        match self {
+            Self::Brave => Some(CredentialProvider::Brave),
+            Self::Tavily => Some(CredentialProvider::Tavily),
+            Self::Serper => Some(CredentialProvider::Serper),
+            Self::Exa => Some(CredentialProvider::Exa),
+            Self::Searxng => Some(CredentialProvider::Searxng),
+            Self::DuckDuckGo => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -67,6 +121,24 @@ impl Freshness {
             Self::Week => "w",
             Self::Month => "m",
             Self::Year => "y",
+        }
+    }
+
+    pub(crate) fn time_range_param(self) -> &'static str {
+        match self {
+            Self::Day => "day",
+            Self::Week => "week",
+            Self::Month => "month",
+            Self::Year => "year",
+        }
+    }
+
+    pub(crate) fn serper_tbs(self) -> &'static str {
+        match self {
+            Self::Day => "qdr:d",
+            Self::Week => "qdr:w",
+            Self::Month => "qdr:m",
+            Self::Year => "qdr:y",
         }
     }
 }
@@ -128,6 +200,51 @@ impl Default for ProviderEndpoints {
     }
 }
 
+#[derive(Debug, Clone)]
+enum ProviderAttempt {
+    Skipped {
+        provider: ConcreteProvider,
+        cooldown_remaining_secs: u64,
+        last_error_status: Option<u16>,
+    },
+    Failed {
+        provider: ConcreteProvider,
+        status: Option<u16>,
+        message: String,
+    },
+}
+
+impl ProviderAttempt {
+    fn format_summary(&self) -> String {
+        match self {
+            Self::Skipped {
+                provider,
+                cooldown_remaining_secs,
+                last_error_status,
+            } => match last_error_status {
+                Some(code) => format!(
+                    "{}: skipped (cooldown {}s remaining, last HTTP {code})",
+                    provider.as_str(),
+                    cooldown_remaining_secs
+                ),
+                None => format!(
+                    "{}: skipped (cooldown {}s remaining)",
+                    provider.as_str(),
+                    cooldown_remaining_secs
+                ),
+            },
+            Self::Failed {
+                provider,
+                status,
+                message,
+            } => match status {
+                Some(code) => format!("{}: failed (HTTP {code}: {message})", provider.as_str()),
+                None => format!("{}: failed ({message})", provider.as_str()),
+            },
+        }
+    }
+}
+
 pub fn search_provider_statuses(
     state_dir: &Path,
 ) -> Result<BTreeMap<String, SearchProviderStatus>> {
@@ -142,9 +259,18 @@ pub fn search_provider_statuses(
     for cred in credentials {
         let name = cred.provider.as_str();
         let entry = health.get(name);
-        let cooldown_remaining_secs = entry
-            .map(|e| e.cooldown_until_epoch_secs.saturating_sub(now_secs))
-            .unwrap_or(0);
+        let cooldown_remaining_secs = match entry {
+            Some(e) if e.cooldown_until_epoch_secs > now_secs => {
+                let current_fp = auth::resolve_credential(state_dir, cred.provider)?
+                    .map(|r| key_fingerprint(r.value.as_str()));
+                if is_cooldown_active(e, current_fp.as_deref(), now_secs) {
+                    e.cooldown_until_epoch_secs.saturating_sub(now_secs)
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        };
         statuses.insert(
             name.to_string(),
             SearchProviderStatus {
@@ -198,12 +324,218 @@ pub fn build_brave_search_url(
 
 pub fn build_ddg_search_url(query: &str, freshness: Option<Freshness>) -> String {
     let encoded = urlencoding::encode(query);
-    let mut url = format!("https://html.duckduckgo.com/html/?q={encoded}");
+    let mut url = format!("{DDG_SEARCH_ENDPOINT}?q={encoded}");
     if let Some(f) = freshness {
         url.push_str("&df=");
         url.push_str(f.ddg_param());
     }
     url
+}
+
+/// Strict lexical needle detector on raw `query` (never `effective_query` with `site:`).
+pub fn is_lexical_needle(raw_query: &str) -> bool {
+    has_non_empty_quoted_phrase(raw_query)
+        || has_scope_operator(raw_query)
+        || has_error_or_hex_token(raw_query)
+        || has_path_or_namespace_token(raw_query)
+}
+
+fn has_non_empty_quoted_phrase(query: &str) -> bool {
+    let bytes = query.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            if let Some(rel_end) = bytes[i + 1..].iter().position(|&b| b == b'"') {
+                let inner = &query[i + 1..i + 1 + rel_end];
+                if let Some(first) = inner.chars().next() {
+                    if !first.is_whitespace() {
+                        return true;
+                    }
+                }
+                i = i + 1 + rel_end + 1;
+                continue;
+            }
+            break;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn is_ascii_word(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn has_scope_operator(query: &str) -> bool {
+    let bytes = query.as_bytes();
+    for i in 1..bytes.len().saturating_sub(2) {
+        if bytes[i] == b':'
+            && bytes[i + 1] == b':'
+            && is_ascii_word(bytes[i - 1])
+            && is_ascii_word(bytes[i + 2])
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_error_or_hex_token(query: &str) -> bool {
+    let bytes = query.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_ascii_word(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_ascii_word(bytes[i]) {
+            i += 1;
+        }
+        let token = &bytes[start..i];
+
+        // \bE[0-9]{4}\b
+        if token.len() == 5 && token[0] == b'E' && token[1..].iter().all(u8::is_ascii_digit) {
+            return true;
+        }
+        // \bERR_[A-Z0-9_]{2,}\b
+        if token.len() >= 6
+            && token.starts_with(b"ERR_")
+            && token[4..]
+                .iter()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
+        {
+            return true;
+        }
+        // \b0x[0-9a-fA-F]{2,}\b (rejects 20x20 because whole word is "20x20")
+        if token.len() >= 4
+            && token[0] == b'0'
+            && token[1] == b'x'
+            && token[2..].iter().all(u8::is_ascii_hexdigit)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+const PROSE_SLASH_PAIRS: &[&str] = &[
+    "pros/cons",
+    "and/or",
+    "ci/cd",
+    "true/false",
+    "yes/no",
+    "read/write",
+    "input/output",
+    "either/or",
+    "his/her",
+    "he/she",
+    "w/o",
+    "n/a",
+    "a/b",
+    "on/off",
+    "up/down",
+    "in/out",
+    "client/server",
+    "front/back",
+    "before/after",
+    "pass/fail",
+    "win/lose",
+];
+
+fn has_path_or_namespace_token(query: &str) -> bool {
+    for raw_word in query.split_whitespace() {
+        let token = raw_word.trim_matches(|c: char| {
+            matches!(
+                c,
+                '(' | ')' | ',' | ';' | '\'' | '"' | '[' | ']' | '?' | '!' | ':'
+            )
+        });
+        if !token.contains('/') {
+            continue;
+        }
+        let lower = token.to_ascii_lowercase();
+        if PROSE_SLASH_PAIRS.contains(&lower.as_str()) {
+            continue;
+        }
+        let segments: Vec<&str> = token.split('/').filter(|s| !s.is_empty()).collect();
+        if segments.len() < 2 {
+            continue;
+        }
+        // Exclude pure numeric dates (2026/11, 2026/11/26) and ratios (50/50, 24/7).
+        if segments
+            .iter()
+            .all(|seg| seg.bytes().all(|b| b.is_ascii_digit()))
+        {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+fn auto_candidate_order(raw_query: &str, options: &SearchOptions) -> [ConcreteProvider; 6] {
+    match options.mode {
+        SearchMode::Semantic => [
+            ConcreteProvider::Exa,
+            ConcreteProvider::Tavily,
+            ConcreteProvider::Brave,
+            ConcreteProvider::Serper,
+            ConcreteProvider::Searxng,
+            ConcreteProvider::DuckDuckGo,
+        ],
+        SearchMode::Exact => [
+            ConcreteProvider::Searxng,
+            ConcreteProvider::Serper,
+            ConcreteProvider::Brave,
+            ConcreteProvider::Tavily,
+            ConcreteProvider::Exa,
+            ConcreteProvider::DuckDuckGo,
+        ],
+        SearchMode::Auto if is_lexical_needle(raw_query) => [
+            ConcreteProvider::Searxng,
+            ConcreteProvider::Serper,
+            ConcreteProvider::Brave,
+            ConcreteProvider::Tavily,
+            ConcreteProvider::Exa,
+            ConcreteProvider::DuckDuckGo,
+        ],
+        SearchMode::Auto if options.extra_snippets => [
+            ConcreteProvider::Brave,
+            ConcreteProvider::Tavily,
+            ConcreteProvider::Exa,
+            ConcreteProvider::Serper,
+            ConcreteProvider::Searxng,
+            ConcreteProvider::DuckDuckGo,
+        ],
+        SearchMode::Auto => [
+            ConcreteProvider::Searxng,
+            ConcreteProvider::Brave,
+            ConcreteProvider::Tavily,
+            ConcreteProvider::Serper,
+            ConcreteProvider::Exa,
+            ConcreteProvider::DuckDuckGo,
+        ],
+    }
+}
+
+fn resolve_all_credentials(
+    state_dir: &Path,
+) -> Result<(
+    BTreeMap<ConcreteProvider, ResolvedCredential>,
+    BTreeMap<ConcreteProvider, String>,
+)> {
+    let mut creds = BTreeMap::new();
+    let mut fingerprints = BTreeMap::new();
+    for &provider in ConcreteProvider::ALL {
+        if let Some(cp) = provider.credential_provider() {
+            if let Some(resolved) = auth::resolve_credential(state_dir, cp)? {
+                fingerprints.insert(provider, key_fingerprint(resolved.value.as_str()));
+                creds.insert(provider, resolved);
+            }
+        }
+    }
+    Ok((creds, fingerprints))
 }
 
 pub async fn search(
@@ -221,281 +553,556 @@ pub async fn search_with_endpoints(
     endpoints: &ProviderEndpoints,
 ) -> Result<SearchResponse> {
     let count = options.limit.clamp(1, 20);
-    let effective_query = build_effective_query(query, options.site.as_deref());
 
     match options.provider {
-        SearchProvider::Brave => {
-            let cred = auth::resolve_credential(&ctx.config.state_dir, CredentialProvider::Brave)?
-                .ok_or_else(|| anyhow::anyhow!("BRAVE_API_KEY is not set"))?;
-            let results = search_brave(
-                ctx,
-                &endpoints.brave_url,
-                &effective_query,
-                count,
-                cred.value.as_str(),
-                options,
-            )
-            .await?;
-            Ok(SearchResponse {
-                provider: "brave",
-                providers_used: vec![],
-                results,
-            })
+        SearchProvider::Auto => search_auto(ctx, query, count, options, endpoints).await,
+        SearchProvider::Federated => search_federated(ctx, query, count, options, endpoints).await,
+        explicit => {
+            let provider = match explicit {
+                SearchProvider::Brave => ConcreteProvider::Brave,
+                SearchProvider::Tavily => ConcreteProvider::Tavily,
+                SearchProvider::Serper => ConcreteProvider::Serper,
+                SearchProvider::Exa => ConcreteProvider::Exa,
+                SearchProvider::Searxng => ConcreteProvider::Searxng,
+                SearchProvider::DuckDuckGo => ConcreteProvider::DuckDuckGo,
+                SearchProvider::Auto | SearchProvider::Federated => unreachable!(),
+            };
+            search_explicit(ctx, provider, query, count, options, endpoints).await
         }
-        SearchProvider::DuckDuckGo => {
-            let results = search_ddg(
-                ctx,
-                &endpoints.ddg_url,
-                &effective_query,
-                count,
-                options.freshness,
-            )
-            .await?;
-            Ok(SearchResponse {
-                provider: "duckduckgo",
-                providers_used: vec![],
-                results,
-            })
-        }
-        SearchProvider::Auto => {
-            if let Some(cred) =
-                auth::resolve_credential(&ctx.config.state_dir, CredentialProvider::Brave)?
-            {
-                match search_brave(
-                    ctx,
-                    &endpoints.brave_url,
-                    &effective_query,
-                    count,
-                    cred.value.as_str(),
-                    options,
-                )
-                .await
-                {
-                    Ok(results) => {
-                        return Ok(SearchResponse {
-                            provider: "brave",
-                            providers_used: vec![],
-                            results,
-                        });
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            "Brave Search API request failed ({}); falling back to DuckDuckGo",
-                            err
-                        );
-                    }
-                }
-            }
-            let results = search_ddg(
-                ctx,
-                &endpoints.ddg_url,
-                &effective_query,
-                count,
-                options.freshness,
-            )
-            .await?;
-            Ok(SearchResponse {
-                provider: "duckduckgo",
-                providers_used: vec![],
-                results,
-            })
-        }
-        other => bail!("search provider {:?} is not yet implemented", other),
     }
 }
 
-async fn search_brave(
+async fn search_explicit(
     ctx: &RuntimeContext,
-    endpoint: &str,
-    query: &str,
-    num_results: usize,
-    api_key: &str,
+    provider: ConcreteProvider,
+    raw_query: &str,
+    count: usize,
     options: &SearchOptions,
-) -> Result<Vec<SearchResult>> {
-    let client = ctx.http_client()?;
-    let encoded = urlencoding::encode(query);
-    let mut url = format!("{endpoint}?count={num_results}&q={encoded}");
-    if let Some(f) = options.freshness {
-        url.push_str("&freshness=");
-        url.push_str(f.brave_param());
-    }
-    if options.extra_snippets {
-        url.push_str("&extra_snippets=true");
-    }
+    endpoints: &ProviderEndpoints,
+) -> Result<SearchResponse> {
+    let (cred_opt, fp_opt) = match provider.credential_provider() {
+        Some(cp) => {
+            let resolved =
+                auth::resolve_credential(&ctx.config.state_dir, cp)?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{} is not configured (set {} or run `wick auth set {}`)",
+                        provider.as_str(),
+                        cp.env_var(),
+                        cp.as_str()
+                    )
+                })?;
+            let fp = key_fingerprint(resolved.value.as_str());
+            (Some(resolved), Some(fp))
+        }
+        None => (None, None),
+    };
 
-    let resp = client
-        .get(&url)
-        .timeout(ctx.config.timeout)
-        .header("X-Subscription-Token", api_key)
-        .header("Accept", "application/json")
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Brave search request failed: {}", e.without_url()))?;
+    reserve_explicit(&ctx.config.state_dir, provider, fp_opt.clone()).await?;
 
-    let status = resp.status();
-    if !status.is_success() {
-        bail!("Brave search failed: HTTP {}", status.as_u16());
-    }
+    let outcome = execute_concrete_provider(
+        ctx,
+        provider,
+        cred_opt.as_ref().map(|c| c.value.as_str()),
+        raw_query,
+        count,
+        options,
+        endpoints,
+    )
+    .await;
 
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| anyhow::anyhow!("Brave search body read failed: {}", e.without_url()))?;
-    parse_brave_json(&body, num_results)
-}
-
-async fn search_ddg(
-    ctx: &RuntimeContext,
-    endpoint: &str,
-    query: &str,
-    num_results: usize,
-    freshness: Option<Freshness>,
-) -> Result<Vec<SearchResult>> {
-    let encoded = urlencoding::encode(query);
-    let mut search_url = format!("{endpoint}?q={encoded}");
-    if let Some(f) = freshness {
-        search_url.push_str("&df=");
-        search_url.push_str(f.ddg_param());
-    }
-    let resp = ctx.client.get(&search_url).await?;
-    if resp.status >= 400 {
-        bail!("DuckDuckGo search failed: HTTP {}", resp.status);
-    }
-
-    parse_ddg_html(&resp.text(), num_results)
-}
-
-#[derive(Deserialize)]
-struct BraveApiPayload {
-    web: Option<BraveWebBlock>,
-}
-
-#[derive(Deserialize)]
-struct BraveWebBlock {
-    #[serde(default)]
-    results: Vec<BraveWebResult>,
-}
-
-#[derive(Deserialize)]
-struct BraveWebResult {
-    #[serde(default)]
-    title: String,
-    #[serde(default)]
-    url: String,
-    #[serde(default)]
-    description: String,
-    #[serde(default)]
-    extra_snippets: Vec<String>,
-}
-
-pub fn parse_brave_json(json_str: &str, max: usize) -> Result<Vec<SearchResult>> {
-    let payload: BraveApiPayload = serde_json::from_str(json_str)?;
-    let raw_results = payload.web.map(|w| w.results).unwrap_or_default();
-
-    let results = raw_results
-        .into_iter()
-        .filter_map(|r| {
-            let title = clean_html_text(&r.title);
-            let url = r.url.trim().to_string();
-            if title.is_empty() || url.is_empty() {
-                return None;
-            }
-            let extra_snippets = r
-                .extra_snippets
-                .into_iter()
-                .map(|s| clean_html_text(&s))
-                .filter(|s| !s.is_empty())
-                .collect();
-            Some(SearchResult {
-                title,
-                url,
-                snippet: clean_html_text(&r.description),
-                extra_snippets,
+    match outcome {
+        Ok(results) => {
+            record_outcome(
+                &ctx.config.state_dir,
+                provider,
+                fp_opt,
+                DispatchOutcome::Success,
+            )
+            .await?;
+            Ok(SearchResponse {
+                provider: provider.as_str(),
+                providers_used: vec![],
+                results,
             })
-        })
-        .take(max)
+        }
+        Err(failure) => {
+            let _ = record_outcome(
+                &ctx.config.state_dir,
+                provider,
+                fp_opt,
+                DispatchOutcome::Failure {
+                    status: failure.status,
+                    cooldown_secs: failure.cooldown_secs,
+                },
+            )
+            .await;
+            bail!("{}", failure.message);
+        }
+    }
+}
+
+async fn search_auto(
+    ctx: &RuntimeContext,
+    raw_query: &str,
+    count: usize,
+    options: &SearchOptions,
+    endpoints: &ProviderEndpoints,
+) -> Result<SearchResponse> {
+    let (creds, fingerprints) = resolve_all_credentials(&ctx.config.state_dir)?;
+    let full_order = auto_candidate_order(raw_query, options);
+    let configured_order: Vec<ConcreteProvider> = full_order
+        .into_iter()
+        .filter(|&p| p == ConcreteProvider::DuckDuckGo || creds.contains_key(&p))
         .collect();
 
-    Ok(results)
-}
+    let timeout_ms = ctx.config.timeout.as_millis().min(u64::MAX as u128) as u64;
+    let mut tried = Vec::new();
+    let mut attempts: Vec<ProviderAttempt> = Vec::new();
+    let mut skipped_recorded: HashSet<ConcreteProvider> = HashSet::new();
 
-fn clean_html_text(input: &str) -> String {
-    let fragment = Html::parse_fragment(input);
-    let raw: String = fragment.root_element().text().collect();
-    collapse_whitespace(&raw)
-}
-
-fn collapse_whitespace(input: &str) -> String {
-    input.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-static DDG_RESULT_SEL: LazyLock<Selector> =
-    LazyLock::new(|| Selector::parse(".result__body, .web-result__body").unwrap());
-static DDG_TITLE_SEL: LazyLock<Selector> =
-    LazyLock::new(|| Selector::parse(".result__a, .result__title a").unwrap());
-static DDG_SNIPPET_SEL: LazyLock<Selector> =
-    LazyLock::new(|| Selector::parse(".result__snippet").unwrap());
-
-pub fn parse_ddg_html(html: &str, max: usize) -> Result<Vec<SearchResult>> {
-    let doc = Html::parse_document(html);
-
-    let mut results = Vec::new();
-
-    for element in doc.select(&DDG_RESULT_SEL) {
-        if results.len() >= max {
+    loop {
+        let remaining: Vec<ConcreteProvider> = configured_order
+            .iter()
+            .copied()
+            .filter(|p| !tried.contains(p))
+            .collect();
+        if remaining.is_empty() {
             break;
         }
 
-        let Some(title_el) = element.select(&DDG_TITLE_SEL).next() else {
-            continue;
+        let decision = reserve_dispatch(
+            &ctx.config.state_dir,
+            remaining,
+            fingerprints.clone(),
+            timeout_ms,
+        )
+        .await?;
+
+        let (provider, wait_ms, skipped) = match decision {
+            DispatchDecision::Selected {
+                provider,
+                wait_ms,
+                skipped,
+            } => (provider, wait_ms, skipped),
+            DispatchDecision::AllCooledDown { skipped } => {
+                record_skipped_attempts(&mut attempts, &mut skipped_recorded, skipped);
+                break;
+            }
         };
-        let title = collapse_whitespace(&title_el.text().collect::<String>());
-        let raw_href = title_el.value().attr("href").unwrap_or("").trim();
-        let url = clean_ddg_url(raw_href);
 
-        if title.is_empty() || url.is_empty() || is_internal_ddg_url(&url) {
-            continue;
+        record_skipped_attempts(&mut attempts, &mut skipped_recorded, skipped);
+
+        if wait_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
         }
 
-        let snippet = element
-            .select(&DDG_SNIPPET_SEL)
-            .next()
-            .map(|el| collapse_whitespace(&el.text().collect::<String>()))
-            .unwrap_or_default();
-
-        results.push(SearchResult {
-            title,
-            url,
-            snippet,
-            extra_snippets: Vec::new(),
-        });
-    }
-
-    Ok(results)
-}
-
-pub fn clean_ddg_url(href: &str) -> String {
-    if let Some(pos) = href.find("uddg=") {
-        let encoded = &href[pos + 5..];
-        let end = encoded.find('&').unwrap_or(encoded.len());
-        if let Ok(decoded) = urlencoding::decode(&encoded[..end]) {
-            return decoded.into_owned();
+        let secret = creds.get(&provider).map(|c| c.value.as_str());
+        let fp = fingerprints.get(&provider).cloned();
+        match execute_concrete_provider(ctx, provider, secret, raw_query, count, options, endpoints)
+            .await
+        {
+            Ok(results) => {
+                record_outcome(
+                    &ctx.config.state_dir,
+                    provider,
+                    fp,
+                    DispatchOutcome::Success,
+                )
+                .await?;
+                return Ok(SearchResponse {
+                    provider: provider.as_str(),
+                    providers_used: vec![],
+                    results,
+                });
+            }
+            Err(failure) => {
+                tracing::warn!(
+                    "search provider {} failed ({}); trying next candidate",
+                    provider.as_str(),
+                    failure.message
+                );
+                let _ = record_outcome(
+                    &ctx.config.state_dir,
+                    provider,
+                    fp,
+                    DispatchOutcome::Failure {
+                        status: failure.status,
+                        cooldown_secs: failure.cooldown_secs,
+                    },
+                )
+                .await;
+                attempts.push(ProviderAttempt::Failed {
+                    provider,
+                    status: failure.status,
+                    message: failure.message,
+                });
+                tried.push(provider);
+            }
         }
     }
-    href.to_string()
+
+    bail!("{}", format_all_attempts_failed(&attempts))
 }
 
-fn is_internal_ddg_url(url: &str) -> bool {
-    if url.starts_with('/') {
-        return true;
+async fn search_federated(
+    ctx: &RuntimeContext,
+    raw_query: &str,
+    count: usize,
+    options: &SearchOptions,
+    endpoints: &ProviderEndpoints,
+) -> Result<SearchResponse> {
+    let (creds, fingerprints) = resolve_all_credentials(&ctx.config.state_dir)?;
+    let configured: Vec<ConcreteProvider> = creds.keys().copied().collect();
+    let timeout_ms = ctx.config.timeout.as_millis().min(u64::MAX as u128) as u64;
+
+    let reservation = reserve_federated(
+        &ctx.config.state_dir,
+        configured,
+        fingerprints.clone(),
+        timeout_ms,
+    )
+    .await?;
+
+    let mut attempts: Vec<ProviderAttempt> = reservation
+        .skipped
+        .into_iter()
+        .map(|s| ProviderAttempt::Skipped {
+            provider: s.provider,
+            cooldown_remaining_secs: s.cooldown_remaining_secs,
+            last_error_status: s.last_error_status,
+        })
+        .collect();
+
+    if reservation.selected.is_empty() {
+        bail!("{}", format_all_attempts_failed(&attempts));
     }
-    let Ok(parsed) = url::Url::parse(url) else {
-        return true;
-    };
-    let Some(host) = parsed.host_str() else {
-        return true;
-    };
-    host.eq_ignore_ascii_case("duckduckgo.com") || host.ends_with(".duckduckgo.com")
+
+    let sub_limit = count.clamp(10, 20);
+    let mut successes: Vec<(usize, ConcreteProvider, Vec<SearchResult>)> = Vec::new();
+
+    if reservation.selected.len() == 1 && reservation.selected[0].1 == ConcreteProvider::DuckDuckGo
+    {
+        let (slot, provider, _wait_ms) = reservation.selected[0];
+        let effective_query = build_effective_query(raw_query, options.site.as_deref());
+        match search_ddg(
+            ctx,
+            &endpoints.ddg_url,
+            &effective_query,
+            sub_limit,
+            options.freshness,
+        )
+        .await
+        {
+            Ok(results) => {
+                record_outcome(
+                    &ctx.config.state_dir,
+                    provider,
+                    None,
+                    DispatchOutcome::Success,
+                )
+                .await?;
+                successes.push((slot, provider, results));
+            }
+            Err(failure) => {
+                let _ = record_outcome(
+                    &ctx.config.state_dir,
+                    provider,
+                    None,
+                    DispatchOutcome::Failure {
+                        status: failure.status,
+                        cooldown_secs: failure.cooldown_secs,
+                    },
+                )
+                .await;
+                attempts.push(ProviderAttempt::Failed {
+                    provider,
+                    status: failure.status,
+                    message: failure.message,
+                });
+            }
+        }
+    } else {
+        let client = ctx.http_client()?;
+        let timeout = ctx.config.timeout;
+        let mut join_set: JoinSet<(
+            usize,
+            ConcreteProvider,
+            Result<Vec<SearchResult>, ProviderFailure>,
+        )> = JoinSet::new();
+
+        for (slot, provider, wait_ms) in reservation.selected {
+            let client = client.clone();
+            let secret = creds
+                .get(&provider)
+                .map(|c| c.value.as_str().to_string())
+                .unwrap_or_default();
+            let raw_query = raw_query.to_string();
+            let options = options.clone();
+            let endpoints = endpoints.clone();
+            join_set.spawn(async move {
+                if wait_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                }
+                let res = execute_json_provider(
+                    &client, timeout, provider, &secret, &raw_query, sub_limit, &options,
+                    &endpoints,
+                )
+                .await;
+                (slot, provider, res)
+            });
+        }
+
+        while let Some(joined) = join_set.join_next().await {
+            let (slot, provider, res) = match joined {
+                Ok(tuple) => tuple,
+                Err(err) => {
+                    tracing::warn!("federated search task panicked/cancelled: {err}");
+                    continue;
+                }
+            };
+            let fp = fingerprints.get(&provider).cloned();
+            match res {
+                Ok(results) => {
+                    record_outcome(
+                        &ctx.config.state_dir,
+                        provider,
+                        fp,
+                        DispatchOutcome::Success,
+                    )
+                    .await?;
+                    successes.push((slot, provider, results));
+                }
+                Err(failure) => {
+                    tracing::warn!(
+                        "federated search provider {} failed: {}",
+                        provider.as_str(),
+                        failure.message
+                    );
+                    let _ = record_outcome(
+                        &ctx.config.state_dir,
+                        provider,
+                        fp,
+                        DispatchOutcome::Failure {
+                            status: failure.status,
+                            cooldown_secs: failure.cooldown_secs,
+                        },
+                    )
+                    .await;
+                    attempts.push(ProviderAttempt::Failed {
+                        provider,
+                        status: failure.status,
+                        message: failure.message,
+                    });
+                }
+            }
+        }
+    }
+
+    if successes.is_empty() {
+        bail!("{}", format_all_attempts_failed(&attempts));
+    }
+
+    successes.sort_by_key(|(slot, _, _)| *slot);
+    let providers_used: Vec<&'static str> = successes.iter().map(|(_, p, _)| p.as_str()).collect();
+    let results = fuse_rrf(successes, count, options.extra_snippets);
+
+    Ok(SearchResponse {
+        provider: "federated",
+        providers_used,
+        results,
+    })
+}
+
+struct FusedEntry {
+    canonical_url: String,
+    score: f64,
+    provider_hit_count: usize,
+    min_rank: usize,
+    first_provider_slot: usize,
+    title: String,
+    url: String,
+    snippet: String,
+    extra_snippets: Vec<String>,
+}
+
+fn fuse_rrf(
+    provider_results: Vec<(usize, ConcreteProvider, Vec<SearchResult>)>,
+    limit: usize,
+    include_extra_snippets: bool,
+) -> Vec<SearchResult> {
+    let mut fused: HashMap<String, FusedEntry> = HashMap::new();
+
+    for (slot, _provider, results) in provider_results {
+        let mut seen_in_provider: HashSet<String> = HashSet::new();
+        for (idx, item) in results.into_iter().enumerate() {
+            let canonical = url::Url::parse(&item.url)
+                .ok()
+                .map(|u| normalize_crawl_url(&u))
+                .unwrap_or_else(|| item.url.clone());
+
+            if !seen_in_provider.insert(canonical.clone()) {
+                continue;
+            }
+            let rank = idx + 1;
+            let contribution = 1.0 / (RRF_K + rank as f64);
+
+            match fused.get_mut(&canonical) {
+                Some(entry) => {
+                    entry.score += contribution;
+                    entry.provider_hit_count += 1;
+                    entry.min_rank = entry.min_rank.min(rank);
+                    entry.first_provider_slot = entry.first_provider_slot.min(slot);
+
+                    if entry.title.is_empty() && !item.title.is_empty() {
+                        entry.title = item.title;
+                    }
+                    if !item.snippet.is_empty() {
+                        if item.snippet.len() > entry.snippet.len() {
+                            let displaced = std::mem::replace(&mut entry.snippet, item.snippet);
+                            if include_extra_snippets && !displaced.is_empty() {
+                                push_unique_extra(
+                                    &mut entry.extra_snippets,
+                                    &entry.snippet,
+                                    displaced,
+                                );
+                            }
+                        } else if include_extra_snippets {
+                            push_unique_extra(
+                                &mut entry.extra_snippets,
+                                &entry.snippet,
+                                item.snippet,
+                            );
+                        }
+                    }
+                    for extra in item.extra_snippets {
+                        push_unique_extra(&mut entry.extra_snippets, &entry.snippet, extra);
+                    }
+                }
+                None => {
+                    let mut extras = Vec::new();
+                    for extra in item.extra_snippets {
+                        push_unique_extra(&mut extras, &item.snippet, extra);
+                    }
+                    fused.insert(
+                        canonical.clone(),
+                        FusedEntry {
+                            canonical_url: canonical,
+                            score: contribution,
+                            provider_hit_count: 1,
+                            min_rank: rank,
+                            first_provider_slot: slot,
+                            title: item.title,
+                            url: item.url,
+                            snippet: item.snippet,
+                            extra_snippets: extras,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    let mut ranked: Vec<FusedEntry> = fused.into_values().collect();
+    ranked.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| b.provider_hit_count.cmp(&a.provider_hit_count))
+            .then_with(|| a.min_rank.cmp(&b.min_rank))
+            .then_with(|| a.first_provider_slot.cmp(&b.first_provider_slot))
+            .then_with(|| a.canonical_url.cmp(&b.canonical_url))
+    });
+
+    ranked
+        .into_iter()
+        .take(limit)
+        .map(|entry| SearchResult {
+            title: entry.title,
+            url: entry.url,
+            snippet: entry.snippet,
+            extra_snippets: entry.extra_snippets,
+        })
+        .collect()
+}
+
+fn push_unique_extra(extras: &mut Vec<String>, primary_snippet: &str, candidate: String) {
+    if extras.len() >= MAX_EXTRA_SNIPPETS {
+        return;
+    }
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() || trimmed == primary_snippet || extras.iter().any(|e| e == trimmed) {
+        return;
+    }
+    extras.push(trimmed.to_string());
+}
+
+async fn execute_concrete_provider(
+    ctx: &RuntimeContext,
+    provider: ConcreteProvider,
+    secret: Option<&str>,
+    raw_query: &str,
+    limit: usize,
+    options: &SearchOptions,
+    endpoints: &ProviderEndpoints,
+) -> Result<Vec<SearchResult>, ProviderFailure> {
+    if provider == ConcreteProvider::DuckDuckGo {
+        let effective_query = build_effective_query(raw_query, options.site.as_deref());
+        return search_ddg(
+            ctx,
+            &endpoints.ddg_url,
+            &effective_query,
+            limit,
+            options.freshness,
+        )
+        .await;
+    }
+
+    let client = ctx.http_client().map_err(|err| ProviderFailure {
+        status: None,
+        cooldown_secs: 60,
+        message: format!("failed to initialize HTTP client: {err}"),
+    })?;
+    let secret = secret.unwrap_or_default();
+    execute_json_provider(
+        &client,
+        ctx.config.timeout,
+        provider,
+        secret,
+        raw_query,
+        limit,
+        options,
+        endpoints,
+    )
+    .await
+}
+
+fn record_skipped_attempts(
+    attempts: &mut Vec<ProviderAttempt>,
+    recorded: &mut HashSet<ConcreteProvider>,
+    skipped: Vec<SkippedProvider>,
+) {
+    for s in skipped {
+        if recorded.insert(s.provider) {
+            attempts.push(ProviderAttempt::Skipped {
+                provider: s.provider,
+                cooldown_remaining_secs: s.cooldown_remaining_secs,
+                last_error_status: s.last_error_status,
+            });
+        }
+    }
+}
+
+fn format_all_attempts_failed(attempts: &[ProviderAttempt]) -> String {
+    if attempts.is_empty() {
+        return "all search providers failed or are unavailable".to_string();
+    }
+    let details: Vec<String> = attempts
+        .iter()
+        .map(ProviderAttempt::format_summary)
+        .collect();
+    format!(
+        "all search providers failed or are in cooldown: {}",
+        details.join("; ")
+    )
 }
 
 pub fn format_urls_only(response: &SearchResponse) -> String {
