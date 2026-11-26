@@ -34,5 +34,5 @@
 
 - `ratchet == 1.000` across all `tests/corpus/` and binary magic-byte cases in `tests/corpus_evaluation.rs`.
 - `untyped_error_matches == 0`: all cross-layer transport/daemon/CEF errors use `TransportError` / `TransportErrorKind` (zero `.contains(` / `.starts_with(` string sniffing).
-- `README.md` CLI and environment contract parity verified by `tests/cli_tests.rs`.
+- `README.md` and `README-FULL.md` CLI and environment contract parity verified by `tests/cli_tests.rs`.
 - **5-to-1 Subtraction Ratio**: every 5 efficacy commits on `main` are followed by 1 pure Subtraction Commit (`ratchet == 1.000`, `signal_density` non-decreasing, net negative lines, preserving `///` doc comments, `debug_assert!`, and `tests/*.rs` `pub` items).

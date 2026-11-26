@@ -515,13 +515,57 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
     assert_eq!(val["daemon"]["active_requests"], 0);
     assert_eq!(val["cef_renderer"]["expected_protocol"], "v5-meta");
 
-    // README.md must stay in sync with v5-meta, env overrides, and batch/search flags.
-    let readme =
-        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
-            .unwrap();
+    // README.md must link cleanly to README-FULL.md anchors and avoid stale protocol references.
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let readme = std::fs::read_to_string(manifest_dir.join("README.md")).unwrap();
+    let readme_full = std::fs::read_to_string(manifest_dir.join("README-FULL.md")).unwrap();
+
+    assert!(
+        readme.contains("README-FULL.md"),
+        "README.md must link to README-FULL.md"
+    );
+    let full_anchors: std::collections::HashSet<String> = readme_full
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            let heading = trimmed.strip_prefix("## ")?;
+            let slug: String = heading
+                .to_ascii_lowercase()
+                .chars()
+                .filter_map(|c| match c {
+                    'a'..='z' | '0'..='9' | '-' => Some(c),
+                    ' ' => Some('-'),
+                    _ => None,
+                })
+                .collect();
+            Some(slug)
+        })
+        .collect();
+    let mut anchor_links_checked = 0usize;
+    let mut scan = readme.as_str();
+    while let Some(pos) = scan.find("README-FULL.md#") {
+        let rest = &scan[pos + "README-FULL.md#".len()..];
+        let end = rest
+            .find(|c: char| c == ')' || c.is_whitespace())
+            .unwrap_or(rest.len());
+        let anchor = &rest[..end];
+        assert!(
+            full_anchors.contains(anchor),
+            "README.md links to missing README-FULL.md anchor: #{anchor}"
+        );
+        anchor_links_checked += 1;
+        scan = &rest[end..];
+    }
+    assert!(
+        anchor_links_checked >= 5,
+        "README.md should link to README-FULL.md sections (found {anchor_links_checked})"
+    );
+
+    // README-FULL.md must stay in sync with v5-meta, env overrides, and batch/search flags.
     for required in [
         "v5-meta",
         "WICK_CEF_RENDERER",
+        "WICK_NO_HOME_CEF",
         "WICK_DAEMON_EXECUTABLE",
         "--jsonl",
         "--urls-only",
@@ -553,14 +597,26 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "semantic",
     ] {
         assert!(
-            readme.contains(required),
-            "README.md missing documented capability: {required}"
+            readme_full.contains(required),
+            "README-FULL.md missing documented capability: {required}"
         );
     }
-    assert!(
-        !readme.contains("v4-meta"),
-        "README.md contains stale v4-meta reference"
-    );
+    for (doc_name, doc_text) in [("README.md", &readme), ("README-FULL.md", &readme_full)] {
+        for retired in [
+            "--meta-only",
+            "--no-cef-daemon",
+            "--cef-idle-timeout",
+            "MESH_WICK_CEF_IDLE_SECS",
+            "MESH_WICK_NO_CEF_DAEMON",
+            "cef.sock",
+            "v4-meta",
+        ] {
+            assert!(
+                !doc_text.contains(retired),
+                "{doc_name} contains retired identifier: {retired}"
+            );
+        }
+    }
 
     // Canonical skills/mesh-wick/SKILL.md must stay in sync with CLI flags, exit codes, and `wick skill print`.
     let skill_md = std::fs::read_to_string(
