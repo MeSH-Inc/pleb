@@ -426,6 +426,7 @@ async fn daemon_round_trips_structured_transport_error_kinds() {
         (TransportErrorKind::Network, None),
         (TransportErrorKind::Timeout, None),
         (TransportErrorKind::ProtocolMismatch, None),
+        (TransportErrorKind::RedirectBlocked, None),
         (TransportErrorKind::ResponseTooLarge, Some(4096)),
     ];
 

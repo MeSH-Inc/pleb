@@ -1371,6 +1371,7 @@ fn is_non_retryable_cef_error(err: &anyhow::Error) -> bool {
                 | TransportErrorKind::InvalidSelector
                 | TransportErrorKind::Canceled
                 | TransportErrorKind::ResponseTooLarge
+                | TransportErrorKind::RedirectBlocked
         )
     })
 }
@@ -1396,6 +1397,7 @@ fn map_transport_error(url: &str, err: anyhow::Error, max_response_bytes: usize)
             TransportErrorKind::LoadError
             | TransportErrorKind::InvalidSelector
             | TransportErrorKind::Canceled
+            | TransportErrorKind::RedirectBlocked
             | TransportErrorKind::Network => FetchError::Transport(err),
         };
     }

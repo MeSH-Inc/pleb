@@ -232,6 +232,8 @@ impl Engine {
             body: Mutex::new(Vec::new()),
             max_body_bytes,
             overflowed: AtomicBool::new(false),
+            blocked_redirect: Mutex::new(None),
+            initial_url: url::Url::parse(url).ok(),
             status_code: AtomicI32::new(0),
             final_url: Mutex::new(url.to_string()),
             content_type: Mutex::new(None),
@@ -343,6 +345,8 @@ struct RequestState {
     body: Mutex<Vec<u8>>,
     max_body_bytes: usize,
     overflowed: AtomicBool,
+    blocked_redirect: Mutex<Option<String>>,
+    initial_url: Option<url::Url>,
     status_code: AtomicI32,
     final_url: Mutex<String>,
     content_type: Mutex<Option<String>>,
@@ -376,11 +380,40 @@ unsafe extern "C" fn executor_execute(
 }
 
 unsafe extern "C" fn on_redirect_received(
-    _callback: ffi::Cronet_UrlRequestCallbackPtr,
+    callback: ffi::Cronet_UrlRequestCallbackPtr,
     request: ffi::Cronet_UrlRequestPtr,
     _info: ffi::Cronet_UrlResponseInfoPtr,
-    _new_location: ffi::Cronet_String,
+    new_location: ffi::Cronet_String,
 ) {
+    let state = get_state(callback);
+    let raw_loc = if new_location.is_null() {
+        String::new()
+    } else {
+        CStr::from_ptr(new_location).to_string_lossy().into_owned()
+    };
+    let resolved = url::Url::parse(&raw_loc).ok().or_else(|| {
+        let current = lock_unpoisoned(&state.final_url).clone();
+        url::Url::parse(&current)
+            .ok()
+            .and_then(|u| u.join(&raw_loc).ok())
+    });
+    let allowed = match (&state.initial_url, &resolved) {
+        (Some(origin), Some(target)) => crate::policy::is_safe_redirect_url(origin, target),
+        _ => false,
+    };
+    if !allowed {
+        let target_desc = resolved
+            .as_ref()
+            .map(|u| u.as_str().to_string())
+            .unwrap_or(raw_loc);
+        *lock_unpoisoned(&state.blocked_redirect) = Some(target_desc);
+        let active = Arc::clone(&state.active_request);
+        cancel_active_request(&active);
+        return;
+    }
+    if let Some(target) = resolved {
+        *lock_unpoisoned(&state.final_url) = target.into();
+    }
     ffi::Cronet_UrlRequest_FollowRedirect(request);
 }
 
@@ -584,7 +617,12 @@ unsafe extern "C" fn on_canceled(
     _info: ffi::Cronet_UrlResponseInfoPtr,
 ) {
     let boxed = finish_request(callback);
-    let err = if boxed.overflowed.load(Ordering::SeqCst) {
+    let err = if let Some(target) = lock_unpoisoned(&boxed.blocked_redirect).take() {
+        anyhow::Error::new(TransportError::new(
+            TransportErrorKind::RedirectBlocked,
+            format!("blocked unsafe redirect to {target}"),
+        ))
+    } else if boxed.overflowed.load(Ordering::SeqCst) {
         anyhow::Error::new(super::ResponseTooLargeError {
             limit_bytes: boxed.max_body_bytes,
         })
@@ -654,6 +692,30 @@ mod tests {
                         "/slow" => {
                             tokio::time::sleep(Duration::from_secs(5)).await;
                         }
+                        "/ok" => {
+                            let body = b"redirect ok";
+                            let hdr = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = socket.write_all(hdr.as_bytes()).await;
+                            let _ = socket.write_all(body).await;
+                        }
+                        "/redir-ok" => {
+                            let _ = socket
+                                .write_all(b"HTTP/1.1 302 Found\r\nLocation: /ok\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                .await;
+                        }
+                        "/redir-imds" => {
+                            let _ = socket
+                                .write_all(b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                .await;
+                        }
+                        "/redir-localhost" => {
+                            let _ = socket
+                                .write_all(b"HTTP/1.1 302 Found\r\nLocation: http://localhost:1/internal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                .await;
+                        }
                         _ => {
                             let _ = socket
                                 .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
@@ -699,6 +761,30 @@ mod tests {
             .downcast_ref::<TransportError>()
             .expect("slow endpoint error must be a structured TransportError");
         assert_eq!(slow_te.kind, TransportErrorKind::Timeout);
+
+        let ok_redir = engine
+            .get(
+                &format!("{base}/redir-ok"),
+                &[],
+                Duration::from_secs(5),
+                65536,
+            )
+            .await
+            .expect("same-host local redirect should succeed");
+        assert_eq!(ok_redir.status_code, 200);
+        assert_eq!(ok_redir.body, b"redirect ok");
+
+        for path in ["/redir-imds", "/redir-localhost"] {
+            let err = engine
+                .get(&format!("{base}{path}"), &[], Duration::from_secs(5), 65536)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{path} redirect must be blocked"));
+            let te = err
+                .downcast_ref::<TransportError>()
+                .expect("blocked redirect must return a structured TransportError");
+            assert_eq!(te.kind, TransportErrorKind::RedirectBlocked);
+        }
 
         drop(engine);
         let _ = std::fs::remove_dir_all(&storage);

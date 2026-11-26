@@ -184,6 +184,23 @@ pub fn is_safe_subresource_url(parent: &Url, target: &Url) -> bool {
     !is_local_or_private_host(target_host)
 }
 
+/// Validate an HTTP `3xx` redirect hop from `origin` to `target`:
+/// both must be `http`/`https`, public origins cannot pivot to local/private/IMDS
+/// hosts, and local/private origins cannot pivot across hosts (e.g. `127.0.0.1` -> IMDS).
+pub fn is_safe_redirect_url(origin: &Url, target: &Url) -> bool {
+    if !matches!(origin.scheme(), "http" | "https") || !matches!(target.scheme(), "http" | "https")
+    {
+        return false;
+    }
+    let (Some(origin_host), Some(target_host)) = (origin.host_str(), target.host_str()) else {
+        return false;
+    };
+    if is_local_or_private_host(origin_host) {
+        return origin_host.eq_ignore_ascii_case(target_host);
+    }
+    !is_local_or_private_host(target_host)
+}
+
 pub fn compute_safe_referer(parent: &Url, target: &Url) -> Option<String> {
     if !matches!(parent.scheme(), "http" | "https") || !matches!(target.scheme(), "http" | "https")
     {
@@ -697,5 +714,57 @@ mod tests {
         let file_url = Url::parse("file:///tmp/test.html").unwrap();
         assert_eq!(compute_safe_referer(&file_url, &same), None);
         assert_eq!(compute_safe_referer(&parent, &file_url), None);
+    }
+
+    #[test]
+    fn redirect_url_blocks_ssrf_and_non_http_pivots_while_allowing_public_and_same_local_hops() {
+        let public_origin = Url::parse("https://docs.example.com/start").unwrap();
+        assert!(is_safe_redirect_url(
+            &public_origin,
+            &Url::parse("https://cdn.other.org/final").unwrap()
+        ));
+        assert!(is_safe_redirect_url(
+            &public_origin,
+            &Url::parse("http://legacy.other.org/final").unwrap()
+        ));
+        for blocked in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1:8080/admin",
+            "http://[::1]:8080/admin",
+            "http://[::ffff:169.254.169.254]/latest/meta-data/",
+            "http://localhost/secret",
+            "https://metadata.google.internal/computeMetadata/v1/",
+            "http://10.0.0.1/internal",
+            "http://192.168.1.1/router",
+            "file:///etc/passwd",
+        ] {
+            let target = Url::parse(blocked).unwrap();
+            assert!(
+                !is_safe_redirect_url(&public_origin, &target),
+                "public redirect to {blocked} must be blocked"
+            );
+        }
+
+        let local_origin = Url::parse("http://127.0.0.1:8080/start").unwrap();
+        assert!(is_safe_redirect_url(
+            &local_origin,
+            &Url::parse("http://127.0.0.1:8080/next").unwrap()
+        ));
+        assert!(is_safe_redirect_url(
+            &local_origin,
+            &Url::parse("http://127.0.0.1:9090/next").unwrap()
+        ));
+        assert!(!is_safe_redirect_url(
+            &local_origin,
+            &Url::parse("http://169.254.169.254/latest/meta-data/").unwrap()
+        ));
+        assert!(!is_safe_redirect_url(
+            &local_origin,
+            &Url::parse("http://localhost:8080/next").unwrap()
+        ));
+        assert!(!is_safe_redirect_url(
+            &local_origin,
+            &Url::parse("file:///etc/passwd").unwrap()
+        ));
     }
 }

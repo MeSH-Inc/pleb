@@ -44,6 +44,7 @@ pub enum TransportErrorKind {
     ResponseTooLarge,
     Canceled,
     ProtocolMismatch,
+    RedirectBlocked,
     Network,
 }
 
@@ -146,6 +147,7 @@ impl TransportClient {
             let _ = storage_path;
             let mut builder = reqwest::Client::builder()
                 .user_agent(chrome_user_agent())
+                .redirect(reqwest_redirect_policy())
                 .gzip(true)
                 .brotli(true)
                 .deflate(true);
@@ -278,7 +280,8 @@ impl TransportClient {
                             .headers(headers)
                             .timeout(timeout)
                             .send()
-                            .await?;
+                            .await
+                            .map_err(map_reqwest_send_error)?;
                         let final_url = resp.url().to_string();
                         let status = resp.status().as_u16();
                         let content_type = resp
@@ -517,9 +520,102 @@ fn request_headers_reqwest(
     Ok(headers)
 }
 
+#[cfg(not(feature = "cronet"))]
+#[derive(Debug, thiserror::Error)]
+#[error("blocked unsafe redirect to {target}")]
+struct BlockedRedirectError {
+    target: String,
+}
+
+#[cfg(not(feature = "cronet"))]
+fn reqwest_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            return attempt.error("too many redirects");
+        }
+        let origin = attempt.previous().first().unwrap_or(attempt.url());
+        if !crate::policy::is_safe_redirect_url(origin, attempt.url()) {
+            let target = attempt.url().to_string();
+            return attempt.error(BlockedRedirectError { target });
+        }
+        attempt.follow()
+    })
+}
+
+#[cfg(not(feature = "cronet"))]
+fn map_reqwest_send_error(err: reqwest::Error) -> anyhow::Error {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(&err);
+    while let Some(source) = cur {
+        if let Some(blocked) = source.downcast_ref::<BlockedRedirectError>() {
+            return anyhow::Error::new(TransportError::new(
+                TransportErrorKind::RedirectBlocked,
+                blocked.to_string(),
+            ));
+        }
+        cur = source.source();
+    }
+    anyhow::Error::from(err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(feature = "cronet"))]
+    #[tokio::test]
+    async fn reqwest_blocks_ssrf_redirects_and_allows_same_host_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let resp = match path {
+                        "/ok" => "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        "/redir-ok" => "HTTP/1.1 302 Found\r\nLocation: /ok\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        "/redir-imds" => "HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    };
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let client = TransportClient::new_direct(Path::new("/tmp"), None, Duration::from_secs(5))
+            .expect("reqwest client should build");
+        let ok = client
+            .get(&format!("http://{addr}/redir-ok"))
+            .await
+            .expect("same-host local redirect should succeed");
+        assert_eq!(ok.status, 200);
+        assert_eq!(ok.body, b"ok");
+
+        let err = client
+            .get(&format!("http://{addr}/redir-imds"))
+            .await
+            .expect_err("IMDS redirect must be blocked");
+        assert_eq!(
+            transport_error_kind(&err),
+            Some(TransportErrorKind::RedirectBlocked)
+        );
+        server.abort();
+    }
 
     #[test]
     fn generates_chromium_greased_sec_ch_ua_for_chrome_154() {
