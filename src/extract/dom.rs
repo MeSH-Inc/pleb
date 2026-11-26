@@ -57,6 +57,8 @@ const CODE_GUTTER_CLASSES: &[&str] = &[
 
 static TITLE_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("title").unwrap());
 static BASE_HREF_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("base[href]").unwrap());
+static META_REFRESH_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("meta[http-equiv][content]").unwrap());
 static HEAD_LINK_SEL: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("head link[rel][href]").unwrap());
 static BODY_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("body").unwrap());
@@ -151,6 +153,34 @@ impl ParsedHtml {
                 continue;
             };
             if resolved != *page_url && crate::policy::is_safe_alternate_url(page_url, &resolved) {
+                return Some(resolved);
+            }
+        }
+        None
+    }
+
+    pub fn meta_refresh_url(&self, page_url: &Url) -> Option<Url> {
+        if self.text_metrics().visible_text_len >= 200 {
+            return None;
+        }
+        let base = self.effective_base_url(page_url);
+        for el in self.doc.select(&META_REFRESH_SEL) {
+            let Some(equiv) = el.value().attr("http-equiv") else {
+                continue;
+            };
+            if !equiv.trim().eq_ignore_ascii_case("refresh") {
+                continue;
+            }
+            let Some(content) = el.value().attr("content") else {
+                continue;
+            };
+            let Some(raw_target) = parse_meta_refresh_target(content) else {
+                continue;
+            };
+            let Ok(resolved) = base.join(raw_target) else {
+                continue;
+            };
+            if matches!(resolved.scheme(), "http" | "https") && resolved != *page_url {
                 return Some(resolved);
             }
         }
@@ -1658,4 +1688,73 @@ fn normalize_plain_text(raw: &str) -> String {
     }
 
     lines.join("\n")
+}
+
+fn parse_meta_refresh_target(content: &str) -> Option<&str> {
+    let trimmed = content.trim();
+    let idx = trimmed.find([';', ','])?;
+    let (delay_part, rest) = (&trimmed[..idx], trimmed[idx + 1..].trim());
+    let delay_secs: u64 = delay_part.trim().parse().ok()?;
+    if delay_secs > 5 {
+        return None;
+    }
+    let after_url = if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case("url=") {
+        rest[4..].trim()
+    } else {
+        return None;
+    };
+    let unquoted = after_url
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .or_else(|| {
+            after_url
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+        })
+        .unwrap_or(after_url)
+        .trim();
+    (!unquoted.is_empty()).then_some(unquoted)
+}
+
+#[cfg(test)]
+mod meta_refresh_tests {
+    use super::*;
+
+    #[test]
+    fn meta_refresh_parses_redirect_stub_and_ignores_content_pages() {
+        let base = Url::parse("https://www.inkandswitch.com/local-first/").unwrap();
+        let stub = ParsedHtml::parse(
+            r#"<!doctype html><html><head><meta http-equiv="refresh" content="0; url=/essay/local-first"></head></html>"#,
+        );
+        assert_eq!(
+            stub.meta_refresh_url(&base).as_ref().map(Url::as_str),
+            Some("https://www.inkandswitch.com/essay/local-first")
+        );
+
+        let quoted = ParsedHtml::parse(
+            r#"<html><head><meta http-equiv="Refresh" content="2; URL='https://example.org/next'"></head></html>"#,
+        );
+        assert_eq!(
+            quoted.meta_refresh_url(&base).as_ref().map(Url::as_str),
+            Some("https://example.org/next")
+        );
+
+        let slow = ParsedHtml::parse(
+            r#"<html><head><meta http-equiv="refresh" content="30; url=/reload"></head></html>"#,
+        );
+        assert!(slow.meta_refresh_url(&base).is_none());
+
+        let js_scheme = ParsedHtml::parse(
+            r#"<html><head><meta http-equiv="refresh" content="0; url=javascript:alert(1)"></head></html>"#,
+        );
+        assert!(js_scheme.meta_refresh_url(&base).is_none());
+
+        let full_body = format!(
+            r#"<html><head><meta http-equiv="refresh" content="0; url=/other"></head><body><p>{}</p></body></html>"#,
+            "substantial article content ".repeat(12)
+        );
+        assert!(ParsedHtml::parse(&full_body)
+            .meta_refresh_url(&base)
+            .is_none());
+    }
 }

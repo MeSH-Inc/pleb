@@ -1012,31 +1012,69 @@ async fn acquire_page(
         .unwrap_or(DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES);
     let accept_markdown = source_mode == SourceMode::Negotiate
         || (source_mode == SourceMode::Auto && rule.is_some_and(|r| r.accept_markdown));
-    let resp = ctx
-        .client
-        .get_with_options(url_str, ctx.config.timeout, max_bytes, accept_markdown)
-        .await
-        .map_err(|e| map_transport_error(url_str, e, max_bytes))?;
-    let status = resp.status;
-    let final_url = resp.final_url.clone();
-    let content_type = resp.content_type.clone();
-    let link_header = resp.link_header.clone();
-    let is_html = resp.is_html();
+    let mut current_url = url_str.to_string();
+    let mut visited_refresh = std::collections::HashSet::from([current_url.clone()]);
+    let (status, final_url, content_type, link_header, is_html, body, mut parsed_html) = {
+        const MAX_META_REFRESH_HOPS: usize = 3;
+        let mut hop = 0usize;
+        loop {
+            let resp = ctx
+                .client
+                .get_with_options(&current_url, ctx.config.timeout, max_bytes, accept_markdown)
+                .await
+                .map_err(|e| map_transport_error(&current_url, e, max_bytes))?;
+            let status = resp.status;
+            let final_url = resp.final_url.clone();
+            let content_type = resp.content_type.clone();
+            let link_header = resp.link_header.clone();
+            let is_html = resp.is_html();
 
-    if status < 400 {
-        if let Some(detected_mime) =
-            extract::detect_binary_content(content_type.as_deref(), &resp.body)
-        {
-            return Err(FetchError::UnsupportedContentType {
-                url: final_url,
-                content_type: detected_mime.or(content_type),
-                byte_count: resp.body.len(),
-            });
+            if status < 400 {
+                if let Some(detected_mime) =
+                    extract::detect_binary_content(content_type.as_deref(), &resp.body)
+                {
+                    return Err(FetchError::UnsupportedContentType {
+                        url: final_url,
+                        content_type: detected_mime.or(content_type),
+                        byte_count: resp.body.len(),
+                    });
+                }
+            }
+
+            let body = resp.text();
+            let mut parsed_html = None;
+            if status == 200 && is_html && hop < MAX_META_REFRESH_HOPS {
+                let page_url = url::Url::parse(&final_url).unwrap_or_else(|_| parsed.clone());
+                let refresh_target = parsed_html
+                    .get_or_insert_with(|| ParsedHtml::parse(&body))
+                    .meta_refresh_url(&page_url);
+                if let Some(next_url) = refresh_target {
+                    let next_str = next_url.to_string();
+                    if visited_refresh.insert(next_str.clone()) {
+                        if respect_robots && !ctx.robots.is_allowed(&ctx.client, &next_str).await {
+                            return Err(FetchError::RobotsDisallowed {
+                                host: next_url.host_str().unwrap_or(host).to_string(),
+                                url: next_str,
+                            });
+                        }
+                        current_url = next_str;
+                        hop += 1;
+                        continue;
+                    }
+                }
+            }
+
+            break (
+                status,
+                final_url,
+                content_type,
+                link_header,
+                is_html,
+                body,
+                parsed_html,
+            );
         }
-    }
-
-    let body = resp.text();
-    let mut parsed_html = None;
+    };
     let classification = classify_response_with_context(
         status,
         is_html,

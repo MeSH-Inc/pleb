@@ -236,6 +236,13 @@ static void CEF_CALLBACK on_after_created(
     cef_life_span_handler_t* self, cef_browser_t* browser) {
     (void)self;
     g_browser = browser;
+    if (browser) {
+        cef_browser_host_t* host = browser->get_host(browser);
+        if (host) {
+            host->set_audio_muted(host, 1);
+            host->base.release(&host->base);
+        }
+    }
 }
 
 static int CEF_CALLBACK do_close(
