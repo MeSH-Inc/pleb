@@ -11,6 +11,9 @@ use crate::policy::{
 use crate::transport::cef::{
     CefProtocolError, CefRenderOptions, CefRenderResult, CefRenderer, CefTimeoutError,
 };
+use crate::transport::{
+    ResponseTooLargeError, DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES, DEFAULT_RAW_MAX_RESPONSE_BYTES,
+};
 
 #[derive(Debug, Error)]
 pub enum FetchError {
@@ -53,6 +56,9 @@ pub enum FetchError {
     #[error("timed out fetching {url}: {detail}")]
     Timeout { url: String, detail: String },
 
+    #[error("response body from {url} exceeded {limit_bytes} byte limit")]
+    ResponseTooLarge { url: String, limit_bytes: usize },
+
     #[error(transparent)]
     Transport(#[from] anyhow::Error),
 }
@@ -66,6 +72,7 @@ impl FetchError {
             Self::InvalidUrl(_)
             | Self::CefUnavailable(_)
             | Self::Timeout { .. }
+            | Self::ResponseTooLarge { .. }
             | Self::Transport(_) => 1,
         }
     }
@@ -80,6 +87,7 @@ impl FetchError {
             Self::UnsupportedContentType { .. } => "unsupported_content_type",
             Self::CefUnavailable(_) => "cef_unavailable",
             Self::Timeout { .. } => "timeout",
+            Self::ResponseTooLarge { .. } => "response_too_large",
             Self::Transport(_) => "transport",
         }
     }
@@ -255,7 +263,15 @@ pub async fn fetch_raw(
         });
     }
 
-    let resp = ctx.client.get(parsed.as_str()).await?;
+    let max_bytes = ctx
+        .config
+        .max_response_bytes
+        .unwrap_or(DEFAULT_RAW_MAX_RESPONSE_BYTES);
+    let resp = ctx
+        .client
+        .get_with_limits(parsed.as_str(), ctx.config.timeout, max_bytes)
+        .await
+        .map_err(|e| map_transport_error(parsed.as_str(), e))?;
     let timing_ms = start.elapsed().as_millis() as u64;
 
     if resp.status >= 400 {
@@ -328,7 +344,15 @@ async fn acquire_page(
         }
     }
 
-    let resp = ctx.client.get(url_str).await?;
+    let max_bytes = ctx
+        .config
+        .max_response_bytes
+        .unwrap_or(DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES);
+    let resp = ctx
+        .client
+        .get_with_limits(url_str, ctx.config.timeout, max_bytes)
+        .await
+        .map_err(|e| map_transport_error(url_str, e))?;
     let status = resp.status;
     let final_url = resp.final_url.clone();
     let content_type = resp.content_type.clone();
@@ -565,6 +589,17 @@ async fn render_cef_checked(
     }
 
     Ok(result)
+}
+
+fn map_transport_error(url: &str, err: anyhow::Error) -> FetchError {
+    if let Some(too_large) = err.downcast_ref::<ResponseTooLargeError>() {
+        FetchError::ResponseTooLarge {
+            url: url.to_string(),
+            limit_bytes: too_large.limit_bytes,
+        }
+    } else {
+        FetchError::Transport(err)
+    }
 }
 
 fn map_cef_error(url: &str, err: anyhow::Error) -> FetchError {

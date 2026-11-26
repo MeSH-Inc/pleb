@@ -220,3 +220,36 @@ fn site_cache_file_has_private_permissions() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn site_cache_concurrent_multi_writer_merges_without_loss() {
+    let dir = temp_dir("cache-flock");
+    let cache_path = dir.join("site-cache.json");
+
+    let handles: Vec<_> = (0..8)
+        .map(|i| {
+            let path = cache_path.clone();
+            std::thread::spawn(move || {
+                let cache = SiteCache::load(path);
+                cache.record_at(&format!("host-{i}.example"), "cronet", 10 + i as u64, 1_000_000);
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let reloaded = SiteCache::load(cache_path);
+    for i in 0..8 {
+        assert_eq!(
+            reloaded
+                .get_at(&format!("host-{i}.example"), 1_000_000 + 60)
+                .map(|e| e.strategy),
+            Some("cronet".to_string()),
+            "missing concurrent writer entry for host-{i}.example"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(dir);
+}

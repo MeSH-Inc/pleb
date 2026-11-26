@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -8,6 +9,7 @@ use super::rules::parent_domain;
 
 const STRATEGY_TTL_SECS: u64 = 7 * 24 * 3600;
 const TIMEOUT_TTL_SECS: u64 = 24 * 3600;
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SiteCacheEntry {
@@ -24,10 +26,7 @@ pub struct SiteCache {
 
 impl SiteCache {
     pub fn load(path: PathBuf) -> Self {
-        let entries = match std::fs::read_to_string(&path) {
-            Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
-            Err(_) => HashMap::new(),
-        };
+        let entries = read_cache_map(&path);
         Self {
             path,
             entries: Mutex::new(entries),
@@ -55,11 +54,16 @@ impl SiteCache {
     }
 
     pub fn record_at(&self, host: &str, strategy: &str, time_ms: u64, now_secs: u64) {
-        let Ok(mut guard) = self.entries.lock() else {
-            return;
+        let lock_file = match acquire_cache_lock(&self.path) {
+            Ok(file) => file,
+            Err(err) => {
+                tracing::warn!("failed to lock site cache {}: {}", self.path.display(), err);
+                return;
+            }
         };
 
-        let entry = guard
+        let mut merged = read_cache_map(&self.path);
+        let entry = merged
             .entry(host.to_string())
             .or_insert_with(|| SiteCacheEntry {
                 strategy: strategy.to_string(),
@@ -73,18 +77,51 @@ impl SiteCache {
         entry.updated_at_epoch_secs = now_secs;
         entry.strategy = strategy.to_string();
 
-        let _ = save_atomic(&self.path, &guard);
+        if let Err(err) = save_atomic(&self.path, &merged) {
+            tracing::warn!("failed to save site cache {}: {}", self.path.display(), err);
+        }
+
+        if let Ok(mut guard) = self.entries.lock() {
+            *guard = merged;
+        }
+        drop(lock_file);
     }
 
     pub fn clear(&self) -> anyhow::Result<()> {
+        let lock_file = acquire_cache_lock(&self.path)?;
         if let Ok(mut guard) = self.entries.lock() {
             guard.clear();
         }
         if self.path.exists() {
             std::fs::remove_file(&self.path)?;
         }
+        drop(lock_file);
         Ok(())
     }
+}
+
+fn read_cache_map(path: &Path) -> HashMap<String, SiteCacheEntry> {
+    match std::fs::read_to_string(path) {
+        Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
+        Err(_) => HashMap::new(),
+    }
+}
+
+fn acquire_cache_lock(cache_path: &Path) -> std::io::Result<std::fs::File> {
+    if let Some(dir) = cache_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let lock_path = cache_path.with_file_name("site-cache.lock");
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(&lock_path)?;
+    file.lock()?;
+    Ok(file)
 }
 
 fn is_expired(entry: &SiteCacheEntry, now_secs: u64) -> bool {
@@ -105,7 +142,8 @@ fn save_atomic(path: &Path, entries: &HashMap<String, SiteCacheEntry>) -> std::i
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("site-cache.json");
-    let tmp = path.with_file_name(format!("{}.tmp.{}", file_name, std::process::id()));
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_file_name(format!("{}.tmp.{}.{}", file_name, std::process::id(), seq));
 
     let write_res = (|| -> std::io::Result<()> {
         use std::io::Write;

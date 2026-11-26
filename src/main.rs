@@ -29,6 +29,10 @@ struct Cli {
     #[arg(long, global = true, default_value = "30")]
     timeout: u64,
 
+    /// Maximum HTTP response body bytes to read (defaults: 16 MiB document, 128 MiB raw)
+    #[arg(long, global = true)]
+    max_response_bytes: Option<usize>,
+
     /// CEF render timeout in seconds
     #[arg(long, global = true, default_value = "60")]
     cef_timeout: u64,
@@ -321,6 +325,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         state_dir: state_dir.clone(),
         proxy: cli.proxy.filter(|s| !s.trim().is_empty()),
         timeout: Duration::from_secs(cli.timeout.max(1)),
+        max_response_bytes: cli.max_response_bytes,
         cef_timeout: Duration::from_secs(cli.cef_timeout.max(1)),
         cef_idle_timeout: Duration::from_secs(cli.daemon_idle_timeout.max(1)),
         cef_daemon: !cli.no_daemon,

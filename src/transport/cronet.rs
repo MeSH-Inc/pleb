@@ -124,7 +124,6 @@ pub struct CronetResponse {
 pub struct Engine {
     engine: ffi::Cronet_EnginePtr,
     executor: ffi::Cronet_ExecutorPtr,
-    timeout: Duration,
     in_flight: Arc<(Mutex<usize>, Condvar)>,
 }
 
@@ -132,12 +131,7 @@ unsafe impl Send for Engine {}
 unsafe impl Sync for Engine {}
 
 impl Engine {
-    pub fn new(
-        storage_path: &Path,
-        user_agent: &str,
-        proxy: Option<&str>,
-        timeout: Duration,
-    ) -> Result<Self> {
+    pub fn new(storage_path: &Path, user_agent: &str, proxy: Option<&str>) -> Result<Self> {
         crate::context::ensure_private_dir(storage_path)?;
 
         let ua = CString::new(user_agent)?;
@@ -174,7 +168,6 @@ impl Engine {
             Ok(Self {
                 engine,
                 executor,
-                timeout,
                 in_flight: Arc::new((Mutex::new(0), Condvar::new())),
             })
         }
@@ -184,6 +177,7 @@ impl Engine {
         &self,
         url: &str,
         headers: &[(&str, String)],
+        timeout: Duration,
         max_body_bytes: usize,
     ) -> Result<CronetResponse> {
         let (tx, rx) = oneshot::channel();
@@ -194,7 +188,7 @@ impl Engine {
 
         self.start_request(url, headers, max_body_bytes, tx, active_request)?;
 
-        match tokio::time::timeout(self.timeout, rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => {
                 drop(guard);
                 result
@@ -205,7 +199,7 @@ impl Engine {
             }
             Err(_) => {
                 drop(guard);
-                bail!("Cronet request timed out after {:?}", self.timeout)
+                bail!("Cronet request timed out after {:?}", timeout)
             }
         }
     }
@@ -559,10 +553,9 @@ unsafe extern "C" fn on_canceled(
 ) {
     let boxed = finish_request(callback);
     let err = if boxed.overflowed.load(Ordering::SeqCst) {
-        anyhow::anyhow!(
-            "response body exceeded {} byte limit",
-            boxed.max_body_bytes
-        )
+        anyhow::Error::new(super::ResponseTooLargeError {
+            limit_bytes: boxed.max_body_bytes,
+        })
     } else {
         anyhow::anyhow!("cronet request canceled")
     };
@@ -644,21 +637,21 @@ mod tests {
         let base = spawn_edge_server().await;
         let storage = temp_storage("edge");
 
-        let engine = Engine::new(&storage, "mesh-wick-test", None, Duration::from_millis(150))
+        let engine = Engine::new(&storage, "mesh-wick-test", None)
             .expect("cronet engine should start");
 
         let err_large = engine
-            .get(&format!("{base}/large"), &[], 1024)
+            .get(&format!("{base}/large"), &[], Duration::from_secs(5), 1024)
             .await
             .err()
             .expect("64 KiB payload should exceed 1024 byte limit");
         assert!(
-            err_large.to_string().contains("exceeded"),
-            "unexpected overflow error: {err_large}"
+            err_large.is::<crate::transport::ResponseTooLargeError>(),
+            "expected ResponseTooLargeError, got: {err_large}"
         );
 
         let err_slow = engine
-            .get(&format!("{base}/slow"), &[], 65536)
+            .get(&format!("{base}/slow"), &[], Duration::from_millis(150), 65536)
             .await
             .err()
             .expect("slow endpoint should time out");

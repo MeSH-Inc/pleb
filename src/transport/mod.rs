@@ -12,7 +12,14 @@ use std::time::Duration;
 
 const CHROME_MAJOR: &str = "143";
 const CHROME_FULL: &str = "143.0.7499.109";
-pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+pub const DEFAULT_RAW_MAX_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
+
+#[derive(Debug, thiserror::Error)]
+#[error("response body exceeded {limit_bytes} byte limit")]
+pub struct ResponseTooLargeError {
+    pub limit_bytes: usize,
+}
 
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
@@ -38,14 +45,18 @@ pub struct TransportClient {
     engine: cronet::Engine,
     #[cfg(not(feature = "cronet"))]
     inner: reqwest::Client,
+    default_timeout: Duration,
 }
 
 impl TransportClient {
     pub fn new(storage_path: &Path, proxy: Option<&str>, timeout: Duration) -> Result<Self> {
         #[cfg(feature = "cronet")]
         {
-            let engine = cronet::Engine::new(storage_path, &chrome_user_agent(), proxy, timeout)?;
-            Ok(Self { engine })
+            let engine = cronet::Engine::new(storage_path, &chrome_user_agent(), proxy)?;
+            Ok(Self {
+                engine,
+                default_timeout: timeout,
+            })
         }
         #[cfg(not(feature = "cronet"))]
         {
@@ -55,8 +66,7 @@ impl TransportClient {
                 .default_headers(chrome_headers_reqwest()?)
                 .gzip(true)
                 .brotli(true)
-                .deflate(true)
-                .timeout(timeout);
+                .deflate(true);
 
             if let Some(proxy_url) = proxy {
                 builder = builder.proxy(reqwest::Proxy::all(proxy_url)?);
@@ -64,6 +74,7 @@ impl TransportClient {
 
             Ok(Self {
                 inner: builder.build()?,
+                default_timeout: timeout,
             })
         }
     }
@@ -77,12 +88,22 @@ impl TransportClient {
     }
 
     pub async fn get(&self, url: &str) -> Result<HttpResponse> {
+        self.get_with_limits(url, self.default_timeout, DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES)
+            .await
+    }
+
+    pub async fn get_with_limits(
+        &self,
+        url: &str,
+        timeout: Duration,
+        max_body_bytes: usize,
+    ) -> Result<HttpResponse> {
         #[cfg(feature = "cronet")]
         {
             let headers = chrome_header_pairs(true);
             let resp = self
                 .engine
-                .get(url, &headers, DEFAULT_MAX_RESPONSE_BYTES)
+                .get(url, &headers, timeout, max_body_bytes)
                 .await?;
             Ok(HttpResponse {
                 status: resp.status_code,
@@ -93,30 +114,36 @@ impl TransportClient {
         }
         #[cfg(not(feature = "cronet"))]
         {
-            let mut resp = self.inner.get(url).send().await?;
-            let final_url = resp.url().to_string();
-            let status = resp.status().as_u16();
-            let content_type = resp
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
-            let mut body = Vec::new();
-            while let Some(chunk) = resp.chunk().await? {
-                if body.len().saturating_add(chunk.len()) > DEFAULT_MAX_RESPONSE_BYTES {
-                    anyhow::bail!(
-                        "response body exceeded {} byte limit",
-                        DEFAULT_MAX_RESPONSE_BYTES
-                    );
+            let fut = async {
+                let mut resp = self.inner.get(url).timeout(timeout).send().await?;
+                let final_url = resp.url().to_string();
+                let status = resp.status().as_u16();
+                let content_type = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                let mut body = Vec::new();
+                while let Some(chunk) = resp.chunk().await? {
+                    if body.len().saturating_add(chunk.len()) > max_body_bytes {
+                        return Err(anyhow::Error::new(ResponseTooLargeError {
+                            limit_bytes: max_body_bytes,
+                        }));
+                    }
+                    body.extend_from_slice(&chunk);
                 }
-                body.extend_from_slice(&chunk);
+                Ok(HttpResponse {
+                    status,
+                    final_url,
+                    content_type,
+                    body,
+                })
+            };
+
+            match tokio::time::timeout(timeout, fut).await {
+                Ok(res) => res,
+                Err(_) => anyhow::bail!("request timed out after {:?}", timeout),
             }
-            Ok(HttpResponse {
-                status,
-                final_url,
-                content_type,
-                body,
-            })
         }
     }
 }

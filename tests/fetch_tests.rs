@@ -268,3 +268,43 @@ async fn fetch_concurrent_requests_and_clean_teardown() {
     drop(ctx);
     let _ = std::fs::remove_dir_all(state_dir);
 }
+
+#[tokio::test]
+async fn fetch_enforces_max_response_bytes() {
+    let base = spawn_mock_server().await;
+    let state_dir = temp_state_dir("max-bytes");
+    let ctx = RuntimeContext::new(RuntimeConfig {
+        state_dir: state_dir.clone(),
+        timeout: Duration::from_secs(5),
+        max_response_bytes: Some(16),
+        cef_timeout: Duration::from_secs(5),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let opts = FetchOptions {
+        render: RenderMode::Cronet,
+        ..Default::default()
+    };
+
+    let err_doc = fetch_document(&ctx, &format!("{base}/page"), &opts)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err_doc, FetchError::ResponseTooLarge { limit_bytes: 16, .. }),
+        "unexpected document error: {err_doc:?}"
+    );
+    assert_eq!(err_doc.exit_code(), 1);
+    assert_eq!(err_doc.kind(), "response_too_large");
+
+    let err_raw = fetch_raw(&ctx, &format!("{base}/page"), false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err_raw, FetchError::ResponseTooLarge { limit_bytes: 16, .. }),
+        "unexpected raw error: {err_raw:?}"
+    );
+
+    drop(ctx);
+    let _ = std::fs::remove_dir_all(state_dir);
+}
