@@ -2,11 +2,11 @@ use anyhow::{bail, Result};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
-use std::sync::atomic::{compiler_fence, AtomicU64, Ordering};
+use std::sync::atomic::{compiler_fence, Ordering};
 
-use crate::context::{acquire_private_lock, ensure_private_dir};
+use crate::context::{acquire_private_lock, ensure_private_dir, write_private_file_atomic};
 
 pub const MAX_SECRET_BYTES: usize = 4096;
 
@@ -18,8 +18,6 @@ const ERR_SEC_ITEM_NOT_FOUND: i32 = 44;
 const CREDENTIALS_FILE_NAME: &str = "credentials.json";
 const CREDENTIALS_LOCK_NAME: &str = "credentials.lock";
 const NO_KEYCHAIN_ENV: &str = "WICK_NO_KEYCHAIN";
-
-static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn zeroize_bytes(bytes: &mut [u8]) {
     for byte in bytes {
@@ -216,7 +214,31 @@ fn encode_lowercase_hex(bytes: &[u8]) -> ZeroizingBytes {
 }
 
 #[cfg(target_os = "macos")]
+fn keychain_error(
+    action: &str,
+    provider: CredentialProvider,
+    output: &std::process::Output,
+) -> anyhow::Error {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = stderr.trim();
+    if detail.is_empty() {
+        anyhow::anyhow!(
+            "failed to {action} {} credential in macOS Keychain (exit {:?})",
+            provider.as_str(),
+            output.status.code()
+        )
+    } else {
+        anyhow::anyhow!(
+            "failed to {action} {} credential in macOS Keychain (exit {:?}): {detail}",
+            provider.as_str(),
+            output.status.code()
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn keychain_set(provider: CredentialProvider, secret: &SecretString) -> Result<()> {
+    use std::io::Write;
     use std::process::{Command, Stdio};
 
     let hex = encode_lowercase_hex(secret.as_str().as_bytes());
@@ -247,21 +269,7 @@ fn keychain_set(provider: CredentialProvider, secret: &SecretString) -> Result<(
 
     let output = child.wait_with_output()?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.trim();
-        if detail.is_empty() {
-            bail!(
-                "failed to store {} credential in macOS Keychain (exit {:?})",
-                provider.as_str(),
-                output.status.code()
-            );
-        }
-        bail!(
-            "failed to store {} credential in macOS Keychain (exit {:?}): {}",
-            provider.as_str(),
-            output.status.code(),
-            detail
-        );
+        return Err(keychain_error("store", provider, &output));
     }
     Ok(())
 }
@@ -293,29 +301,14 @@ fn keychain_get(provider: CredentialProvider) -> Result<Option<SecretString>> {
                 provider.as_str()
             )
         })?;
-        let validated = validate_credential(provider, raw)?;
-        return Ok(Some(validated));
+        return Ok(Some(validate_credential(provider, raw)?));
     }
 
     if output.status.code() == Some(ERR_SEC_ITEM_NOT_FOUND) {
         return Ok(None);
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let detail = stderr.trim();
-    if detail.is_empty() {
-        bail!(
-            "failed to read {} credential from macOS Keychain (exit {:?})",
-            provider.as_str(),
-            output.status.code()
-        );
-    }
-    bail!(
-        "failed to read {} credential from macOS Keychain (exit {:?}): {}",
-        provider.as_str(),
-        output.status.code(),
-        detail
-    );
+    Err(keychain_error("read", provider, &output))
 }
 
 #[cfg(target_os = "macos")]
@@ -343,21 +336,7 @@ fn keychain_delete(provider: CredentialProvider) -> Result<bool> {
         return Ok(false);
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let detail = stderr.trim();
-    if detail.is_empty() {
-        bail!(
-            "failed to delete {} credential from macOS Keychain (exit {:?})",
-            provider.as_str(),
-            output.status.code()
-        );
-    }
-    bail!(
-        "failed to delete {} credential from macOS Keychain (exit {:?}): {}",
-        provider.as_str(),
-        output.status.code(),
-        detail
-    );
+    Err(keychain_error("delete", provider, &output))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -450,71 +429,11 @@ fn read_credentials_map_locked(creds_path: &Path) -> Result<(ZeroizingCredential
     Ok((ZeroizingCredentialMap(parsed), true))
 }
 
-fn write_credentials_map_locked(
-    state_dir: &Path,
-    creds_path: &Path,
-    map: &BTreeMap<String, String>,
-) -> Result<()> {
+fn write_credentials_map_locked(creds_path: &Path, map: &BTreeMap<String, String>) -> Result<()> {
     let mut json_bytes = serde_json::to_vec_pretty(map)?;
     json_bytes.push(b'\n');
     let json_bytes = ZeroizingBytes(json_bytes);
-
-    let pid = std::process::id();
-    let mut temp_path = None;
-    let mut temp_file = None;
-    for _ in 0..16 {
-        let seq = TEMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
-        let candidate = state_dir.join(format!("{CREDENTIALS_FILE_NAME}.tmp.{pid}.{seq}"));
-        let mut opts = std::fs::OpenOptions::new();
-        opts.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        match opts.open(&candidate) {
-            Ok(file) => {
-                temp_path = Some(candidate);
-                temp_file = Some(file);
-                break;
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(err.into()),
-        }
-    }
-
-    let temp_path = temp_path.ok_or_else(|| {
-        anyhow::anyhow!(
-            "failed to allocate temporary credentials file in {}",
-            state_dir.display()
-        )
-    })?;
-    let mut temp_file = temp_file.expect("temp_file set alongside temp_path");
-
-    let write_result = (|| -> Result<()> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            temp_file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        temp_file.write_all(&json_bytes.0)?;
-        temp_file.sync_all()?;
-        Ok(())
-    })();
-
-    drop(temp_file);
-    drop(json_bytes);
-
-    if let Err(err) = write_result {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(err);
-    }
-
-    if let Err(err) = std::fs::rename(&temp_path, creds_path) {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(err.into());
-    }
-
+    write_private_file_atomic(creds_path, &json_bytes.0)?;
     Ok(())
 }
 
@@ -541,7 +460,7 @@ fn file_set(state_dir: &Path, provider: CredentialProvider, secret: &SecretStrin
     let (mut map, _) = read_credentials_map_locked(&creds_path)?;
     map.0
         .insert(provider.as_str().to_string(), secret.as_str().to_string());
-    write_credentials_map_locked(state_dir, &creds_path, &map.0)
+    write_credentials_map_locked(&creds_path, &map.0)
 }
 
 fn file_delete(state_dir: &Path, provider: CredentialProvider) -> Result<bool> {
@@ -560,7 +479,7 @@ fn file_delete(state_dir: &Path, provider: CredentialProvider) -> Result<bool> {
         return Ok(false);
     };
     drop(SecretString::new(removed_val));
-    write_credentials_map_locked(state_dir, &creds_path, &map.0)?;
+    write_credentials_map_locked(&creds_path, &map.0)?;
     Ok(true)
 }
 

@@ -475,8 +475,12 @@ fn has_path_or_namespace_token(query: &str) -> bool {
 }
 
 fn auto_candidate_order(raw_query: &str, options: &SearchOptions) -> [ConcreteProvider; 6] {
-    match options.mode {
-        SearchMode::Semantic => [
+    match (
+        options.mode,
+        is_lexical_needle(raw_query),
+        options.extra_snippets,
+    ) {
+        (SearchMode::Semantic, _, _) => [
             ConcreteProvider::Exa,
             ConcreteProvider::Tavily,
             ConcreteProvider::Brave,
@@ -484,7 +488,7 @@ fn auto_candidate_order(raw_query: &str, options: &SearchOptions) -> [ConcretePr
             ConcreteProvider::Searxng,
             ConcreteProvider::DuckDuckGo,
         ],
-        SearchMode::Exact => [
+        (SearchMode::Exact, _, _) | (SearchMode::Auto, true, _) => [
             ConcreteProvider::Searxng,
             ConcreteProvider::Serper,
             ConcreteProvider::Brave,
@@ -492,15 +496,7 @@ fn auto_candidate_order(raw_query: &str, options: &SearchOptions) -> [ConcretePr
             ConcreteProvider::Exa,
             ConcreteProvider::DuckDuckGo,
         ],
-        SearchMode::Auto if is_lexical_needle(raw_query) => [
-            ConcreteProvider::Searxng,
-            ConcreteProvider::Serper,
-            ConcreteProvider::Brave,
-            ConcreteProvider::Tavily,
-            ConcreteProvider::Exa,
-            ConcreteProvider::DuckDuckGo,
-        ],
-        SearchMode::Auto if options.extra_snippets => [
+        (SearchMode::Auto, false, true) => [
             ConcreteProvider::Brave,
             ConcreteProvider::Tavily,
             ConcreteProvider::Exa,
@@ -508,7 +504,7 @@ fn auto_candidate_order(raw_query: &str, options: &SearchOptions) -> [ConcretePr
             ConcreteProvider::Searxng,
             ConcreteProvider::DuckDuckGo,
         ],
-        SearchMode::Auto => [
+        (SearchMode::Auto, false, false) => [
             ConcreteProvider::Searxng,
             ConcreteProvider::Brave,
             ConcreteProvider::Tavily,

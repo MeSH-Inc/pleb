@@ -156,13 +156,27 @@ fn classify_http_failure(
     }
 }
 
-/// Splits normalized `--site` into `(host_only, has_path)`.
-fn split_site_host(site: Option<&str>) -> Option<(String, bool)> {
-    let normalized = normalize_site(site?)?;
-    match normalized.split_once('/') {
-        Some((host, _path)) if !host.is_empty() => Some((host.to_string(), true)),
-        _ => Some((normalized, false)),
+/// Splits normalized `--site` into `(query_text, include_domains)`.
+fn site_query_and_domains<'a>(
+    raw_query: &'a str,
+    effective_query: &'a str,
+    site: Option<&str>,
+) -> (&'a str, Option<Vec<String>>) {
+    match site.and_then(normalize_site) {
+        Some(normalized) => match normalized.split_once('/') {
+            Some((host, _)) if !host.is_empty() => (effective_query, Some(vec![host.to_string()])),
+            _ => (raw_query.trim(), Some(vec![normalized])),
+        },
+        None => (raw_query.trim(), None),
     }
+}
+
+fn parse_failure(provider: ConcreteProvider, err: anyhow::Error) -> ProviderFailure {
+    ProviderFailure::new(
+        Some(200),
+        60,
+        format!("{} search response parse failed: {err}", provider.as_str()),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -281,13 +295,7 @@ async fn search_brave(
         .header("X-Subscription-Token", api_key)
         .header("Accept", "application/json");
     let body = execute_provider_request(ConcreteProvider::Brave, req, now_secs).await?;
-    parse_brave_json(&body, limit).map_err(|err| {
-        ProviderFailure::new(
-            Some(200),
-            60,
-            format!("brave search response parse failed: {err}"),
-        )
-    })
+    parse_brave_json(&body, limit).map_err(|err| parse_failure(ConcreteProvider::Brave, err))
 }
 
 #[derive(Serialize)]
@@ -315,12 +323,8 @@ async fn search_tavily(
     options: &SearchOptions,
     now_secs: u64,
 ) -> Result<Vec<SearchResult>, ProviderFailure> {
-    let site_split = split_site_host(options.site.as_deref());
-    let (query_text, include_domains) = match site_split {
-        Some((host, true)) => (effective_query, Some(vec![host])),
-        Some((host, false)) => (raw_query.trim(), Some(vec![host])),
-        None => (raw_query.trim(), None),
-    };
+    let (query_text, include_domains) =
+        site_query_and_domains(raw_query, effective_query, options.site.as_deref());
 
     let payload = TavilyRequest {
         query: query_text,
@@ -342,13 +346,8 @@ async fn search_tavily(
         .header("Accept", "application/json")
         .json(&payload);
     let body = execute_provider_request(ConcreteProvider::Tavily, req, now_secs).await?;
-    parse_tavily_json(&body, limit, options.extra_snippets).map_err(|err| {
-        ProviderFailure::new(
-            Some(200),
-            60,
-            format!("tavily search response parse failed: {err}"),
-        )
-    })
+    parse_tavily_json(&body, limit, options.extra_snippets)
+        .map_err(|err| parse_failure(ConcreteProvider::Tavily, err))
 }
 
 #[derive(Serialize)]
@@ -383,13 +382,8 @@ async fn search_serper(
         .header("Accept", "application/json")
         .json(&payload);
     let body = execute_provider_request(ConcreteProvider::Serper, req, now_secs).await?;
-    parse_serper_json(&body, limit, options.extra_snippets).map_err(|err| {
-        ProviderFailure::new(
-            Some(200),
-            60,
-            format!("serper search response parse failed: {err}"),
-        )
-    })
+    parse_serper_json(&body, limit, options.extra_snippets)
+        .map_err(|err| parse_failure(ConcreteProvider::Serper, err))
 }
 
 #[derive(Serialize)]
@@ -427,12 +421,8 @@ async fn search_exa(
     options: &SearchOptions,
     now_secs: u64,
 ) -> Result<Vec<SearchResult>, ProviderFailure> {
-    let site_split = split_site_host(options.site.as_deref());
-    let (query_text, include_domains) = match site_split {
-        Some((host, true)) => (effective_query, Some(vec![host])),
-        Some((host, false)) => (raw_query.trim(), Some(vec![host])),
-        None => (raw_query.trim(), None),
-    };
+    let (query_text, include_domains) =
+        site_query_and_domains(raw_query, effective_query, options.site.as_deref());
 
     let payload = ExaRequest {
         query: query_text,
@@ -455,13 +445,8 @@ async fn search_exa(
         .header("Accept", "application/json")
         .json(&payload);
     let body = execute_provider_request(ConcreteProvider::Exa, req, now_secs).await?;
-    parse_exa_json(&body, limit, options.extra_snippets).map_err(|err| {
-        ProviderFailure::new(
-            Some(200),
-            60,
-            format!("exa search response parse failed: {err}"),
-        )
-    })
+    parse_exa_json(&body, limit, options.extra_snippets)
+        .map_err(|err| parse_failure(ConcreteProvider::Exa, err))
 }
 
 pub(crate) fn build_searxng_search_url(
@@ -495,13 +480,7 @@ async fn search_searxng(
         .timeout(timeout)
         .header("Accept", "application/json");
     let body = execute_provider_request(ConcreteProvider::Searxng, req, now_secs).await?;
-    parse_searxng_json(&body, limit).map_err(|err| {
-        ProviderFailure::new(
-            Some(200),
-            60,
-            format!("searxng search response parse failed: {err}"),
-        )
-    })
+    parse_searxng_json(&body, limit).map_err(|err| parse_failure(ConcreteProvider::Searxng, err))
 }
 
 pub(crate) async fn search_ddg(

@@ -1,13 +1,11 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::auth::CredentialProvider;
-use crate::context::{acquire_private_lock, ensure_private_dir};
+use crate::context::{acquire_private_lock, ensure_private_dir, write_private_file_atomic};
 
 use super::{ConcreteProvider, Freshness};
 
@@ -16,8 +14,6 @@ const LOCK_FILE_NAME: &str = "search-state.lock";
 pub(crate) const BRAVE_BURST_WINDOW_MS: u64 = 1_100;
 const BRAVE_MAX_PACING_WAIT_MS: u64 = 2_500;
 const MAX_FUTURE_SLOT_HORIZON_MS: u64 = 5_000;
-
-static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProviderHealthEntry {
@@ -711,44 +707,7 @@ fn read_state_map(path: &Path) -> BTreeMap<String, ProviderHealthEntry> {
 }
 
 fn save_state_atomic(path: &Path, map: &BTreeMap<String, ProviderHealthEntry>) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("search state path has no parent"))?;
-    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp_path = parent.join(format!(
-        "{STATE_FILE_NAME}.tmp.{}.{seq}",
-        std::process::id()
-    ));
-
     let payload = serde_json::to_vec_pretty(map)?;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    }
-
-    let write_res = (|| -> Result<()> {
-        let mut file = opts.open(&tmp_path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        file.write_all(&payload)?;
-        file.sync_all()?;
-        Ok(())
-    })();
-
-    if let Err(err) = write_res {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(err);
-    }
-
-    if let Err(err) = std::fs::rename(&tmp_path, path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(err.into());
-    }
+    write_private_file_atomic(path, &payload)?;
     Ok(())
 }

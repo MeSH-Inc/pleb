@@ -1,15 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::rules::parent_domain;
+use crate::context::{acquire_private_lock, write_private_file_atomic};
 
 const STRATEGY_TTL_SECS: u64 = 7 * 24 * 3600;
 const TIMEOUT_TTL_SECS: u64 = 24 * 3600;
-static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SiteCacheEntry {
@@ -153,17 +152,7 @@ fn acquire_cache_lock(cache_path: &Path) -> std::io::Result<std::fs::File> {
     if let Some(dir) = cache_path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let lock_path = cache_path.with_file_name("site-cache.lock");
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).truncate(false).read(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let file = opts.open(&lock_path)?;
-    file.lock()?;
-    Ok(file)
+    acquire_private_lock(&cache_path.with_file_name("site-cache.lock"))
 }
 
 fn is_expired(entry: &SiteCacheEntry, now_secs: u64) -> bool {
@@ -178,39 +167,9 @@ fn save_atomic(path: &Path, entries: &HashMap<String, SiteCacheEntry>) -> std::i
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let data = serde_json::to_string_pretty(entries)
+    let data = serde_json::to_vec_pretty(entries)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("site-cache.json");
-    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = path.with_file_name(format!("{}.tmp.{}.{}", file_name, std::process::id(), seq));
-
-    let write_res = (|| -> std::io::Result<()> {
-        use std::io::Write;
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut file = opts.open(&tmp)?;
-        file.write_all(data.as_bytes())?;
-        file.flush()?;
-        Ok(())
-    })();
-    if let Err(err) = write_res {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(err);
-    }
-
-    if let Err(err) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(err);
-    }
-    Ok(())
+    write_private_file_atomic(path, &data)
 }
 
 fn now_epoch_secs() -> u64 {

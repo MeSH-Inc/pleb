@@ -1,9 +1,13 @@
 use anyhow::Result;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::policy::{robots::RobotsCache, SiteCache, SiteRules};
 use crate::transport::{cef::CefRenderer, TransportClient};
+
+static ATOMIC_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -126,6 +130,65 @@ pub fn acquire_private_lock(lock_path: &Path) -> std::io::Result<std::fs::File> 
     Ok(lock_file)
 }
 
+pub(crate) fn write_private_file_atomic(path: &Path, payload: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("path has no parent directory: {}", path.display()),
+        )
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("state.json");
+    let pid = std::process::id();
+
+    let (temp_path, mut temp_file) = (0..16)
+        .find_map(|_| {
+            let seq = ATOMIC_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let candidate = parent.join(format!("{file_name}.tmp.{pid}.{seq}"));
+            let mut opts = std::fs::OpenOptions::new();
+            opts.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            }
+            match opts.open(&candidate) {
+                Ok(file) => Some(Ok((candidate, file))),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(err) => Some(Err(err)),
+            }
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("failed to allocate temporary file in {}", parent.display()),
+            )
+        })??;
+
+    let write_result = (|| -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            temp_file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        temp_file.write_all(payload)?;
+        temp_file.sync_all()
+    })();
+    drop(temp_file);
+
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    if let Err(err) = std::fs::rename(&temp_path, path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    Ok(())
+}
+
 pub struct RuntimeContext {
     pub config: RuntimeConfig,
     pub client: TransportClient,
@@ -246,15 +309,5 @@ pub fn clear_state_dir(state_dir: &Path) -> Result<()> {
     drop(lock_file);
 
     crate::search::clear_search_state(state_dir)?;
-    let search_state_file = state_dir.join("search-state.json");
-    if search_state_file.exists() {
-        let search_lock = acquire_private_lock(&state_dir.join("search-state.lock"))?;
-        match std::fs::remove_file(&search_state_file) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
-        }
-        drop(search_lock);
-    }
     Ok(())
 }
