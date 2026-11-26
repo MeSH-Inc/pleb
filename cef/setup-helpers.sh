@@ -6,7 +6,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEST="${1:-$SCRIPT_DIR/Frameworks}"
-CEF_DIR="${2:-$(ls -d "$SCRIPT_DIR"/cef_binary_144* 2>/dev/null | head -1 || true)}"
+CEF_DIR="${2:-$(ls -d "$SCRIPT_DIR"/cef_binary_* 2>/dev/null | head -1 || true)}"
+CEF_API_VERSION="${3:-15400}"
 
 if [ -z "$CEF_DIR" ] || [ ! -d "$CEF_DIR" ]; then
     echo "Error: CEF distribution not found (checked '$CEF_DIR')" >&2
@@ -23,7 +24,7 @@ echo "Setting up CEF helper bundles in $DEST..."
 
 # Compile helper binary
 echo "Compiling wick Helper..."
-clang -DCEF_API_VERSION=14400 \
+clang -DCEF_API_VERSION="${CEF_API_VERSION}" \
     -o "$TMP_HELPER" \
     "$SCRIPT_DIR/helper.m" \
     -I"$SCRIPT_DIR" \

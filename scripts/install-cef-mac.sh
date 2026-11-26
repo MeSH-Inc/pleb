@@ -80,11 +80,12 @@ else
     INSTALL_DIR="$STATE_HOME/cef"
 fi
 
-CEF_VERSION="144.0.18+gc5b2ec2+chromium-144.0.7559.246"
+CEF_VERSION="154.0.34+g14c5a08+chromium-154.0.8037.98"
+CEF_API_VERSION="15400"
 CEF_PLATFORM="macosarm64"
 CEF_DIR="cef_binary_${CEF_VERSION}_${CEF_PLATFORM}_minimal"
 CEF_URL="https://cef-builds.spotifycdn.com/${CEF_DIR}.tar.bz2"
-CEF_SHA1="d0e87e125ddfd147ae0e6605445ffe9537c123e3"
+CEF_SHA1="b7081f6609e5edccf07be96b5d7977329fbe1bdf"
 
 SDK_CACHE_DIR="${HOME}/.cache/mesh-wick/cef-sdk"
 SDK_TARBALL="${SDK_CACHE_DIR}/${CEF_DIR}.tar.bz2"
@@ -179,7 +180,7 @@ fi
 
 echo "Compiling wick-renderer (${RENDERER_PROTOCOL})..."
 clang -o "$TMP_BUILD_BIN" "$RENDERER_SRC/renderer.m" \
-    -DCEF_API_VERSION=14400 \
+    -DCEF_API_VERSION="${CEF_API_VERSION}" \
     -I"$RENDERER_SRC" \
     -I"$SDK_DIR" \
     -F"$SDK_DIR/Release" \
@@ -226,7 +227,7 @@ cp -R "$SDK_DIR/Release/Chromium Embedded Framework.framework" \
     "$APP_DIR/Contents/Frameworks/"
 
 echo "Building CEF helper bundles..."
-bash "$RENDERER_SRC/setup-helpers.sh" "$APP_DIR/Contents/Frameworks" "$SDK_DIR"
+bash "$RENDERER_SRC/setup-helpers.sh" "$APP_DIR/Contents/Frameworks" "$SDK_DIR" "$CEF_API_VERSION"
 
 # Each helper .app looks in its own Contents/Frameworks via @executable_path/../Frameworks.
 for helper in "$APP_DIR/Contents/Frameworks"/wick\ Helper*.app; do

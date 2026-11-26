@@ -1,21 +1,20 @@
 #!/bin/bash
-# Download prebuilt libcronet.so for Linux from SagerNet releases.
+# Download prebuilt libcronet.so for Linux from the sagernet/cronet-go 'go' branch.
+# Built from Chromium 154.0.8037.49 (matching macOS libcronet.a and src/transport/mod.rs).
 set -euo pipefail
 
-CRONET_VERSION="143.0.7499.109-2"
-RELEASE_URL="https://github.com/SagerNet/cronet-go/releases/download/${CRONET_VERSION}"
+COMMIT="2767273ce7ab"
+BASE_URL="https://raw.githubusercontent.com/SagerNet/cronet-go/${COMMIT}/lib"
 
 ARCH=$(uname -m)
 case "$ARCH" in
     x86_64)
         DIR="linux_amd64"
-        LIB="libcronet-linux-amd64.so"
-        SHA256="436fbbea68293ca4b844e0d24bd61dc7e7d55ef08af47ab85b6d0f99f05f2129"
+        SHA256="fcc7c263c15e4276a315dc094f584f8737874387d06830fd9c29e3acf7a44aa9"
         ;;
     aarch64)
         DIR="linux_arm64"
-        LIB="libcronet-linux-arm64.so"
-        SHA256="288341d94a086696e586002044f3167b4930867458d96741e19e8046429ae45c"
+        SHA256="9633c2d0e1e4a41d9ba5da72810d87d6211e12cb6ce126ed5043f288023196b9"
         ;;
     *)
         echo "Error: unsupported architecture: $ARCH" >&2
@@ -47,8 +46,8 @@ if [ -f "$DEST/libcronet.so" ]; then
     fi
 fi
 
-echo "Downloading ${LIB} for Linux ${ARCH}..."
-curl -fL --progress-bar -o "$DEST/libcronet.so" "${RELEASE_URL}/${LIB}"
+echo "Downloading libcronet.so for Linux ${ARCH} (Chromium 154.0.8037.49)..."
+curl -fL --progress-bar -o "$DEST/libcronet.so" "${BASE_URL}/${DIR}/libcronet.so"
 
 echo "Verifying checksum..."
 if ! verify_sha256 "$DEST/libcronet.so"; then

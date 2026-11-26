@@ -1,13 +1,13 @@
 #!/bin/bash
 # Download prebuilt libcronet.a for macOS arm64 from the sagernet/cronet-go 'go' branch.
-# This is a ~40MB static library built from Chromium 143.
+# This is a ~48MB static library built from Chromium 154.0.8037.49.
 
 set -euo pipefail
 
 ARCH=$(uname -m)
-# Pinned commit on the 'go' branch for reproducibility
-COMMIT="2fef65f9dba9"
-SHA256="828f9ce5595d3aa2c9be90e64e4e1b5f9120be70c101e1dbbdde4ef81cf67eed"
+# Pinned commit on the 'go' branch for reproducibility (Chromium 154.0.8037.49)
+COMMIT="2767273ce7ab"
+SHA256="d25cd5f048901cc16abbf875a9ca79ad542656e34c44d184acf4ef8823733be9"
 
 case "$ARCH" in
     arm64)  DIR="darwin_arm64" ;;

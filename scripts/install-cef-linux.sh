@@ -81,11 +81,12 @@ else
     INSTALL_DIR="$STATE_HOME/cef"
 fi
 
-CEF_VERSION="144.0.18+gc5b2ec2+chromium-144.0.7559.246"
+CEF_VERSION="154.0.34+g14c5a08+chromium-154.0.8037.98"
+CEF_API_VERSION="15400"
 CEF_PLATFORM="linux64"
 CEF_DIR="cef_binary_${CEF_VERSION}_${CEF_PLATFORM}_minimal"
 CEF_URL="https://cef-builds.spotifycdn.com/${CEF_DIR}.tar.bz2"
-CEF_SHA1="b9940762fa6ef10a04167feb193c1952f35b8f44"
+CEF_SHA1="15c91ad767097217b2e82ba8b933fe30b134be69"
 
 SDK_CACHE_DIR="${HOME}/.cache/mesh-wick/cef-sdk"
 SDK_TARBALL="${SDK_CACHE_DIR}/${CEF_DIR}.tar.bz2"
@@ -196,7 +197,7 @@ strip libcef.so libEGL.so libGLESv2.so libvk_swiftshader.so libvulkan.so.1 2>/de
 
 echo "Compiling wick-renderer and wick-helper (${RENDERER_PROTOCOL})..."
 gcc -o wick-renderer "$RENDERER_SRC/renderer_linux.c" \
-    -DCEF_API_VERSION=14400 \
+    -DCEF_API_VERSION="${CEF_API_VERSION}" \
     -I"$SDK_DIR" \
     -I"$RENDERER_SRC" \
     -L. -lcef \
@@ -204,7 +205,7 @@ gcc -o wick-renderer "$RENDERER_SRC/renderer_linux.c" \
     -pthread
 
 gcc -o wick-helper "$RENDERER_SRC/helper_linux.c" \
-    -DCEF_API_VERSION=14400 \
+    -DCEF_API_VERSION="${CEF_API_VERSION}" \
     -I"$SDK_DIR" \
     -I"$RENDERER_SRC" \
     -L. -lcef \

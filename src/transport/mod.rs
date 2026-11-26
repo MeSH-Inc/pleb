@@ -8,8 +8,8 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const CHROME_MAJOR: &str = "143";
-const CHROME_FULL: &str = "143.0.7499.109";
+const CHROME_MAJOR: usize = 154;
+const CHROME_FULL: &str = "154.0.8037.49";
 pub const MARKDOWN_ACCEPT_HEADER: &str =
     "text/markdown, text/x-markdown;q=0.95, text/html;q=0.9, application/xhtml+xml;q=0.8, */*;q=0.7";
 pub const IMAGE_ACCEPT_HEADER: &str =
@@ -359,9 +359,44 @@ pub fn chrome_user_agent() -> String {
 }
 
 fn sec_ch_ua_value() -> String {
-    format!(
-        r#""Chromium";v="{CHROME_MAJOR}", "Google Chrome";v="{CHROME_MAJOR}", "Not:A-Brand";v="24""#
-    )
+    sec_ch_ua_for_major(CHROME_MAJOR)
+}
+
+fn sec_ch_ua_for_major(major: usize) -> String {
+    const GREASE_CHARS: [char; 11] = [' ', '(', ':', '-', '.', '/', ')', ';', '=', '?', '_'];
+    const GREASE_VERSIONS: [&str; 3] = ["8", "99", "24"];
+    const ORDERS: [[usize; 3]; 6] = [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ];
+    let major_str = major.to_string();
+    let grease_brand = format!(
+        "Not{}A{}Brand",
+        GREASE_CHARS[major % GREASE_CHARS.len()],
+        GREASE_CHARS[(major + 1) % GREASE_CHARS.len()]
+    );
+    let brands = [
+        (
+            grease_brand.as_str(),
+            GREASE_VERSIONS[major % GREASE_VERSIONS.len()],
+        ),
+        ("Chromium", major_str.as_str()),
+        ("Google Chrome", major_str.as_str()),
+    ];
+    let order = ORDERS[major % ORDERS.len()];
+    let mut shuffled = [("", ""); 3];
+    for (idx, &slot) in order.iter().enumerate() {
+        shuffled[slot] = brands[idx];
+    }
+    shuffled
+        .iter()
+        .map(|(brand, ver)| format!(r#""{brand}";v="{ver}""#))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn sec_ch_ua_platform() -> &'static str {
@@ -485,6 +520,14 @@ fn request_headers_reqwest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generates_chromium_greased_sec_ch_ua_for_chrome_154() {
+        assert_eq!(
+            sec_ch_ua_for_major(154),
+            r#""Chromium";v="154", "Google Chrome";v="154", "Not A(Brand";v="99""#
+        );
+    }
 
     #[test]
     fn computes_sec_fetch_site_for_same_origin_same_site_cross_site_and_none() {
