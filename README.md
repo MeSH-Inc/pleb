@@ -2,7 +2,7 @@
 
 Local, zero-telemetry web fetch and search CLI (`wick`) for AI agents, forked from [wickproject/wick](https://github.com/wickproject/wick).
 
-Uses Chrome's network stack (Cronet) for browser-identical TLS/HTTP2/QUIC fingerprinting, an optional embedded Chromium (CEF `v5-meta`) renderer for JS-heavy pages, single-parse `O(N)` DOM-pruned compact markdown extraction with charset-aware decoding, and Brave Search API / DuckDuckGo search.
+Uses Chrome's network stack (Cronet) for browser-identical TLS/HTTP2/QUIC fingerprinting, an optional embedded Chromium (CEF `v5-meta`) renderer for JS-heavy pages, structured source negotiation (GitHub/GitLab/Gist raw source rewrites, advertised Markdown mirrors, native `text/markdown` extraction, and RSS 2.0 / Atom 1.0 / JSON Feed 1.1 conversion), single-parse `O(N)` DOM-pruned compact markdown extraction with charset-aware decoding, and Brave Search API / DuckDuckGo search.
 
 ## Build & Install
 
@@ -64,13 +64,19 @@ Key `fetch` flags:
 - `--format <markdown|html|text|raw>` (default: `markdown`; aliases `md`, `txt`)
 - `--extract <clean|article|full>` (default: `clean`)
 - `--render <auto|cef|cronet>` (default: `auto`)
+- `--source <auto|negotiate|none>` (default: `auto`):
+  - `auto`: preserves Chrome's exact primary `Accept` header while rewriting GitHub/GitLab/Gist blob/gist URLs to lossless raw sources (`strategy: "raw_source"`, with automatic `404` HTML fallback) and following advertised HTTP `Link` or HTML `<link rel="alternate" type="text/markdown">` mirrors (`strategy: "markdown_mirror"`)
+  - `negotiate`: sends `Accept: text/markdown` on the primary HTTP GET (`strategy: "markdown_negotiated"`) and probes `<path>.md` on documentation paths when HTML lacks an alternate link
+  - `none`: disables raw-source rewrites, Markdown mirror discovery, and `Accept: text/markdown` negotiation (also bypassed automatically for `--format html`, `--format raw`, and `--render cef`)
 - `--wait-for-selector <css>`
 - `--respect-robots` (disabled by default for interactive single-URL fetches)
-- `--no-rewrite` (disable host rewrites such as `reddit.com` -> `old.reddit.com`)
+- `--no-rewrite` (disable host rewrites such as `reddit.com` -> `old.reddit.com` and forge raw-source rewrites)
 - `--no-images`, `--no-links`, `--max-bytes <N>`
 - `--concurrency <N>` (batch mode max concurrent fetches, `1..=16`, default `4`, capped at 2 per host)
 - `--output <path>` (`-o`): write output to a file instead of stdout (single-URL only; created only after fetch succeeds)
 - `--json` (global flag), `--jsonl` (streaming per-URL JSON lines), `--metadata-only`
+
+Native `text/markdown` responses extract/strip YAML frontmatter in `clean`/`article` modes, resolve relative links outside code fences, and apply fence-safe `--max-bytes` truncation. Syndication feeds (RSS 2.0, Atom 1.0, and JSON Feed 1.1) are automatically converted into compact Markdown digests in `clean`/`article` modes (pass `--extract full` or `--format raw` for verbatim XML/JSON).
 
 ### Search
 

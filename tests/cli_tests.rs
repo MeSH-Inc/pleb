@@ -146,6 +146,8 @@ async fn cli_supports_value_enums_output_file_and_uniform_json_errors() {
             "Clean",
             "--render",
             "no-js",
+            "--source",
+            "None",
             "--json",
             "--metadata-only",
             &format!("{base}/ok"),
@@ -511,6 +513,11 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "--jsonl",
         "--urls-only",
         "daemon.sock",
+        "--source",
+        "raw_source",
+        "markdown_mirror",
+        "markdown_negotiated",
+        "RSS 2.0",
     ] {
         assert!(
             readme.contains(required),

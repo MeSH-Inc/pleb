@@ -9,8 +9,10 @@ use tokio::task::JoinSet;
 use crate::context::RuntimeContext;
 use crate::extract::{self, ExtractOptions, OutputFormat, ParsedHtml};
 use crate::policy::{
-    classify_response_with_context, detect_interstitial_challenge, plan_strategy, PrimaryTransport,
-    RenderMode, ResponseClassification, SourceMode,
+    classify_response_with_context, detect_interstitial_challenge, is_markdown_content_type,
+    is_mirror_acceptable_content_type, parse_markdown_link_header, plan_strategy,
+    resolve_raw_source_candidate, PrimaryTransport, RawSourceCandidate, RawSourceKind, RenderMode,
+    ResponseClassification, SourceMode,
 };
 use crate::transport::cef::{
     CefProtocolError, CefRenderOptions, CefRenderResult, CefRenderer, CefTimeoutError,
@@ -157,6 +159,7 @@ pub struct FetchRawResult {
 struct AcquiredPage {
     body: String,
     final_url: String,
+    extract_base_url: Option<url::Url>,
     status_code: u16,
     content_type: Option<String>,
     strategy: String,
@@ -179,19 +182,44 @@ pub async fn fetch_document(
     let (effective, _) =
         resolve_and_check_robots(ctx, url, options.apply_rewrites, options.respect_robots).await?;
 
+    let effective_source_mode = if options.source == SourceMode::None
+        || matches!(
+            options.extract.format,
+            OutputFormat::Html | OutputFormat::Raw
+        )
+        || options.render == RenderMode::Cef
+    {
+        SourceMode::None
+    } else {
+        options.source
+    };
+
+    if options.apply_rewrites && effective_source_mode != SourceMode::None {
+        if let Some(candidate) = resolve_raw_source_candidate(&effective) {
+            if let Some(output) =
+                try_fetch_raw_source(ctx, url, &effective, &candidate, options, start).await
+            {
+                return Ok(output);
+            }
+        }
+    }
+
     let page = acquire_page(
         ctx,
         &effective,
         options.render,
+        effective_source_mode,
         options.wait_for_selector.as_deref(),
+        options.respect_robots,
     )
     .await?;
 
     let final_url_parsed = url::Url::parse(&page.final_url).unwrap_or_else(|_| effective.clone());
+    let extract_url = page.extract_base_url.as_ref().unwrap_or(&final_url_parsed);
     let extracted = extract::extract_document_parsed(
         &page.body,
         page.parsed,
-        &final_url_parsed,
+        extract_url,
         page.content_type.as_deref(),
         &options.extract,
     )?;
@@ -218,7 +246,15 @@ pub async fn fetch_html(
     respect_robots: bool,
 ) -> std::result::Result<FetchHtmlResult, FetchError> {
     let (effective, _) = resolve_and_check_robots(ctx, url, true, respect_robots).await?;
-    let page = acquire_page(ctx, &effective, RenderMode::Auto, None).await?;
+    let page = acquire_page(
+        ctx,
+        &effective,
+        RenderMode::Auto,
+        SourceMode::None,
+        None,
+        respect_robots,
+    )
+    .await?;
     Ok(FetchHtmlResult {
         html: page.body,
         url: page.final_url,
@@ -290,11 +326,187 @@ async fn resolve_and_check_robots(
     Ok((effective, host))
 }
 
+async fn try_fetch_raw_source(
+    ctx: &RuntimeContext,
+    original_url: &str,
+    effective_url: &url::Url,
+    candidate: &RawSourceCandidate,
+    options: &FetchOptions,
+    start: Instant,
+) -> Option<FetchOutput> {
+    let raw_str = candidate.raw_url.as_str();
+    if options.respect_robots && !ctx.robots.is_allowed(&ctx.client, raw_str).await {
+        return None;
+    }
+
+    let max_bytes = ctx
+        .config
+        .max_response_bytes
+        .unwrap_or(DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES);
+    let resp = ctx
+        .client
+        .get_with_options(raw_str, ctx.config.timeout, max_bytes, false)
+        .await
+        .ok()?;
+    if resp.status >= 400 || resp.is_html() {
+        return None;
+    }
+    if extract::detect_binary_content(resp.content_type.as_deref(), &resp.body).is_some()
+        || extract::detect_binary_content(None, &resp.body).is_some()
+    {
+        return None;
+    }
+
+    let body = resp.text();
+    let raw_final_url =
+        url::Url::parse(&resp.final_url).unwrap_or_else(|_| candidate.raw_url.clone());
+    let extracted = match candidate.kind {
+        RawSourceKind::Markdown => extract::extract_document_parsed(
+            &body,
+            None,
+            &raw_final_url,
+            Some("text/markdown"),
+            &options.extract,
+        )
+        .ok()?,
+        RawSourceKind::Code { language } => {
+            if is_markdown_content_type(resp.content_type.as_deref()) {
+                extract::extract_document_parsed(
+                    &body,
+                    None,
+                    &raw_final_url,
+                    Some("text/markdown"),
+                    &options.extract,
+                )
+                .ok()?
+            } else {
+                extract::wrap_raw_code_document(
+                    &candidate.filename,
+                    &body,
+                    language,
+                    &options.extract,
+                )
+            }
+        }
+    };
+
+    let timing_ms = start.elapsed().as_millis() as u64;
+    if let Some(host) = effective_url.host_str() {
+        ctx.site_cache
+            .record(host, ctx.client.transport_name(), timing_ms);
+    }
+    let content_bytes = extracted.content.len();
+    Some(FetchOutput {
+        url: original_url.to_string(),
+        final_url: resp.final_url,
+        status_code: resp.status,
+        content_type: resp.content_type,
+        title: extracted.title,
+        content: extracted.content,
+        content_bytes,
+        strategy: "raw_source".to_string(),
+        escalated: false,
+        truncated: extracted.truncated,
+        timing_ms,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn try_fetch_markdown_mirror(
+    ctx: &RuntimeContext,
+    requested: &url::Url,
+    final_url: &str,
+    link_header: Option<&str>,
+    html_body: &str,
+    parsed_html: &mut Option<ParsedHtml>,
+    source_mode: SourceMode,
+    respect_robots: bool,
+    max_bytes: usize,
+) -> Option<(String, url::Url)> {
+    let final_url_parsed = url::Url::parse(final_url).unwrap_or_else(|_| requested.clone());
+
+    let advertised = link_header
+        .and_then(|h| parse_markdown_link_header(h, &final_url_parsed))
+        .or_else(|| {
+            let doc = parsed_html.get_or_insert_with(|| ParsedHtml::parse(html_body));
+            doc.markdown_alternate_url(&final_url_parsed)
+        });
+
+    if let Some(mirror_url) = advertised {
+        if mirror_url != final_url_parsed {
+            if respect_robots
+                && !ctx
+                    .robots
+                    .is_allowed(&ctx.client, mirror_url.as_str())
+                    .await
+            {
+                return None;
+            }
+            if let Ok(resp) = ctx
+                .client
+                .get_with_options(mirror_url.as_str(), ctx.config.timeout, max_bytes, true)
+                .await
+            {
+                if resp.status == 200
+                    && !resp.is_html()
+                    && is_mirror_acceptable_content_type(resp.content_type.as_deref())
+                    && extract::detect_binary_content(None, &resp.body).is_none()
+                {
+                    let text = resp.text();
+                    if !text.trim().is_empty() {
+                        let base = url::Url::parse(&resp.final_url).unwrap_or(mirror_url);
+                        return Some((text, base));
+                    }
+                }
+            }
+        }
+        return None;
+    }
+
+    if source_mode == SourceMode::Negotiate {
+        let path = final_url_parsed.path();
+        let lower_path = path.to_ascii_lowercase();
+        if !path.is_empty()
+            && !lower_path.ends_with('/')
+            && !lower_path.ends_with(".html")
+            && !lower_path.ends_with(".htm")
+            && !lower_path.ends_with(".md")
+        {
+            let mut probe = final_url_parsed.clone();
+            probe.set_path(&format!("{path}.md"));
+            probe.set_fragment(None);
+            if respect_robots && !ctx.robots.is_allowed(&ctx.client, probe.as_str()).await {
+                return None;
+            }
+            if let Ok(resp) = ctx
+                .client
+                .get_with_options(probe.as_str(), ctx.config.timeout, max_bytes, true)
+                .await
+            {
+                if resp.status == 200
+                    && is_markdown_content_type(resp.content_type.as_deref())
+                    && extract::detect_binary_content(None, &resp.body).is_none()
+                {
+                    let text = resp.text();
+                    if !text.trim().is_empty() {
+                        let base = url::Url::parse(&resp.final_url).unwrap_or(probe);
+                        return Some((text, base));
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 async fn acquire_page(
     ctx: &RuntimeContext,
     parsed: &url::Url,
     render_mode: RenderMode,
+    source_mode: SourceMode,
     wait_for_selector: Option<&str>,
+    respect_robots: bool,
 ) -> std::result::Result<AcquiredPage, FetchError> {
     let start = Instant::now();
     let url_str = parsed.as_str();
@@ -349,14 +561,17 @@ async fn acquire_page(
         .config
         .max_response_bytes
         .unwrap_or(DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES);
+    let accept_markdown = source_mode == SourceMode::Negotiate
+        || (source_mode == SourceMode::Auto && rule.is_some_and(|r| r.accept_markdown));
     let resp = ctx
         .client
-        .get_with_limits(url_str, ctx.config.timeout, max_bytes)
+        .get_with_options(url_str, ctx.config.timeout, max_bytes, accept_markdown)
         .await
         .map_err(|e| map_transport_error(url_str, e, max_bytes))?;
     let status = resp.status;
     let final_url = resp.final_url.clone();
     let content_type = resp.content_type.clone();
+    let link_header = resp.link_header.clone();
     let is_html = resp.is_html();
 
     if status < 400 {
@@ -384,12 +599,60 @@ async fn acquire_page(
 
     match classification {
         ResponseClassification::Ok => {
+            if accept_markdown && status < 400 && is_markdown_content_type(content_type.as_deref())
+            {
+                let timing_ms = start.elapsed().as_millis() as u64;
+                ctx.site_cache
+                    .record(host, ctx.client.transport_name(), timing_ms);
+                return Ok(AcquiredPage {
+                    body,
+                    final_url,
+                    extract_base_url: None,
+                    status_code: status,
+                    content_type,
+                    strategy: "markdown_negotiated".to_string(),
+                    escalated: cef_fallback,
+                    parsed: None,
+                });
+            }
+
+            if source_mode != SourceMode::None && status == 200 && is_html {
+                if let Some((mirror_body, mirror_base_url)) = try_fetch_markdown_mirror(
+                    ctx,
+                    parsed,
+                    &final_url,
+                    link_header.as_deref(),
+                    &body,
+                    &mut parsed_html,
+                    source_mode,
+                    respect_robots,
+                    max_bytes,
+                )
+                .await
+                {
+                    let timing_ms = start.elapsed().as_millis() as u64;
+                    ctx.site_cache
+                        .record(host, ctx.client.transport_name(), timing_ms);
+                    return Ok(AcquiredPage {
+                        body: mirror_body,
+                        final_url,
+                        extract_base_url: Some(mirror_base_url),
+                        status_code: status,
+                        content_type: Some("text/markdown".to_string()),
+                        strategy: "markdown_mirror".to_string(),
+                        escalated: cef_fallback,
+                        parsed: None,
+                    });
+                }
+            }
+
             let timing_ms = start.elapsed().as_millis() as u64;
             let strategy = ctx.client.transport_name().to_string();
             ctx.site_cache.record(host, &strategy, timing_ms);
             Ok(AcquiredPage {
                 body,
                 final_url,
+                extract_base_url: None,
                 status_code: status,
                 content_type,
                 strategy,
@@ -418,6 +681,7 @@ async fn acquire_page(
             Ok(AcquiredPage {
                 body,
                 final_url,
+                extract_base_url: None,
                 status_code: status,
                 content_type,
                 strategy,
@@ -529,6 +793,7 @@ fn classify_cef_result(
             Ok(AcquiredPage {
                 body: res.html,
                 final_url: res.final_url,
+                extract_base_url: None,
                 status_code: res.status_code,
                 content_type: Some("text/html".to_string()),
                 strategy: "cef".to_string(),
@@ -923,5 +1188,175 @@ mod tests {
         assert!(is_non_retryable_cef_error(&invalid_selector_err));
         let mapped = map_transport_error("https://example.com", invalid_selector_err, 1024);
         assert!(matches!(mapped, FetchError::Transport(_)));
+    }
+
+    #[tokio::test]
+    async fn try_fetch_raw_source_handles_markdown_code_404_and_binary_fallback() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let (status, ct, body): (&str, &str, &[u8]) = match path {
+                        "/README.md" => (
+                            "200 OK",
+                            "text/plain; charset=utf-8",
+                            b"# Raw Readme\n\nHello raw.",
+                        ),
+                        "/lib.rs" => (
+                            "200 OK",
+                            "text/plain; charset=utf-8",
+                            b"pub fn answer() -> u32 { 42 }\n",
+                        ),
+                        "/binary.bin" => ("200 OK", "application/pdf", b"%PDF-1.7\n"),
+                        "/missing.rs" => ("404 Not Found", "text/plain", b"not found"),
+                        "/robots.txt" => (
+                            "200 OK",
+                            "text/plain",
+                            b"User-agent: *\nDisallow: /lib.rs\n",
+                        ),
+                        _ => ("404 Not Found", "text/plain", b"unknown"),
+                    };
+                    let hdr = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(hdr.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                });
+            }
+        });
+
+        let state_dir =
+            std::path::PathBuf::from(format!("/tmp/wick-t-{}-rawsrc", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let ctx = RuntimeContext::new(crate::context::RuntimeConfig {
+            state_dir: state_dir.clone(),
+            timeout: Duration::from_secs(5),
+            cef_timeout: Duration::from_secs(5),
+            use_daemon: false,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let effective = url::Url::parse("https://github.com/org/repo/blob/main/README.md").unwrap();
+        let opts = FetchOptions {
+            render: RenderMode::Cronet,
+            ..Default::default()
+        };
+
+        // 1. Markdown raw source succeeds with strategy == "raw_source".
+        let md_cand = RawSourceCandidate {
+            raw_url: url::Url::parse(&format!("{base}/README.md")).unwrap(),
+            filename: "README.md".to_string(),
+            kind: RawSourceKind::Markdown,
+        };
+        let md_out = try_fetch_raw_source(
+            &ctx,
+            effective.as_str(),
+            &effective,
+            &md_cand,
+            &opts,
+            Instant::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(md_out.strategy, "raw_source");
+        assert!(md_out.content.contains("Hello raw."));
+
+        // 2. Code raw source succeeds with strategy == "raw_source".
+        let rs_cand = RawSourceCandidate {
+            raw_url: url::Url::parse(&format!("{base}/lib.rs")).unwrap(),
+            filename: "lib.rs".to_string(),
+            kind: RawSourceKind::Code {
+                language: Some("rust"),
+            },
+        };
+        let rs_out = try_fetch_raw_source(
+            &ctx,
+            effective.as_str(),
+            &effective,
+            &rs_cand,
+            &opts,
+            Instant::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rs_out.strategy, "raw_source");
+        assert!(rs_out.content.contains("```rust"));
+        assert!(rs_out.content.contains("pub fn answer()"));
+
+        // 3. 404 returns None so fetch_document falls back to HTML.
+        let missing_cand = RawSourceCandidate {
+            raw_url: url::Url::parse(&format!("{base}/missing.rs")).unwrap(),
+            filename: "missing.rs".to_string(),
+            kind: RawSourceKind::Code {
+                language: Some("rust"),
+            },
+        };
+        assert!(try_fetch_raw_source(
+            &ctx,
+            effective.as_str(),
+            &effective,
+            &missing_cand,
+            &opts,
+            Instant::now()
+        )
+        .await
+        .is_none());
+
+        // 4. Binary content returns None so fetch_document falls back cleanly.
+        let bin_cand = RawSourceCandidate {
+            raw_url: url::Url::parse(&format!("{base}/binary.bin")).unwrap(),
+            filename: "binary.bin".to_string(),
+            kind: RawSourceKind::Code { language: None },
+        };
+        assert!(try_fetch_raw_source(
+            &ctx,
+            effective.as_str(),
+            &effective,
+            &bin_cand,
+            &opts,
+            Instant::now()
+        )
+        .await
+        .is_none());
+
+        // 5. respect_robots=true skips disallowed raw_url.
+        let robots_opts = FetchOptions {
+            respect_robots: true,
+            ..opts
+        };
+        assert!(try_fetch_raw_source(
+            &ctx,
+            effective.as_str(),
+            &effective,
+            &rs_cand,
+            &robots_opts,
+            Instant::now()
+        )
+        .await
+        .is_none());
+
+        let _ = std::fs::remove_dir_all(&state_dir);
     }
 }

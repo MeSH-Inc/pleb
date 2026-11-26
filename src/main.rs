@@ -7,7 +7,7 @@ use mesh_wick::extract::{format_page_section, ExtractMode, OutputFormat};
 use mesh_wick::fetch::{
     self, BatchFetchOptions, BatchItemResult, FetchError, FetchOptions, FetchOutput,
 };
-use mesh_wick::policy::RenderMode;
+use mesh_wick::policy::{RenderMode, SourceMode};
 use mesh_wick::search::{self, Freshness, SearchOptions, SearchProvider};
 use mesh_wick::transport::cef::{self, RendererProbe};
 use serde::Serialize;
@@ -89,6 +89,9 @@ enum Command {
         /// Transport mode
         #[arg(long, value_enum, default_value_t = RenderMode::Auto, ignore_case = true)]
         render: RenderMode,
+        /// Structured source negotiation mode
+        #[arg(long, value_enum, default_value_t = SourceMode::Auto, ignore_case = true)]
+        source: SourceMode,
         /// CSS selector to wait for when CEF renders
         #[arg(long)]
         wait_for_selector: Option<String>,
@@ -530,6 +533,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             format,
             extract,
             render,
+            source,
             wait_for_selector,
             respect_robots,
             no_rewrite,
@@ -622,7 +626,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     max_bytes,
                 },
                 render,
-                source: mesh_wick::policy::SourceMode::Auto,
+                source,
                 wait_for_selector,
                 respect_robots,
                 apply_rewrites: !no_rewrite,

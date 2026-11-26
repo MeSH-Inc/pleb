@@ -2,6 +2,7 @@ pub mod cache;
 pub mod classify;
 pub mod robots;
 pub mod rules;
+pub mod source;
 
 pub use cache::{SiteCache, SiteCacheEntry};
 pub use classify::{
@@ -9,6 +10,10 @@ pub use classify::{
     detect_challenge, detect_interstitial_challenge, detect_js_shell, ResponseClassification,
 };
 pub use rules::{parent_domain, SiteRule, SiteRules};
+pub use source::{
+    is_markdown_content_type, is_mirror_acceptable_content_type, is_safe_alternate_url,
+    parse_markdown_link_header, resolve_raw_source_candidate, RawSourceCandidate, RawSourceKind,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum RenderMode {

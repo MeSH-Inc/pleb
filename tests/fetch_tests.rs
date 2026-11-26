@@ -7,7 +7,9 @@ use mesh_wick::fetch::{
     batch_exit_code, fetch_batch, fetch_document, fetch_raw, parse_batch_stdin, BatchFetchOptions,
     BatchItemResult, FetchError, FetchOptions,
 };
-use mesh_wick::policy::RenderMode;
+use mesh_wick::policy::{
+    parse_markdown_link_header, resolve_raw_source_candidate, RawSourceKind, RenderMode, SourceMode,
+};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -1143,4 +1145,325 @@ for raw in sys.stdin:
         2,
         "non-challenge empty CEF render should still retry once"
     );
+}
+
+#[tokio::test]
+async fn source_negotiation_dot_md_probe_and_bypass_modes() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+
+                let resp = match path {
+                    "/docs/guide" => http_response(
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        b"<html><head><title>HTML Guide</title></head><body><main><p>HTML body</p></main></body></html>",
+                    ),
+                    "/docs/guide.md" => http_response(
+                        "200 OK",
+                        "text/markdown; charset=utf-8",
+                        b"# Markdown Guide\n\nClean markdown mirror from dot-md probe.",
+                    ),
+                    "/docs/soft404" => http_response(
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        b"<html><head><title>Real Page</title></head><body><main><p>Real HTML content</p></main></body></html>",
+                    ),
+                    "/docs/soft404.md" => http_response(
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        b"<html><body>Soft 404 HTML page</body></html>",
+                    ),
+                    _ => http_response("404 Not Found", "text/plain", b"missing"),
+                };
+                let _ = socket.write_all(&resp).await;
+            });
+        }
+    });
+
+    // Verify public forge raw-source & RFC 8288 Link header resolvers.
+    let gh_url =
+        url::Url::parse("https://github.com/tokio-rs/tokio/blob/master/tokio/src/lib.rs").unwrap();
+    let cand = resolve_raw_source_candidate(&gh_url).unwrap();
+    assert_eq!(
+        cand.raw_url.as_str(),
+        "https://raw.githubusercontent.com/tokio-rs/tokio/master/tokio/src/lib.rs"
+    );
+    assert_eq!(
+        cand.kind,
+        RawSourceKind::Code {
+            language: Some("rust")
+        }
+    );
+    let link_base = url::Url::parse("https://docs.example.com/guide").unwrap();
+    let parsed_link = parse_markdown_link_header(
+        r#"</guide.md>; rel="alternate"; type="text/markdown""#,
+        &link_base,
+    )
+    .unwrap();
+    assert_eq!(parsed_link.as_str(), "https://docs.example.com/guide.md");
+
+    let state_dir = temp_state_dir();
+    let ctx = RuntimeContext::new(RuntimeConfig {
+        state_dir: state_dir.path().to_path_buf(),
+        timeout: Duration::from_secs(5),
+        cef_timeout: Duration::from_secs(5),
+        use_daemon: false,
+        ..Default::default()
+    })
+    .unwrap();
+
+    // 1. SourceMode::Negotiate probes <path>.md when HTML lacks an alternate link.
+    let negotiate_opts = FetchOptions {
+        render: RenderMode::Cronet,
+        source: SourceMode::Negotiate,
+        ..Default::default()
+    };
+    let res = fetch_document(&ctx, &format!("{base}/docs/guide"), &negotiate_opts)
+        .await
+        .unwrap();
+    assert_eq!(res.strategy, "markdown_mirror");
+    assert!(res.final_url.ends_with("/docs/guide"));
+    assert!(res
+        .content
+        .contains("Clean markdown mirror from dot-md probe."));
+
+    // 2. Soft-404 HTML returned for <path>.md is rejected; original HTML is kept.
+    let soft404 = fetch_document(&ctx, &format!("{base}/docs/soft404"), &negotiate_opts)
+        .await
+        .unwrap();
+    assert_ne!(soft404.strategy, "markdown_mirror");
+    assert!(soft404.content.contains("Real HTML content"));
+
+    // 3. SourceMode::None bypasses structured source resolution.
+    let none_opts = FetchOptions {
+        render: RenderMode::Cronet,
+        source: SourceMode::None,
+        ..Default::default()
+    };
+    let none_res = fetch_document(&ctx, &format!("{base}/docs/guide"), &none_opts)
+        .await
+        .unwrap();
+    assert_ne!(none_res.strategy, "markdown_mirror");
+    assert!(none_res.content.contains("HTML body"));
+
+    // 4. OutputFormat::Html bypasses structured source resolution even with SourceMode::Negotiate.
+    let html_opts = FetchOptions {
+        render: RenderMode::Cronet,
+        source: SourceMode::Negotiate,
+        extract: ExtractOptions {
+            format: OutputFormat::Html,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let html_res = fetch_document(&ctx, &format!("{base}/docs/guide"), &html_opts)
+        .await
+        .unwrap();
+    assert_ne!(html_res.strategy, "markdown_mirror");
+    assert!(html_res.content.contains("<p>HTML body</p>"));
+}
+
+#[tokio::test]
+async fn source_negotiation_follows_http_link_html_alternate_and_accept_markdown() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let accepts_markdown = req.lines().any(|line| {
+                    line.split_once(':').is_some_and(|(k, v)| {
+                        k.trim().eq_ignore_ascii_case("accept")
+                            && v.to_ascii_lowercase().contains("text/markdown")
+                    })
+                });
+
+                let resp: Vec<u8> = match path {
+                    "/link-header" => {
+                        let body = b"<html><head><title>HTML Chrome</title></head><body><main><p>Heavy HTML page.</p></main></body></html>";
+                        let hdr = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nLink: </mirrors/link-header.md>; rel=\"alternate\"; type=\"text/markdown\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let mut out = hdr.into_bytes();
+                        out.extend_from_slice(body);
+                        out
+                    }
+                    "/mirrors/link-header.md" => http_response(
+                        "200 OK",
+                        "text/markdown; charset=utf-8",
+                        b"---\ntitle: Link Mirror Title\n---\n\nFrom HTTP Link header with [Sibling](./sibling.md).\n",
+                    ),
+                    "/html-alternate" => http_response(
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        b"<html><head><title>HTML Alternate Page</title><link rel=\"alternate\" type=\"text/markdown\" href=\"/mirrors/html-alt.md\"></head><body><main><p>HTML fallback body.</p></main></body></html>",
+                    ),
+                    "/mirrors/html-alt.md" => http_response(
+                        "200 OK",
+                        "text/markdown; charset=utf-8",
+                        b"---\ntitle: HTML Alt Mirror\n---\n\nFrom HTML head link alternate.\n",
+                    ),
+                    "/binary-mirror" => http_response(
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        b"<html><head><title>Binary Mirror Fallback</title><link rel=\"alternate\" type=\"text/markdown\" href=\"/mirrors/fake-png.md\"></head><body><main><p>Safe HTML fallback.</p></main></body></html>",
+                    ),
+                    "/mirrors/fake-png.md" => http_response(
+                        "200 OK",
+                        "text/markdown; charset=utf-8",
+                        b"\x89PNG\r\n\x1a\n\x00\x00binary-disguised-as-markdown",
+                    ),
+                    "/negotiable" => {
+                        if accepts_markdown {
+                            http_response(
+                                "200 OK",
+                                "text/markdown; charset=utf-8",
+                                b"# Negotiated Markdown\n\nServed directly via Accept header.\n",
+                            )
+                        } else {
+                            http_response(
+                                "200 OK",
+                                "text/html; charset=utf-8",
+                                b"<html><head><title>Default Chrome HTML</title></head><body><main><p>Standard HTML response.</p></main></body></html>",
+                            )
+                        }
+                    }
+                    _ => http_response("404 Not Found", "text/plain", b"missing"),
+                };
+                let _ = socket.write_all(&resp).await;
+            });
+        }
+    });
+
+    let state_dir = temp_state_dir();
+    let ctx = RuntimeContext::new(RuntimeConfig {
+        state_dir: state_dir.path().to_path_buf(),
+        timeout: Duration::from_secs(5),
+        cef_timeout: Duration::from_secs(5),
+        use_daemon: false,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let auto_opts = FetchOptions {
+        render: RenderMode::Cronet,
+        source: SourceMode::Auto,
+        ..Default::default()
+    };
+
+    // 1. HTTP Link header Markdown mirror follow in SourceMode::Auto.
+    let link_res = fetch_document(&ctx, &format!("{base}/link-header"), &auto_opts)
+        .await
+        .unwrap();
+    assert_eq!(link_res.strategy, "markdown_mirror");
+    assert!(link_res.final_url.ends_with("/link-header"));
+    assert_eq!(link_res.title.as_deref(), Some("Link Mirror Title"));
+    assert!(link_res.content.contains("From HTTP Link header"));
+    assert!(
+        link_res
+            .content
+            .contains(&format!("[Sibling]({base}/mirrors/sibling.md)")),
+        "relative link in mirror should resolve against mirror URL, got: {}",
+        link_res.content
+    );
+    assert!(!link_res.content.contains("Heavy HTML page."));
+
+    // 2. HTML <link rel="alternate" type="text/markdown"> mirror follow in SourceMode::Auto.
+    let alt_res = fetch_document(&ctx, &format!("{base}/html-alternate"), &auto_opts)
+        .await
+        .unwrap();
+    assert_eq!(alt_res.strategy, "markdown_mirror");
+    assert!(alt_res.final_url.ends_with("/html-alternate"));
+    assert_eq!(alt_res.title.as_deref(), Some("HTML Alt Mirror"));
+    assert!(alt_res.content.contains("From HTML head link alternate."));
+    assert!(!alt_res.content.contains("HTML fallback body."));
+
+    // 3. SourceMode::Auto preserves default Chrome Accept header (does NOT negotiate Markdown).
+    let auto_neg = fetch_document(&ctx, &format!("{base}/negotiable"), &auto_opts)
+        .await
+        .unwrap();
+    assert_ne!(auto_neg.strategy, "markdown_negotiated");
+    assert!(auto_neg.content.contains("Standard HTML response."));
+
+    // 4. SourceMode::Negotiate sends Accept: text/markdown and returns strategy == "markdown_negotiated".
+    let negotiate_opts = FetchOptions {
+        render: RenderMode::Cronet,
+        source: SourceMode::Negotiate,
+        ..Default::default()
+    };
+    let neg_res = fetch_document(&ctx, &format!("{base}/negotiable"), &negotiate_opts)
+        .await
+        .unwrap();
+    assert_eq!(neg_res.strategy, "markdown_negotiated");
+    assert_eq!(neg_res.title.as_deref(), Some("Negotiated Markdown"));
+    assert!(neg_res
+        .content
+        .contains("Served directly via Accept header."));
+
+    // 5. SourceMode::None and OutputFormat::Html bypass HTTP Link and HTML <link> mirrors.
+    let none_opts = FetchOptions {
+        render: RenderMode::Cronet,
+        source: SourceMode::None,
+        ..Default::default()
+    };
+    let none_link = fetch_document(&ctx, &format!("{base}/link-header"), &none_opts)
+        .await
+        .unwrap();
+    assert_ne!(none_link.strategy, "markdown_mirror");
+    assert!(none_link.content.contains("Heavy HTML page."));
+
+    let html_opts = FetchOptions {
+        render: RenderMode::Cronet,
+        source: SourceMode::Auto,
+        extract: ExtractOptions {
+            format: OutputFormat::Html,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let html_alt = fetch_document(&ctx, &format!("{base}/html-alternate"), &html_opts)
+        .await
+        .unwrap();
+    assert_ne!(html_alt.strategy, "markdown_mirror");
+    assert!(html_alt.content.contains("HTML fallback body."));
+
+    // 6. Binary PNG/NUL payload disguised as text/markdown mirror is rejected and falls back to HTML.
+    let bin_fallback = fetch_document(&ctx, &format!("{base}/binary-mirror"), &auto_opts)
+        .await
+        .unwrap();
+    assert_ne!(bin_fallback.strategy, "markdown_mirror");
+    assert!(bin_fallback.content.contains("Safe HTML fallback."));
 }
