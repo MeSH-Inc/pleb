@@ -18,7 +18,7 @@ static int get_exe_dir(char* buf, size_t bufsize) {
 
 int main(int argc, char* argv[]) {
     int has_display = (getenv("DISPLAY") != NULL);
-    int extra_args = has_display ? 7 : 9;
+    int extra_args = has_display ? 6 : 8;
 
     const char* cache_dir_arg = NULL;
     char** new_argv = (char**)malloc(sizeof(char*) * ((size_t)argc + (size_t)extra_args + 1));
@@ -55,7 +55,6 @@ int main(int argc, char* argv[]) {
         new_argv[a++] = (char*)"--enable-webgl";
     }
     new_argv[a++] = (char*)"--mute-audio";
-    new_argv[a++] = (char*)"--autoplay-policy=document-user-gesture-required";
     new_argv[a] = NULL;
 
     cef_api_hash(CEF_API_VERSION, 0);

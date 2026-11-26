@@ -6,6 +6,7 @@ pub mod native_markdown;
 pub mod resources;
 pub mod transcript;
 pub mod url;
+pub mod youtube;
 
 pub use charset::decode_text_bytes;
 pub use dom::ParsedHtml;
@@ -170,6 +171,12 @@ pub fn extract_document_parsed(
 
     if transcript::is_transcript_document(mime.as_deref(), body) {
         return transcript::extract_transcript(body, options);
+    }
+
+    if options.format != OutputFormat::Html {
+        if let Some(doc) = youtube::extract_youtube_watch(body, page_url, options) {
+            return Ok(doc);
+        }
     }
 
     if is_passthrough_non_html(content_type) {

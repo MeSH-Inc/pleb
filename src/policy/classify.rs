@@ -193,6 +193,10 @@ fn detect_js_shell_with_parsed_lower(
         return None;
     }
 
+    if crate::extract::youtube::has_embedded_youtube_metadata(body) {
+        return None;
+    }
+
     const SIGNALS: &[&str] = &[
         "javascript is not available",
         "we've detected that javascript is disabled",
