@@ -116,7 +116,7 @@ wick crawl https://docs.example.com --depth 2 --max-pages 10
 wick map https://example.com --limit 100
 ```
 
-### Session, Daemon, and Status
+### Session, Daemon, Status, and Agent Skill
 
 ```bash
 wick status
@@ -124,6 +124,13 @@ wick status --json
 wick daemon status
 wick daemon stop
 wick session clear
+wick skill print
+```
+
+To symlink the canonical `mesh-wick` skill (`skills/mesh-wick/SKILL.md`) into local agent harnesses (`~/.agents`, `~/.gemini`, `~/.claude`, `~/.codex`, `~/.config/opencode`):
+
+```bash
+bash scripts/install-skill.sh
 ```
 
 ## Configuration

@@ -546,6 +546,63 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         !readme.contains("v4-meta"),
         "README.md contains stale v4-meta reference"
     );
+
+    // Canonical skills/mesh-wick/SKILL.md must stay in sync with CLI flags, exit codes, and `wick skill print`.
+    let skill_md = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("skills/mesh-wick/SKILL.md"),
+    )
+    .unwrap();
+    for required in [
+        "name: mesh-wick",
+        "v5-meta",
+        "daemon.sock",
+        "protocol_version: 3",
+        "--source",
+        "raw_source",
+        "markdown_mirror",
+        "markdown_negotiated",
+        "--resources",
+        "--stage-resources",
+        "--referer",
+        "--stage",
+        "--jsonl",
+        "--urls-only",
+        "--metadata-only",
+        "--daemon-idle-timeout",
+        "--no-daemon",
+        "WICK_CEF_RENDERER",
+        "WICK_DAEMON_EXECUTABLE",
+        "WICK_NO_HOME_CEF",
+        "wick skill print",
+        "artifacts/",
+    ] {
+        assert!(
+            skill_md.contains(required),
+            "skills/mesh-wick/SKILL.md missing documented capability: {required}"
+        );
+    }
+    for retired in [
+        "--meta-only",
+        "--no-cef-daemon",
+        "--cef-idle-timeout",
+        "MESH_WICK_CEF_IDLE_SECS",
+        "MESH_WICK_NO_CEF_DAEMON",
+        "cef.sock",
+        "v4-meta",
+    ] {
+        assert!(
+            !skill_md.contains(retired),
+            "skills/mesh-wick/SKILL.md contains retired identifier: {retired}"
+        );
+    }
+
+    let skill_out = Command::new(wick_bin)
+        .args(["skill", "print"])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(skill_out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&skill_out.stdout), skill_md);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

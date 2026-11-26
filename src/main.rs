@@ -207,7 +207,20 @@ enum Command {
     },
     /// Show binary, Cronet, CEF, and search configuration status
     Status,
+    /// Emit the canonical version-locked mesh-wick agent skill
+    Skill {
+        #[command(subcommand)]
+        action: SkillAction,
+    },
 }
+
+#[derive(Subcommand)]
+enum SkillAction {
+    /// Print the bundled mesh-wick SKILL.md to stdout
+    Print,
+}
+
+const BUNDLED_SKILL_MD: &str = include_str!("../skills/mesh-wick/SKILL.md");
 
 #[derive(Subcommand)]
 enum DaemonAction {
@@ -543,6 +556,20 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Skill { action } => match action {
+            SkillAction::Print => {
+                if json {
+                    print_json(&serde_json::json!({
+                        "name": "mesh-wick",
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "content": BUNDLED_SKILL_MD,
+                    }))?;
+                } else {
+                    print!("{}", BUNDLED_SKILL_MD);
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+        },
         Command::Fetch {
             urls,
             format,
