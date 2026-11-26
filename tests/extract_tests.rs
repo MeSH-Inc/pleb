@@ -1560,4 +1560,25 @@ fn adversarial_canary_inverse_false_positives_preserve_valid_content() {
     )
     .unwrap();
     assert!(!no_refs.content.contains("GUIDE.md"));
+
+    // 4. Native Markdown --format text preserves literal brackets/identifiers and fenced code,
+    // while unwrapping defined shortcut refs and stripping link-ref definitions.
+    let txt_md = "Array arr[0] and [INFO] stay intact, plus `foo__bar` and [Defined].\n\n```md\n**fenced_bold** and [Keep]: ./keep.md\n```\n\n[Defined]: ./defined.md\n";
+    let txt_doc = extract_document(
+        txt_md,
+        &md_url,
+        Some("text/markdown"),
+        &ExtractOptions {
+            format: OutputFormat::Text,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(txt_doc
+        .content
+        .contains("Array arr[0] and [INFO] stay intact, plus foo__bar and Defined."));
+    assert!(txt_doc
+        .content
+        .contains("**fenced_bold** and [Keep]: ./keep.md"));
+    assert!(!txt_doc.content.contains("defined.md"));
 }

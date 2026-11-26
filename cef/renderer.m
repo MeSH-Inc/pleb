@@ -15,7 +15,7 @@ int main(int argc, char* argv[]) {
     }
 
     const char* cache_dir_arg = NULL;
-    char** new_argv = (char**)malloc(sizeof(char*) * ((size_t)argc + 4));
+    char** new_argv = (char**)malloc(sizeof(char*) * ((size_t)argc + 5));
     if (!new_argv) {
         wick_write_ready(stdout, 0, "out of memory");
         return 1;
@@ -35,6 +35,7 @@ int main(int argc, char* argv[]) {
     new_argv[new_argc++] = (char*)"--no-sandbox";
     new_argv[new_argc++] = (char*)"--disable-gpu-compositing";
     new_argv[new_argc++] = (char*)"--mute-audio";
+    new_argv[new_argc++] = (char*)"--use-mock-keychain";
     new_argv[new_argc] = NULL;
 
     cef_api_hash(CEF_API_VERSION, 0);

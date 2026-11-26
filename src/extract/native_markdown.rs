@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::HashSet;
 use url::Url;
 
 use super::markdown::{
@@ -341,12 +342,14 @@ fn rewrite_markdown_links(
     out
 }
 
-fn rewrite_link_ref_definition(
-    line: &str,
-    base_url: &Url,
-    include_images: bool,
-    include_links: bool,
-) -> Option<String> {
+struct LinkRefDef<'a> {
+    indent: &'a str,
+    label: &'a str,
+    dest: &'a str,
+    title: &'a str,
+}
+
+fn parse_link_ref_definition(line: &str) -> Option<LinkRefDef<'_>> {
     let indent = line.bytes().take_while(|&b| b == b' ').count();
     if indent > 3 || line.as_bytes().get(indent) != Some(&b'[') {
         return None;
@@ -379,21 +382,39 @@ fn rewrite_link_ref_definition(
     if dest.is_empty() || (!angle && !dest.contains(['/', '.', '#', '?', ':'])) || !valid_title {
         return None;
     }
+    Some(LinkRefDef {
+        indent: &line[..indent],
+        label,
+        dest,
+        title,
+    })
+}
+
+fn rewrite_link_ref_definition(
+    line: &str,
+    base_url: &Url,
+    include_images: bool,
+    include_links: bool,
+) -> Option<String> {
+    let def = parse_link_ref_definition(line)?;
     if !include_links && !include_images {
         return Some(String::new());
     }
-    match resolve_and_clean_url(dest, base_url) {
-        ResolvedUrl::Resolved(cleaned) => Some(if title.is_empty() {
+    match resolve_and_clean_url(def.dest, base_url) {
+        ResolvedUrl::Resolved(cleaned) => Some(if def.title.is_empty() {
             format!(
-                "{}[{label}]: {}",
-                &line[..indent],
+                "{}[{}]: {}",
+                def.indent,
+                def.label,
                 format_destination(&cleaned)
             )
         } else {
             format!(
-                "{}[{label}]: {} {title}",
-                &line[..indent],
-                format_destination(&cleaned)
+                "{}[{}]: {} {}",
+                def.indent,
+                def.label,
+                format_destination(&cleaned),
+                def.title
             )
         }),
         ResolvedUrl::Drop | ResolvedUrl::UnwrapText => Some(String::new()),
@@ -673,6 +694,7 @@ fn parse_paren_destination(s: &str, open_paren: usize) -> Option<ParenDestinatio
 }
 
 fn markdown_to_plain_text(md: &str) -> String {
+    let defined_refs = collect_defined_ref_labels(md);
     let mut lines: Vec<String> = Vec::new();
     let mut fence: Option<(char, usize)> = None;
     let mut blank_run = 0usize;
@@ -691,8 +713,11 @@ fn markdown_to_plain_text(md: &str) -> String {
             fence = Some(f);
             continue;
         }
+        if parse_link_ref_definition(raw_line).is_some() {
+            continue;
+        }
 
-        let stripped = strip_line_markdown(raw_line.trim_end());
+        let stripped = strip_line_markdown(raw_line.trim_end(), &defined_refs);
         let trimmed = stripped.trim();
         if trimmed.is_empty() {
             blank_run += 1;
@@ -712,9 +737,29 @@ fn markdown_to_plain_text(md: &str) -> String {
     lines.join("\n")
 }
 
-fn strip_line_markdown(line: &str) -> String {
+fn collect_defined_ref_labels(md: &str) -> HashSet<String> {
+    let mut refs = HashSet::new();
+    let mut fence: Option<(char, usize)> = None;
+    for line in md.lines() {
+        if let Some((fc, fl)) = fence {
+            if is_closing_fence(line, fc, fl) {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some(f) = parse_opening_fence(line) {
+            fence = Some(f);
+            continue;
+        }
+        if let Some(def) = parse_link_ref_definition(line) {
+            refs.insert(def.label.trim().to_ascii_lowercase());
+        }
+    }
+    refs
+}
+
+fn strip_line_markdown(line: &str, defined_refs: &HashSet<String>) -> String {
     let trimmed = line.trim_start();
-    // Strip ATX heading markers.
     let without_heading = {
         let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
         if (1..=6).contains(&hashes) && trimmed.as_bytes().get(hashes) == Some(&b' ') {
@@ -725,28 +770,55 @@ fn strip_line_markdown(line: &str) -> String {
     };
     let without_quote = without_heading.trim_start_matches(['>', ' ']).trim_start();
 
-    // Unwrap `[label](url)` and `![alt](url)` to label/alt, and strip backticks / emphasis markers.
     let mut out = String::with_capacity(without_quote.len());
     let bytes = without_quote.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
+        if bytes[i] == b'`' {
+            let run = count_byte_run(bytes, i, b'`');
+            if let Some(close_end) = find_closing_backticks(bytes, i + run, run) {
+                out.push_str(&without_quote[i + run..close_end - run]);
+                i = close_end;
+                continue;
+            }
+            i += run;
+            continue;
+        }
+        if matches!(bytes.get(i..i + 2), Some(b"**" | b"~~")) {
+            let marker = &bytes[i..i + 2];
+            if let Some(rel) = without_quote[i + 2..].find(std::str::from_utf8(marker).unwrap()) {
+                let inner = &without_quote[i + 2..i + 2 + rel];
+                if !inner.is_empty() {
+                    out.push_str(&strip_line_markdown(inner, defined_refs));
+                    i = i + 2 + rel + 2;
+                    continue;
+                }
+            }
+        }
         let is_image = bytes[i] == b'!' && i + 1 < bytes.len() && bytes[i + 1] == b'[';
         let is_link = bytes[i] == b'[';
         if is_image || is_link {
             let bracket_start = if is_image { i + 1 } else { i };
             if let Some(bracket_end) = find_matching_bracket(without_quote, bracket_start) {
+                let label = &without_quote[bracket_start + 1..bracket_end];
                 if bracket_end + 1 < bytes.len() && bytes[bracket_end + 1] == b'(' {
                     if let Some(parsed) = parse_paren_destination(without_quote, bracket_end + 1) {
-                        out.push_str(&without_quote[bracket_start + 1..bracket_end]);
+                        out.push_str(label);
                         i = parsed.close_paren + 1;
                         continue;
                     }
+                } else if bracket_end + 1 < bytes.len() && bytes[bracket_end + 1] == b'[' {
+                    if let Some(ref_end) = find_matching_bracket(without_quote, bracket_end + 1) {
+                        out.push_str(label);
+                        i = ref_end + 1;
+                        continue;
+                    }
+                } else if !is_image && defined_refs.contains(&label.trim().to_ascii_lowercase()) {
+                    out.push_str(label);
+                    i = bracket_end + 1;
+                    continue;
                 }
             }
-        }
-        if bytes[i] == b'`' {
-            i += 1;
-            continue;
         }
         let ch = without_quote[i..].chars().next().unwrap();
         out.push(ch);

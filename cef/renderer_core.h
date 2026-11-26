@@ -528,21 +528,26 @@ static void render_url_v5(const WickRenderRequest* req) {
 }
 
 static void wick_resolve_cache_path(const char* cache_dir_arg, char* out, size_t out_cap) {
+    char raw[4096];
     if (cache_dir_arg && cache_dir_arg[0]) {
-        snprintf(out, out_cap, "%s", cache_dir_arg);
-        return;
+        snprintf(raw, sizeof(raw), "%s", cache_dir_arg);
+    } else {
+        const char* state_home = getenv("MESH_WICK_HOME");
+        const char* home = getenv("HOME");
+        if (state_home && state_home[0]) {
+            snprintf(raw, sizeof(raw), "%s/cef-cache", state_home);
+        } else if (home && home[0]) {
+            snprintf(raw, sizeof(raw), "%s/.mesh-wick/cef-cache", home);
+        } else {
+            snprintf(raw, sizeof(raw), "/tmp/mesh-wick-%lu/cef-cache", (unsigned long)getuid());
+        }
     }
-    const char* state_home = getenv("MESH_WICK_HOME");
-    if (state_home && state_home[0]) {
-        snprintf(out, out_cap, "%s/cef-cache", state_home);
-        return;
+    char resolved[4096];
+    if (realpath(raw, resolved)) {
+        snprintf(out, out_cap, "%s", resolved);
+    } else {
+        snprintf(out, out_cap, "%s", raw);
     }
-    const char* home = getenv("HOME");
-    if (home && home[0]) {
-        snprintf(out, out_cap, "%s/.mesh-wick/cef-cache", home);
-        return;
-    }
-    snprintf(out, out_cap, "/tmp/mesh-wick-%lu/cef-cache", (unsigned long)getuid());
 }
 
 static void wick_run_request_loop(void) {

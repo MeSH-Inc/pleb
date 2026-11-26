@@ -601,3 +601,91 @@ function runScenario(setupFn) {{
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+fn extract_quoted_assignment(src: &str, key: &str) -> String {
+    let prefix = format!("{key}=\"");
+    src.lines()
+        .find_map(|line| {
+            let rest = line.trim().strip_prefix(&prefix)?;
+            let end = rest.find('"')?;
+            Some(rest[..end].to_string())
+        })
+        .unwrap_or_else(|| panic!("missing {key}=\"...\" assignment"))
+}
+
+#[test]
+fn chromium_cronet_cef_version_and_keyring_parity() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let transport_src = fs::read_to_string(root.join("src/transport/mod.rs")).unwrap();
+    let chrome_major: u32 = transport_src
+        .lines()
+        .find_map(|line| {
+            let rest = line.trim().strip_prefix("const CHROME_MAJOR: usize = ")?;
+            rest.strip_suffix(';')?.trim().parse().ok()
+        })
+        .expect("missing CHROME_MAJOR in src/transport/mod.rs");
+    let chrome_full = transport_src
+        .lines()
+        .find_map(|line| {
+            let rest = line.trim().strip_prefix("const CHROME_FULL: &str = \"")?;
+            let end = rest.find('"')?;
+            Some(rest[..end].to_string())
+        })
+        .expect("missing CHROME_FULL in src/transport/mod.rs");
+    assert!(
+        chrome_full.starts_with(&format!("{chrome_major}.0.")),
+        "CHROME_FULL ({chrome_full}) must start with {chrome_major}.0."
+    );
+
+    let cronet_mac = fs::read_to_string(root.join("scripts/download-cronet-macos.sh")).unwrap();
+    let cronet_linux = fs::read_to_string(root.join("scripts/download-cronet-linux.sh")).unwrap();
+    let mac_commit = extract_quoted_assignment(&cronet_mac, "COMMIT");
+    let linux_commit = extract_quoted_assignment(&cronet_linux, "COMMIT");
+    assert_eq!(
+        mac_commit, linux_commit,
+        "macOS and Linux Cronet scripts must pin the same SagerNet/cronet-go commit"
+    );
+    assert!(
+        cronet_mac.contains(&chrome_full) && cronet_linux.contains(&chrome_full),
+        "Cronet download scripts must stay aligned with CHROME_FULL ({chrome_full})"
+    );
+
+    let cef_mac = fs::read_to_string(root.join("scripts/install-cef-mac.sh")).unwrap();
+    let cef_linux = fs::read_to_string(root.join("scripts/install-cef-linux.sh")).unwrap();
+    let cef_helpers = fs::read_to_string(root.join("cef/setup-helpers.sh")).unwrap();
+    let mac_cef_ver = extract_quoted_assignment(&cef_mac, "CEF_VERSION");
+    let linux_cef_ver = extract_quoted_assignment(&cef_linux, "CEF_VERSION");
+    assert_eq!(
+        mac_cef_ver, linux_cef_ver,
+        "macOS and Linux CEF installers must pin the same CEF_VERSION"
+    );
+    assert!(
+        mac_cef_ver.contains(&format!("+chromium-{chrome_major}.0.")),
+        "CEF_VERSION ({mac_cef_ver}) must match CHROME_MAJOR ({chrome_major})"
+    );
+
+    let expected_api = (chrome_major * 100).to_string();
+    assert_eq!(
+        extract_quoted_assignment(&cef_mac, "CEF_API_VERSION"),
+        expected_api
+    );
+    assert_eq!(
+        extract_quoted_assignment(&cef_linux, "CEF_API_VERSION"),
+        expected_api
+    );
+    assert!(
+        cef_helpers.contains(&format!("CEF_API_VERSION=\"${{3:-{expected_api}}}\"")),
+        "cef/setup-helpers.sh default CEF_API_VERSION must equal {expected_api}"
+    );
+
+    let renderer_mac = fs::read_to_string(root.join("cef/renderer.m")).unwrap();
+    let renderer_linux = fs::read_to_string(root.join("cef/renderer_linux.c")).unwrap();
+    assert!(
+        renderer_mac.contains("--use-mock-keychain"),
+        "cef/renderer.m must pass --use-mock-keychain to prevent headless macOS Keychain hangs"
+    );
+    assert!(
+        renderer_linux.contains("--password-store=basic"),
+        "cef/renderer_linux.c must pass --password-store=basic to prevent headless keyring hangs"
+    );
+}
