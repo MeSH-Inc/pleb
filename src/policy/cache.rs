@@ -9,6 +9,7 @@ use crate::context::{acquire_private_lock, write_private_file_atomic};
 
 const STRATEGY_TTL_SECS: u64 = 7 * 24 * 3600;
 const TIMEOUT_TTL_SECS: u64 = 24 * 3600;
+const DISK_REFRESH_INTERVAL_SECS: u64 = 3600;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SiteCacheEntry {
@@ -67,6 +68,21 @@ impl SiteCache {
     }
 
     pub fn record_at(&self, host: &str, strategy: &str, time_ms: u64, now_secs: u64) {
+        // Avoid lock/read/fsync churn on repeated fetches to the same host when
+        // the cached strategy is unchanged and freshly persisted on disk.
+        if let Ok(mut guard) = self.entries.lock() {
+            if let Some(existing) = guard.get_mut(host) {
+                if existing.strategy == strategy
+                    && now_secs.saturating_sub(existing.updated_at_epoch_secs)
+                        < DISK_REFRESH_INTERVAL_SECS
+                {
+                    existing.successes = existing.successes.saturating_add(1);
+                    existing.avg_time_ms = (existing.avg_time_ms * 3 + time_ms) / 4;
+                    return;
+                }
+            }
+        }
+
         let lock_file = match acquire_cache_lock(&self.path) {
             Ok(file) => file,
             Err(err) => {

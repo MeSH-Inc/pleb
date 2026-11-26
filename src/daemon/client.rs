@@ -149,6 +149,8 @@ pub async fn daemon_http_get_with_request_options(
         accept_markdown: opts.accept_markdown,
         referer: opts.referer.clone(),
         subresource_dest: opts.subresource_dest,
+        expected_protocol_version: Some(PROTOCOL_VERSION),
+        expected_build_id: Some(BUILD_ID.to_string()),
     };
     let io_timeout = timeout.saturating_add(CLIENT_IO_GRACE);
     let (hdr, body) = send_daemon_rpc(
@@ -213,6 +215,8 @@ pub async fn daemon_cef_render_with_executable(
         wait_for_selector: opts.wait_for_selector.clone(),
         proxy: proxy.map(str::to_string),
         timeout_ms: timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+        expected_protocol_version: Some(PROTOCOL_VERSION),
+        expected_build_id: Some(BUILD_ID.to_string()),
     };
     let io_timeout = timeout.saturating_add(CLIENT_IO_GRACE);
     let (hdr, body) = send_daemon_rpc(

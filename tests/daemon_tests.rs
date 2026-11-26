@@ -1112,3 +1112,191 @@ async fn adversarial_subresource_ssrf_referer_and_image_accept_precedence() {
         "SubresourceDest::Image must not leak markdown Accept header: {body}"
     );
 }
+
+#[tokio::test]
+async fn daemon_rejects_version_mismatch_before_executing_upstream_http_request() {
+    use mesh_wick::daemon::protocol::read_frame;
+    use tokio::net::UnixStream;
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_srv = Arc::clone(&hits);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let hits = Arc::clone(&hits_srv);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let _ = socket.read(&mut buf).await;
+                hits.fetch_add(1, Ordering::AcqRel);
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await;
+            });
+        }
+    });
+
+    let dir = TempStateDir::new();
+    let dir_clone = dir.to_path_buf();
+    let handle =
+        tokio::spawn(async move { run_daemon(dir_clone, Duration::from_secs(30), false).await });
+    let _ = wait_for_ping(dir.path()).await;
+
+    let stream = UnixStream::connect(socket_path(dir.path())).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let req = serde_json::json!({
+        "op": "http_get",
+        "url": format!("http://{addr}/must-not-hit"),
+        "proxy": null,
+        "timeout_ms": 5000,
+        "max_body_bytes": 65536,
+        "expected_protocol_version": PROTOCOL_VERSION,
+        "expected_build_id": "stale-client-build",
+    });
+    let mut line = serde_json::to_string(&req).unwrap();
+    line.push('\n');
+    write_half.write_all(line.as_bytes()).await.unwrap();
+    write_half.flush().await.unwrap();
+
+    let mut reader = BufReader::new(read_half);
+    let (hdr, body) = read_frame(&mut reader).await.unwrap();
+    assert!(!hdr.ok);
+    assert_eq!(hdr.build_id, BUILD_ID);
+    assert_eq!(hdr.protocol_version, PROTOCOL_VERSION);
+    assert_eq!(
+        hdr.error_kind,
+        Some(mesh_wick::transport::TransportErrorKind::ProtocolMismatch)
+    );
+    assert!(body.is_empty());
+    assert_eq!(
+        hits.load(Ordering::Acquire),
+        0,
+        "daemon must reject mismatched build_id before hitting upstream origin"
+    );
+
+    assert!(daemon_stop(dir.path()).await.unwrap());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn daemon_cancels_inflight_cef_render_on_client_disconnect() {
+    use mesh_wick::daemon::daemon_cef_render;
+    use mesh_wick::transport::cef::CefRenderOptions;
+
+    let dir = TempStateDir::new();
+    let cef_dir = dir.path().join("cef");
+    std::fs::create_dir_all(&cef_dir).unwrap();
+    let renderer_bin = cef_dir.join("wick-renderer");
+    let started_flag = dir.path().join("slow-started.flag");
+
+    let script = format!(
+        r#"#!/usr/bin/env python3
+# WICK_RENDERER_PROTOCOL=v5-meta
+import json, sys, time
+
+flag_path = {flag_path:?}
+sys.stdout.write(json.dumps({{"ready": True, "protocol": "v5-meta", "error": None}}) + "\n")
+sys.stdout.flush()
+
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        break
+    req = json.loads(line)
+    url = req["url"]
+    if url.endswith("/slow"):
+        with open(flag_path, "w") as f:
+            f.write("started\n")
+        time.sleep(6.0)
+        html = b"<html><body>slow</body></html>"
+    else:
+        html = b"<html><body>fast-ok</body></html>"
+    hdr = {{"status_code": 200, "final_url": url, "html_bytes": len(html), "error": None}}
+    sys.stdout.write(json.dumps(hdr) + "\n")
+    sys.stdout.flush()
+    sys.stdout.buffer.write(html)
+    sys.stdout.buffer.flush()
+"#,
+        flag_path = started_flag
+    );
+    std::fs::write(&renderer_bin, script).unwrap();
+    std::fs::set_permissions(&renderer_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let dir_clone = dir.to_path_buf();
+    let handle =
+        tokio::spawn(async move { run_daemon(dir_clone, Duration::from_secs(30), false).await });
+    let _ = wait_for_ping(dir.path()).await;
+
+    // Launch slow CEF render and wait until the renderer child has received it.
+    let slow_dir = dir.to_path_buf();
+    let slow_task = tokio::spawn(async move {
+        daemon_cef_render(
+            &slow_dir,
+            None,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            false,
+            "https://mock.example/slow",
+            &CefRenderOptions::default(),
+        )
+        .await
+    });
+
+    for _ in 0..80 {
+        if started_flag.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        started_flag.exists(),
+        "slow mock CEF renderer should have started"
+    );
+
+    // Abort client -> closes daemon.sock stream -> daemon cancels in-flight CEF render & frees slot.
+    slow_task.abort();
+    let _ = slow_task.await;
+
+    let mut settled = false;
+    for _ in 0..40 {
+        if let Some(st) = daemon_ping(dir.path()).await {
+            if st.active_requests == 0 {
+                settled = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        settled,
+        "active_requests must drop to 0 promptly after CEF client disconnect"
+    );
+
+    // Follow-up fast CEF render completes quickly instead of waiting for the 6s cancelled render.
+    let fast_start = Instant::now();
+    let fast = daemon_cef_render(
+        dir.path(),
+        None,
+        Duration::from_secs(5),
+        Duration::from_secs(30),
+        false,
+        "https://mock.example/fast",
+        &CefRenderOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert!(fast.html.contains("fast-ok"));
+    assert!(
+        fast_start.elapsed() < Duration::from_secs(2),
+        "follow-up CEF render took {:?}, suggesting cancelled render held slot lock",
+        fast_start.elapsed()
+    );
+
+    assert!(daemon_stop(dir.path()).await.unwrap());
+    let _ = handle.await;
+}

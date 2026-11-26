@@ -1,7 +1,7 @@
 use ego_tree::{NodeId, NodeRef};
 use scraper::{Html, Node, Selector};
 use std::collections::{HashMap, HashSet};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 use url::Url;
 
 use super::resources::{index_resources_in_subtree, ResourceDescriptor};
@@ -110,12 +110,14 @@ static CHECKBOX_POPUP_SEL: LazyLock<Selector> =
 /// link discovery, and pruned extraction.
 pub struct ParsedHtml {
     doc: Html,
+    text_metrics_cache: OnceLock<DomTextMetrics>,
 }
 
 impl ParsedHtml {
     pub fn parse(html: &str) -> Self {
         Self {
             doc: Html::parse_document(html),
+            text_metrics_cache: OnceLock::new(),
         }
     }
 
@@ -193,7 +195,8 @@ impl ParsedHtml {
             let Ok(resolved) = base.join(raw_target) else {
                 continue;
             };
-            if matches!(resolved.scheme(), "http" | "https") && resolved != *page_url {
+            if resolved != *page_url && crate::policy::is_safe_subresource_url(page_url, &resolved)
+            {
                 return Some(resolved);
             }
         }
@@ -220,6 +223,12 @@ impl ParsedHtml {
     }
 
     pub fn text_metrics(&self) -> DomTextMetrics {
+        *self
+            .text_metrics_cache
+            .get_or_init(|| self.compute_text_metrics())
+    }
+
+    fn compute_text_metrics(&self) -> DomTextMetrics {
         let root_id = self.doc.root_element().id();
         let body_id = self
             .doc
@@ -1765,6 +1774,22 @@ fn normalize_plain_text(raw: &str) -> String {
     lines.join("\n")
 }
 
+/// Fast zero-allocation pre-check avoiding eager HTML parsing when no
+/// `<meta http-equiv="refresh">` tag can be present.
+pub fn may_contain_meta_refresh(html: &str) -> bool {
+    if html.len() > 2_000_000 {
+        return false;
+    }
+    let bytes = html.as_bytes();
+    contains_ascii_ci(bytes, b"http-equiv") && contains_ascii_ci(bytes, b"refresh")
+}
+
+fn contains_ascii_ci(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle))
+}
+
 fn parse_meta_refresh_target(content: &str) -> Option<&str> {
     let trimmed = content.trim();
     let idx = trimmed.find([';', ','])?;
@@ -1831,5 +1856,29 @@ mod meta_refresh_tests {
         assert!(ParsedHtml::parse(&full_body)
             .meta_refresh_url(&base)
             .is_none());
+
+        // Pre-parse fast check skips normal HTML without meta-refresh tokens.
+        assert!(!may_contain_meta_refresh(
+            "<html><head><title>Normal</title></head><body><p>Refresh your view</p></body></html>"
+        ));
+        assert!(may_contain_meta_refresh(
+            r#"<html><head><meta HTTP-EQUIV="Refresh" content="0; url=/next"></head></html>"#
+        ));
+
+        // SSRF & HTTPS->HTTP downgrade targets are blocked from a public HTTPS origin.
+        for blocked in [
+            "http://169.254.169.254/latest/meta-data",
+            "https://127.0.0.1/admin",
+            "https://localhost:8080/internal",
+            "http://example.org/downgrade",
+        ] {
+            let html = format!(
+                r#"<html><head><meta http-equiv="refresh" content="0; url={blocked}"></head></html>"#
+            );
+            assert!(
+                ParsedHtml::parse(&html).meta_refresh_url(&base).is_none(),
+                "meta-refresh SSRF/downgrade target must be blocked: {blocked}"
+            );
+        }
     }
 }

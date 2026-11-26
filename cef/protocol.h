@@ -422,13 +422,11 @@ static void wick_clamp_timeouts(
     int has_selector,
     int* total_cap,
     int* post_load_cap,
-    int* js_cap,
-    int* cf_cap
+    int* js_cap
 ) {
     int default_total = has_selector ? 60000 : 45000;
     int default_post = has_selector ? 30000 : 12000;
     int default_js = has_selector ? 20000 : 8000;
-    int default_cf = 30000;
 
     int budget = (timeout_ms > 2000) ? (timeout_ms - 1500) : ((timeout_ms * 3) / 4);
     if (budget < 200) budget = 200;
@@ -436,20 +434,17 @@ static void wick_clamp_timeouts(
     int eff_total = (budget < default_total) ? budget : default_total;
     int eff_post = (eff_total < default_post) ? eff_total : default_post;
     int eff_js = (eff_post < default_js) ? eff_post : default_js;
-    int eff_cf = (eff_total < default_cf) ? eff_total : default_cf;
 
     *total_cap = eff_total;
     *post_load_cap = eff_post;
     *js_cap = eff_js;
-    *cf_cap = eff_cf;
 }
 
 static char* wick_build_poller_js(
     const char* selector_or_null,
     const char* marker,
     const char* sel_err_prefix,
-    int js_cap_ms,
-    int cf_cap_ms
+    int js_cap_ms
 ) {
     char* escaped_sel = NULL;
     const char* sel_expr = "null";
@@ -506,10 +501,11 @@ static char* wick_build_poller_js(
         "  var body=document.body;"
         "  var bt=body&&body.innerText?body.innerText:'';"
         "  var blt=bt.toLowerCase();"
-        "  var isChallenge=blt.indexOf('performing security verification')>=0||"
-        "                  blt.indexOf('checking your browser')>=0;"
-        "  var cap=isChallenge?%d:%d;"
-        "  if(now-start>=cap){dump();return;}"
+        "  var isChallenge=blt.length<4000&&"
+        "                  (blt.indexOf('performing security verification')>=0||"
+        "                   blt.indexOf('checking your browser')>=0);"
+        "  if(isChallenge){dump();return;}"
+        "  if(now-start>=%d){dump();return;}"
         "  if(sel){"
         "    var el=null;"
         "    try{el=document.querySelector(sel);}"
@@ -518,7 +514,7 @@ static char* wick_build_poller_js(
         "      console.log('%s'+(e&&e.message?e.message:String(e)));"
         "      return;"
         "    }"
-        "    if(el&&!isChallenge){"
+        "    if(el){"
         "      if(!selMatchedAt)selMatchedAt=now;"
         "      var hasContent=((el.innerText||'').trim().length>0)||"
         "                     (el.children&&el.children.length>0)||"
@@ -531,14 +527,13 @@ static char* wick_build_poller_js(
         "  var hasEmptySpaRoot=(!!spa&&((spa.innerText||'').trim().length<50))||"
         "                      (bt.trim().length===0&&document.scripts&&document.scripts.length>0);"
         "  var inflight=(typeof window.__wickInflight==='number')?window.__wickInflight:0;"
-        "  if(isChallenge||hasEmptySpaRoot||inflight>0){lastMut=now;return;}"
+        "  if(hasEmptySpaRoot||inflight>0){lastMut=now;return;}"
         "  if(now-lastMut>=QUIET_MS){finishAfterRaf();}"
         "};"
         "iv=setInterval(check,40);"
         "})();",
         sel_expr,
         marker,
-        cf_cap_ms,
         js_cap_ms,
         sel_err_prefix
     );

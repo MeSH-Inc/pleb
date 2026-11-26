@@ -324,7 +324,7 @@ int main(void) {
     assert(strstr(req.wait_for_selector, "[data-x='a\\b']") != NULL);
     assert(strstr(req.wait_for_selector, "\xF0\x9F\xA6\x80") != NULL);
 
-    char* js = wick_build_poller_js(req.wait_for_selector, "MARK", "SERR", 5000, 9000);
+    char* js = wick_build_poller_js(req.wait_for_selector, "MARK", "SERR", 5000);
     assert(js != NULL);
     assert(strstr(js, "\\'a\\\\b\\'") != NULL);
     assert(strstr(js, "try{el=document.querySelector(sel);}") != NULL);
@@ -338,12 +338,11 @@ int main(void) {
     wick_render_request_free(&req);
 
     // Timeout clamping leaves headroom below caller deadline.
-    int total = 0, post = 0, js_cap = 0, cf_cap = 0;
-    wick_clamp_timeouts(5000, 1, &total, &post, &js_cap, &cf_cap);
+    int total = 0, post = 0, js_cap = 0;
+    wick_clamp_timeouts(5000, 1, &total, &post, &js_cap);
     assert(total == 3500);
     assert(post == 3500);
     assert(js_cap == 3500);
-    assert(cf_cap == 3500);
 
     // Unpaired surrogate must fail loudly.
     assert(wick_parse_request_line("{\"url\":\"https://x.com\",\"wait_for_selector\":\"\\uD800\"}", &req, err, sizeof(err)) != 0);
@@ -461,7 +460,7 @@ fn v5_poller_js_short_page_settles_fast_and_waits_for_empty_spa_root() {
 #include "protocol.h"
 
 int main(void) {
-    char* js = wick_build_poller_js(NULL, "MARK:", "SERR:", 4000, 8000);
+    char* js = wick_build_poller_js(NULL, "MARK:", "SERR:", 4000);
     if (!js) return 1;
     fputs(js, stdout);
     free(js);
@@ -579,6 +578,16 @@ function runScenario(setupFn) {{
     }});
     if (inflightRes.logs.length !== 1 || inflightRes.elapsed < 300) {{
         throw new Error('inflight subresources did not gate settle: ' + JSON.stringify(inflightRes));
+    }}
+
+    // 4. Active bot challenge interstitial dumps immediately instead of waiting out a challenge timer.
+    const challengeRes = await runScenario((sb) => {{
+        sb.document.body.innerText = 'Just a moment... Checking your browser before accessing';
+        sb.document.documentElement.outerHTML = '<html><body>Checking your browser</body></html>';
+        sb.window.__wickInflight = 1;
+    }});
+    if (challengeRes.logs.length !== 1 || challengeRes.elapsed >= 200) {{
+        throw new Error('challenge interstitial did not fail fast: ' + JSON.stringify(challengeRes));
     }}
 }})().catch((err) => {{
     console.error(err);

@@ -13,7 +13,7 @@ use tokio::task::JoinSet;
 
 use super::protocol::{
     lock_path, read_bounded_line, socket_path, storage_key, write_frame, DaemonRequest,
-    DaemonResponseHeader, MAX_HEADER_LINE_BYTES,
+    DaemonResponseHeader, BUILD_ID, MAX_HEADER_LINE_BYTES, PROTOCOL_VERSION,
 };
 use crate::context::ensure_private_dir;
 use crate::transport::cef::{CefRenderOptions, CefRenderer};
@@ -437,7 +437,18 @@ async fn handle_connection(
             accept_markdown,
             referer,
             subresource_dest,
+            expected_protocol_version,
+            expected_build_id,
         } => {
+            if is_version_mismatch(expected_protocol_version, expected_build_id.as_deref()) {
+                let hdr = DaemonResponseHeader::err(
+                    "daemon version mismatch",
+                    Some(TransportErrorKind::ProtocolMismatch),
+                    None,
+                );
+                let _ = write_frame(&mut write_half, &hdr, &[]).await;
+                return Ok(());
+            }
             let _active = ActiveRequestGuard::new(active_requests, idle_notify);
             let timeout = Duration::from_millis(timeout_ms.max(1));
             let (slot, _lease) = match pool.acquire(&state_dir, proxy.as_deref(), timeout, verbose)
@@ -498,7 +509,18 @@ async fn handle_connection(
             wait_for_selector,
             proxy,
             timeout_ms,
+            expected_protocol_version,
+            expected_build_id,
         } => {
+            if is_version_mismatch(expected_protocol_version, expected_build_id.as_deref()) {
+                let hdr = DaemonResponseHeader::err(
+                    "daemon version mismatch",
+                    Some(TransportErrorKind::ProtocolMismatch),
+                    None,
+                );
+                let _ = write_frame(&mut write_half, &hdr, &[]).await;
+                return Ok(());
+            }
             let _active = ActiveRequestGuard::new(active_requests, idle_notify);
             let timeout = Duration::from_millis(timeout_ms.max(1));
             let deadline = tokio::time::Instant::now() + timeout;
@@ -542,25 +564,43 @@ async fn handle_connection(
             }
 
             let opts = CefRenderOptions { wait_for_selector };
-            match renderer_guard.render(&url, &opts, remaining).await {
-                Ok(result) => {
-                    let bytes = result.html.as_bytes();
-                    let mut hdr = DaemonResponseHeader::ok_empty();
-                    hdr.status_code = Some(result.status_code);
-                    hdr.final_url = Some(result.final_url);
-                    hdr.content_type = Some("text/html".to_string());
-                    hdr.body_bytes = bytes.len();
-                    let _ = write_frame(&mut write_half, &hdr, bytes).await;
+            let render_fut = renderer_guard.render(&url, &opts, remaining);
+            tokio::select! {
+                biased;
+                _ = wait_for_client_disconnect(&mut reader) => {
+                    return Ok(());
                 }
-                Err(err) => {
-                    let kind = transport_error_kind(&err).unwrap_or(TransportErrorKind::Network);
-                    let hdr = DaemonResponseHeader::err(err.to_string(), Some(kind), None);
-                    let _ = write_frame(&mut write_half, &hdr, &[]).await;
+                res = render_fut => {
+                    match res {
+                        Ok(result) => {
+                            let bytes = result.html.as_bytes();
+                            let mut hdr = DaemonResponseHeader::ok_empty();
+                            hdr.status_code = Some(result.status_code);
+                            hdr.final_url = Some(result.final_url);
+                            hdr.content_type = Some("text/html".to_string());
+                            hdr.body_bytes = bytes.len();
+                            let _ = write_frame(&mut write_half, &hdr, bytes).await;
+                        }
+                        Err(err) => {
+                            let kind =
+                                transport_error_kind(&err).unwrap_or(TransportErrorKind::Network);
+                            let hdr = DaemonResponseHeader::err(err.to_string(), Some(kind), None);
+                            let _ = write_frame(&mut write_half, &hdr, &[]).await;
+                        }
+                    }
                 }
             }
             Ok(())
         }
     }
+}
+
+fn is_version_mismatch(
+    expected_protocol_version: Option<u32>,
+    expected_build_id: Option<&str>,
+) -> bool {
+    expected_protocol_version.is_some_and(|v| v != PROTOCOL_VERSION)
+        || expected_build_id.is_some_and(|id| id != BUILD_ID)
 }
 
 async fn wait_for_client_disconnect<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) {

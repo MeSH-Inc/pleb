@@ -1043,7 +1043,11 @@ async fn acquire_page(
 
             let body = resp.text();
             let mut parsed_html = None;
-            if status == 200 && is_html && hop < MAX_META_REFRESH_HOPS {
+            if status == 200
+                && is_html
+                && hop < MAX_META_REFRESH_HOPS
+                && extract::dom::may_contain_meta_refresh(&body)
+            {
                 let page_url = url::Url::parse(&final_url).unwrap_or_else(|_| parsed.clone());
                 let refresh_target = parsed_html
                     .get_or_insert_with(|| ParsedHtml::parse(&body))
@@ -1150,7 +1154,7 @@ async fn acquire_page(
         ResponseClassification::JavaScriptShell { reason } => {
             if plan.allow_cef_escalation {
                 match try_cef_escalation(ctx, host, start, &final_url, effective_selector).await {
-                    CefEscalation::Completed(res) => return res,
+                    CefEscalation::Completed(res) => return *res,
                     CefEscalation::Unavailable(err) => return Err(err),
                     CefEscalation::RenderFailed(err) => {
                         tracing::warn!(
@@ -1179,7 +1183,7 @@ async fn acquire_page(
         ResponseClassification::Blocked { status } => {
             if plan.allow_cef_escalation {
                 match try_cef_escalation(ctx, host, start, &final_url, effective_selector).await {
-                    CefEscalation::Completed(res) => return res,
+                    CefEscalation::Completed(res) => return *res,
                     CefEscalation::Unavailable(err) => return Err(err),
                     CefEscalation::RenderFailed(err) => {
                         return Err(FetchError::Blocked {
@@ -1201,26 +1205,11 @@ async fn acquire_page(
                 detail,
             })
         }
-        ResponseClassification::Challenge { status, reason } => {
-            if plan.allow_cef_escalation {
-                match try_cef_escalation(ctx, host, start, &final_url, effective_selector).await {
-                    CefEscalation::Completed(res) => return res,
-                    CefEscalation::Unavailable(err) => return Err(err),
-                    CefEscalation::RenderFailed(err) => {
-                        return Err(FetchError::Challenge {
-                            url: final_url,
-                            status,
-                            reason: format!("{} (CEF escalation failed: {})", reason, err),
-                        });
-                    }
-                }
-            }
-            Err(FetchError::Challenge {
-                url: final_url,
-                status,
-                reason,
-            })
-        }
+        ResponseClassification::Challenge { status, reason } => Err(FetchError::Challenge {
+            url: final_url,
+            status,
+            reason,
+        }),
         ResponseClassification::HttpError { status } => Err(FetchError::HttpError {
             url: final_url,
             status,
@@ -1229,7 +1218,7 @@ async fn acquire_page(
 }
 
 enum CefEscalation {
-    Completed(std::result::Result<AcquiredPage, FetchError>),
+    Completed(Box<std::result::Result<AcquiredPage, FetchError>>),
     Unavailable(FetchError),
     RenderFailed(FetchError),
 }
@@ -1242,9 +1231,9 @@ async fn try_cef_escalation(
     wait_for_selector: Option<&str>,
 ) -> CefEscalation {
     match render_cef_checked(&ctx.cef, url, wait_for_selector, ctx.config.cef_timeout).await {
-        Ok(cef_res) => {
-            CefEscalation::Completed(classify_cef_result(ctx, host, url, start, cef_res, true))
-        }
+        Ok(cef_res) => CefEscalation::Completed(Box::new(classify_cef_result(
+            ctx, host, url, start, cef_res, true,
+        ))),
         Err(err @ FetchError::CefUnavailable(_)) => CefEscalation::Unavailable(err),
         Err(err) => CefEscalation::RenderFailed(err),
     }

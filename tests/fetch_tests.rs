@@ -1062,6 +1062,81 @@ for raw in sys.stdin:
 
 #[cfg(unix)]
 #[tokio::test]
+async fn auto_mode_fails_fast_on_cronet_challenge_without_escalating_to_cef() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let body = b"<html><head><title>Just a moment...</title></head><body><script src=\"https://challenges.cloudflare.com/turnstile/v0/api.js\"></script></body></html>";
+                let _ = socket
+                    .write_all(&http_response("403 Forbidden", "text/html", body))
+                    .await;
+            });
+        }
+    });
+
+    let state_dir = temp_state_dir();
+    let cef_dir = state_dir.path().join("cef");
+    std::fs::create_dir_all(&cef_dir).unwrap();
+    let renderer_bin = cef_dir.join("wick-renderer");
+    let count_file = state_dir.path().join("auto_challenge_cef.log");
+
+    let script = format!(
+        r#"#!/usr/bin/env python3
+# WICK_RENDERER_PROTOCOL=v5-meta
+import json, sys
+
+with open({count_path:?}, "a") as f:
+    f.write("spawned\n")
+sys.stdout.write(json.dumps({{"ready": True, "protocol": "v5-meta", "error": None}}) + "\n")
+sys.stdout.flush()
+"#,
+        count_path = count_file
+    );
+    std::fs::write(&renderer_bin, script).unwrap();
+    std::fs::set_permissions(&renderer_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let ctx = RuntimeContext::new(RuntimeConfig {
+        state_dir: state_dir.path().to_path_buf(),
+        timeout: Duration::from_secs(5),
+        cef_timeout: Duration::from_secs(5),
+        cef_renderer_executable: Some(renderer_bin),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let err = fetch_document(
+        &ctx,
+        &format!("{base}/cf"),
+        &FetchOptions {
+            render: RenderMode::Auto,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(err, FetchError::Challenge { status: 403, .. }),
+        "expected FetchError::Challenge, got {err:?}"
+    );
+    assert_eq!(err.exit_code(), 2);
+    assert!(
+        !count_file.exists(),
+        "RenderMode::Auto must fail fast on Cronet challenge without spawning CEF"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn adversarial_cef_transient_empty_render_retries_once_and_succeeds() {
     use std::os::unix::fs::PermissionsExt;
 

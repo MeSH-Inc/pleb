@@ -429,8 +429,8 @@ static void render_url_v5(const WickRenderRequest* req) {
     frame->base.release(&frame->base);
 
     int has_selector = (req->wait_for_selector && req->wait_for_selector[0]) ? 1 : 0;
-    int total_cap = 0, post_load_cap = 0, js_cap = 0, cf_cap = 0;
-    wick_clamp_timeouts(req->timeout_ms, has_selector, &total_cap, &post_load_cap, &js_cap, &cf_cap);
+    int total_cap = 0, post_load_cap = 0, js_cap = 0;
+    wick_clamp_timeouts(req->timeout_ms, has_selector, &total_cap, &post_load_cap, &js_cap);
 
     int post_load_ms = 0;
     const int tick_ms = 25;
@@ -477,8 +477,7 @@ static void render_url_v5(const WickRenderRequest* req) {
                     req->wait_for_selector,
                     g_marker,
                     g_sel_err_prefix,
-                    js_cap,
-                    cf_cap
+                    js_cap
                 );
                 if (poller_js) {
                     execute_js_on_main_frame(poller_js);

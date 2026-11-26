@@ -248,7 +248,7 @@ impl ProviderAttempt {
 pub fn search_provider_statuses(
     state_dir: &Path,
 ) -> Result<BTreeMap<String, SearchProviderStatus>> {
-    let credentials = auth::all_credential_statuses(state_dir)?;
+    let resolved = auth::resolve_all_credentials(state_dir)?;
     let health = provider_health_summary(state_dir)?;
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -256,13 +256,12 @@ pub fn search_provider_statuses(
         .as_secs();
 
     let mut statuses = BTreeMap::new();
-    for cred in credentials {
-        let name = cred.provider.as_str();
+    for (provider, cred) in resolved {
+        let name = provider.as_str();
         let entry = health.get(name);
         let cooldown_remaining_secs = match entry {
             Some(e) if e.cooldown_until_epoch_secs > now_secs => {
-                let current_fp = auth::resolve_credential(state_dir, cred.provider)?
-                    .map(|r| key_fingerprint(r.value.as_str()));
+                let current_fp = cred.as_ref().map(|r| key_fingerprint(r.value.as_str()));
                 if is_cooldown_active(e, current_fp.as_deref(), now_secs) {
                     e.cooldown_until_epoch_secs.saturating_sub(now_secs)
                 } else {
@@ -271,11 +270,15 @@ pub fn search_provider_statuses(
             }
             _ => 0,
         };
+        let (configured, source) = match cred {
+            Some(r) => (true, Some(r.source)),
+            None => (false, None),
+        };
         statuses.insert(
             name.to_string(),
             SearchProviderStatus {
-                configured: cred.configured,
-                source: cred.source,
+                configured,
+                source,
                 cooldown_remaining_secs,
                 month_requests: entry.map(|e| e.month_requests).unwrap_or(0),
                 last_error_status: entry.and_then(|e| e.last_error_status),
@@ -523,12 +526,17 @@ fn resolve_all_credentials(
 )> {
     let mut creds = BTreeMap::new();
     let mut fingerprints = BTreeMap::new();
-    for &provider in ConcreteProvider::ALL {
-        if let Some(cp) = provider.credential_provider() {
-            if let Some(resolved) = auth::resolve_credential(state_dir, cp)? {
-                fingerprints.insert(provider, key_fingerprint(resolved.value.as_str()));
-                creds.insert(provider, resolved);
-            }
+    for (cp, resolved_opt) in auth::resolve_all_credentials(state_dir)? {
+        if let Some(resolved) = resolved_opt {
+            let provider = match cp {
+                CredentialProvider::Brave => ConcreteProvider::Brave,
+                CredentialProvider::Tavily => ConcreteProvider::Tavily,
+                CredentialProvider::Serper => ConcreteProvider::Serper,
+                CredentialProvider::Exa => ConcreteProvider::Exa,
+                CredentialProvider::Searxng => ConcreteProvider::Searxng,
+            };
+            fingerprints.insert(provider, key_fingerprint(resolved.value.as_str()));
+            creds.insert(provider, resolved);
         }
     }
     Ok((creds, fingerprints))

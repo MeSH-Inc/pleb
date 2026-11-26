@@ -583,15 +583,45 @@ pub fn remove_credential(
     }
 }
 
-pub fn all_credential_statuses(state_dir: &Path) -> Result<Vec<CredentialStatus>> {
-    let mut statuses = Vec::with_capacity(CredentialProvider::ALL.len());
-    for &provider in CredentialProvider::ALL {
-        let resolved = resolve_credential(state_dir, provider)?;
-        statuses.push(CredentialStatus {
-            provider,
-            configured: resolved.is_some(),
-            source: resolved.map(|r| r.source),
-        });
+pub fn resolve_all_credentials(
+    state_dir: &Path,
+) -> Result<Vec<(CredentialProvider, Option<ResolvedCredential>)>> {
+    if !keychain_enabled() {
+        let mut out = Vec::with_capacity(CredentialProvider::ALL.len());
+        for &provider in CredentialProvider::ALL {
+            out.push((provider, resolve_credential(state_dir, provider)?));
+        }
+        return Ok(out);
     }
-    Ok(statuses)
+
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = CredentialProvider::ALL
+            .iter()
+            .copied()
+            .map(|provider| {
+                scope.spawn(move || (provider, resolve_credential(state_dir, provider)))
+            })
+            .collect();
+
+        let mut out = Vec::with_capacity(handles.len());
+        for handle in handles {
+            let (provider, res) = handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("credential resolution worker panicked"))?;
+            out.push((provider, res?));
+        }
+        Ok(out)
+    })
+}
+
+pub fn all_credential_statuses(state_dir: &Path) -> Result<Vec<CredentialStatus>> {
+    let resolved = resolve_all_credentials(state_dir)?;
+    Ok(resolved
+        .into_iter()
+        .map(|(provider, cred)| CredentialStatus {
+            provider,
+            configured: cred.is_some(),
+            source: cred.map(|r| r.source),
+        })
+        .collect())
 }

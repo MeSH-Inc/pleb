@@ -64,12 +64,20 @@ pub enum DaemonRequest {
         referer: Option<String>,
         #[serde(default)]
         subresource_dest: Option<SubresourceDest>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_protocol_version: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_build_id: Option<String>,
     },
     CefRender {
         url: String,
         wait_for_selector: Option<String>,
         proxy: Option<String>,
         timeout_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_protocol_version: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_build_id: Option<String>,
     },
 }
 

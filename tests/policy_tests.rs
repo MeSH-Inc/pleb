@@ -108,6 +108,25 @@ fn site_cache_atomic_save_and_ttl_expiry() {
         .get_at("slow.example.org", 1_000_000 + 24 * 3600 + 1)
         .is_none());
 
+    // Repeated same-strategy record within the refresh interval skips disk rewrite,
+    // while a strategy change or post-interval refresh persists immediately.
+    let before_same = std::fs::read_to_string(dir.join("site-cache.json")).unwrap();
+    cache.record_at("example.com", "cef", 900, 1_000_000 + 60);
+    let after_same = std::fs::read_to_string(dir.join("site-cache.json")).unwrap();
+    assert_eq!(
+        before_same, after_same,
+        "unchanged fresh strategy must not rewrite site-cache.json"
+    );
+
+    cache.record_at("example.com", "cronet", 50, 1_000_000 + 61);
+    let after_change = SiteCache::load(dir.join("site-cache.json"));
+    assert_eq!(
+        after_change
+            .get_at("example.com", 1_000_000 + 120)
+            .map(|e| e.strategy),
+        Some("cronet".to_string())
+    );
+
     let _ = std::fs::remove_dir_all(dir);
 }
 
