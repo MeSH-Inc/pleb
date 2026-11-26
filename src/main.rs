@@ -3,15 +3,18 @@ use mesh_wick::context::{clear_state_dir, default_state_dir, RuntimeConfig, Runt
 use mesh_wick::crawl;
 #[cfg(unix)]
 use mesh_wick::daemon;
-use mesh_wick::extract::{ExtractMode, OutputFormat};
-use mesh_wick::fetch::{self, FetchError, FetchOptions, FetchOutput};
+use mesh_wick::extract::{format_page_section, ExtractMode, OutputFormat};
+use mesh_wick::fetch::{
+    self, BatchFetchOptions, BatchItemResult, FetchError, FetchOptions, FetchOutput,
+};
 use mesh_wick::policy::RenderMode;
 use mesh_wick::search::{self, SearchProvider};
 use mesh_wick::transport::cef::{self, RendererProbe};
 use serde::Serialize;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -72,10 +75,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Fetch a URL and print extracted content to stdout
+    /// Fetch one or more URLs (or '-' to read newline-separated URLs from stdin)
     Fetch {
-        /// Target URL (http or https)
-        url: String,
+        /// Target URL(s) (http/https), or '-' to read URLs from stdin
+        #[arg(required = true)]
+        urls: Vec<String>,
         /// Output format
         #[arg(long, value_enum, default_value_t = OutputFormat::Markdown, ignore_case = true)]
         format: OutputFormat,
@@ -103,8 +107,14 @@ enum Command {
         /// Truncate extracted content to at most N bytes
         #[arg(long)]
         max_bytes: Option<usize>,
-        /// With --json, omit the content field and emit metadata only
-        #[arg(long, requires = "json")]
+        /// Maximum concurrent requests in batch mode (1-16)
+        #[arg(long, default_value = "4")]
+        concurrency: usize,
+        /// Stream one JSON object per completed URL in batch mode
+        #[arg(long, conflicts_with = "json")]
+        jsonl: bool,
+        /// With --json or --jsonl, omit the content field and emit metadata only
+        #[arg(long)]
         metadata_only: bool,
         /// Write output to file path instead of stdout (created only after fetch succeeds)
         #[arg(short = 'o', long, conflicts_with = "metadata_only")]
@@ -286,7 +296,9 @@ fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(err) => {
-            if err.use_stderr() && std::env::args_os().any(|a| a == "--json") {
+            if err.use_stderr()
+                && std::env::args_os().any(|a| a == "--json" || a == "--jsonl")
+            {
                 let cli_err = CliError::invalid_input(err.to_string().trim_end());
                 emit_cli_error(&cli_err, true);
                 return ExitCode::from(cli_err.exit_code);
@@ -296,7 +308,8 @@ fn main() -> ExitCode {
     };
 
     init_tracing(cli.verbose);
-    let json_mode = cli.json;
+    let json_error_mode =
+        cli.json || matches!(&cli.command, Command::Fetch { jsonl: true, .. });
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -305,22 +318,22 @@ fn main() -> ExitCode {
         Ok(rt) => rt,
         Err(err) => {
             let cli_err = CliError::runtime("runtime_error", err);
-            emit_cli_error(&cli_err, json_mode);
+            emit_cli_error(&cli_err, json_error_mode);
             return ExitCode::from(cli_err.exit_code);
         }
     };
 
     match runtime.block_on(run(cli)) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(err) => {
             drop(runtime);
-            emit_cli_error(&err, json_mode);
+            emit_cli_error(&err, json_error_mode);
             ExitCode::from(err.exit_code)
         }
     }
 }
 
-async fn run(cli: Cli) -> Result<(), CliError> {
+async fn run(cli: Cli) -> Result<ExitCode, CliError> {
     let state_dir = cli.state_dir.unwrap_or_else(default_state_dir);
     let json = cli.json;
     let quiet = cli.quiet;
@@ -344,7 +357,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                     daemon::run_daemon(config.state_dir, config.daemon_idle_timeout, config.verbose)
                         .await
                         .map_err(|e| CliError::runtime("daemon_error", e))?;
-                    Ok(())
+                    Ok(ExitCode::SUCCESS)
                 }
                 #[cfg(not(unix))]
                 {
@@ -364,7 +377,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 } else {
                     print_daemon_status(&status);
                 }
-                Ok(())
+                Ok(ExitCode::SUCCESS)
             }
             DaemonAction::Stop => {
                 #[cfg(unix)]
@@ -381,7 +394,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                             println!("Transport daemon not running");
                         }
                     }
-                    Ok(())
+                    Ok(ExitCode::SUCCESS)
                 }
                 #[cfg(not(unix))]
                 {
@@ -418,7 +431,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 } else if !quiet {
                     eprintln!("Cleared session state at {}", config.state_dir.display());
                 }
-                Ok(())
+                Ok(ExitCode::SUCCESS)
             }
         },
         Command::Status => {
@@ -503,10 +516,10 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                     }
                 );
             }
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Fetch {
-            url,
+            urls,
             format,
             extract,
             render,
@@ -516,12 +529,32 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             no_images,
             no_links,
             max_bytes,
+            concurrency,
+            jsonl,
             metadata_only,
             output,
         } => {
-            if format == OutputFormat::Raw && (json || metadata_only) {
+            if metadata_only && !(json || jsonl) {
                 return Err(CliError::invalid_input(
-                    "--format raw cannot be combined with --json or --metadata-only",
+                    "--metadata-only requires --json or --jsonl",
+                ));
+            }
+            let is_stdin = urls.len() == 1 && urls[0] == "-";
+            if urls.len() > 1 && urls.iter().any(|u| u == "-") {
+                return Err(CliError::invalid_input(
+                    "stdin '-' cannot be mixed with positional URLs",
+                ));
+            }
+            let batch_mode = is_stdin || urls.len() > 1;
+
+            if format == OutputFormat::Raw && (json || jsonl || metadata_only || batch_mode) {
+                return Err(CliError::invalid_input(
+                    "--format raw cannot be combined with batch mode, --json, --jsonl, or --metadata-only",
+                ));
+            }
+            if batch_mode && output.is_some() {
+                return Err(CliError::invalid_input(
+                    "--output cannot be combined with batch mode",
                 ));
             }
             if format == OutputFormat::Raw && output.is_none() && std::io::stdout().is_terminal() {
@@ -530,11 +563,27 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 ));
             }
 
+            let target_urls = if is_stdin {
+                use std::io::Read;
+                let mut stdin_buf = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut stdin_buf)
+                    .map_err(|e| CliError::runtime("io_error", e))?;
+                let parsed = fetch::parse_batch_stdin(&stdin_buf);
+                if parsed.is_empty() {
+                    return Err(CliError::invalid_input("no URLs provided on stdin"));
+                }
+                parsed
+            } else {
+                urls
+            };
+
             let ctx = RuntimeContext::new(config)
                 .map_err(|e| CliError::runtime("context_error", e))?;
 
             if format == OutputFormat::Raw {
-                let res = fetch::fetch_raw(&ctx, &url, respect_robots)
+                let url = &target_urls[0];
+                let res = fetch::fetch_raw(&ctx, url, respect_robots)
                     .await
                     .map_err(CliError::from_fetch)?;
 
@@ -550,12 +599,11 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                     std::fs::write(path, &res.bytes)
                         .map_err(|e| CliError::runtime("io_error", e))?;
                 } else {
-                    use std::io::Write;
                     std::io::stdout()
                         .write_all(&res.bytes)
                         .map_err(|e| CliError::runtime("io_error", e))?;
                 }
-                return Ok(());
+                return Ok(ExitCode::SUCCESS);
             }
 
             let opts = FetchOptions {
@@ -572,42 +620,105 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 apply_rewrites: !no_rewrite,
             };
 
-            let res = fetch::fetch_document(&ctx, &url, &opts)
-                .await
-                .map_err(CliError::from_fetch)?;
+            if !batch_mode {
+                let url = &target_urls[0];
+                let res = fetch::fetch_document(&ctx, url, &opts)
+                    .await
+                    .map_err(CliError::from_fetch)?;
+
+                if jsonl {
+                    let item = BatchItemResult::from_result(url, Ok(res), metadata_only);
+                    let encoded = serde_json::to_string(&item)
+                        .map_err(|e| CliError::runtime("serialization_error", e))?;
+                    println!("{encoded}");
+                } else if json {
+                    let encoded = if metadata_only {
+                        serde_json::to_string(&FetchMetadataOutput::from(&res))
+                    } else {
+                        serde_json::to_string(&res)
+                    }
+                    .map_err(|e| CliError::runtime("serialization_error", e))?;
+
+                    if let Some(ref path) = output {
+                        std::fs::write(path, format!("{encoded}\n"))
+                            .map_err(|e| CliError::runtime("io_error", e))?;
+                    } else {
+                        println!("{}", encoded);
+                    }
+                } else {
+                    if !quiet {
+                        if let Some(title) = &res.title {
+                            eprintln!("Title: {}", title);
+                        }
+                        eprintln!(
+                            "Status: {} | Strategy: {} | Time: {}ms\n",
+                            res.status_code, res.strategy, res.timing_ms
+                        );
+                    }
+                    if let Some(ref path) = output {
+                        std::fs::write(path, res.content.as_bytes())
+                            .map_err(|e| CliError::runtime("io_error", e))?;
+                    } else {
+                        print!("{}", res.content);
+                    }
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+
+            let batch_opts = BatchFetchOptions {
+                fetch: opts,
+                concurrency,
+                metadata_only,
+            };
+            let mut results = fetch::fetch_batch(Arc::new(ctx), target_urls, batch_opts, |_, item| {
+                if jsonl {
+                    if let Ok(line) = serde_json::to_string(item) {
+                        let mut stdout = std::io::stdout().lock();
+                        let _ = writeln!(stdout, "{line}");
+                        let _ = stdout.flush();
+                    }
+                }
+            })
+            .await;
+
+            results.sort_by_key(|(idx, _)| *idx);
+            let ordered: Vec<BatchItemResult> =
+                results.into_iter().map(|(_, item)| item).collect();
+            let exit_code = fetch::batch_exit_code(&ordered);
 
             if json {
-                let encoded = if metadata_only {
-                    serde_json::to_string(&FetchMetadataOutput::from(&res))
-                } else {
-                    serde_json::to_string(&res)
-                }
-                .map_err(|e| CliError::runtime("serialization_error", e))?;
-
-                if let Some(ref path) = output {
-                    std::fs::write(path, format!("{encoded}\n"))
-                        .map_err(|e| CliError::runtime("io_error", e))?;
-                } else {
-                    println!("{}", encoded);
-                }
-            } else {
-                if !quiet {
-                    if let Some(title) = &res.title {
-                        eprintln!("Title: {}", title);
+                let encoded = serde_json::to_string(&ordered)
+                    .map_err(|e| CliError::runtime("serialization_error", e))?;
+                println!("{encoded}");
+            } else if !jsonl {
+                let total = ordered.len();
+                let mut printed_any = false;
+                for (i, item) in ordered.iter().enumerate() {
+                    match item {
+                        BatchItemResult::Success(s) => {
+                            if printed_any {
+                                println!();
+                            }
+                            print!(
+                                "{}",
+                                format_page_section(
+                                    i + 1,
+                                    total,
+                                    s.title.as_deref(),
+                                    &s.final_url,
+                                    s.content.as_deref().unwrap_or(""),
+                                )
+                            );
+                            printed_any = true;
+                        }
+                        BatchItemResult::Failure(f) => {
+                            eprintln!("error [{}]: {}", f.url, f.error);
+                        }
                     }
-                    eprintln!(
-                        "Status: {} | Strategy: {} | Time: {}ms\n",
-                        res.status_code, res.strategy, res.timing_ms
-                    );
-                }
-                if let Some(ref path) = output {
-                    std::fs::write(path, res.content.as_bytes())
-                        .map_err(|e| CliError::runtime("io_error", e))?;
-                } else {
-                    print!("{}", res.content);
                 }
             }
-            Ok(())
+
+            Ok(ExitCode::from(exit_code))
         }
         Command::Search {
             query,
@@ -628,7 +739,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             } else {
                 println!("{}", search::format_results(&response));
             }
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Crawl {
             url,
@@ -671,7 +782,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 }
                 print!("{}", crawl::format_crawl_output(&result, &host));
             }
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Map {
             url,
@@ -711,7 +822,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 }
                 print!("{}", crawl::format_map_output(&result, &host));
             }
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
     }
 }

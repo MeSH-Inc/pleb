@@ -1,7 +1,11 @@
 use mesh_wick::context::{RuntimeConfig, RuntimeContext};
 use mesh_wick::extract::{ExtractOptions, OutputFormat};
-use mesh_wick::fetch::{fetch_document, fetch_raw, FetchError, FetchOptions};
+use mesh_wick::fetch::{
+    batch_exit_code, fetch_batch, fetch_document, fetch_raw, parse_batch_stdin, BatchFetchOptions,
+    BatchItemResult, FetchError, FetchOptions,
+};
 use mesh_wick::policy::RenderMode;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -304,6 +308,80 @@ async fn fetch_enforces_max_response_bytes() {
         matches!(err_raw, FetchError::ResponseTooLarge { limit_bytes: 16, .. }),
         "unexpected raw error: {err_raw:?}"
     );
+
+    drop(ctx);
+    let _ = std::fs::remove_dir_all(state_dir);
+}
+
+#[tokio::test]
+async fn fetch_batch_enforces_concurrency_and_exit_codes() {
+    assert_eq!(
+        parse_batch_stdin("\n# comment\n  https://a.example  \n\nhttps://b.example\n"),
+        vec!["https://a.example".to_string(), "https://b.example".to_string()]
+    );
+
+    let base = spawn_mock_server().await;
+    let state_dir = temp_state_dir("batch");
+    let ctx = Arc::new(
+        RuntimeContext::new(RuntimeConfig {
+            state_dir: state_dir.clone(),
+            timeout: Duration::from_secs(5),
+            cef_timeout: Duration::from_secs(5),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+
+    let batch_opts = BatchFetchOptions {
+        fetch: FetchOptions {
+            render: RenderMode::Cronet,
+            ..Default::default()
+        },
+        concurrency: 4,
+        metadata_only: true,
+    };
+
+    let mut streamed = 0usize;
+    let mut mixed = fetch_batch(
+        Arc::clone(&ctx),
+        vec![
+            format!("{base}/page"),
+            format!("{base}/missing"),
+            format!("{base}/data.json"),
+        ],
+        batch_opts.clone(),
+        |_, item| {
+            streamed += 1;
+            if let BatchItemResult::Success(s) = item {
+                assert!(s.content.is_none());
+            }
+        },
+    )
+    .await;
+    assert_eq!(streamed, 3);
+    mixed.sort_by_key(|(idx, _)| *idx);
+    let mixed_items: Vec<BatchItemResult> = mixed.into_iter().map(|(_, item)| item).collect();
+    assert_eq!(batch_exit_code(&mixed_items), 4);
+
+    let all_404 = fetch_batch(
+        Arc::clone(&ctx),
+        vec![format!("{base}/missing"), format!("{base}/missing2")],
+        batch_opts.clone(),
+        |_, _| {},
+    )
+    .await;
+    let all_404_items: Vec<BatchItemResult> = all_404.into_iter().map(|(_, i)| i).collect();
+    assert_eq!(batch_exit_code(&all_404_items), 3);
+
+    let hetero = fetch_batch(
+        Arc::clone(&ctx),
+        vec![format!("{base}/blocked"), format!("{base}/missing")],
+        batch_opts,
+        |_, _| {},
+    )
+    .await;
+    let hetero_items: Vec<BatchItemResult> = hetero.into_iter().map(|(_, i)| i).collect();
+    assert_eq!(batch_exit_code(&hetero_items), 1);
 
     drop(ctx);
     let _ = std::fs::remove_dir_all(state_dir);

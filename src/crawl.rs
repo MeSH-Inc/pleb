@@ -156,14 +156,12 @@ pub fn format_crawl_output(result: &CrawlResult, host: &str) -> String {
 
     let mut total_len = out.len();
     for (i, page) in result.pages.iter().enumerate() {
-        let title = page.title.as_deref().unwrap_or("Untitled");
-        let section = format!(
-            "\n---\n## [{}/{}] {}\n**URL:** {}\n\n{}\n",
+        let section = extract::format_page_section(
             i + 1,
             result.pages.len(),
-            title,
-            page.url,
-            page.content,
+            page.title.as_deref(),
+            &page.url,
+            &page.content,
         );
 
         if total_len + section.len() > 100_000 {

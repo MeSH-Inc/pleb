@@ -1,6 +1,10 @@
 use serde::Serialize;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use crate::context::RuntimeContext;
 use crate::extract::{self, ExtractOptions, OutputFormat, ParsedHtml};
@@ -639,4 +643,176 @@ fn resolve_target_url(ctx: &RuntimeContext, parsed: &url::Url, apply_rewrites: b
     ctx.rules
         .rewrite_url(parsed)
         .unwrap_or_else(|| parsed.clone())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchItemSuccess {
+    pub url: String,
+    pub ok: bool,
+    pub final_url: String,
+    pub status_code: u16,
+    pub content_type: Option<String>,
+    pub title: Option<String>,
+    pub strategy: String,
+    pub escalated: bool,
+    pub truncated: bool,
+    pub timing_ms: u64,
+    pub content_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchItemFailure {
+    pub url: String,
+    pub ok: bool,
+    pub error: String,
+    pub kind: String,
+    pub exit_code: u8,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum BatchItemResult {
+    Success(BatchItemSuccess),
+    Failure(BatchItemFailure),
+}
+
+impl BatchItemResult {
+    pub fn from_result(
+        url: &str,
+        res: std::result::Result<FetchOutput, FetchError>,
+        metadata_only: bool,
+    ) -> Self {
+        match res {
+            Ok(out) => Self::Success(BatchItemSuccess {
+                url: out.url,
+                ok: true,
+                final_url: out.final_url,
+                status_code: out.status_code,
+                content_type: out.content_type,
+                title: out.title,
+                strategy: out.strategy,
+                escalated: out.escalated,
+                truncated: out.truncated,
+                timing_ms: out.timing_ms,
+                content_bytes: out.content_bytes,
+                content: (!metadata_only).then_some(out.content),
+            }),
+            Err(err) => Self::Failure(BatchItemFailure {
+                url: url.to_string(),
+                ok: false,
+                error: err.to_string(),
+                kind: err.kind().to_string(),
+                exit_code: err.exit_code().clamp(1, 255) as u8,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchFetchOptions {
+    pub fetch: FetchOptions,
+    pub concurrency: usize,
+    pub metadata_only: bool,
+}
+
+pub fn parse_batch_stdin(input: &str) -> Vec<String> {
+    input
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect()
+}
+
+pub fn batch_exit_code(results: &[BatchItemResult]) -> u8 {
+    if results.is_empty() {
+        return 1;
+    }
+    let mut successes = 0usize;
+    let mut failure_codes: HashSet<u8> = HashSet::new();
+    for item in results {
+        match item {
+            BatchItemResult::Success(_) => successes += 1,
+            BatchItemResult::Failure(f) => {
+                failure_codes.insert(f.exit_code);
+            }
+        }
+    }
+    if failure_codes.is_empty() {
+        0
+    } else if successes > 0 {
+        4
+    } else if failure_codes.len() == 1 {
+        *failure_codes.iter().next().unwrap_or(&1)
+    } else {
+        1
+    }
+}
+
+pub async fn fetch_batch<F>(
+    ctx: Arc<RuntimeContext>,
+    urls: Vec<String>,
+    options: BatchFetchOptions,
+    mut on_complete: F,
+) -> Vec<(usize, BatchItemResult)>
+where
+    F: FnMut(usize, &BatchItemResult),
+{
+    let concurrency = options.concurrency.clamp(1, 16);
+    let global_sem = Arc::new(Semaphore::new(concurrency));
+    let host_sems: Arc<Mutex<HashMap<String, Arc<Semaphore>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let fetch_opts = Arc::new(options.fetch);
+    let metadata_only = options.metadata_only;
+
+    let mut set = JoinSet::new();
+    for (idx, raw_url) in urls.into_iter().enumerate() {
+        let ctx_c = Arc::clone(&ctx);
+        let global_c = Arc::clone(&global_sem);
+        let host_sems_c = Arc::clone(&host_sems);
+        let opts_c = Arc::clone(&fetch_opts);
+
+        set.spawn(async move {
+            let host_key = batch_host_key(&ctx_c, &raw_url, opts_c.apply_rewrites);
+            let host_sem = {
+                let mut map = host_sems_c.lock().expect("host semaphore map poisoned");
+                Arc::clone(
+                    map.entry(host_key)
+                        .or_insert_with(|| Arc::new(Semaphore::new(2))),
+                )
+            };
+
+            let _host_permit = host_sem.acquire_owned().await.expect("host semaphore closed");
+            let _global_permit = global_c
+                .acquire_owned()
+                .await
+                .expect("global semaphore closed");
+
+            let res = fetch_document(&ctx_c, &raw_url, &opts_c).await;
+            let item = BatchItemResult::from_result(&raw_url, res, metadata_only);
+            (idx, item)
+        });
+    }
+
+    let mut collected = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        if let Ok((idx, item)) = joined {
+            on_complete(idx, &item);
+            collected.push((idx, item));
+        }
+    }
+    collected
+}
+
+fn batch_host_key(ctx: &RuntimeContext, raw_url: &str, apply_rewrites: bool) -> String {
+    let Ok(parsed) = parse_http_url(raw_url) else {
+        return "__invalid__".to_string();
+    };
+    let effective = resolve_target_url(ctx, &parsed, apply_rewrites);
+    effective
+        .host_str()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| "__invalid__".to_string())
 }

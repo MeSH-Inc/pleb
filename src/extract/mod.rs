@@ -56,6 +56,20 @@ pub struct ExtractedDocument {
     pub truncated: bool,
 }
 
+pub fn format_page_section(
+    index: usize,
+    total: usize,
+    title: Option<&str>,
+    url: &str,
+    content: &str,
+) -> String {
+    let title = title.unwrap_or("Untitled");
+    format!(
+        "\n---\n## [{}/{}] {}\n**URL:** {}\n\n{}\n",
+        index, total, title, url, content
+    )
+}
+
 pub fn extract_document(
     body: &str,
     page_url: &::url::Url,
