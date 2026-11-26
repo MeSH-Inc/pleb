@@ -1,22 +1,46 @@
 use std::fs;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::process::Command;
 
-fn temp_dir(tag: &str) -> std::path::PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let dir = std::path::PathBuf::from(format!(
-        "/tmp/mw-cli-{}-{}-{}",
-        tag,
-        std::process::id(),
-        nanos
-    ));
-    fs::create_dir_all(&dir).unwrap();
-    dir
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new() -> Self {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = PathBuf::from(format!("/tmp/wick-t-{}-{}", std::process::id(), seq));
+        fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        Self(dir)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for TempDir {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.0.as_os_str()
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn temp_dir() -> TempDir {
+    TempDir::new()
 }
 
 async fn spawn_cli_test_server() -> String {
@@ -69,8 +93,8 @@ async fn spawn_cli_test_server() -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_supports_value_enums_output_file_and_uniform_json_errors() {
     let base = spawn_cli_test_server().await;
-    let state_dir = temp_dir("state");
-    let out_dir = temp_dir("out");
+    let state_dir = temp_dir();
+    let out_dir = temp_dir();
     let wick_bin = env!("CARGO_BIN_EXE_wick");
 
     // 1. status --json emits structured JSON.
@@ -141,7 +165,7 @@ async fn cli_supports_value_enums_output_file_and_uniform_json_errors() {
     assert!(meta_json["content_bytes"].as_u64().unwrap() > 0);
 
     // 4. --format raw --output writes exact bytes without touching stdout.
-    let raw_path = out_dir.join("doc.pdf");
+    let raw_path = out_dir.path().join("doc.pdf");
     let raw_out = Command::new(wick_bin)
         .args(["--state-dir"])
         .arg(&state_dir)
@@ -166,7 +190,7 @@ async fn cli_supports_value_enums_output_file_and_uniform_json_errors() {
     assert_eq!(fs::read(&raw_path).unwrap(), b"%PDF-1.7\nbinary");
 
     // 5. Failed fetch with --output must NOT create an empty file, and --json writes error JSON to stderr.
-    let fail_path = out_dir.join("should-not-exist.md");
+    let fail_path = out_dir.path().join("should-not-exist.md");
     let fail_404 = Command::new(wick_bin)
         .args(["--state-dir"])
         .arg(&state_dir)
@@ -192,7 +216,13 @@ async fn cli_supports_value_enums_output_file_and_uniform_json_errors() {
     let fail_403 = Command::new(wick_bin)
         .args(["--state-dir"])
         .arg(&state_dir)
-        .args(["--json", "fetch", "--render", "cronet", &format!("{base}/blocked")])
+        .args([
+            "--json",
+            "fetch",
+            "--render",
+            "cronet",
+            &format!("{base}/blocked"),
+        ])
         .output()
         .await
         .unwrap();
@@ -203,7 +233,13 @@ async fn cli_supports_value_enums_output_file_and_uniform_json_errors() {
     let fail_pdf = Command::new(wick_bin)
         .args(["--state-dir"])
         .arg(&state_dir)
-        .args(["--json", "fetch", "--render", "cronet", &format!("{base}/file.pdf")])
+        .args([
+            "--json",
+            "fetch",
+            "--render",
+            "cronet",
+            &format!("{base}/file.pdf"),
+        ])
         .output()
         .await
         .unwrap();
@@ -214,7 +250,13 @@ async fn cli_supports_value_enums_output_file_and_uniform_json_errors() {
     let fail_raw_json = Command::new(wick_bin)
         .args(["--state-dir"])
         .arg(&state_dir)
-        .args(["--json", "fetch", "--format", "raw", &format!("{base}/file.pdf")])
+        .args([
+            "--json",
+            "fetch",
+            "--format",
+            "raw",
+            &format!("{base}/file.pdf"),
+        ])
         .output()
         .await
         .unwrap();
@@ -241,9 +283,6 @@ async fn cli_supports_value_enums_output_file_and_uniform_json_errors() {
         .args(["daemon", "stop"])
         .output()
         .await;
-
-    let _ = fs::remove_dir_all(&state_dir);
-    let _ = fs::remove_dir_all(&out_dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -252,7 +291,7 @@ async fn cli_batch_fetch_modes_stdin_and_flag_conflicts() {
     use tokio::io::AsyncWriteExt as _;
 
     let base = spawn_cli_test_server().await;
-    let state_dir = temp_dir("batch");
+    let state_dir = temp_dir();
     let wick_bin = env!("CARGO_BIN_EXE_wick");
 
     // 1. Multi-URL --json returns ordered JSON array.
@@ -302,8 +341,12 @@ async fn cli_batch_fetch_modes_stdin_and_flag_conflicts() {
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
     assert_eq!(lines.len(), 2);
-    assert!(lines.iter().any(|v| v["ok"] == true && v.get("content").is_none()));
-    assert!(lines.iter().any(|v| v["ok"] == false && v["exit_code"] == 3));
+    assert!(lines
+        .iter()
+        .any(|v| v["ok"] == true && v.get("content").is_none()));
+    assert!(lines
+        .iter()
+        .any(|v| v["ok"] == false && v["exit_code"] == 3));
 
     // 3. Multi-URL default markdown prints numbered sections.
     let batch_md = Command::new(wick_bin)
@@ -401,8 +444,20 @@ async fn cli_batch_fetch_modes_stdin_and_flag_conflicts() {
 
     // 7. Flag conflicts return exit 1.
     for args in [
-        vec!["fetch", "--format", "raw", &format!("{base}/ok"), &format!("{base}/ok")],
-        vec!["fetch", "--output", "/tmp/unused.md", &format!("{base}/ok"), &format!("{base}/ok")],
+        vec![
+            "fetch",
+            "--format",
+            "raw",
+            &format!("{base}/ok"),
+            &format!("{base}/ok"),
+        ],
+        vec![
+            "fetch",
+            "--output",
+            "/tmp/unused.md",
+            &format!("{base}/ok"),
+            &format!("{base}/ok"),
+        ],
         vec!["fetch", "--json", "--jsonl", &format!("{base}/ok")],
         vec!["fetch", "--metadata-only", &format!("{base}/ok")],
         vec!["search", "--urls-only", "--json", "rust"],
@@ -423,5 +478,4 @@ async fn cli_batch_fetch_modes_stdin_and_flag_conflicts() {
         .args(["daemon", "stop"])
         .output()
         .await;
-    let _ = fs::remove_dir_all(&state_dir);
 }

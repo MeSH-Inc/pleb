@@ -1,28 +1,51 @@
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use mesh_wick::context::{RuntimeConfig, RuntimeContext};
-use mesh_wick::extract::{ExtractOptions, OutputFormat};
+use mesh_wick::crawl::{crawl, map, CrawlOptions, MapOptions};
+use mesh_wick::extract::{ExtractMode, ExtractOptions, OutputFormat};
 use mesh_wick::fetch::{
     batch_exit_code, fetch_batch, fetch_document, fetch_raw, parse_batch_stdin, BatchFetchOptions,
     BatchItemResult, FetchError, FetchOptions,
 };
 use mesh_wick::policy::RenderMode;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-fn temp_state_dir(name: &str) -> std::path::PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "mesh-wick-fetch-{}-{}-{}",
-        name,
-        std::process::id(),
-        nanos
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new() -> Self {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = PathBuf::from(format!("/tmp/wick-t-{}-{}", std::process::id(), seq));
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        Self(dir)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn temp_state_dir() -> TempDir {
+    TempDir::new()
 }
 
 async fn spawn_mock_server() -> String {
@@ -127,9 +150,9 @@ fn http_response(status: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
 #[tokio::test]
 async fn fetch_pipeline_end_to_end_against_local_server() {
     let base = spawn_mock_server().await;
-    let state_dir = temp_state_dir("e2e");
+    let state_dir = temp_state_dir();
     let ctx = RuntimeContext::new(RuntimeConfig {
-        state_dir: state_dir.clone(),
+        state_dir: state_dir.path().to_path_buf(),
         timeout: Duration::from_secs(5),
         cef_timeout: Duration::from_secs(5),
         ..Default::default()
@@ -155,7 +178,9 @@ async fn fetch_pipeline_end_to_end_against_local_server() {
         .await
         .unwrap();
     assert!(redir.final_url.ends_with("/docs/sub/entry"));
-    assert!(redir.content.contains(&format!("[Guide]({base}/docs/sub/guide?v=1)")));
+    assert!(redir
+        .content
+        .contains(&format!("[Guide]({base}/docs/sub/guide?v=1)")));
 
     // 3. JSON passes through unmodified.
     let json_doc = fetch_document(&ctx, &format!("{base}/data.json"), &cronet_opts)
@@ -230,18 +255,21 @@ async fn fetch_pipeline_end_to_end_against_local_server() {
     let err_404_png = fetch_document(&ctx, &format!("{base}/missing.png"), &cronet_opts)
         .await
         .unwrap_err();
-    assert!(matches!(err_404_png, FetchError::HttpError { status: 404, .. }));
+    assert!(matches!(
+        err_404_png,
+        FetchError::HttpError { status: 404, .. }
+    ));
     assert_eq!(err_404_png.exit_code(), 3);
 
-    let _ = std::fs::remove_dir_all(state_dir);
+    drop(ctx);
 }
 
 #[tokio::test]
 async fn fetch_concurrent_requests_and_clean_teardown() {
     let base = spawn_mock_server().await;
-    let state_dir = temp_state_dir("concurrent");
+    let state_dir = temp_state_dir();
     let ctx = RuntimeContext::new(RuntimeConfig {
-        state_dir: state_dir.clone(),
+        state_dir: state_dir.path().to_path_buf(),
         timeout: Duration::from_secs(5),
         cef_timeout: Duration::from_secs(5),
         ..Default::default()
@@ -270,15 +298,14 @@ async fn fetch_concurrent_requests_and_clean_teardown() {
     assert!(r4.unwrap().content.contains("<svg"));
 
     drop(ctx);
-    let _ = std::fs::remove_dir_all(state_dir);
 }
 
 #[tokio::test]
 async fn fetch_enforces_max_response_bytes() {
     let base = spawn_mock_server().await;
-    let state_dir = temp_state_dir("max-bytes");
+    let state_dir = temp_state_dir();
     let ctx = RuntimeContext::new(RuntimeConfig {
-        state_dir: state_dir.clone(),
+        state_dir: state_dir.path().to_path_buf(),
         timeout: Duration::from_secs(5),
         max_response_bytes: Some(16),
         cef_timeout: Duration::from_secs(5),
@@ -295,7 +322,13 @@ async fn fetch_enforces_max_response_bytes() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err_doc, FetchError::ResponseTooLarge { limit_bytes: 16, .. }),
+        matches!(
+            err_doc,
+            FetchError::ResponseTooLarge {
+                limit_bytes: 16,
+                ..
+            }
+        ),
         "unexpected document error: {err_doc:?}"
     );
     assert_eq!(err_doc.exit_code(), 1);
@@ -305,26 +338,34 @@ async fn fetch_enforces_max_response_bytes() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err_raw, FetchError::ResponseTooLarge { limit_bytes: 16, .. }),
+        matches!(
+            err_raw,
+            FetchError::ResponseTooLarge {
+                limit_bytes: 16,
+                ..
+            }
+        ),
         "unexpected raw error: {err_raw:?}"
     );
 
     drop(ctx);
-    let _ = std::fs::remove_dir_all(state_dir);
 }
 
 #[tokio::test]
 async fn fetch_batch_enforces_concurrency_and_exit_codes() {
     assert_eq!(
         parse_batch_stdin("\n# comment\n  https://a.example  \n\nhttps://b.example\n"),
-        vec!["https://a.example".to_string(), "https://b.example".to_string()]
+        vec![
+            "https://a.example".to_string(),
+            "https://b.example".to_string()
+        ]
     );
 
     let base = spawn_mock_server().await;
-    let state_dir = temp_state_dir("batch");
+    let state_dir = temp_state_dir();
     let ctx = Arc::new(
         RuntimeContext::new(RuntimeConfig {
-            state_dir: state_dir.clone(),
+            state_dir: state_dir.path().to_path_buf(),
             timeout: Duration::from_secs(5),
             cef_timeout: Duration::from_secs(5),
             ..Default::default()
@@ -384,5 +425,441 @@ async fn fetch_batch_enforces_concurrency_and_exit_codes() {
     assert_eq!(batch_exit_code(&hetero_items), 1);
 
     drop(ctx);
-    let _ = std::fs::remove_dir_all(state_dir);
+}
+
+#[tokio::test]
+async fn crawl_updates_origin_after_seed_redirect() {
+    // Target origin serves /home linking to /child and back to /home.
+    let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_base = format!("http://{}", target_listener.local_addr().unwrap());
+    let target_base_srv = target_base.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = target_listener.accept().await else {
+                break;
+            };
+            let base = target_base_srv.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let resp = match path {
+                    "/home" => http_response(
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        format!(
+                            "<html><head><title>Home</title></head><body><main>\
+                             <a href=\"{base}/home\">Self</a>\
+                             <a href=\"/child\">Child</a>\
+                             </main></body></html>"
+                        )
+                        .as_bytes(),
+                    ),
+                    "/child" => http_response(
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        b"<html><head><title>Child</title></head><body><main><p>Child body</p></main></body></html>",
+                    ),
+                    _ => http_response("404 Not Found", "text/plain", b"missing"),
+                };
+                let _ = socket.write_all(&resp).await;
+            });
+        }
+    });
+
+    // Seed origin redirects /start -> target_base/home (different origin).
+    let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let seed_base = format!("http://{}", seed_listener.local_addr().unwrap());
+    let redirect_target = format!("{target_base}/home");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = seed_listener.accept().await else {
+                break;
+            };
+            let loc = redirect_target.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 301 Moved Permanently\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let state_dir = temp_state_dir();
+    let ctx = RuntimeContext::new(RuntimeConfig {
+        state_dir: state_dir.path().to_path_buf(),
+        timeout: Duration::from_secs(5),
+        cef_timeout: Duration::from_secs(5),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let res = crawl(
+        &ctx,
+        &format!("{seed_base}/start"),
+        CrawlOptions {
+            max_depth: 1,
+            max_pages: 5,
+            format: OutputFormat::Markdown,
+            extract_mode: ExtractMode::Clean,
+            respect_robots: false,
+            path_filter: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let urls: Vec<&str> = res.pages.iter().map(|p| p.url.as_str()).collect();
+    assert_eq!(
+        urls,
+        vec![
+            format!("{target_base}/home"),
+            format!("{target_base}/child")
+        ]
+    );
+}
+
+#[tokio::test]
+async fn crawl_enforces_max_pages_and_deterministic_order_under_concurrency() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+
+                // Stagger delays so /p1 finishes AFTER /p2 and /p3 to test deterministic sorting.
+                let delay_ms = match path {
+                    "/p1" => 180,
+                    "/p2" => 60,
+                    "/p3" => 10,
+                    _ => 0,
+                };
+                if delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+
+                let resp = match path {
+                    "/" => http_response(
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        b"<html><head><title>Seed</title></head><body><main>\
+                          <a href=\"/p1\">P1</a>\
+                          <a href=\"/p2\">P2</a>\
+                          <a href=\"/p3\">P3</a>\
+                          <a href=\"/p4\">P4</a>\
+                          <a href=\"/p5\">P5</a>\
+                          </main></body></html>",
+                    ),
+                    "/p1" | "/p2" | "/p3" | "/p4" | "/p5" => http_response(
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        format!("<html><head><title>{path}</title></head><body><main><p>Body {path}</p></main></body></html>")
+                            .as_bytes(),
+                    ),
+                    _ => http_response("404 Not Found", "text/plain", b"missing"),
+                };
+                let _ = socket.write_all(&resp).await;
+            });
+        }
+    });
+
+    let state_dir = temp_state_dir();
+    let ctx = RuntimeContext::new(RuntimeConfig {
+        state_dir: state_dir.path().to_path_buf(),
+        timeout: Duration::from_secs(5),
+        cef_timeout: Duration::from_secs(5),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let res = crawl(
+        &ctx,
+        &format!("{base}/"),
+        CrawlOptions {
+            max_depth: 1,
+            max_pages: 4,
+            format: OutputFormat::Markdown,
+            extract_mode: ExtractMode::Clean,
+            respect_robots: false,
+            path_filter: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(res.pages.len(), 4);
+    let urls: Vec<&str> = res.pages.iter().map(|p| p.url.as_str()).collect();
+    assert_eq!(
+        urls,
+        vec![
+            format!("{base}/"),
+            format!("{base}/p1"),
+            format!("{base}/p2"),
+            format!("{base}/p3"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn robots_cache_coalesces_concurrent_cold_requests() {
+    let robots_hits = Arc::new(AtomicUsize::new(0));
+    let hits_srv = Arc::clone(&robots_hits);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let base_srv = base.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let hits = Arc::clone(&hits_srv);
+            let origin = base_srv.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                if path == "/robots.txt" {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                    let body = format!(
+                        "User-agent: *\nDisallow: /secret\nSitemap: {origin}/custom-map.xml\n"
+                    );
+                    let _ = socket
+                        .write_all(&http_response("200 OK", "text/plain", body.as_bytes()))
+                        .await;
+                } else {
+                    let _ = socket
+                        .write_all(&http_response("404 Not Found", "text/plain", b"missing"))
+                        .await;
+                }
+            });
+        }
+    });
+
+    let state_dir = temp_state_dir();
+    let ctx = Arc::new(
+        RuntimeContext::new(RuntimeConfig {
+            state_dir: state_dir.path().to_path_buf(),
+            timeout: Duration::from_secs(5),
+            cef_timeout: Duration::from_secs(5),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+
+    let mut handles = Vec::new();
+    for i in 0..8 {
+        let ctx_clone = Arc::clone(&ctx);
+        let url = if i % 2 == 0 {
+            format!("{base}/public/{i}")
+        } else {
+            format!("{base}/secret/{i}")
+        };
+        handles.push(tokio::spawn(async move {
+            ctx_clone.robots.is_allowed(&ctx_clone.client, &url).await
+        }));
+    }
+
+    let mut results = Vec::new();
+    for handle in handles {
+        results.push(handle.await.unwrap());
+    }
+    for (i, allowed) in results.into_iter().enumerate() {
+        assert_eq!(allowed, i % 2 == 0);
+    }
+
+    let sitemaps = ctx
+        .robots
+        .sitemap_urls(&ctx.client, &format!("{base}/"))
+        .await;
+    assert_eq!(sitemaps, vec![format!("{base}/custom-map.xml")]);
+    assert_eq!(
+        robots_hits.load(Ordering::SeqCst),
+        1,
+        "concurrent cold requests must coalesce into a single /robots.txt fetch"
+    );
+}
+
+#[tokio::test]
+async fn map_resolves_recursive_sitemapindex_guards_and_gzip_sitemaps() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let base_srv = base.clone();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let origin = base_srv.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+
+                let resp = match path {
+                    "/robots.txt" => http_response(
+                        "200 OK",
+                        "text/plain",
+                        format!(
+                            "User-agent: *\nDisallow: /blocked-by-robots\nSitemap: {origin}/gz-sitemap.xml.gz\n"
+                        )
+                        .as_bytes(),
+                    ),
+                    // Depth 0: namespaced sitemapindex with a cycle back to itself + depth chain.
+                    "/sitemap.xml" => http_response(
+                        "200 OK",
+                        "application/xml",
+                        format!(
+                            r#"<?xml version="1.0" encoding="UTF-8"?>
+                            <sm:sitemapindex xmlns:sm="http://www.sitemaps.org/schemas/sitemap/0.9">
+                              <sm:sitemap><sm:loc>{origin}/index-d1.xml</sm:loc></sm:sitemap>
+                              <sm:sitemap><sm:loc>{origin}/sitemap.xml</sm:loc></sm:sitemap>
+                            </sm:sitemapindex>"#
+                        )
+                        .as_bytes(),
+                    ),
+                    // Depth 1: points back to /sitemap.xml (cycle) and forward to depth 2 + leaf urlset.
+                    "/index-d1.xml" => http_response(
+                        "200 OK",
+                        "application/xml",
+                        format!(
+                            r#"<sitemapindex>
+                              <sitemap><loc>{origin}/sitemap.xml</loc></sitemap>
+                              <sitemap><loc>{origin}/leaf-d2.xml</loc></sitemap>
+                              <sitemap><loc>{origin}/index-d2.xml</loc></sitemap>
+                            </sitemapindex>"#
+                        )
+                        .as_bytes(),
+                    ),
+                    // Depth 2 leaf: CDATA, &amp; entity, cross-origin URL, robots-disallowed URL.
+                    "/leaf-d2.xml" => http_response(
+                        "200 OK",
+                        "application/xml",
+                        format!(
+                            r#"<sm:urlset xmlns:sm="http://www.sitemaps.org/schemas/sitemap/0.9">
+                              <sm:url><sm:loc><![CDATA[{origin}/from-cdata?a=1&b=2]]></sm:loc></sm:url>
+                              <sm:url><sm:loc>{origin}/from-entity?x=1&amp;y=2</sm:loc></sm:url>
+                              <sm:url><sm:loc>{origin}/blocked-by-robots</sm:loc></sm:url>
+                              <sm:url><sm:loc>https://other.example.com/offsite</sm:loc></sm:url>
+                            </sm:urlset>"#
+                        )
+                        .as_bytes(),
+                    ),
+                    // Depth 2 -> Depth 3 -> Depth 4 (depth 4 must NOT be fetched because depth <= 3).
+                    "/index-d2.xml" => http_response(
+                        "200 OK",
+                        "application/xml",
+                        format!(
+                            r#"<sitemapindex><sitemap><loc>{origin}/index-d3.xml</loc></sitemap></sitemapindex>"#
+                        )
+                        .as_bytes(),
+                    ),
+                    "/index-d3.xml" => http_response(
+                        "200 OK",
+                        "application/xml",
+                        format!(
+                            r#"<sitemapindex><sitemap><loc>{origin}/too-deep-d4.xml</loc></sitemap></sitemapindex>"#
+                        )
+                        .as_bytes(),
+                    ),
+                    "/too-deep-d4.xml" => http_response(
+                        "200 OK",
+                        "application/xml",
+                        format!(r#"<urlset><url><loc>{origin}/too-deep-page</loc></url></urlset>"#)
+                            .as_bytes(),
+                    ),
+                    // Raw gzip-compressed sitemap discovered from robots.txt Sitemap: directive.
+                    "/gz-sitemap.xml.gz" => {
+                        let xml = format!(
+                            r#"<urlset><url><loc>{origin}/from-gzip</loc></url></urlset>"#
+                        );
+                        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+                        encoder.write_all(xml.as_bytes()).unwrap();
+                        let gz_bytes = encoder.finish().unwrap();
+                        http_response("200 OK", "application/gzip", &gz_bytes)
+                    }
+                    "/" => http_response(
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        b"<html><body><main><p>Home</p></main></body></html>",
+                    ),
+                    _ => http_response("404 Not Found", "text/plain", b"missing"),
+                };
+                let _ = socket.write_all(&resp).await;
+            });
+        }
+    });
+
+    let state_dir = temp_state_dir();
+    let ctx = RuntimeContext::new(RuntimeConfig {
+        state_dir: state_dir.path().to_path_buf(),
+        timeout: Duration::from_secs(5),
+        cef_timeout: Duration::from_secs(5),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let res = map(
+        &ctx,
+        &format!("{base}/"),
+        MapOptions {
+            limit: 50,
+            use_sitemap: true,
+            respect_robots: true,
+            path_filter: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(res.urls.contains(&format!("{base}/from-gzip")));
+    assert!(res.urls.contains(&format!("{base}/from-cdata?a=1&b=2")));
+    assert!(res.urls.contains(&format!("{base}/from-entity?x=1&y=2")));
+    assert!(!res.urls.iter().any(|u| u.contains("blocked-by-robots")));
+    assert!(!res.urls.iter().any(|u| u.contains("other.example.com")));
+    assert!(!res.urls.iter().any(|u| u.contains("too-deep-page")));
+    assert_eq!(res.from_sitemap, 3);
 }
