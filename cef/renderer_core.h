@@ -338,7 +338,7 @@ static void render_url_v4(const WickRenderRequest* req) {
 
     cef_frame_t* frame = g_browser->get_main_frame(g_browser);
     if (!frame) {
-        wick_write_response(stdout, 0, req->url, NULL, 0, "main frame unavailable");
+        wick_write_response(stdout, 0, req->url, NULL, 0, "main frame unavailable", NULL);
         return;
     }
 
@@ -411,14 +411,14 @@ static void render_url_v4(const WickRenderRequest* req) {
     if (g_load_error != 0) {
         char err_msg[96];
         snprintf(err_msg, sizeof(err_msg), "load error %d", g_load_error);
-        wick_write_response(stdout, 0, req->url, NULL, 0, err_msg);
+        wick_write_response(stdout, 0, req->url, NULL, 0, err_msg, NULL);
         return;
     }
 
     if (g_selector_error && g_selector_error[0]) {
         char* err_msg = wick_asprintf("invalid selector: %s", g_selector_error);
         wick_write_response(stdout, g_status_code, req->url, NULL, 0,
-                            err_msg ? err_msg : "invalid selector");
+                            err_msg ? err_msg : "invalid selector", NULL);
         free(err_msg);
         return;
     }
@@ -427,13 +427,13 @@ static void render_url_v4(const WickRenderRequest* req) {
         const char* msg = timed_out_uncommitted
             ? "timed out before main frame commit"
             : "timed out capturing rendered DOM";
-        wick_write_response(stdout, g_status_code, req->url, NULL, 0, msg);
+        wick_write_response(stdout, g_status_code, req->url, NULL, 0, msg, NULL);
         return;
     }
 
     char* final_url = copy_main_frame_url();
     const char* out_url = (final_url && final_url[0]) ? final_url : req->url;
-    wick_write_response(stdout, g_status_code, out_url, g_html, g_html_len, NULL);
+    wick_write_response(stdout, g_status_code, out_url, g_html, g_html_len, NULL, NULL);
     free(final_url);
 }
 
@@ -460,7 +460,7 @@ static void wick_run_request_loop(void) {
     int too_long = 0;
     while (wick_read_line(stdin, &line, WICK_MAX_REQUEST_LINE_BYTES, &too_long)) {
         if (too_long) {
-            wick_write_response(stdout, 0, "", NULL, 0, "request line exceeds 64 KiB limit");
+            wick_write_response(stdout, 0, "", NULL, 0, "request line exceeds 64 KiB limit", NULL);
             continue;
         }
         if (line[0] == '\0') {
@@ -472,7 +472,7 @@ static void wick_run_request_loop(void) {
         WickRenderRequest req = {};
         char err_buf[256] = {};
         if (wick_parse_request_line(line, &req, err_buf, sizeof(err_buf)) != 0) {
-            wick_write_response(stdout, 0, "", NULL, 0, err_buf);
+            wick_write_response(stdout, 0, "", NULL, 0, err_buf, NULL);
             free(line);
             line = NULL;
             continue;

@@ -20,6 +20,17 @@ pub fn classify_response_with_parsed(
     body: &str,
     parsed: &mut Option<dom::ParsedHtml>,
 ) -> ResponseClassification {
+    classify_response_with_context(status, is_html, None, None, body, parsed)
+}
+
+pub fn classify_response_with_context(
+    status: u16,
+    is_html: bool,
+    _requested_url: Option<&str>,
+    _final_url: Option<&str>,
+    body: &str,
+    parsed: &mut Option<dom::ParsedHtml>,
+) -> ResponseClassification {
     if status == 403 || status == 503 {
         let lower = body.to_ascii_lowercase();
         if let Some(reason) = detect_challenge_lower(&lower) {

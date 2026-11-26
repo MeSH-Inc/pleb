@@ -2,7 +2,7 @@ use mesh_wick::extract::{
     decode_text_bytes, detect_binary_content, extract_document_parsed, is_html_content_type,
     ExtractMode, ExtractOptions, OutputFormat,
 };
-use mesh_wick::policy::{classify_response_with_parsed, ResponseClassification};
+use mesh_wick::policy::{classify_response_with_context, ResponseClassification};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -317,7 +317,14 @@ fn evaluate_fixture(path: &Path) -> (String, FixtureSpec, FixtureOutcome) {
     let mut out = FixtureOutcome::default();
     let is_html = is_html_content_type(spec.content_type.as_deref());
     let mut parsed = None;
-    let cls = classify_response_with_parsed(spec.status_code, is_html, &body_str, &mut parsed);
+    let cls = classify_response_with_context(
+        spec.status_code,
+        is_html,
+        Some(&spec.url),
+        Some(spec.final_url.as_deref().unwrap_or(&spec.url)),
+        &body_str,
+        &mut parsed,
+    );
     let (cls_name, mut actual_exit, mut actual_kind) = match &cls {
         ResponseClassification::Ok => ("ok", 0, None),
         ResponseClassification::Blocked { .. } => ("blocked", 2, Some("blocked")),

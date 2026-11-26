@@ -9,7 +9,7 @@ use tokio::task::JoinSet;
 use crate::context::RuntimeContext;
 use crate::extract::{self, ExtractOptions, OutputFormat, ParsedHtml};
 use crate::policy::{
-    classify_response_with_parsed, detect_interstitial_challenge, plan_strategy, PrimaryTransport,
+    classify_response_with_context, detect_interstitial_challenge, plan_strategy, PrimaryTransport,
     RenderMode, ResponseClassification,
 };
 use crate::transport::cef::{
@@ -323,7 +323,7 @@ async fn acquire_page(
         )
         .await
         {
-            Ok(cef_res) => return classify_cef_result(ctx, host, start, cef_res, false),
+            Ok(cef_res) => return classify_cef_result(ctx, host, url_str, start, cef_res, false),
             Err(err) => {
                 let timing_ms = start.elapsed().as_millis() as u64;
                 if matches!(err, FetchError::Timeout { .. }) {
@@ -370,7 +370,14 @@ async fn acquire_page(
 
     let body = resp.text();
     let mut parsed_html = None;
-    let classification = classify_response_with_parsed(status, is_html, &body, &mut parsed_html);
+    let classification = classify_response_with_context(
+        status,
+        is_html,
+        Some(url_str),
+        Some(&final_url),
+        &body,
+        &mut parsed_html,
+    );
 
     match classification {
         ResponseClassification::Ok => {
@@ -482,7 +489,7 @@ async fn try_cef_escalation(
 ) -> CefEscalation {
     match render_cef_checked(&ctx.cef, url, wait_for_selector, ctx.config.cef_timeout).await {
         Ok(cef_res) => {
-            CefEscalation::Completed(classify_cef_result(ctx, host, start, cef_res, true))
+            CefEscalation::Completed(classify_cef_result(ctx, host, url, start, cef_res, true))
         }
         Err(err @ FetchError::CefUnavailable(_)) => CefEscalation::Unavailable(err),
         Err(err) => CefEscalation::RenderFailed(err),
@@ -492,6 +499,7 @@ async fn try_cef_escalation(
 fn classify_cef_result(
     ctx: &RuntimeContext,
     host: &str,
+    requested_url: &str,
     start: Instant,
     res: CefRenderResult,
     escalated: bool,
@@ -504,7 +512,14 @@ fn classify_cef_result(
     }
 
     let mut parsed_html = None;
-    match classify_response_with_parsed(res.status_code, true, &res.html, &mut parsed_html) {
+    match classify_response_with_context(
+        res.status_code,
+        true,
+        Some(requested_url),
+        Some(&res.final_url),
+        &res.html,
+        &mut parsed_html,
+    ) {
         ResponseClassification::Ok | ResponseClassification::JavaScriptShell { .. } => {
             let timing_ms = start.elapsed().as_millis() as u64;
             ctx.site_cache.record(host, "cef", timing_ms);

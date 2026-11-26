@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
-pub const EXPECTED_PROTOCOL: &str = "v4-meta";
+pub const EXPECTED_PROTOCOL: &str = "v5-meta";
 const PROTOCOL_MARKER_PREFIX: &[u8] = b"WICK_RENDERER_PROTOCOL=";
 const STDERR_TAIL_MAX_BYTES: usize = 64 * 1024;
 const MAX_HTML_BYTES: usize = 64 * 1024 * 1024;
@@ -69,6 +69,9 @@ struct RendererResponseHeader {
     html_bytes: usize,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    error_kind: Option<crate::transport::TransportErrorKind>,
 }
 
 struct DaemonProcess {

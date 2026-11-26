@@ -66,14 +66,14 @@ async fn v4_meta_mock_renderer_handles_metadata_selectors_and_errors() {
 
     let script = format!(
         r#"#!/usr/bin/env python3
-# WICK_RENDERER_PROTOCOL=v4-meta
+# WICK_RENDERER_PROTOCOL=v5-meta
 import json, sys
 
 args_log = {log_path:?}
 with open(args_log, "a") as f:
     f.write("ARGS=" + json.dumps(sys.argv[1:]) + "\n")
 
-sys.stdout.write(json.dumps({{"ready": True, "protocol": "v4-meta", "error": None}}) + "\n")
+sys.stdout.write(json.dumps({{"ready": True, "protocol": "v5-meta", "error": None}}) + "\n")
 sys.stdout.flush()
 
 for raw in sys.stdin:
@@ -233,7 +233,7 @@ async fn outdated_v3_renderer_fails_loudly_with_rebuild_hint() {
     assert!(err.is::<CefProtocolError>());
     let msg = err.to_string();
     assert!(msg.contains("v3-cf-aware"));
-    assert!(msg.contains("v4-meta"));
+    assert!(msg.contains("v5-meta"));
     assert!(msg.contains("install-cef-"));
 }
 
@@ -253,7 +253,7 @@ fn renderer_override_and_no_home_cef_isolation() {
     let custom_bin = custom_dir.path().join("custom-renderer");
     write_executable(
         &custom_bin,
-        "#!/bin/sh\n# WICK_RENDERER_PROTOCOL=v4-meta\nexit 0\n",
+        "#!/bin/sh\n# WICK_RENDERER_PROTOCOL=v5-meta\nexit 0\n",
     );
 
     let renderer = CefRenderer::new_direct(empty_state.to_path_buf(), None, false)
@@ -311,7 +311,7 @@ int main(void) {
     FILE* tmp = tmpfile();
     assert(tmp != NULL);
     wick_write_ready(tmp, 1, NULL);
-    wick_write_response(tmp, 200, "https://example.com/a\"b", "<b>hi</b>", 9, NULL);
+    wick_write_response(tmp, 200, "https://example.com/a\"b", "<b>hi</b>", 9, NULL, NULL);
     rewind(tmp);
 
     char* rline = NULL;
@@ -362,7 +362,7 @@ fn adversarial_explicit_missing_renderer_override_does_not_fallback_to_state_dir
     let state_renderer = cef_dir.join("wick-renderer");
     fs::write(
         &state_renderer,
-        b"#!/bin/sh\n# WICK_RENDERER_PROTOCOL=v4-meta\n",
+        b"#!/bin/sh\n# WICK_RENDERER_PROTOCOL=v5-meta\n",
     )
     .unwrap();
 

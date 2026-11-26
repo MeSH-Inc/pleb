@@ -8,7 +8,7 @@
 
 #include "browser_environment.h"
 
-#define WICK_RENDERER_PROTOCOL_VERSION "v4-meta"
+#define WICK_RENDERER_PROTOCOL_VERSION "v5-meta"
 #define WICK_MAX_REQUEST_LINE_BYTES (64 * 1024)
 
 __attribute__((used)) static const char WICK_RENDERER_PROTOCOL[] =
@@ -401,12 +401,15 @@ static void wick_write_response(
     const char* final_url,
     const char* html,
     size_t html_len,
-    const char* error
+    const char* error,
+    const char* error_kind
 ) {
     fprintf(out, "{\"status_code\":%d,\"final_url\":", status_code);
     wick_write_json_escaped(out, final_url ? final_url : "");
     fprintf(out, ",\"html_bytes\":%zu,\"error\":", (error && error[0]) ? (size_t)0 : html_len);
     wick_write_json_escaped(out, (error && error[0]) ? error : NULL);
+    fputs(",\"error_kind\":", out);
+    wick_write_json_escaped(out, (error_kind && error_kind[0]) ? error_kind : NULL);
     fputs("}\n", out);
     if ((!error || !error[0]) && html && html_len > 0) {
         fwrite(html, 1, html_len, out);

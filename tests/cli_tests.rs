@@ -108,7 +108,7 @@ async fn cli_supports_value_enums_output_file_and_uniform_json_errors() {
     assert_eq!(status_out.status.code(), Some(0));
     let status_json: serde_json::Value = serde_json::from_slice(&status_out.stdout).unwrap();
     assert_eq!(status_json["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(status_json["cef_renderer"]["expected_protocol"], "v4-meta");
+    assert_eq!(status_json["cef_renderer"]["expected_protocol"], "v5-meta");
 
     // 2. daemon status --json and session clear --json work cleanly.
     let daemon_out = Command::new(wick_bin)

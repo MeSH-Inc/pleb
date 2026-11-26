@@ -5,8 +5,8 @@ pub mod rules;
 
 pub use cache::{SiteCache, SiteCacheEntry};
 pub use classify::{
-    classify_response, classify_response_with_parsed, detect_challenge,
-    detect_interstitial_challenge, detect_js_shell, ResponseClassification,
+    classify_response, classify_response_with_context, classify_response_with_parsed,
+    detect_challenge, detect_interstitial_challenge, detect_js_shell, ResponseClassification,
 };
 pub use rules::{parent_domain, SiteRule, SiteRules};
 

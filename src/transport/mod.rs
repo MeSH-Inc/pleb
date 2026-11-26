@@ -13,6 +13,34 @@ const CHROME_FULL: &str = "143.0.7499.109";
 pub const DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_RAW_MAX_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportErrorKind {
+    Timeout,
+    LoadError,
+    InvalidSelector,
+    ResponseTooLarge,
+    Canceled,
+    ProtocolMismatch,
+    Network,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct TransportError {
+    pub kind: TransportErrorKind,
+    pub message: String,
+}
+
+impl TransportError {
+    pub fn new(kind: TransportErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("response body exceeded {limit_bytes} byte limit")]
 pub struct ResponseTooLargeError {
