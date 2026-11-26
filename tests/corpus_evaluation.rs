@@ -1,9 +1,11 @@
+use pleb::extract::webmcp::{MAX_ENUM_VALUES, MAX_SCHEMA_BYTES, MAX_SCHEMA_PROPERTIES};
 use pleb::extract::{
     decode_text_bytes, detect_binary_content, extract_document_parsed, is_html_content_type,
     ExtractMode, ExtractOptions, OutputFormat, ParsedHtml, ResourceKind,
 };
-use pleb::policy::{classify_response_with_context, ResponseClassification};
+use pleb::policy::{classify_response_with_context, is_safe_redirect_url, ResponseClassification};
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use url::Url;
@@ -61,6 +63,12 @@ struct VariantSpec {
     expected_resource_kinds: Vec<String>,
     #[serde(default)]
     forbidden_resource_urls: Vec<String>,
+    #[serde(default)]
+    expected_tool_names: Vec<String>,
+    #[serde(default)]
+    forbidden_tool_names: Vec<String>,
+    #[serde(default)]
+    expected_tool_count: Option<usize>,
     minimum_output_bytes: Option<usize>,
     maximum_output_bytes: Option<usize>,
     expected_structure: Option<ExpectedStructure>,
@@ -593,6 +601,135 @@ fn evaluate_fixture(path: &Path) -> (String, FixtureSpec, FixtureOutcome) {
                     .push(format!("{}: forbidden resource url {forb_url}", v.name));
             } else {
                 out.forbidden_clean += 1;
+            }
+        }
+
+        let tool_names: Vec<&str> = doc.tools.iter().map(|t| t.name.as_str()).collect();
+        for tool_name in &v.expected_tool_names {
+            out.expected_total += 1;
+            if tool_names.iter().any(|&n| n == tool_name) {
+                out.expected_hits += 1;
+            } else {
+                out.failures.push(format!(
+                    "{}: missing tool {tool_name} (found {tool_names:?})",
+                    v.name
+                ));
+            }
+        }
+        for forb_tool in &v.forbidden_tool_names {
+            out.forbidden_total += 1;
+            if tool_names.iter().any(|&n| n == forb_tool) {
+                out.failures
+                    .push(format!("{}: forbidden tool {forb_tool}", v.name));
+            } else {
+                out.forbidden_clean += 1;
+            }
+        }
+        if let Some(exp_count) = v.expected_tool_count {
+            out.expected_total += 1;
+            if doc.tools.len() == exp_count {
+                out.expected_hits += 1;
+            } else {
+                out.failures.push(format!(
+                    "{}: tool count {} != {exp_count} (found {tool_names:?})",
+                    v.name,
+                    doc.tools.len()
+                ));
+            }
+        }
+        if v.expected_tool_count.is_some() || !v.expected_tool_names.is_empty() {
+            let mut seen_tools = HashSet::new();
+            for tool in &doc.tools {
+                if !seen_tools.insert(tool.name.as_str()) {
+                    out.failures
+                        .push(format!("{}: duplicate tool {}", v.name, tool.name));
+                }
+                if tool.annotations.as_ref().and_then(|a| a.untrusted_content) != Some(true) {
+                    out.failures.push(format!(
+                        "{}: tool {} missing untrusted_content=true",
+                        v.name, tool.name
+                    ));
+                }
+                if tool.description.trim().is_empty()
+                    || tool.description.len() > 1024
+                    || tool.description.bytes().any(|b| b < 0x20 || b == 0x7f)
+                {
+                    out.failures.push(format!(
+                        "{}: tool {} has empty or unsanitized description",
+                        v.name, tool.name
+                    ));
+                }
+                if tool
+                    .title
+                    .as_deref()
+                    .is_some_and(|t| t.len() > 256 || t.bytes().any(|b| b < 0x20 || b == 0x7f))
+                {
+                    out.failures.push(format!(
+                        "{}: tool {} has oversized or unsanitized title",
+                        v.name, tool.name
+                    ));
+                }
+                if let Some(action_str) = &tool.action_url {
+                    match Url::parse(action_str) {
+                        Ok(resolved) => {
+                            let downgrade =
+                                page_url.scheme() == "https" && resolved.scheme() != "https";
+                            let has_creds_or_frag = !resolved.username().is_empty()
+                                || resolved.password().is_some()
+                                || resolved.fragment().is_some();
+                            if downgrade
+                                || has_creds_or_frag
+                                || !is_safe_redirect_url(&page_url, &resolved)
+                            {
+                                out.failures.push(format!(
+                                    "{}: tool {} has unsafe action_url {action_str}",
+                                    v.name, tool.name
+                                ));
+                            }
+                        }
+                        Err(_) => out.failures.push(format!(
+                            "{}: tool {} has unparseable action_url {action_str}",
+                            v.name, tool.name
+                        )),
+                    }
+                }
+                if let Some(schema) = &tool.input_schema {
+                    let serialized_len = serde_json::to_vec(schema)
+                        .map(|b| b.len())
+                        .unwrap_or(usize::MAX);
+                    if serialized_len > MAX_SCHEMA_BYTES {
+                        out.failures.push(format!(
+                            "{}: tool {} schema exceeds MAX_SCHEMA_BYTES ({serialized_len})",
+                            v.name, tool.name
+                        ));
+                    }
+                    if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
+                        if props.len() > MAX_SCHEMA_PROPERTIES {
+                            out.failures.push(format!(
+                                "{}: tool {} properties {} > MAX_SCHEMA_PROPERTIES",
+                                v.name,
+                                tool.name,
+                                props.len()
+                            ));
+                        }
+                        for (prop_name, prop_val) in props {
+                            if let Some(enum_arr) = prop_val
+                                .get("enum")
+                                .or_else(|| prop_val.get("items").and_then(|i| i.get("enum")))
+                                .and_then(|e| e.as_array())
+                            {
+                                if enum_arr.len() > MAX_ENUM_VALUES {
+                                    out.failures.push(format!(
+                                        "{}: tool {} prop {prop_name} enum {} > MAX_ENUM_VALUES",
+                                        v.name,
+                                        tool.name,
+                                        enum_arr.len()
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 

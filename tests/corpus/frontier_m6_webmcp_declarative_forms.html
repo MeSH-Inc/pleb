@@ -1,0 +1,59 @@
+<!-- pleb-fixture: {"tier":"frontier","url":"https://docs.example.com/guide/declarative","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"WebMCP Declarative Forms Guide","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["Declarative WebMCP forms let static pages expose structured schemas without client scripts.","Surrounding article prose outside the form must remain intact in both clean and article extraction modes.","Subscribe to release notes"],"forbidden_substrings":["Query string label","Exact match option label","Default radio scope label","Deprecated tag option","Internal secret option","Search Catalog Submit Chrome","Run Health Probe Button","Form helper chrome text"],"expected_tool_names":["search_catalog","ping_status"],"expected_tool_count":2,"minimum_output_bytes":160,"maximum_output_bytes":1600,"expected_structure":{"minimum_headings":1}},{"name":"article_md","format":"markdown","mode":"article","expected_substrings":["Declarative WebMCP forms let static pages expose structured schemas without client scripts.","Surrounding article prose outside the form must remain intact in both clean and article extraction modes."],"forbidden_substrings":["Run Health Probe Button","Form helper chrome text","Query string label","Search Catalog Submit Chrome"],"expected_tool_names":["search_catalog","ping_status"],"expected_tool_count":2,"minimum_output_bytes":120,"maximum_output_bytes":1400,"expected_structure":{"minimum_headings":1}},{"name":"clean_text","format":"text","mode":"clean","expected_substrings":["WebMCP Declarative Forms Guide","Declarative WebMCP forms let static pages expose structured schemas without client scripts.","Surrounding article prose outside the form must remain intact in both clean and article extraction modes."],"forbidden_substrings":["Query string label","Search Catalog Submit Chrome","Run Health Probe Button","Form helper chrome text"],"expected_tool_names":["search_catalog","ping_status"],"expected_tool_count":2,"minimum_output_bytes":120,"maximum_output_bytes":1400}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>WebMCP Declarative Forms Guide</title>
+</head>
+<body>
+  <nav aria-label="Primary">
+    <a href="/">Home</a>
+    <form toolname="search_catalog" tooldescription="Search documentation and API reference entries" tooltitle="Search Catalog" toolautosubmit action="/search" method="get">
+      <label for="q-input">Query string label</label>
+      <input id="q-input" type="text" name="query" required>
+      <input type="email" name="contact" toolparamdescription="Optional notification email">
+      <label for="exact-cb">Exact match option label</label>
+      <input id="exact-cb" type="checkbox" name="exact" toolparamdescription="Require exact phrase match">
+      <input type="number" name="limit" min="1" max="50" toolparamdescription="Maximum results">
+      <input type="range" name="min_score" min="0" max="10.5" toolparamdescription="Minimum relevance score">
+      <label for="scope-on">Default radio scope label</label>
+      <input id="scope-on" type="radio" name="scope" toolparamdescription="Scope to search">
+      <input type="radio" name="scope" value="" toolparamdescription="Ignored second radio description">
+      <input type="radio" name="scope" value="api">
+      <input type="radio" name="scope" value="guides">
+      <input type="radio" name="scope" value="api">
+      <select name="tags" multiple toolparamdescription="Filter tags">
+        <option value="rust">Rust</option>
+        <option>guides</option>
+        <option value="deprecated" disabled>Deprecated tag option</option>
+        <optgroup label="Internal" disabled>
+          <option value="secret">Internal secret option</option>
+        </optgroup>
+        <optgroup label="Active">
+          <option value="cli">CLI</option>
+          <option value="rust">Rust duplicate</option>
+        </optgroup>
+      </select>
+      <textarea name="notes" toolparamdescription="Extra query context"></textarea>
+      <button type="submit">Search Catalog Submit Chrome</button>
+    </form>
+  </nav>
+  <main>
+    <article>
+      <h1>WebMCP Declarative Forms Guide</h1>
+      <p>Declarative WebMCP forms let static pages expose structured schemas without client scripts.</p>
+      <form toolname="ping_status" tooldescription="Check endpoint health status" action="/api/ping" method="post">
+        <p class="hint">Form helper chrome text</p>
+        <button type="submit">Run Health Probe Button</button>
+      </form>
+      <p>Surrounding article prose outside the form must remain intact in both clean and article extraction modes.</p>
+    </article>
+    <section>
+      <form action="/newsletter" method="post">
+        <label for="news-email">Subscribe to release notes</label>
+        <input id="news-email" type="email" name="email">
+      </form>
+    </section>
+  </main>
+</body>
+</html>
