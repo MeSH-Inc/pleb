@@ -12,8 +12,8 @@ pub struct RuntimeConfig {
     pub timeout: Duration,
     pub max_response_bytes: Option<usize>,
     pub cef_timeout: Duration,
-    pub cef_idle_timeout: Duration,
-    pub cef_daemon: bool,
+    pub daemon_idle_timeout: Duration,
+    pub use_daemon: bool,
     pub verbose: bool,
 }
 
@@ -25,8 +25,8 @@ impl Default for RuntimeConfig {
             timeout: Duration::from_secs(30),
             max_response_bytes: None,
             cef_timeout: Duration::from_secs(60),
-            cef_idle_timeout: Duration::from_secs(300),
-            cef_daemon: false,
+            daemon_idle_timeout: Duration::from_secs(300),
+            use_daemon: false,
             verbose: false,
         }
     }
@@ -74,17 +74,44 @@ pub struct RuntimeContext {
 impl RuntimeContext {
     pub fn new(config: RuntimeConfig) -> Result<Self> {
         ensure_private_dir(&config.state_dir)?;
-        let storage_path = config.state_dir.join("data");
-        let client = TransportClient::new(
-            &storage_path,
+
+        #[cfg(unix)]
+        if !config.use_daemon && crate::daemon::is_daemon_running(&config.state_dir) {
+            anyhow::bail!(
+                "a background wick daemon owns {} (run `wick daemon stop` or pass an isolated `--state-dir`)",
+                config.state_dir.display()
+            );
+        }
+
+        #[cfg(unix)]
+        let client = if config.use_daemon {
+            TransportClient::new_daemon(
+                config.state_dir.clone(),
+                config.proxy.clone(),
+                config.timeout,
+                config.daemon_idle_timeout,
+                config.verbose,
+            )
+        } else {
+            TransportClient::new_direct(
+                &config.state_dir.join("data"),
+                config.proxy.as_deref(),
+                config.timeout,
+            )?
+        };
+
+        #[cfg(not(unix))]
+        let client = TransportClient::new_direct(
+            &config.state_dir.join("data"),
             config.proxy.as_deref(),
             config.timeout,
         )?;
+
         let cef = CefRenderer::new(
             config.state_dir.clone(),
             config.proxy.clone(),
-            config.cef_idle_timeout,
-            config.cef_daemon,
+            config.daemon_idle_timeout,
+            config.use_daemon,
             config.verbose,
         );
         let rules = SiteRules::load(&config.state_dir);

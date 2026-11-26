@@ -9,8 +9,8 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "mesh-wick-cli-{}-{}-{}",
+    let dir = std::path::PathBuf::from(format!(
+        "/tmp/mw-cli-{}-{}-{}",
         tag,
         std::process::id(),
         nanos
@@ -233,6 +233,13 @@ async fn cli_supports_value_enums_output_file_and_uniform_json_errors() {
     assert_eq!(fail_search.status.code(), Some(1));
     let err_search_json: serde_json::Value = serde_json::from_slice(&fail_search.stderr).unwrap();
     assert_eq!(err_search_json["kind"], "search_error");
+
+    let _ = Command::new(wick_bin)
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args(["daemon", "stop"])
+        .output()
+        .await;
 
     let _ = fs::remove_dir_all(&state_dir);
     let _ = fs::remove_dir_all(&out_dir);

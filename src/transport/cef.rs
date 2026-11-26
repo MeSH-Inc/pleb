@@ -158,7 +158,7 @@ impl CefRenderer {
     ) -> Result<CefRenderResult> {
         #[cfg(unix)]
         if self.use_daemon {
-            return super::cef_daemon::daemon_render(
+            return crate::daemon::daemon_cef_render(
                 &self.state_dir,
                 self.proxy.as_deref(),
                 timeout,

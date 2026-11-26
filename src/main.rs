@@ -1,13 +1,13 @@
 use clap::{Parser, Subcommand};
 use mesh_wick::context::{clear_state_dir, default_state_dir, RuntimeConfig, RuntimeContext};
 use mesh_wick::crawl;
+#[cfg(unix)]
+use mesh_wick::daemon;
 use mesh_wick::extract::{ExtractMode, OutputFormat};
 use mesh_wick::fetch::{self, FetchError, FetchOptions, FetchOutput};
 use mesh_wick::policy::RenderMode;
 use mesh_wick::search::{self, SearchProvider};
 use mesh_wick::transport::cef::{self, RendererProbe};
-#[cfg(unix)]
-use mesh_wick::transport::cef_daemon;
 use serde::Serialize;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -265,7 +265,11 @@ struct DaemonStatusJson {
     supported: bool,
     running: bool,
     pid: Option<u32>,
-    renderer_alive: bool,
+    protocol_version: Option<u32>,
+    build_id: Option<String>,
+    active_requests: usize,
+    cronet_slots: usize,
+    cef_renderers_alive: usize,
 }
 
 #[derive(Serialize)]
@@ -273,7 +277,7 @@ struct StatusJson {
     version: &'static str,
     cronet_enabled: bool,
     cef_renderer: RendererStatusJson,
-    cef_daemon: DaemonStatusJson,
+    daemon: DaemonStatusJson,
     state_dir: String,
     brave_api_key_configured: bool,
 }
@@ -327,8 +331,8 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         timeout: Duration::from_secs(cli.timeout.max(1)),
         max_response_bytes: cli.max_response_bytes,
         cef_timeout: Duration::from_secs(cli.cef_timeout.max(1)),
-        cef_idle_timeout: Duration::from_secs(cli.daemon_idle_timeout.max(1)),
-        cef_daemon: !cli.no_daemon,
+        daemon_idle_timeout: Duration::from_secs(cli.daemon_idle_timeout.max(1)),
+        use_daemon: !cli.no_daemon,
         verbose: cli.verbose,
     };
 
@@ -337,7 +341,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             DaemonAction::Run => {
                 #[cfg(unix)]
                 {
-                    cef_daemon::run_daemon(config.state_dir, config.cef_idle_timeout, config.verbose)
+                    daemon::run_daemon(config.state_dir, config.daemon_idle_timeout, config.verbose)
                         .await
                         .map_err(|e| CliError::runtime("daemon_error", e))?;
                     Ok(())
@@ -345,7 +349,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 #[cfg(not(unix))]
                 {
                     Err(CliError::invalid_input(
-                        "CEF daemon mode is only supported on Unix systems",
+                        "Transport daemon mode is only supported on Unix systems",
                     ))
                 }
             }
@@ -357,32 +361,24 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                         serde_json::to_string(&status)
                             .map_err(|e| CliError::runtime("serialization_error", e))?
                     );
-                } else if !status.supported {
-                    println!("CEF daemon: unsupported on this OS");
-                } else if status.running {
-                    println!(
-                        "CEF daemon: running (pid {}, renderer {})",
-                        status.pid.unwrap_or(0),
-                        if status.renderer_alive { "warm" } else { "idle" }
-                    );
                 } else {
-                    println!("CEF daemon: stopped");
+                    print_daemon_status(&status);
                 }
                 Ok(())
             }
             DaemonAction::Stop => {
                 #[cfg(unix)]
                 {
-                    let stopped = cef_daemon::daemon_stop(&config.state_dir)
+                    let stopped = daemon::daemon_stop(&config.state_dir)
                         .await
                         .map_err(|e| CliError::runtime("daemon_error", e))?;
                     if json {
                         println!("{}", serde_json::json!({ "stopped": stopped }));
                     } else if !quiet {
                         if stopped {
-                            println!("Stopped CEF daemon");
+                            println!("Stopped transport daemon");
                         } else {
-                            println!("CEF daemon not running");
+                            println!("Transport daemon not running");
                         }
                     }
                     Ok(())
@@ -390,7 +386,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 #[cfg(not(unix))]
                 {
                     Err(CliError::invalid_input(
-                        "CEF daemon mode is only supported on Unix systems",
+                        "Transport daemon mode is only supported on Unix systems",
                     ))
                 }
             }
@@ -398,7 +394,17 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Command::Session { action } => match action {
             SessionAction::Clear => {
                 #[cfg(unix)]
-                let _ = cef_daemon::daemon_stop(&config.state_dir).await;
+                {
+                    daemon::daemon_stop(&config.state_dir)
+                        .await
+                        .map_err(|e| CliError::runtime("session_error", e))?;
+                    if daemon::is_daemon_running(&config.state_dir) {
+                        return Err(CliError::runtime(
+                            "session_error",
+                            "daemon is still running after stop; cannot clear state directory",
+                        ));
+                    }
+                }
                 clear_state_dir(&config.state_dir)
                     .map_err(|e| CliError::runtime("session_error", e))?;
                 if json {
@@ -448,7 +454,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                     version: env!("CARGO_PKG_VERSION"),
                     cronet_enabled: cfg!(feature = "cronet"),
                     cef_renderer: renderer_json,
-                    cef_daemon: daemon_json,
+                    daemon: daemon_json,
                     state_dir: config.state_dir.display().to_string(),
                     brave_api_key_configured: search::brave_api_key_configured(),
                 };
@@ -486,21 +492,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                     ),
                     RendererProbe::NotInstalled => println!("CEF renderer: not installed"),
                 }
-                if daemon_json.supported {
-                    if daemon_json.running {
-                        println!(
-                            "CEF daemon: running (pid {}, renderer {})",
-                            daemon_json.pid.unwrap_or(0),
-                            if daemon_json.renderer_alive {
-                                "warm"
-                            } else {
-                                "idle"
-                            }
-                        );
-                    } else {
-                        println!("CEF daemon: stopped");
-                    }
-                }
+                print_daemon_status(&daemon_json);
                 println!("State dir: {}", config.state_dir.display());
                 println!(
                     "Brave Search API key: {}",
@@ -724,21 +716,45 @@ async fn run(cli: Cli) -> Result<(), CliError> {
     }
 }
 
+fn print_daemon_status(status: &DaemonStatusJson) {
+    if !status.supported {
+        println!("Transport daemon: unsupported on this OS");
+    } else if status.running {
+        println!(
+            "Transport daemon: running (pid {}, {} active, {} slot(s), {} CEF warm)",
+            status.pid.unwrap_or(0),
+            status.active_requests,
+            status.cronet_slots,
+            status.cef_renderers_alive
+        );
+    } else {
+        println!("Transport daemon: stopped");
+    }
+}
+
 async fn daemon_status_json(state_dir: &std::path::Path) -> DaemonStatusJson {
     #[cfg(unix)]
     {
-        match cef_daemon::daemon_ping(state_dir).await {
+        match daemon::daemon_ping(state_dir).await {
             Some(st) => DaemonStatusJson {
                 supported: true,
                 running: true,
                 pid: Some(st.pid),
-                renderer_alive: st.renderer_alive,
+                protocol_version: Some(st.protocol_version),
+                build_id: Some(st.build_id),
+                active_requests: st.active_requests,
+                cronet_slots: st.cronet_slots,
+                cef_renderers_alive: st.cef_renderers_alive,
             },
             None => DaemonStatusJson {
                 supported: true,
                 running: false,
                 pid: None,
-                renderer_alive: false,
+                protocol_version: None,
+                build_id: None,
+                active_requests: 0,
+                cronet_slots: 0,
+                cef_renderers_alive: 0,
             },
         }
     }
@@ -749,7 +765,11 @@ async fn daemon_status_json(state_dir: &std::path::Path) -> DaemonStatusJson {
             supported: false,
             running: false,
             pid: None,
-            renderer_alive: false,
+            protocol_version: None,
+            build_id: None,
+            active_requests: 0,
+            cronet_slots: 0,
+            cef_renderers_alive: 0,
         }
     }
 }

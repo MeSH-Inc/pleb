@@ -1,13 +1,11 @@
 pub mod cef;
-#[cfg(unix)]
-pub mod cef_daemon;
 #[cfg(feature = "cronet")]
 pub mod cronet;
 #[cfg(feature = "cronet")]
 pub mod cronet_ffi;
 
 use anyhow::Result;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const CHROME_MAJOR: &str = "143";
@@ -39,22 +37,39 @@ impl HttpResponse {
     }
 }
 
-/// Network transport client backed by Cronet (when enabled) or reqwest.
+enum TransportBackend {
+    Direct {
+        #[cfg(feature = "cronet")]
+        engine: cronet::Engine,
+        #[cfg(not(feature = "cronet"))]
+        inner: reqwest::Client,
+    },
+    #[cfg(unix)]
+    Daemon {
+        state_dir: PathBuf,
+        proxy: Option<String>,
+        idle_timeout: Duration,
+        verbose: bool,
+    },
+}
+
+/// Network transport client backed by Cronet/reqwest directly or the warm daemon.
 pub struct TransportClient {
-    #[cfg(feature = "cronet")]
-    engine: cronet::Engine,
-    #[cfg(not(feature = "cronet"))]
-    inner: reqwest::Client,
+    backend: TransportBackend,
     default_timeout: Duration,
 }
 
 impl TransportClient {
     pub fn new(storage_path: &Path, proxy: Option<&str>, timeout: Duration) -> Result<Self> {
+        Self::new_direct(storage_path, proxy, timeout)
+    }
+
+    pub fn new_direct(storage_path: &Path, proxy: Option<&str>, timeout: Duration) -> Result<Self> {
         #[cfg(feature = "cronet")]
         {
             let engine = cronet::Engine::new(storage_path, &chrome_user_agent(), proxy)?;
             Ok(Self {
-                engine,
+                backend: TransportBackend::Direct { engine },
                 default_timeout: timeout,
             })
         }
@@ -73,9 +88,30 @@ impl TransportClient {
             }
 
             Ok(Self {
-                inner: builder.build()?,
+                backend: TransportBackend::Direct {
+                    inner: builder.build()?,
+                },
                 default_timeout: timeout,
             })
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn new_daemon(
+        state_dir: PathBuf,
+        proxy: Option<String>,
+        timeout: Duration,
+        idle_timeout: Duration,
+        verbose: bool,
+    ) -> Self {
+        Self {
+            backend: TransportBackend::Daemon {
+                state_dir,
+                proxy,
+                idle_timeout,
+                verbose,
+            },
+            default_timeout: timeout,
         }
     }
 
@@ -98,51 +134,75 @@ impl TransportClient {
         timeout: Duration,
         max_body_bytes: usize,
     ) -> Result<HttpResponse> {
-        #[cfg(feature = "cronet")]
-        {
-            let headers = chrome_header_pairs(true);
-            let resp = self
-                .engine
-                .get(url, &headers, timeout, max_body_bytes)
-                .await?;
-            Ok(HttpResponse {
-                status: resp.status_code,
-                final_url: resp.final_url,
-                content_type: resp.content_type,
-                body: resp.body,
-            })
-        }
-        #[cfg(not(feature = "cronet"))]
-        {
-            let fut = async {
-                let mut resp = self.inner.get(url).timeout(timeout).send().await?;
-                let final_url = resp.url().to_string();
-                let status = resp.status().as_u16();
-                let content_type = resp
-                    .headers()
-                    .get(reqwest::header::CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string());
-                let mut body = Vec::new();
-                while let Some(chunk) = resp.chunk().await? {
-                    if body.len().saturating_add(chunk.len()) > max_body_bytes {
-                        return Err(anyhow::Error::new(ResponseTooLargeError {
-                            limit_bytes: max_body_bytes,
-                        }));
-                    }
-                    body.extend_from_slice(&chunk);
+        match &self.backend {
+            #[cfg(unix)]
+            TransportBackend::Daemon {
+                state_dir,
+                proxy,
+                idle_timeout,
+                verbose,
+            } => {
+                crate::daemon::daemon_http_get(
+                    state_dir,
+                    proxy.as_deref(),
+                    timeout,
+                    max_body_bytes,
+                    *idle_timeout,
+                    *verbose,
+                    url,
+                )
+                .await
+            }
+            TransportBackend::Direct {
+                #[cfg(feature = "cronet")]
+                engine,
+                #[cfg(not(feature = "cronet"))]
+                inner,
+            } => {
+                #[cfg(feature = "cronet")]
+                {
+                    let headers = chrome_header_pairs(true);
+                    let resp = engine.get(url, &headers, timeout, max_body_bytes).await?;
+                    Ok(HttpResponse {
+                        status: resp.status_code,
+                        final_url: resp.final_url,
+                        content_type: resp.content_type,
+                        body: resp.body,
+                    })
                 }
-                Ok(HttpResponse {
-                    status,
-                    final_url,
-                    content_type,
-                    body,
-                })
-            };
+                #[cfg(not(feature = "cronet"))]
+                {
+                    let fut = async {
+                        let mut resp = inner.get(url).timeout(timeout).send().await?;
+                        let final_url = resp.url().to_string();
+                        let status = resp.status().as_u16();
+                        let content_type = resp
+                            .headers()
+                            .get(reqwest::header::CONTENT_TYPE)
+                            .and_then(|v| v.to_str().ok())
+                            .map(|s| s.to_string());
+                        let mut body = Vec::new();
+                        while let Some(chunk) = resp.chunk().await? {
+                            if body.len().saturating_add(chunk.len()) > max_body_bytes {
+                                return Err(anyhow::Error::new(ResponseTooLargeError {
+                                    limit_bytes: max_body_bytes,
+                                }));
+                            }
+                            body.extend_from_slice(&chunk);
+                        }
+                        Ok(HttpResponse {
+                            status,
+                            final_url,
+                            content_type,
+                            body,
+                        })
+                    };
 
-            match tokio::time::timeout(timeout, fut).await {
-                Ok(res) => res,
-                Err(_) => anyhow::bail!("request timed out after {:?}", timeout),
+                    match tokio::time::timeout(timeout, fut).await {
+                        Ok(res) => res,
+                        Err(_) => anyhow::bail!("request timed out after {:?}", timeout),
+                    }
+                }
             }
         }
     }

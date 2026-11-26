@@ -130,7 +130,7 @@ for raw in sys.stdin:
         state_dir: state_dir.clone(),
         timeout: Duration::from_secs(5),
         cef_timeout: Duration::from_secs(5),
-        cef_daemon: false,
+        use_daemon: false,
         ..Default::default()
     })
     .unwrap();
