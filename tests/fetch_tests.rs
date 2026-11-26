@@ -1057,3 +1057,90 @@ for raw in sys.stdin:
         "CEF must fail fast on challenge interstitial without retrying"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn adversarial_cef_transient_empty_render_retries_once_and_succeeds() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state_dir = temp_state_dir();
+    let cef_dir = state_dir.path().join("cef");
+    std::fs::create_dir_all(&cef_dir).unwrap();
+    let renderer_bin = cef_dir.join("wick-renderer");
+    let count_file = state_dir.path().join("retry_invocations.log");
+
+    let script = format!(
+        r#"#!/usr/bin/env python3
+# WICK_RENDERER_PROTOCOL=v5-meta
+import json, sys
+
+count_path = {count_path:?}
+attempt = 0
+sys.stdout.write(json.dumps({{"ready": True, "protocol": "v5-meta", "error": None}}) + "\n")
+sys.stdout.flush()
+
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        break
+    attempt += 1
+    req = json.loads(line)
+    with open(count_path, "a") as f:
+        f.write(str(attempt) + "\n")
+    if attempt == 1:
+        html = b""
+        status = 0
+    else:
+        html = b"<html><head><title>Recovered</title></head><body><main><h1>Recovered</h1><p>Second CEF attempt succeeded cleanly.</p></main></body></html>"
+        status = 200
+    hdr = {{
+        "status_code": status,
+        "final_url": req["url"],
+        "html_bytes": len(html),
+        "error": None,
+        "error_kind": None,
+    }}
+    sys.stdout.write(json.dumps(hdr) + "\n")
+    sys.stdout.flush()
+    sys.stdout.buffer.write(html)
+    sys.stdout.buffer.flush()
+"#,
+        count_path = count_file
+    );
+
+    std::fs::write(&renderer_bin, script).unwrap();
+    std::fs::set_permissions(&renderer_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let ctx = RuntimeContext::new(RuntimeConfig {
+        state_dir: state_dir.path().to_path_buf(),
+        timeout: Duration::from_secs(10),
+        cef_timeout: Duration::from_secs(10),
+        cef_renderer_executable: Some(renderer_bin),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let out = fetch_document(
+        &ctx,
+        "https://transient.example/page",
+        &FetchOptions {
+            render: RenderMode::Cef,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(out.status_code, 200);
+    assert_eq!(out.title.as_deref(), Some("Recovered"));
+    assert!(out
+        .content
+        .contains("Second CEF attempt succeeded cleanly."));
+
+    let invocations = std::fs::read_to_string(&count_file).unwrap();
+    assert_eq!(
+        invocations.lines().count(),
+        2,
+        "non-challenge empty CEF render should still retry once"
+    );
+}
