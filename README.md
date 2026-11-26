@@ -46,7 +46,7 @@ bash scripts/install-cef-linux.sh --force
 
 ## Usage
 
-### Fetch a page
+### Fetch pages (single or batch)
 
 ```bash
 wick fetch https://example.com
@@ -55,6 +55,8 @@ wick fetch --render cef --wait-for-selector "article" https://x.com/user
 wick fetch --format text https://news.ycombinator.com
 wick fetch --format raw --output doc.pdf https://example.com/doc.pdf
 wick fetch --json --metadata-only https://example.com
+wick fetch --jsonl --concurrency 4 https://example.com https://example.org
+wick search --urls-only "rust async runtime" | wick fetch -
 ```
 
 Key `fetch` flags:
@@ -66,8 +68,9 @@ Key `fetch` flags:
 - `--respect-robots` (disabled by default for interactive single-URL fetches)
 - `--no-rewrite` (disable host rewrites such as `reddit.com` -> `old.reddit.com`)
 - `--no-images`, `--no-links`, `--max-bytes <N>`
-- `--output <path>` (`-o`): write output to a file instead of stdout (created only after fetch succeeds)
-- `--json` (global flag), `--metadata-only`
+- `--concurrency <N>` (batch mode max concurrent fetches, `1..=16`, default `4`, capped at 2 per host)
+- `--output <path>` (`-o`): write output to a file instead of stdout (single-URL only; created only after fetch succeeds)
+- `--json` (global flag), `--jsonl` (streaming per-URL JSON lines), `--metadata-only`
 
 ### Search
 
@@ -76,7 +79,18 @@ Uses the Brave Search API when `BRAVE_API_KEY` is set (`--provider auto`), falli
 ```bash
 wick search "rust async runtime" -n 8
 wick search --provider duckduckgo --json "cronet tls fingerprint"
+wick search --site docs.rs --freshness month --urls-only "tokio"
+wick search --extra-snippets "cronet http2"
 ```
+
+Key `search` flags:
+
+- `-n` / `--limit <N>` (`1..=20`, default `8`)
+- `--provider <auto|brave|duckduckgo>` (alias `ddg`)
+- `--freshness <day|week|month|year>`
+- `--site <domain>` (prepends `site:<domain>` after stripping scheme/trailing slash)
+- `--extra-snippets` (Brave Search extra excerpts)
+- `--urls-only` (one URL per line, empty stdout on zero results; conflicts with `--json`)
 
 ### Crawl and Map
 
@@ -99,11 +113,12 @@ wick session clear
 
 ## Configuration
 
-- `MESH_WICK_HOME` / `--state-dir`: private (`0o700`) state directory for cookies, HTTP cache, CEF `cef-cache`, CEF daemon socket (`cef.sock`), `site-cache.json` (`0o600`), and optional local `site-rules.json` overlay over bundled structural rules (`reddit.com` -> `old.reddit.com`, `x.com`/`twitter.com`) (default: `~/.mesh-wick`; `wick session clear` stops any running CEF daemon and clears cookies, HTTP cache, `cef-cache`, and `site-cache.json`)
+- `MESH_WICK_HOME` / `--state-dir`: private (`0o700`) state directory for proxy-partitioned HTTP cache/cookies (`data/`), CEF `cef-cache/`, unified transport daemon socket (`daemon.sock`), daemon logs (`daemon.log`), `site-cache.json` (`0o600`), and optional local `site-rules.json` overlay over bundled structural rules (`reddit.com` -> `old.reddit.com`, `x.com`/`twitter.com`) (default: `~/.mesh-wick`; `wick session clear` stops any running daemon and clears `data/`, `cef-cache/`, and `site-cache.json`)
 - `MESH_WICK_PROXY` / `--proxy`: SOCKS5/HTTP proxy URL
 - `MESH_WICK_TIMEZONE`: optional IANA timezone override injected into CEF `Intl.DateTimeFormat`
 - `BRAVE_API_KEY`: enables Brave Search API in `search`
 - `--timeout <SECS>`: network request timeout (default: `30`)
+- `--max-response-bytes <BYTES>`: maximum HTTP response body size (defaults: `16 MiB` document, `128 MiB` raw)
 - `--cef-timeout <SECS>`: CEF render timeout (default: `60`)
 - `--daemon-idle-timeout <SECS>` / `MESH_WICK_DAEMON_IDLE_SECONDS`: auto-exit timeout for the warm Unix-socket daemon (also honored by `wick daemon run`; default: `300`)
 - `--no-daemon` / `MESH_WICK_NO_DAEMON`: bypass the shared background daemon and run in-process
@@ -111,9 +126,10 @@ wick session clear
 ## Exit Codes
 
 - `0`: success
-- `1`: invalid input, unavailable/mismatched CEF renderer, or network/transport failure
+- `1`: invalid input, unavailable/mismatched CEF renderer, response-size overflow, network/transport failure, or heterogeneous all-failed batch
 - `2`: blocked by origin (`403`/`503`), anti-bot challenge, or `robots.txt`
 - `3`: origin HTTP `4xx`/`5xx` error
+- `4`: partial batch failure (some URLs succeeded, some failed)
 - `5`: unsupported binary content type in non-raw mode (re-run with `--format raw --output <path>`)
 
 ## License

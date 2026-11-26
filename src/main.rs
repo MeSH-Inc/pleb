@@ -8,7 +8,7 @@ use mesh_wick::fetch::{
     self, BatchFetchOptions, BatchItemResult, FetchError, FetchOptions, FetchOutput,
 };
 use mesh_wick::policy::RenderMode;
-use mesh_wick::search::{self, SearchProvider};
+use mesh_wick::search::{self, Freshness, SearchOptions, SearchProvider};
 use mesh_wick::transport::cef::{self, RendererProbe};
 use serde::Serialize;
 use std::io::{IsTerminal, Write};
@@ -130,6 +130,18 @@ enum Command {
         /// Search provider
         #[arg(long, value_enum, default_value_t = SearchProvider::Auto, ignore_case = true)]
         provider: SearchProvider,
+        /// Print only one bare URL per line (nothing on empty results)
+        #[arg(long, conflicts_with = "json")]
+        urls_only: bool,
+        /// Filter search results by recency
+        #[arg(long, value_enum, ignore_case = true)]
+        freshness: Option<Freshness>,
+        /// Restrict search results to a domain (prepends site:<domain>)
+        #[arg(long)]
+        site: Option<String>,
+        /// Request additional snippet excerpts from Brave Search
+        #[arg(long)]
+        extra_snippets: bool,
     },
     /// Crawl a website starting from a URL
     Crawl {
@@ -724,13 +736,28 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             query,
             limit,
             provider,
+            urls_only,
+            freshness,
+            site,
+            extra_snippets,
         } => {
             let ctx = RuntimeContext::new(config)
                 .map_err(|e| CliError::runtime("context_error", e))?;
-            let response = search::search(&ctx, &query, limit, provider)
+            let opts = SearchOptions {
+                limit,
+                provider,
+                freshness,
+                site,
+                extra_snippets,
+            };
+            let response = search::search(&ctx, &query, &opts)
                 .await
                 .map_err(|e| CliError::runtime("search_error", e))?;
-            if json {
+            if urls_only {
+                if !response.results.is_empty() {
+                    println!("{}", search::format_urls_only(&response));
+                }
+            } else if json {
                 println!(
                     "{}",
                     serde_json::to_string(&response)

@@ -405,6 +405,7 @@ async fn cli_batch_fetch_modes_stdin_and_flag_conflicts() {
         vec!["fetch", "--output", "/tmp/unused.md", &format!("{base}/ok"), &format!("{base}/ok")],
         vec!["fetch", "--json", "--jsonl", &format!("{base}/ok")],
         vec!["fetch", "--metadata-only", &format!("{base}/ok")],
+        vec!["search", "--urls-only", "--json", "rust"],
     ] {
         let out = Command::new(wick_bin)
             .args(["--state-dir"])

@@ -69,6 +69,7 @@ pub struct RuntimeContext {
     pub rules: SiteRules,
     pub site_cache: SiteCache,
     pub robots: RobotsCache,
+    brave_client: std::sync::Mutex<Option<reqwest::Client>>,
 }
 
 impl RuntimeContext {
@@ -125,7 +126,28 @@ impl RuntimeContext {
             rules,
             site_cache,
             robots,
+            brave_client: std::sync::Mutex::new(None),
         })
+    }
+
+    pub fn brave_client(&self) -> Result<reqwest::Client> {
+        let mut guard = self
+            .brave_client
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Brave HTTP client lock poisoned"))?;
+        if let Some(ref client) = *guard {
+            return Ok(client.clone());
+        }
+        let mut builder = reqwest::Client::builder();
+        if let Some(proxy_url) = self.config.proxy.as_deref() {
+            let trimmed = proxy_url.trim();
+            if !trimmed.is_empty() {
+                builder = builder.proxy(reqwest::Proxy::all(trimmed)?);
+            }
+        }
+        let client = builder.build()?;
+        *guard = Some(client.clone());
+        Ok(client)
     }
 }
 
