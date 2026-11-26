@@ -14,16 +14,16 @@ By default, `pleb` makes HTTP requests using Chrome's network stack (Cronet) or 
 
 ## Benchmarks
 
-Measured with `cargo run --release --example corpus_benchmark` across all `43` sanitized fixtures in [tests/corpus_evaluation.rs](tests/corpus_evaluation.rs) (`39` extractable documents across `50` warm iterations, `4` classification gates; token counts estimated via `ceil(bytes / 4)`):
+Measured with `cargo run --release --example corpus_benchmark` across all `45` sanitized fixtures in [tests/corpus_evaluation.rs](tests/corpus_evaluation.rs) (`41` extractable documents across `50` warm iterations, `4` classification gates; token counts estimated via `ceil(bytes / 4)`):
 
 | Category | Fixtures | Raw Bytes | Output Bytes | Byte Reduction | Est. Tokens (`Raw -> Clean`) | Mean Release Latency |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| HTML pages | 26 | 26,402 | 9,306 | 64.8% | 6,601 -> 2,327 | 51.8 us |
-| Feeds (RSS/Atom/JSON) | 4 | 3,031 | 1,424 | 53.0% | 758 -> 356 | 23.2 us |
-| Transcripts (WebVTT/SRT) | 2 | 520 | 205 | 60.6% | 130 -> 52 | 1.4 us |
-| Native Markdown | 5 | 2,108 | 2,142 | -1.6% | 527 -> 536 | 2.8 us |
+| HTML pages | 28 | 40,221 | 9,652 | 76.0% | 10,056 -> 2,413 | 62.3 us |
+| Feeds (RSS/Atom/JSON) | 4 | 3,031 | 1,424 | 53.0% | 758 -> 356 | 22.3 us |
+| Transcripts (WebVTT/SRT) | 2 | 520 | 205 | 60.6% | 130 -> 52 | 1.5 us |
+| Native Markdown | 5 | 2,108 | 2,142 | -1.6% | 527 -> 536 | 3.0 us |
 | Plain/JSON passthrough | 2 | 152 | 152 | 0.0% | 38 -> 38 | 0.1 us |
-| **All extractable** | **39** | **32,213** | **13,229** | **58.9%** | **8,054 -> 3,308** | **37.4 us** (`21.08 MiB/s`) |
+| **All extractable** | **41** | **46,032** | **13,575** | **70.5%** | **11,508 -> 3,394** | **45.1 us** (`23.72 MiB/s`) |
 
 All `4/4` non-extractable fixtures (`ratchet_challenge_403.html`, `frontier_soft_404_login_wall.html`, `ratchet_js_shell.html`, `frontier_canary_sveltekit_spa.html`) classified accurately for fail-fast blocking or CEF escalation. See [Benchmarks](README-FULL.md#benchmarks) for methodology and native Markdown link-resolution details.
 
