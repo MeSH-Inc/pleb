@@ -1,0 +1,16 @@
+<!-- wick-fixture: {"tier":"ratchet","url":"https://assets.example.com/downloads","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"Signed Artifact Downloads","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["Presigned object downloads","Tracking parameters on documentation links"],"expected_links":["https://s3.example.com/releases/wick.tar.gz?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=a%2Bb%3Dc%2Fd","https://cdn.example.com/docs/install"],"forbidden_substrings":["utm_campaign","fbclid"],"minimum_output_bytes":140,"maximum_output_bytes":1500,"expected_structure":{"minimum_headings":1,"minimum_links":2}}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>Signed Artifact Downloads</title>
+  <base href="https://cdn.example.com/docs/">
+</head>
+<body>
+  <main>
+    <h1>Signed Artifact Downloads</h1>
+    <p>Presigned object downloads must preserve exact query encoding:</p>
+    <p><a href="https://s3.example.com/releases/wick.tar.gz?X-Amz-Algorithm=AWS4-HMAC-SHA256&amp;X-Amz-Signature=a%2Bb%3Dc%2Fd">Download Archive</a></p>
+    <p>Tracking parameters on documentation links are stripped cleanly: <a href="install?utm_campaign=launch&amp;fbclid=abc123">Install Guide</a>.</p>
+  </main>
+</body>
+</html>

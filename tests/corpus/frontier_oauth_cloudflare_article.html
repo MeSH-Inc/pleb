@@ -1,0 +1,16 @@
+<!-- wick-fixture: {"tier":"frontier","url":"https://engineering.example.com/post/oauth-cloudflare-debugging","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"Debugging OAuth Redirects Behind Cloudflare","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["When reverse proxies sit in front of an OAuth callback endpoint","never misclassify long technical documentation","deterministic status codes"],"minimum_output_bytes":650,"maximum_output_bytes":3000,"expected_structure":{"minimum_headings":2}}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><title>Debugging OAuth Redirects Behind Cloudflare</title></head>
+<body>
+  <main>
+    <article>
+      <h1>Debugging OAuth Redirects Behind Cloudflare</h1>
+      <p>When reverse proxies sit in front of an OAuth callback endpoint, automated crawlers occasionally encounter interstitial pages containing phrases such as "Just a moment..." or "checking your browser before accessing" while debugging edge rules. Understanding how those interstitials interact with OAuth state cookies is essential for reliable diagnostics.</p>
+      <h2>Distinguishing Documentation From Interstitials</h2>
+      <p>A naive substring detector that inspects raw HTML without measuring visible prose length will mistakenly reject this exact technical write-up as a live challenge. By gating HTTP 200 challenge and login-wall classification on post-strip prose volume, an extraction pipeline can never misclassify long technical documentation that quotes edge security headers, login redirect flows, or OAuth PKCE verification steps.</p>
+      <p>In production, every legitimate authentication endpoint should also emit deterministic status codes and structured JSON error payloads so downstream clients can separate transient gateway blocks from permanent authorization failures without relying on brittle heuristics.</p>
+    </article>
+  </main>
+</body>
+</html>

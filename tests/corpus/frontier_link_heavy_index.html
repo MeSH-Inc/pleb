@@ -1,0 +1,24 @@
+<!-- wick-fixture: {"tier":"frontier","url":"https://news.example.com/frontpage","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"Systems News Index","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["Systems News Index","Lock-free ring buffers in Rust","Deterministic browser readiness protocols","Zero-copy framing over Unix sockets","Rustdoc module index: std::sync::atomic"],"expected_links":["https://news.example.com/item/101","https://news.example.com/item/102","https://news.example.com/item/103","https://news.example.com/docs/std/sync/atomic"],"forbidden_substrings":["Promo Directory Alpha","Promo Directory Beta","Promo Directory Gamma","Promo Directory Delta","Promo Directory Epsilon"],"minimum_output_bytes":180,"maximum_output_bytes":2200,"expected_structure":{"minimum_headings":1,"minimum_links":4}}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><title>Systems News Index</title></head>
+<body>
+  <div class="global-directory">
+    <a href="/d/a">Promo Directory Alpha</a>
+    <a href="/d/b">Promo Directory Beta</a>
+    <a href="/d/c">Promo Directory Gamma</a>
+    <a href="/d/d">Promo Directory Delta</a>
+    <a href="/d/e">Promo Directory Epsilon</a>
+    <a href="/d/f">Promo Directory Zeta</a>
+  </div>
+  <main>
+    <h1>Systems News Index</h1>
+    <table>
+      <tr><td>1.</td><td><a href="/item/101">Lock-free ring buffers in Rust</a></td><td>312 points</td></tr>
+      <tr><td>2.</td><td><a href="/item/102">Deterministic browser readiness protocols</a></td><td>245 points</td></tr>
+      <tr><td>3.</td><td><a href="/item/103">Zero-copy framing over Unix sockets</a></td><td>189 points</td></tr>
+      <tr><td>4.</td><td><a href="/docs/std/sync/atomic">Rustdoc module index: std::sync::atomic</a></td><td>98 points</td></tr>
+    </table>
+  </main>
+</body>
+</html>

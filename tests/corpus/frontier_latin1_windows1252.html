@@ -1,0 +1,14 @@
+<!-- wick-fixture: {"tier":"frontier","url":"https://legacy.example.com/archive/1999","status_code":200,"content_type":"text/html; charset=windows-1252","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"CafÃ© Archive","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["naÃ¯ve parsers","â€œlegacyâ€ â€” still valid"],"forbidden_substrings":["ï¿½"],"minimum_output_bytes":80,"maximum_output_bytes":1000,"expected_structure":{"minimum_headings":1}}]} -->
+<!DOCTYPE html>
+<html>
+<head>
+  <meta http-equiv="Content-Type" content="text/html; charset=windows-1252">
+  <title>Café Archive</title>
+</head>
+<body>
+<main>
+  <h1>Café Archive</h1>
+  <p>Many naïve parsers corrupt “legacy” — still valid European documents.</p>
+</main>
+</body>
+</html>

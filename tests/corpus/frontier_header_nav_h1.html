@@ -1,0 +1,28 @@
+<!-- wick-fixture: {"tier":"frontier","url":"https://blog.example.com/posts/header-surgery","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"Header Surgery Engineering Note","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["Header Surgery Engineering Note","Published on engineering blog","Detaching sibling navigation inside a header preserves the primary heading"],"forbidden_substrings":["Top Nav Home","Top Nav Pricing","Top Nav Careers","Top Nav Login","Top Nav Sign Up"],"minimum_output_bytes":120,"maximum_output_bytes":1200,"expected_structure":{"minimum_headings":1}}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><title>Header Surgery Engineering Note</title></head>
+<body>
+  <header class="site-hero">
+    <nav class="primary-nav">
+      <a href="/">Top Nav Home</a>
+      <a href="/pricing">Top Nav Pricing</a>
+      <a href="/careers">Top Nav Careers</a>
+    </nav>
+    <div class="header-actions">
+      <a href="/login">Top Nav Login</a>
+      <a href="/signup">Top Nav Sign Up</a>
+      <a href="/docs">Docs</a>
+      <a href="/blog">Blog</a>
+      <a href="/status">Status</a>
+    </div>
+    <div class="hero-title">
+      <h1>Header Surgery Engineering Note</h1>
+      <p>Published on engineering blog with zero external dependencies.</p>
+    </div>
+  </header>
+  <main>
+    <p>Detaching sibling navigation inside a header preserves the primary heading while removing global navigation clutter.</p>
+  </main>
+</body>
+</html>

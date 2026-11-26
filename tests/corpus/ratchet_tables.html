@@ -1,0 +1,22 @@
+<!-- wick-fixture: {"tier":"ratchet","url":"https://docs.example.com/reference/exit-codes","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"CLI Exit Codes","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["deterministic status code","Exit Code","Meaning","Retryable","Blocked or challenge","Unsupported binary content"],"expected_links":["https://docs.example.com/reference/raw-mode"],"forbidden_substrings":["Footer Links"],"minimum_output_bytes":150,"maximum_output_bytes":1500,"expected_structure":{"minimum_headings":1,"minimum_tables":1,"minimum_links":1}}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><title>CLI Exit Codes</title></head>
+<body>
+  <main>
+    <h1>CLI Exit Codes</h1>
+    <p>Every subcommand emits a deterministic status code for shell pipelines.</p>
+    <table>
+      <thead>
+        <tr><th>Exit Code</th><th>Meaning</th><th>Retryable</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>0</td><td>Success</td><td>No</td></tr>
+        <tr><td>2</td><td>Blocked or challenge</td><td>Maybe</td></tr>
+        <tr><td>5</td><td>Unsupported binary content; use <a href="/reference/raw-mode">raw mode</a></td><td>No</td></tr>
+      </tbody>
+    </table>
+  </main>
+  <footer>Footer Links</footer>
+</body>
+</html>

@@ -1,0 +1,19 @@
+<!-- wick-fixture: {"tier":"ratchet","url":"https://docs.example.com/examples/rust-client","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"Rust Client Example","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["Invoke the fetch helper","Verify the exit status"],"expected_code_blocks":[{"language":"rust","snippet":"let output = fetch_document(&ctx, url, &opts).await?;"},{"language":"bash","snippet":"wick fetch --json https://example.com"}],"minimum_output_bytes":160,"maximum_output_bytes":1500,"expected_structure":{"minimum_headings":1,"minimum_code_blocks":2}},{"name":"truncated_md","format":"markdown","mode":"clean","max_bytes":160,"expected_substrings":["Invoke the fetch helper"],"minimum_output_bytes":60,"maximum_output_bytes":160}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><title>Rust Client Example</title></head>
+<body>
+  <main>
+    <h1>Rust Client Example</h1>
+    <p>Invoke the fetch helper directly from an async Tokio runtime:</p>
+    <pre><code class="language-rust">use mesh_wick::fetch::{fetch_document, FetchOptions};
+
+let output = fetch_document(&ctx, url, &opts).await?;
+println!("{}", output.content);
+</code></pre>
+    <p>Verify the exit status from your shell:</p>
+    <pre><code class="language-bash">wick fetch --json https://example.com
+</code></pre>
+  </main>
+</body>
+</html>
