@@ -64,14 +64,25 @@ pub struct SiteRules {
 impl SiteRules {
     pub fn load(state_dir: &Path) -> Self {
         let overlay_path = state_dir.join("site-rules.json");
-        let overlay = std::fs::read_to_string(overlay_path).ok();
+        let overlay = match std::fs::read_to_string(&overlay_path) {
+            Ok(data) => Some(data),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                tracing::warn!(
+                    "failed to read site-rules overlay {}: {}",
+                    overlay_path.display(),
+                    err
+                );
+                None
+            }
+        };
         Self::from_json_with_overlay(BUNDLED_RULES, overlay.as_deref())
     }
 
     pub fn from_json_with_overlay(seed: &str, overlay: Option<&str>) -> Self {
-        let mut rules = parse_rule_map(seed);
+        let mut rules = parse_rule_map(seed, "bundled");
         if let Some(ov) = overlay {
-            for (host, rule) in parse_rule_map(ov) {
+            for (host, rule) in parse_rule_map(ov, "overlay") {
                 rules.insert(host, rule);
             }
         }
@@ -98,10 +109,14 @@ impl SiteRules {
     }
 }
 
-fn parse_rule_map(data: &str) -> HashMap<String, SiteRule> {
-    serde_json::from_str::<RuleFile>(data)
-        .map(|f| f.rules)
-        .unwrap_or_default()
+fn parse_rule_map(data: &str, source: &str) -> HashMap<String, SiteRule> {
+    match serde_json::from_str::<RuleFile>(data) {
+        Ok(file) => file.rules,
+        Err(err) => {
+            tracing::warn!("invalid {} site-rules.json ignored: {}", source, err);
+            HashMap::new()
+        }
+    }
 }
 
 pub fn parent_domain(host: &str) -> Option<&str> {
@@ -303,6 +318,16 @@ pub enum ResponseClassification {
 }
 
 pub fn classify_response(status: u16, is_html: bool, body: &str) -> ResponseClassification {
+    let mut parsed = None;
+    classify_response_with_parsed(status, is_html, body, &mut parsed)
+}
+
+pub fn classify_response_with_parsed(
+    status: u16,
+    is_html: bool,
+    body: &str,
+    parsed: &mut Option<dom::ParsedHtml>,
+) -> ResponseClassification {
     if status == 403 || status == 503 {
         if let Some(reason) = detect_challenge(body) {
             return ResponseClassification::Challenge { status, reason };
@@ -318,7 +343,7 @@ pub fn classify_response(status: u16, is_html: bool, body: &str) -> ResponseClas
         if let Some(reason) = detect_interstitial_challenge(body) {
             return ResponseClassification::Challenge { status, reason };
         }
-        if let Some(reason) = detect_js_shell(body) {
+        if let Some(reason) = detect_js_shell_with_parsed(body, parsed) {
             return ResponseClassification::JavaScriptShell { reason };
         }
     }
@@ -363,6 +388,14 @@ pub fn detect_interstitial_challenge(body: &str) -> Option<String> {
 }
 
 pub fn detect_js_shell(body: &str) -> Option<String> {
+    let mut parsed = None;
+    detect_js_shell_with_parsed(body, &mut parsed)
+}
+
+fn detect_js_shell_with_parsed(
+    body: &str,
+    parsed: &mut Option<dom::ParsedHtml>,
+) -> Option<String> {
     if body.len() > 2_000_000 {
         return None;
     }
@@ -385,7 +418,8 @@ pub fn detect_js_shell(body: &str) -> Option<String> {
         }
     }
 
-    let metrics = dom::dom_text_metrics(body);
+    let doc = parsed.get_or_insert_with(|| dom::ParsedHtml::parse(body));
+    let metrics = doc.text_metrics();
     if metrics.visible_text_len < 200
         && (metrics.has_empty_spa_root || metrics.script_count >= 3)
     {

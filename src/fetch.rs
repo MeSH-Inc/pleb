@@ -3,10 +3,10 @@ use std::time::Instant;
 use thiserror::Error;
 
 use crate::context::RuntimeContext;
-use crate::extract::{self, ExtractOptions, OutputFormat};
+use crate::extract::{self, ExtractOptions, OutputFormat, ParsedHtml};
 use crate::policy::{
-    classify_response, detect_interstitial_challenge, plan_strategy, PrimaryTransport, RenderMode,
-    ResponseClassification,
+    classify_response_with_parsed, detect_interstitial_challenge, plan_strategy, PrimaryTransport,
+    RenderMode, ResponseClassification,
 };
 use crate::transport::cef::{CefRenderOptions, CefRenderer};
 
@@ -35,6 +35,16 @@ pub enum FetchError {
     #[error("HTTP {status} error fetching {url}")]
     HttpError { url: String, status: u16 },
 
+    #[error(
+        "unsupported binary content ({}) on {url} ({byte_count} bytes); use --format raw --output <path>",
+        content_type.as_deref().unwrap_or("unknown")
+    )]
+    UnsupportedContentType {
+        url: String,
+        content_type: Option<String>,
+        byte_count: usize,
+    },
+
     #[error("CEF renderer unavailable: {0}")]
     CefUnavailable(String),
 
@@ -47,6 +57,7 @@ impl FetchError {
         match self {
             Self::RobotsDisallowed { .. } | Self::Blocked { .. } | Self::Challenge { .. } => 2,
             Self::HttpError { .. } => 3,
+            Self::UnsupportedContentType { .. } => 5,
             Self::InvalidUrl(_) | Self::CefUnavailable(_) | Self::Transport(_) => 1,
         }
     }
@@ -87,11 +98,12 @@ pub struct FetchOutput {
     pub timing_ms: u64,
 }
 
-#[derive(Debug, Clone)]
 pub struct FetchHtmlResult {
     pub html: String,
     pub url: String,
     pub status_code: u16,
+    pub content_type: Option<String>,
+    pub parsed: Option<ParsedHtml>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +123,7 @@ struct AcquiredPage {
     content_type: Option<String>,
     strategy: String,
     escalated: bool,
+    parsed: Option<ParsedHtml>,
 }
 
 pub async fn fetch_document(
@@ -147,9 +160,11 @@ pub async fn fetch_document(
     )
     .await?;
 
-    let extracted = extract::extract_document(
+    let final_url_parsed = url::Url::parse(&page.final_url).unwrap_or_else(|_| effective.clone());
+    let extracted = extract::extract_document_parsed(
         &page.body,
-        &effective,
+        page.parsed,
+        &final_url_parsed,
         page.content_type.as_deref(),
         &options.extract,
     )?;
@@ -192,6 +207,8 @@ pub async fn fetch_html(
         html: page.body,
         url: page.final_url,
         status_code: page.status_code,
+        content_type: page.content_type,
+        parsed: page.parsed,
     })
 }
 
@@ -275,6 +292,7 @@ async fn acquire_page(
                     content_type: Some("text/html".to_string()),
                     strategy: "cef".to_string(),
                     escalated: false,
+                    parsed: None,
                 });
             }
             Err(err) => {
@@ -283,7 +301,11 @@ async fn acquire_page(
                 if !plan.allow_cronet_fallback {
                     return Err(err);
                 }
-                tracing::warn!("CEF render failed for {}: {}; falling back to network transport", host, err);
+                tracing::warn!(
+                    "CEF render failed for {}: {}; falling back to network transport",
+                    host,
+                    err
+                );
                 cef_fallback = true;
             }
         }
@@ -294,8 +316,23 @@ async fn acquire_page(
     let final_url = resp.final_url.clone();
     let content_type = resp.content_type.clone();
     let is_html = resp.is_html();
+
+    if status < 400 {
+        if let Some(detected_mime) =
+            extract::detect_binary_content(content_type.as_deref(), &resp.body)
+        {
+            return Err(FetchError::UnsupportedContentType {
+                url: final_url,
+                content_type: detected_mime.or(content_type),
+                byte_count: resp.body.len(),
+            });
+        }
+    }
+
     let body = resp.text();
-    let classification = classify_response(status, is_html, &body);
+    let mut parsed_html = None;
+    let classification =
+        classify_response_with_parsed(status, is_html, &body, &mut parsed_html);
 
     match classification {
         ResponseClassification::Ok => {
@@ -309,6 +346,7 @@ async fn acquire_page(
                 content_type,
                 strategy,
                 escalated: cef_fallback,
+                parsed: parsed_html,
             })
         }
         ResponseClassification::JavaScriptShell { reason } => {
@@ -324,6 +362,7 @@ async fn acquire_page(
                             content_type: Some("text/html".to_string()),
                             strategy: "cef".to_string(),
                             escalated: true,
+                            parsed: None,
                         });
                     }
                     Err(err) => {
@@ -346,6 +385,7 @@ async fn acquire_page(
                 content_type,
                 strategy,
                 escalated: cef_fallback,
+                parsed: parsed_html,
             })
         }
         ResponseClassification::Blocked { status } => {
@@ -361,6 +401,7 @@ async fn acquire_page(
                             content_type: Some("text/html".to_string()),
                             strategy: "cef".to_string(),
                             escalated: true,
+                            parsed: None,
                         });
                     }
                     Err(err) => {
@@ -396,6 +437,7 @@ async fn acquire_page(
                             content_type: Some("text/html".to_string()),
                             strategy: "cef".to_string(),
                             escalated: true,
+                            parsed: None,
                         });
                     }
                     Err(err) => {

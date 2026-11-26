@@ -1,6 +1,7 @@
+use mesh_wick::extract::ParsedHtml;
 use mesh_wick::policy::{
-    classify_response, plan_strategy, PrimaryTransport, RenderMode, ResponseClassification,
-    SiteCache, SiteCacheEntry, SiteRule, SiteRules,
+    classify_response, classify_response_with_parsed, plan_strategy, PrimaryTransport, RenderMode,
+    ResponseClassification, SiteCache, SiteCacheEntry, SiteRule, SiteRules,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
@@ -178,4 +179,24 @@ fn response_classifier_covers_challenges_js_shells_and_normal_pages() {
     );
     assert!(huge.len() > 2_000_000);
     assert_eq!(classify_response(200, true, &huge), ResponseClassification::Ok);
+
+    // Lazy parsing only populates ParsedHtml when DOM metrics are actually evaluated.
+    let mut parsed: Option<ParsedHtml> = None;
+    assert!(matches!(
+        classify_response_with_parsed(403, true, "Forbidden", &mut parsed),
+        ResponseClassification::Blocked { status: 403 }
+    ));
+    assert!(parsed.is_none());
+
+    assert!(matches!(
+        classify_response_with_parsed(200, true, x_shell, &mut parsed),
+        ResponseClassification::JavaScriptShell { .. }
+    ));
+    assert!(parsed.is_none());
+
+    assert_eq!(
+        classify_response_with_parsed(200, true, normal_page, &mut parsed),
+        ResponseClassification::Ok
+    );
+    assert!(parsed.is_some());
 }

@@ -49,13 +49,38 @@ async fn spawn_mock_server() -> String {
                         "text/html; charset=utf-8",
                         b"<html><head><title>Mock Page</title></head><body><nav>NavLinks</nav><main><h1>Hello</h1><p>Main body content.</p></main></body></html>",
                     ),
+                    "/docs/sub/entry" => http_response(
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        b"<html><head><title>Nested</title></head><body><main><a href=\"guide?utm_source=x&amp;v=1\">Guide</a></main></body></html>",
+                    ),
                     "/redirect" => {
-                        b"HTTP/1.1 302 Found\r\nLocation: /page\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                        b"HTTP/1.1 302 Found\r\nLocation: /docs/sub/entry\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
                     }
                     "/data.json" => http_response(
                         "200 OK",
                         "application/json",
                         br#"{"ok":true,"count":42}"#,
+                    ),
+                    "/doc.pdf" => http_response(
+                        "200 OK",
+                        "application/pdf",
+                        b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n",
+                    ),
+                    "/logo.svg" => http_response(
+                        "200 OK",
+                        "image/svg+xml",
+                        b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>",
+                    ),
+                    "/latin1" => http_response(
+                        "200 OK",
+                        "text/html; charset=iso-8859-1",
+                        b"<html><body><p>Caf\xe9 menu</p></body></html>",
+                    ),
+                    "/missing.png" => http_response(
+                        "404 Not Found",
+                        "image/png",
+                        b"\x89PNG\r\n\x1a\n",
                     ),
                     "/blocked" => http_response("403 Forbidden", "text/html", b"Access denied"),
                     "/missing" => http_response("404 Not Found", "text/plain", b"Not found"),
@@ -121,12 +146,12 @@ async fn fetch_pipeline_end_to_end_against_local_server() {
     assert!(page.content.contains("Main body content."));
     assert!(!page.content.contains("NavLinks"));
 
-    // 2. Redirect captures final_url.
+    // 2. Redirect captures final_url and resolves relative links against post-redirect path.
     let redir = fetch_document(&ctx, &format!("{base}/redirect"), &cronet_opts)
         .await
         .unwrap();
-    assert!(redir.final_url.ends_with("/page"));
-    assert!(redir.content.contains("Main body content."));
+    assert!(redir.final_url.ends_with("/docs/sub/entry"));
+    assert!(redir.content.contains(&format!("[Guide]({base}/docs/sub/guide?v=1)")));
 
     // 3. JSON passes through unmodified.
     let json_doc = fetch_document(&ctx, &format!("{base}/data.json"), &cronet_opts)
@@ -161,7 +186,7 @@ async fn fetch_pipeline_end_to_end_against_local_server() {
             format: OutputFormat::Markdown,
             ..Default::default()
         },
-        ..cronet_opts
+        ..cronet_opts.clone()
     };
     let err_robots = fetch_document(&ctx, &format!("{base}/private"), &robots_opts)
         .await
@@ -174,6 +199,35 @@ async fn fetch_pipeline_end_to_end_against_local_server() {
         .await
         .unwrap();
     assert_eq!(raw.bytes, vec![0x00, 0xFF, 0xFE, 0x41, 0x42]);
+
+    // 8. Binary guard rejects PDF and NUL octet-stream with exit code 5,
+    // allows SVG passthrough and Latin-1 HTML, and keeps 404 PNG as HttpError (exit 3).
+    let err_pdf = fetch_document(&ctx, &format!("{base}/doc.pdf"), &cronet_opts)
+        .await
+        .unwrap_err();
+    assert!(matches!(err_pdf, FetchError::UnsupportedContentType { .. }));
+    assert_eq!(err_pdf.exit_code(), 5);
+
+    let err_bin = fetch_document(&ctx, &format!("{base}/binary"), &cronet_opts)
+        .await
+        .unwrap_err();
+    assert_eq!(err_bin.exit_code(), 5);
+
+    let svg = fetch_document(&ctx, &format!("{base}/logo.svg"), &cronet_opts)
+        .await
+        .unwrap();
+    assert!(svg.content.contains("<svg"));
+
+    let latin1 = fetch_document(&ctx, &format!("{base}/latin1"), &cronet_opts)
+        .await
+        .unwrap();
+    assert!(latin1.content.contains("Caf"));
+
+    let err_404_png = fetch_document(&ctx, &format!("{base}/missing.png"), &cronet_opts)
+        .await
+        .unwrap_err();
+    assert!(matches!(err_404_png, FetchError::HttpError { status: 404, .. }));
+    assert_eq!(err_404_png.exit_code(), 3);
 
     let _ = std::fs::remove_dir_all(state_dir);
 }

@@ -1,5 +1,9 @@
 use mesh_wick::extract::markdown::compact_markdown;
-use mesh_wick::extract::{extract_document, ExtractMode, ExtractOptions, OutputFormat};
+use mesh_wick::extract::url::{clean_url, resolve_and_clean_url, ResolvedUrl};
+use mesh_wick::extract::{
+    detect_binary_content, extract_document, truncate_markdown, truncate_utf8, ExtractMode,
+    ExtractOptions, OutputFormat, ParsedHtml,
+};
 use url::Url;
 
 #[test]
@@ -242,4 +246,101 @@ fn non_html_passthrough_json_and_plain_text() {
     )
     .unwrap();
     assert_eq!(doc_txt.content, txt);
+}
+
+fn assert_send<T: Send>() {}
+
+#[test]
+fn parsed_html_is_send_and_resolves_base_href_and_links() {
+    assert_send::<ParsedHtml>();
+
+    let html = r##"<!DOCTYPE html>
+<html>
+<head>
+  <title>Docs Guide</title>
+  <base href="https://cdn.example.com/v2/guide/">
+</head>
+<body>
+  <main>
+    <p>See <a href="getting-started?utm_source=x&amp;tab=rust">the <strong>Rust</strong> guide</a>.</p>
+    <p>Jump to <a href="#overview">overview</a> or <a href="java&#x09;script:void(0)">expand details</a>.</p>
+    <p>Empty <a href="https://example.com/empty">   </a> and image link <a href="https://example.com/big.jpg"><img src="thumb.png?fbclid=123" alt="Thumb"></a>.</p>
+  </main>
+</body>
+</html>"##;
+
+    let page_url = Url::parse("https://example.com/old/path").unwrap();
+    let doc = extract_document(html, &page_url, Some("text/html"), &ExtractOptions::default()).unwrap();
+    assert!(doc.content.contains("[the **Rust** guide](https://cdn.example.com/v2/guide/getting-started?tab=rust)"));
+    assert!(doc.content.contains("[overview](#overview)"));
+    assert!(doc.content.contains("expand details"));
+    assert!(!doc.content.contains("javascript:"));
+    assert!(!doc.content.contains("https://example.com/empty"));
+    assert!(doc.content.contains("[![Thumb](https://cdn.example.com/v2/guide/thumb.png)](https://example.com/big.jpg)"));
+
+    let no_img_doc = extract_document(
+        html,
+        &page_url,
+        Some("text/html"),
+        &ExtractOptions {
+            include_images: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(!no_img_doc.content.contains("big.jpg"));
+    assert!(!no_img_doc.content.contains("thumb.png"));
+}
+
+#[test]
+fn tracking_param_stripping_preserves_signed_urls_and_strips_case_insensitively() {
+    let signed = Url::parse("https://s3.example.com/obj?X-Amz-Signature=a%2Bb%20c&response-content-type=text%2Fplain").unwrap();
+    assert_eq!(clean_url(&signed).as_str(), signed.as_str());
+
+    let tracked = Url::parse("https://example.com/post?UTM_SOURCE=news&fbclid=abc&gclid=xyz").unwrap();
+    assert_eq!(clean_url(&tracked).as_str(), "https://example.com/post");
+
+    let base = Url::parse("https://example.com/docs/").unwrap();
+    assert_eq!(
+        resolve_and_clean_url("page?utm_medium=social&id=42", &base),
+        ResolvedUrl::Resolved("https://example.com/docs/page?id=42".to_string())
+    );
+    assert_eq!(
+        resolve_and_clean_url("java\tscript:alert(1)", &base),
+        ResolvedUrl::UnwrapText
+    );
+}
+
+#[test]
+fn truncate_markdown_closes_fences_without_contaminating_non_markdown() {
+    let json_with_backticks = r#"{"snippet":"```rust\nfn main() {}\n```","extra":"0123456789abcdef0123456789abcdef"}"#;
+    let (json_cut, json_truncated) = truncate_utf8(json_with_backticks, 50);
+    assert!(json_truncated);
+    assert!(json_cut.len() <= 50);
+    assert!(json_cut.ends_with("\n\n[... truncated]"));
+    assert!(!json_cut.contains("\n```\n\n[... truncated]"));
+
+    let md_four_ticks = "````markdown\n# Inside\nline two\nline three\nline four\n````\n";
+    let (md_cut, md_truncated) = truncate_markdown(md_four_ticks, 55);
+    assert!(md_truncated);
+    assert!(md_cut.len() <= 55);
+    assert!(md_cut.ends_with("\n````\n\n[... truncated]"));
+
+    let md_cut_on_opening = "Intro paragraph.\n\n```rust\nfn very_long_function_name() {}\n```\n";
+    let (rewound, rewound_truncated) = truncate_markdown(md_cut_on_opening, 42);
+    assert!(rewound_truncated);
+    assert!(rewound.len() <= 42);
+    assert!(!rewound.contains("```rust"));
+    assert!(rewound.contains("Intro paragraph."));
+}
+
+#[test]
+fn binary_detection_handles_mimes_magic_svg_and_latin1() {
+    assert!(detect_binary_content(Some("application/pdf"), b"%PDF-1.7").is_some());
+    assert!(detect_binary_content(None, b"%PDF-1.7\n...").is_some());
+    assert!(detect_binary_content(None, b"abc\x00def").is_some());
+    assert!(detect_binary_content(Some("image/png"), b"\x89PNG\r\n\x1a\n").is_some());
+
+    assert!(detect_binary_content(Some("image/svg+xml"), b"<svg></svg>").is_none());
+    assert!(detect_binary_content(Some("text/html; charset=iso-8859-1"), b"<p>Caf\xe9</p>").is_none());
 }

@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use crate::context::RuntimeContext;
@@ -219,34 +220,38 @@ fn clean_html_text(input: &str) -> String {
     raw.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+static DDG_RESULT_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(".result__body, .web-result__body").unwrap());
+static DDG_TITLE_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(".result__a, .result__title a").unwrap());
+static DDG_SNIPPET_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(".result__snippet").unwrap());
+
 pub fn parse_ddg_html(html: &str, max: usize) -> Result<Vec<SearchResult>> {
     let doc = Html::parse_document(html);
-    let result_sel = Selector::parse(".result__body, .web-result__body").unwrap();
-    let title_sel = Selector::parse(".result__a, .result__title a").unwrap();
-    let snippet_sel = Selector::parse(".result__snippet").unwrap();
 
     let mut results = Vec::new();
 
-    for element in doc.select(&result_sel) {
+    for element in doc.select(&DDG_RESULT_SEL) {
         if results.len() >= max {
             break;
         }
 
         let title = element
-            .select(&title_sel)
+            .select(&DDG_TITLE_SEL)
             .next()
             .map(|el| el.text().collect::<String>().trim().to_string())
             .unwrap_or_default();
 
         let url = element
-            .select(&title_sel)
+            .select(&DDG_TITLE_SEL)
             .next()
             .and_then(|el| el.value().attr("href"))
             .map(clean_ddg_url)
             .unwrap_or_default();
 
         let snippet = element
-            .select(&snippet_sel)
+            .select(&DDG_SNIPPET_SEL)
             .next()
             .map(|el| el.text().collect::<String>().trim().to_string())
             .unwrap_or_default();

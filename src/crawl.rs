@@ -1,12 +1,14 @@
 use anyhow::Result;
-use scraper::{Html, Selector};
 use serde::Serialize;
 use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 use url::Url;
 
 use crate::context::RuntimeContext;
-use crate::extract::{self, ExtractMode, ExtractOptions, ExtractedDocument, OutputFormat};
+use crate::extract::{
+    self, url::normalize_crawl_url, ExtractMode, ExtractOptions, ExtractedDocument, OutputFormat,
+    ParsedHtml,
+};
 use crate::fetch;
 
 #[derive(Debug, Clone)]
@@ -73,43 +75,61 @@ pub async fn crawl(
             continue;
         }
 
-        if depth < options.max_depth {
-            let page_url = Url::parse(&html_result.url).unwrap_or_else(|_| parsed.clone());
-            for link in extract_links(&html_result.html, &page_url) {
-                let link_str = link.to_string();
-                let norm = normalize_url(&link_str);
+        let page_url = Url::parse(&html_result.url).unwrap_or_else(|_| parsed.clone());
+        let is_html = is_html_content_type(html_result.content_type.as_deref());
+        let parsed_doc = if is_html {
+            Some(
+                html_result
+                    .parsed
+                    .unwrap_or_else(|| ParsedHtml::parse(&html_result.html)),
+            )
+        } else {
+            None
+        };
 
-                if !is_same_origin(&link, &origin) {
-                    continue;
-                }
-                if let Some(ref prefix) = options.path_filter {
-                    if !link.path().starts_with(prefix.as_str()) {
+        if depth < options.max_depth {
+            if let Some(ref doc) = parsed_doc {
+                for link in doc.links(&page_url) {
+                    let link_str = link.to_string();
+                    let norm = normalize_crawl_url(&link);
+
+                    if !is_same_origin(&link, &origin) {
                         continue;
                     }
-                }
-                if !is_crawlable_extension(&link) || visited.contains(&norm) {
-                    continue;
-                }
+                    if let Some(ref prefix) = options.path_filter {
+                        if !link.path().starts_with(prefix.as_str()) {
+                            continue;
+                        }
+                    }
+                    if !is_crawlable_extension(&link) || visited.contains(&norm) {
+                        continue;
+                    }
 
-                visited.insert(norm);
-                urls_discovered += 1;
-                queue.push_back((link_str, depth + 1));
+                    visited.insert(norm);
+                    urls_discovered += 1;
+                    queue.push_back((link_str, depth + 1));
+                }
             }
         }
 
-        let page_url = Url::parse(&html_result.url).unwrap_or_else(|_| parsed.clone());
         let opts = ExtractOptions {
             format: options.format,
             mode: options.extract_mode,
             max_bytes: Some(10_000),
             ..Default::default()
         };
-        let extracted = extract::extract_document(&html_result.html, &page_url, Some("text/html"), &opts)
-            .unwrap_or(ExtractedDocument {
-                content: String::new(),
-                title: None,
-                truncated: false,
-            });
+        let extracted = extract::extract_document_parsed(
+            &html_result.html,
+            parsed_doc,
+            &page_url,
+            html_result.content_type.as_deref(),
+            &opts,
+        )
+        .unwrap_or(ExtractedDocument {
+            content: String::new(),
+            title: None,
+            truncated: false,
+        });
 
         pages.push(CrawlPage {
             url: html_result.url,
@@ -236,10 +256,17 @@ pub async fn map(
         };
         pages_fetched += 1;
 
+        if !is_html_content_type(html_result.content_type.as_deref()) {
+            continue;
+        }
+
         let page_url = Url::parse(&html_result.url).unwrap_or_else(|_| parsed.clone());
-        for link in extract_links(&html_result.html, &page_url) {
+        let doc = html_result
+            .parsed
+            .unwrap_or_else(|| ParsedHtml::parse(&html_result.html));
+        for link in doc.links(&page_url) {
             let link_str = link.to_string();
-            let norm = normalize_url(&link_str);
+            let norm = normalize_crawl_url(&link);
 
             if !is_same_origin(&link, &origin) {
                 continue;
@@ -322,45 +349,19 @@ fn parse_sitemap_xml(xml: &str) -> Vec<String> {
     urls
 }
 
-fn extract_links(html: &str, page_url: &Url) -> Vec<Url> {
-    let doc = Html::parse_document(html);
-    let selector = Selector::parse("a[href]").unwrap();
-    let mut links = Vec::new();
-    let mut seen = HashSet::new();
-
-    for element in doc.select(&selector) {
-        if let Some(href) = element.value().attr("href") {
-            let href = href.trim();
-            if href.is_empty()
-                || href.starts_with('#')
-                || href.starts_with("javascript:")
-                || href.starts_with("mailto:")
-            {
-                continue;
-            }
-            if let Ok(resolved) = page_url.join(href) {
-                let norm = normalize_url(resolved.as_str());
-                if !seen.contains(&norm) {
-                    seen.insert(norm);
-                    links.push(resolved);
-                }
-            }
+fn is_html_content_type(content_type: Option<&str>) -> bool {
+    match content_type {
+        Some(ct) => {
+            let mime = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+            mime.is_empty() || mime == "text/html" || mime == "application/xhtml+xml"
         }
+        None => true,
     }
-
-    links
 }
 
 fn normalize_url(url: &str) -> String {
     match Url::parse(url) {
-        Ok(mut u) => {
-            u.set_fragment(None);
-            let mut s = u.to_string();
-            if s.ends_with('/') && u.path() != "/" {
-                s.pop();
-            }
-            s
-        }
+        Ok(u) => normalize_crawl_url(&u),
         Err(_) => url.to_string(),
     }
 }
