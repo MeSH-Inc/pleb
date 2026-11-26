@@ -360,24 +360,22 @@ pub fn open_fence_at(md: &str, cut: usize) -> Option<(char, usize, usize, usize)
 /// - Trim trailing horizontal whitespace per line
 pub fn compact_markdown(md: &str) -> String {
     let mut out_lines: Vec<String> = Vec::new();
-    let mut fence: Option<(char, usize)> = None;
+    let mut fence = FenceTracker::default();
     let mut blank_run = 0usize;
 
     for raw_line in md.lines() {
-        if let Some((fence_char, fence_len)) = fence {
-            out_lines.push(raw_line.to_string());
-            if is_closing_fence(raw_line, fence_char, fence_len) {
-                fence = None;
+        match fence.step(raw_line) {
+            FenceLine::Opening => {
+                out_lines.push(raw_line.trim_end().to_string());
+                blank_run = 0;
+                continue;
             }
-            blank_run = 0;
-            continue;
-        }
-
-        if let Some(f) = parse_opening_fence(raw_line) {
-            fence = Some(f);
-            out_lines.push(raw_line.trim_end().to_string());
-            blank_run = 0;
-            continue;
+            FenceLine::Inside | FenceLine::Closing => {
+                out_lines.push(raw_line.to_string());
+                blank_run = 0;
+                continue;
+            }
+            FenceLine::Outside => {}
         }
 
         let trimmed_end = raw_line.trim_end();
@@ -505,7 +503,35 @@ fn collapse_spaces(s: &str) -> String {
     out
 }
 
-pub(crate) fn parse_opening_fence(line: &str) -> Option<(char, usize)> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FenceLine {
+    Outside,
+    Opening,
+    Inside,
+    Closing,
+}
+
+#[derive(Default)]
+pub(crate) struct FenceTracker(Option<(char, usize)>);
+
+impl FenceTracker {
+    pub(crate) fn step(&mut self, line: &str) -> FenceLine {
+        if let Some((fc, fl)) = self.0 {
+            if is_closing_fence(line, fc, fl) {
+                self.0 = None;
+                return FenceLine::Closing;
+            }
+            return FenceLine::Inside;
+        }
+        if let Some(f) = parse_opening_fence(line) {
+            self.0 = Some(f);
+            return FenceLine::Opening;
+        }
+        FenceLine::Outside
+    }
+}
+
+fn parse_opening_fence(line: &str) -> Option<(char, usize)> {
     let trimmed = line.trim_start();
     let first = trimmed.chars().next()?;
     if first != '`' && first != '~' {
@@ -519,7 +545,7 @@ pub(crate) fn parse_opening_fence(line: &str) -> Option<(char, usize)> {
     }
 }
 
-pub(crate) fn is_closing_fence(line: &str, fence_char: char, min_len: usize) -> bool {
+fn is_closing_fence(line: &str, fence_char: char, min_len: usize) -> bool {
     let trimmed = line.trim();
     if trimmed.len() < min_len {
         return false;

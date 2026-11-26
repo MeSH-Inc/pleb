@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use url::Url;
 
 use super::markdown::{
-    compact_markdown, format_destination, is_closing_fence, parse_opening_fence, truncate_markdown,
+    compact_markdown, format_destination, truncate_markdown, FenceLine, FenceTracker,
 };
 use super::url::{resolve_and_clean_url, ResolvedUrl};
 use super::{
@@ -218,18 +218,10 @@ fn unquote_yaml_scalar(val: &str) -> String {
 }
 
 fn first_markdown_h1(md: &str) -> Option<String> {
-    let mut fence: Option<(char, usize)> = None;
+    let mut fence = FenceTracker::default();
     let mut prev_para: Option<&str> = None;
     for raw_line in md.lines() {
-        if let Some((fc, fl)) = fence {
-            if is_closing_fence(raw_line, fc, fl) {
-                fence = None;
-            }
-            prev_para = None;
-            continue;
-        }
-        if let Some(f) = parse_opening_fence(raw_line) {
-            fence = Some(f);
+        if fence.step(raw_line) != FenceLine::Outside {
             prev_para = None;
             continue;
         }
@@ -298,7 +290,7 @@ fn rewrite_markdown_links(
     include_links: bool,
 ) -> String {
     let mut out = String::with_capacity(md.len());
-    let mut fence: Option<(char, usize)> = None;
+    let mut fence = FenceTracker::default();
 
     for raw_line in md.split_inclusive('\n') {
         let (line, newline) = if let Some(stripped) = raw_line.strip_suffix("\r\n") {
@@ -309,17 +301,7 @@ fn rewrite_markdown_links(
             (raw_line, "")
         };
 
-        if let Some((fc, fl)) = fence {
-            out.push_str(line);
-            out.push_str(newline);
-            if is_closing_fence(line, fc, fl) {
-                fence = None;
-            }
-            continue;
-        }
-
-        if let Some(f) = parse_opening_fence(line) {
-            fence = Some(f);
+        if fence.step(line) != FenceLine::Outside {
             out.push_str(line);
             out.push_str(newline);
             continue;
@@ -697,22 +679,18 @@ fn markdown_to_plain_text(md: &str) -> String {
     let defined_refs = collect_defined_ref_labels(md);
     let cleaned_tags = strip_markdown_html_mdx_tags(md);
     let mut lines: Vec<String> = Vec::new();
-    let mut fence: Option<(char, usize)> = None;
+    let mut fence = FenceTracker::default();
     let mut blank_run = 0usize;
 
     for raw_line in cleaned_tags.lines() {
-        if let Some((fc, fl)) = fence {
-            if is_closing_fence(raw_line, fc, fl) {
-                fence = None;
-            } else {
+        match fence.step(raw_line) {
+            FenceLine::Opening | FenceLine::Closing => continue,
+            FenceLine::Inside => {
                 lines.push(raw_line.trim_end().to_string());
                 blank_run = 0;
+                continue;
             }
-            continue;
-        }
-        if let Some(f) = parse_opening_fence(raw_line) {
-            fence = Some(f);
-            continue;
+            FenceLine::Outside => {}
         }
         if parse_link_ref_definition(raw_line).is_some() {
             continue;
@@ -741,7 +719,7 @@ fn markdown_to_plain_text(md: &str) -> String {
 fn strip_markdown_html_mdx_tags(md: &str) -> String {
     let bytes = md.as_bytes();
     let mut out = String::with_capacity(md.len());
-    let mut fence: Option<(char, usize)> = None;
+    let mut fence = FenceTracker::default();
     let mut i = 0usize;
     let mut at_line_start = true;
 
@@ -749,16 +727,7 @@ fn strip_markdown_html_mdx_tags(md: &str) -> String {
         if at_line_start {
             let line_end = md[i..].find('\n').map(|n| i + n + 1).unwrap_or(bytes.len());
             let raw_line = md[i..line_end].trim_end_matches(['\r', '\n']);
-            if let Some((fc, fl)) = fence {
-                out.push_str(&md[i..line_end]);
-                if is_closing_fence(raw_line, fc, fl) {
-                    fence = None;
-                }
-                i = line_end;
-                continue;
-            }
-            if let Some(f) = parse_opening_fence(raw_line) {
-                fence = Some(f);
+            if fence.step(raw_line) != FenceLine::Outside {
                 out.push_str(&md[i..line_end]);
                 i = line_end;
                 continue;
@@ -812,30 +781,27 @@ fn strip_markdown_html_mdx_tags(md: &str) -> String {
 }
 
 fn match_html_or_mdx_tag(s: &str) -> Option<(usize, bool)> {
-    const HTML_TAGS: &[&str] = &[
-        "a",
-        "abbr",
+    const INLINE_HTML_TAGS: &[&str] = &[
+        "a", "abbr", "b", "code", "del", "em", "font", "i", "ins", "kbd", "mark", "q", "s",
+        "small", "span", "strong", "sub", "sup", "u",
+    ];
+    const BLOCK_HTML_TAGS: &[&str] = &[
         "article",
         "aside",
         "audio",
-        "b",
         "blockquote",
         "br",
         "caption",
         "center",
-        "code",
         "col",
         "colgroup",
         "dd",
-        "del",
         "details",
         "div",
         "dl",
         "dt",
-        "em",
         "figcaption",
         "figure",
-        "font",
         "footer",
         "h1",
         "h2",
@@ -845,31 +811,20 @@ fn match_html_or_mdx_tag(s: &str) -> Option<(usize, bool)> {
         "h6",
         "header",
         "hr",
-        "i",
         "iframe",
         "img",
-        "ins",
-        "kbd",
         "li",
         "main",
-        "mark",
         "nav",
         "ol",
         "p",
         "picture",
         "pre",
-        "q",
-        "s",
         "script",
         "section",
-        "small",
         "source",
-        "span",
-        "strong",
         "style",
-        "sub",
         "summary",
-        "sup",
         "svg",
         "table",
         "tbody",
@@ -879,13 +834,8 @@ fn match_html_or_mdx_tag(s: &str) -> Option<(usize, bool)> {
         "thead",
         "tr",
         "track",
-        "u",
         "ul",
         "video",
-    ];
-    const INLINE_TAGS: &[&str] = &[
-        "a", "abbr", "b", "code", "del", "em", "font", "i", "ins", "kbd", "mark", "q", "s",
-        "small", "span", "strong", "sub", "sup", "u",
     ];
 
     let bytes = s.as_bytes();
@@ -905,11 +855,12 @@ fn match_html_or_mdx_tag(s: &str) -> Option<(usize, bool)> {
         return None;
     }
     let lower = name.to_ascii_lowercase();
-    let is_html = HTML_TAGS.binary_search(&lower.as_str()).is_ok();
+    let is_inline_html = INLINE_HTML_TAGS.binary_search(&lower.as_str()).is_ok();
+    let is_block_html = !is_inline_html && BLOCK_HTML_TAGS.binary_search(&lower.as_str()).is_ok();
     let is_mdx = first.is_ascii_uppercase()
         && name.bytes().any(|b| b.is_ascii_lowercase())
         && !name.contains('-');
-    if !is_html && !is_mdx {
+    if !is_inline_html && !is_block_html && !is_mdx {
         return None;
     }
 
@@ -935,7 +886,7 @@ fn match_html_or_mdx_tag(s: &str) -> Option<(usize, bool)> {
                         total += rel + close_pat.len();
                     }
                 }
-                let block_break = is_mdx || INLINE_TAGS.binary_search(&lower.as_str()).is_err();
+                let block_break = is_mdx || !is_inline_html;
                 return Some((total, block_break));
             }
             None => {}
@@ -947,16 +898,9 @@ fn match_html_or_mdx_tag(s: &str) -> Option<(usize, bool)> {
 
 fn collect_defined_ref_labels(md: &str) -> HashSet<String> {
     let mut refs = HashSet::new();
-    let mut fence: Option<(char, usize)> = None;
+    let mut fence = FenceTracker::default();
     for line in md.lines() {
-        if let Some((fc, fl)) = fence {
-            if is_closing_fence(line, fc, fl) {
-                fence = None;
-            }
-            continue;
-        }
-        if let Some(f) = parse_opening_fence(line) {
-            fence = Some(f);
+        if fence.step(line) != FenceLine::Outside {
             continue;
         }
         if let Some(def) = parse_link_ref_definition(line) {
