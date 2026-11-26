@@ -1380,3 +1380,73 @@ intro-1\n\
     .unwrap();
     assert_eq!(srt_doc.content, "First line\nSecond & final line");
 }
+
+#[test]
+fn adversarial_m4_svg_cap_non_http_resources_and_vtt_angle_brackets() {
+    let url = Url::parse("https://docs.example.com/spec").unwrap();
+
+    // 1. Inline SVG with 40 distinct text nodes caps at 32 segments, ignores <script>, and drops width=63.
+    let mut nodes_40 = String::new();
+    for i in 1..=40 {
+        nodes_40.push_str(&format!("<text>Node{i}</text>"));
+    }
+    let svg_html = format!(
+        r#"<!DOCTYPE html><html><head><title>Cap</title></head><body><main>
+        <svg aria-label="Large Graph" width="800" height="400"><script>alert(1)</script>{nodes_40}</svg>
+        <svg aria-label="Too Narrow" width="63" height="200"><text>NarrowA</text><text>NarrowB</text><text>NarrowC</text></svg>
+        <img src="javascript:alert(1)" width="600" height="400" alt="Evil diagram">
+        <img src="/img/borderline.png" width="99" height="80" alt="Borderline tiny diagram">
+        <a href="javascript:void(0)/evil.pdf">Bad PDF</a>
+        <a href="/schemas/user.schema.json">User Schema</a>
+        <a href="/data/events.jsonl">Events JSONL</a>
+        <a href="/rpc/raft.proto">Raft Proto</a>
+        </main></body></html>"#
+    );
+    let doc = extract_document(
+        &svg_html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert!(doc.content.contains("Node1"));
+    assert!(doc.content.contains("Node32"));
+    assert!(
+        !doc.content.contains("Node33"),
+        "SVG rescue must cap segments at 32"
+    );
+    assert!(!doc.content.contains("alert(1)"));
+    assert!(!doc.content.contains("Too Narrow"));
+    assert!(!doc.content.contains("NarrowA"));
+
+    let urls: Vec<&str> = doc.resources.iter().map(|r| r.url.as_str()).collect();
+    assert!(!urls.iter().any(|u| u.starts_with("javascript:")));
+    assert!(!urls.iter().any(|u| u.contains("borderline.png")));
+    assert_eq!(
+        urls,
+        vec![
+            "https://docs.example.com/schemas/user.schema.json",
+            "https://docs.example.com/data/events.jsonl",
+            "https://docs.example.com/rpc/raft.proto",
+        ]
+    );
+    assert_eq!(doc.resources[0].kind, ResourceKind::Schema);
+    assert_eq!(doc.resources[1].kind, ResourceKind::Dataset);
+    assert_eq!(doc.resources[2].kind, ResourceKind::Schema);
+
+    // 2. WebVTT literal `a < b` comparison survives tag stripping; `WEBVTTX` is not sniffed as VTT.
+    let vtt_math = "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nCheck x < y and y > z carefully.\n";
+    let vtt_doc =
+        extract_document(vtt_math, &url, Some("text/vtt"), &ExtractOptions::default()).unwrap();
+    assert_eq!(vtt_doc.content, "Check x < y and y > z carefully.");
+
+    let not_vtt = "WEBVTTX header\n00:00:01.000 --> 00:00:02.000\nKeep raw text.";
+    let plain_doc = extract_document(
+        not_vtt,
+        &url,
+        Some("text/plain"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(plain_doc.content, not_vtt);
+}
