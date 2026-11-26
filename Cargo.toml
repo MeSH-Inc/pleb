@@ -8,6 +8,7 @@ description = "pleb: local, zero-telemetry web fetch and search CLI for AI agent
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/MeSH-Inc/pleb"
+homepage = "https://github.com/MeSH-Inc/pleb"
 keywords = ["cli", "web-fetch", "markdown", "search", "ai-agents"]
 categories = ["command-line-utilities", "web-programming::http-client"]
 exclude = ["research/"]

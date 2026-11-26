@@ -71,12 +71,31 @@ fn emit_build_id(manifest_dir: &Path) {
     println!("cargo:rustc-env=PLEB_BUILD_ID={hash:016x}");
 }
 
+fn ensure_cronet_lib(manifest_dir: &str, rel_path: &str, script: &str) {
+    println!("cargo:rerun-if-changed={rel_path}");
+    let lib_path = Path::new(manifest_dir).join(rel_path);
+    assert!(
+        lib_path.exists(),
+        "Building with --features cronet requires prebuilt Cronet at {}. \
+         Prebuilt Cronet libraries are not bundled in crates.io tarballs. \
+         Install without --features cronet (`cargo install pleb`) for the default \
+         reqwest/rustls transport, or clone https://github.com/MeSH-Inc/pleb \
+         and run `{script}` before building with `--features cronet`.",
+        lib_path.display()
+    );
+}
+
 fn main() {
     let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     emit_build_id(Path::new(&dir));
 
     if std::env::var("CARGO_FEATURE_CRONET").is_ok() {
         if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
+            ensure_cronet_lib(
+                &dir,
+                "lib/darwin_arm64/libcronet.a",
+                "./scripts/download-cronet-macos.sh",
+            );
             // macOS arm64: static link libcronet.a
             println!("cargo:rustc-link-search=native={}/lib/darwin_arm64", dir);
             println!("cargo:rustc-link-lib=static=cronet");
@@ -110,11 +129,21 @@ fn main() {
             println!("cargo:rustc-link-lib=pmsample");
             println!("cargo:rustc-link-lib=resolv");
         } else if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
+            ensure_cronet_lib(
+                &dir,
+                "lib/linux_amd64/libcronet.so",
+                "./scripts/download-cronet-linux.sh",
+            );
             // Linux amd64: dynamic link libcronet.so
             // The .so must be next to the binary at runtime, or in LD_LIBRARY_PATH
             println!("cargo:rustc-link-search=native={}/lib/linux_amd64", dir);
             println!("cargo:rustc-link-lib=dylib=cronet");
         } else if cfg!(target_os = "linux") && cfg!(target_arch = "aarch64") {
+            ensure_cronet_lib(
+                &dir,
+                "lib/linux_arm64/libcronet.so",
+                "./scripts/download-cronet-linux.sh",
+            );
             // Linux arm64: dynamic link libcronet.so
             println!("cargo:rustc-link-search=native={}/lib/linux_arm64", dir);
             println!("cargo:rustc-link-lib=dylib=cronet");

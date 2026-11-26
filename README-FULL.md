@@ -99,7 +99,13 @@ Methodology notes:
 
 ### Building and Installing `pleb`
 
-With Cronet on macOS Apple Silicon (recommended):
+From `crates.io` (pure-Rust `reqwest` with `rustls` TLS fallback):
+
+```bash
+cargo install pleb
+```
+
+From a repository checkout with Cronet on macOS Apple Silicon (recommended for Chrome TLS/HTTP2/QUIC):
 
 ```bash
 ./scripts/download-cronet-macos.sh

@@ -108,7 +108,7 @@ Expected markers: `"cronet_enabled": true`, `"cef_renderer": { "expected_protoco
 | Code | Meaning |
 | :--- | :--- |
 | `0` | Success |
-| `1` | Invalid input, unavailable/mismatched CEF renderer, response-size overflow, transport failure, or heterogeneous all-failed batch |
+| `1` | Invalid input, unavailable/mismatched CEF or CDP renderer, response-size overflow, transport failure, or heterogeneous all-failed batch |
 | `2` | Origin block (`403`/`503`), anti-bot challenge, or `robots.txt` disallow |
 | `3` | Origin HTTP `4xx`/`5xx` error |
 | `4` | Partial batch failure (mixed success and failure) |

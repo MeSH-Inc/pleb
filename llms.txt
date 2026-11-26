@@ -33,4 +33,4 @@
 
 - [LICENSE](LICENSE): MIT license and upstream attribution (`wickproject/wick`)
 - [data/site-rules.json](data/site-rules.json): Bundled host rewrite and mandatory CEF overrides
-- [tests/corpus_evaluation.rs](tests/corpus_evaluation.rs): Corpus non-regression test harness across all `43` fixtures
+- [tests/corpus_evaluation.rs](tests/corpus_evaluation.rs): Corpus non-regression test harness across all `45` fixtures

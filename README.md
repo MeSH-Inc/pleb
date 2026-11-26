@@ -31,7 +31,7 @@ All `4/4` non-extractable fixtures (`ratchet_challenge_403.html`, `frontier_soft
 
 | Tool | Execution & State | HTTP / Browser Stack | Challenge Policy | Built-in Search & Auth |
 | :--- | :--- | :--- | :--- | :--- |
-| **`pleb`** | Single MIT Rust binary (`~/.pleb`); zero telemetry | Cronet (`Chromium 154`) or `reqwest` + optional CEF `v5-meta` daemon | Fail fast (`exit 2`), zero CAPTCHA bypass | `pleb search` (6 providers + RRF) & `pleb auth` |
+| **`pleb`** | Single MIT Rust binary (`~/.pleb`); zero telemetry | Cronet (`Chromium 154`) or `reqwest` + optional CEF `v5-meta` / remote CDP (`--render cdp`) | Fail fast (`exit 2`), zero CAPTCHA bypass | `pleb search` (6 providers + RRF), `pleb auth`, & RFC 9421 Web Bot Auth |
 | **Firecrawl** | Cloud API, `firecrawl-local` binary, or AGPL-3.0 Docker stack (Redis, Postgres, browser) | Cloud browsers or Playwright/Fire-engine | Managed cloud unblocking | Cloud/v2 `/search` endpoint |
 | **Jina Reader** | Hosted `r.jina.ai` (`20 RPM` no-key / paid tokens) or Apache-2.0 container | Hosted Chromium fleet | Rate-limit tiers (not bypass) | Separate `s.jina.ai` endpoint |
 | **Crawl4AI** | Python + Playwright (Apache-2.0) or Crawl4AI Cloud | Async Playwright browser pool | Community hooks/proxies | Crawl4AI Cloud only |
@@ -41,18 +41,21 @@ See [Comparison with Alternatives](README-FULL.md#comparison-with-alternatives) 
 
 ## Install
 
-Build and install the `pleb` binary onto `PATH`:
+Install `pleb` onto `PATH`:
 
 ```bash
-# macOS Apple Silicon with Cronet (recommended)
+# From crates.io (pure-Rust reqwest/rustls transport)
+cargo install pleb
+
+# macOS Apple Silicon from source with Cronet (recommended for Chrome TLS/HTTP2/QUIC)
 ./scripts/download-cronet-macos.sh
 cargo install --path . --features cronet --locked
 
-# Linux with Cronet
+# Linux from source with Cronet
 ./scripts/download-cronet-linux.sh
 cargo install --path . --features cronet --locked
 
-# Without Cronet (reqwest fallback)
+# Local build without Cronet (reqwest fallback)
 cargo build --release
 ```
 

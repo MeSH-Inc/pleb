@@ -119,7 +119,7 @@ Notes:
 | Exit Code | Meaning |
 | :--- | :--- |
 | `0` | Success |
-| `1` | Invalid flags/input, missing/mismatched CEF renderer, size overflow, transport failure, or heterogeneous all-failed batch |
+| `1` | Invalid flags/input, missing/mismatched CEF or CDP renderer, size overflow, transport failure, or heterogeneous all-failed batch |
 | `2` | Origin block (`403`/`503`, login/cookie wall), active bot challenge, or `robots.txt` disallow |
 | `3` | Origin HTTP `4xx`/`5xx` error (including low-prose soft-`404`) |
 | `4` | Partial batch failure (mixed success and failure) |
