@@ -536,6 +536,18 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         license.contains("Memory Sync Hub LLC"),
         "LICENSE missing Memory Sync Hub LLC copyright line"
     );
+    let cargo_toml = std::fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
+    for required_meta in [
+        "authors = [\"Memory Sync Hub LLC\"]",
+        "readme = \"README.md\"",
+        "repository = \"https://github.com/MeSH-Inc/mesh-wick\"",
+        "homepage = \"https://github.com/MeSH-Inc/mesh-wick\"",
+    ] {
+        assert!(
+            cargo_toml.contains(required_meta),
+            "Cargo.toml missing expected metadata: {required_meta}"
+        );
+    }
 
     fn extract_markdown_anchors(md: &str) -> std::collections::HashSet<String> {
         let mut anchors = std::collections::HashSet::new();

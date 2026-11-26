@@ -1,8 +1,8 @@
 ---
 name: mesh-wick
-description: Reference for the local `mesh-wick` CLI (`wick` binary with Cronet TLS, `v5-meta` CEF renderer, unified `daemon.sock` v3, structured source negotiation, feed/transcript extraction, and selective resource staging). Use when fetching pages that resist built-in web fetch, batch-fetching search results, inspecting or staging diagrams/PDFs/transcripts, or debugging `wick` daemon and CEF behavior.
+description: Reference for the local MeSH-wick CLI (`wick` binary with Cronet TLS, `v5-meta` CEF renderer, unified `daemon.sock` v3, structured source negotiation, feed/transcript extraction, and selective resource staging). Use when fetching pages that resist built-in web fetch, batch-fetching search results, inspecting or staging diagrams/PDFs/transcripts, or debugging `wick` daemon and CEF behavior.
 metadata:
-  author: fluffyrabbot
+  author: Memory Sync Hub LLC
   repository: https://github.com/MeSH-Inc/mesh-wick
   scope: user
 ---

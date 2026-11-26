@@ -3,8 +3,14 @@ name = "mesh-wick"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.89"
-description = "Local browser-grade web fetch and search CLI for AI agents"
+authors = ["Memory Sync Hub LLC"]
+description = "MeSH-wick: local, zero-telemetry web fetch and search CLI for AI agents"
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/MeSH-Inc/mesh-wick"
+homepage = "https://github.com/MeSH-Inc/mesh-wick"
+keywords = ["cli", "web-fetch", "markdown", "search", "ai-agents"]
+categories = ["command-line-utilities", "web-programming::http-client"]
 
 [lib]
 name = "mesh_wick"
