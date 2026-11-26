@@ -4,6 +4,113 @@ Local, zero-telemetry web fetch and search CLI (`wick`) for AI agents, forked fr
 
 Uses Chrome's network stack (Cronet) for browser-identical TLS/HTTP2/QUIC fingerprinting, an optional embedded Chromium (CEF `v5-meta`) renderer for JS-heavy pages, structured source negotiation (GitHub/GitLab/Gist raw source rewrites, advertised Markdown mirrors, native `text/markdown` extraction, and RSS 2.0 / Atom 1.0 / JSON Feed 1.1 conversion), single-parse `O(N)` DOM-pruned compact markdown extraction with charset-aware decoding, and multi-provider search balancing (`brave`, `tavily`, `serper`, `exa`, `searxng`, `duckduckgo`, `federated`) with tool-owned credential storage (`wick auth`).
 
+## Context Cleanup for Agents
+
+Raw HTML spends most of its bytes on navigation menus, hidden popovers, cookie banners, tracking query parameters, code-gutter tables, and duplicate visual spans that waste context tokens. In its default mode (`--extract clean --source auto --resources none`), `wick fetch` runs a deterministic, single-parse `O(N)` cleanup pipeline before emitting Markdown or plain text.
+
+| Stage | Removed or Bypassed | Preserved or Rescued |
+| :--- | :--- | :--- |
+| **1. Source bypass (`--source`)** | Forge chrome on GitHub `/blob/`, GitLab `/-/blob/`, and Gist pages; HTML wrappers when an RFC 8288 `Link` or `<link rel="alternate" type="text/markdown">` mirror (or `--source negotiate` `Accept: text/markdown` / `<path>.md`) is available; leading YAML frontmatter (`<= 4 KiB`) in `clean`/`article` modes | Raw source files wrapped in language-tagged code fences (`raw_source`, with HTML fallback on `404`/binary); native Markdown with YAML `title` promoted to `# Heading` and relative links/reference definitions resolved outside code fences |
+| **2. Single-pass DOM pruning** | `<script>`, `<style>`, `<noscript>`, `<template>`, `[hidden]`, `[aria-hidden="true"]`, `.sr-only`, inline `display: none` / `visibility: hidden` (except TeX-annotated math), `<= 1px` tracking pixels; `<nav>`, `<footer>`, `<aside>`, `<header>` without `<h1>`, ARIA `navigation` / `search` / `banner` / `contentinfo` / `complementary` / `menu` / `menubar` / `tooltip`; cookie consent banners (`onetrust`, `cookie-banner`, `cmp-container`), standalone `Skip to ...` blocks, unchecked checkbox popups (`aria-haspopup="true"`), mdBook/MediaWiki chrome (`[edit]`, hidden categories, CS1 maintenance tags, print footers), heading permalink glyphs (`#`, `§`, `¶`, `🔗`), `<pre>` copy buttons and `.line-numbers-rows`; non-landmark link clusters (`> 65%` link text, average link `<= 32` bytes) | `<main>`, `<article>`, `[role="main"]`, `<table>`, headings, prose, and code blocks shielded from link-density pruning; `<h1>` document headers and real interactive checkboxes inside lists |
+| **3. Technical signal rescue** | Line-number pipe artifacts (`\| 1 \|`) in syntax-highlighted code tables; duplicate `aria-hidden` KaTeX/MathJax spans; UI icon `<svg>` sprites (`icon`, `octicon`, `lucide`, `feather`, `fa-*`, `< 64px`, or inside controls); `data:` placeholder image URIs; legacy charset mojibake | Two-column gutter tables (`hljs-ln`, `blob-num`, `linenos`, `rouge-table`, `highlighttable`, or sequential `1..N` code rows) unwrapped to language-tagged fenced code while leaving `<thead>`/`<th>` data tables intact; KaTeX/MathJax TeX annotations as `$...$` / `$$...$$`; content `<svg>` `<title>`/`aria-label`/`<text>`/`<foreignObject>` labels as `[Diagram: ...]`; `data-src` / `<picture>` / descriptor-aware `srcset` URLs (preserving commas in image-transform paths); UTF-8/UTF-16 BOM and WHATWG Windows-1252 (`0x80..=0x9F`) decoding |
+| **4. URL hygiene & Markdown compaction** | Tracking parameters (`utm_*`, `fbclid`, `gclid`, `dclid`, `msclkid`, `mc_cid`, `mc_eid`, `igshid`, `_hsenc`, `_hsmi`, `ref_src`); `javascript:` / `vbscript:` / `data:` link wrappers (unwrapped to plain text); horizontal pipe-table padding and separator dashes (`------` -> `---`), trailing whitespace, excess blank lines, duplicate `# Title` headings | Clean and presigned query strings (such as S3 `X-Amz-Signature`) left un-reencoded; relative links resolved against `<base href>` / final URL; unbalanced URL parentheses escaped; table alignment colons and fenced code blocks untouched; fence-safe `--max-bytes` truncation that closes open code fences (or rewinds before them) before `[... truncated]` |
+| **5. Non-HTML & deferred assets** | Verbose RSS/Atom/JSON Feed XML/JSON boilerplate; YouTube player/sidebar chrome; WebVTT/SRT timing cues, `STYLE`/`NOTE`/`REGION` blocks, inline cue tags, and rolling-caption duplicates; decorative badges (`shields.io`), avatars, emojis, and `< 100x80` icons; accidental binary dumps in text mode (fail fast with exit `5`) | Compact Markdown digests for RSS 2.0, Atom 1.0, and JSON Feed 1.1; YouTube title, channel, duration, description, and prioritized caption tracks from `ytInitialPlayerResponse`; `**[Speaker]:**` transcript turns; zero-fetch indexing of diagrams, transcripts, PDFs (`citation_pdf_url` + `.pdf`), datasets (`.csv`, `.tsv`, `.parquet`, `.jsonl`), and schemas (`openapi.yaml`, `llms.txt`, `.proto`, `.sql`) surfaced via `stderr` and `--json` for selective staging |
+
+### Example: Raw HTML to Agent-Ready Markdown
+
+Given a `2,551`-byte HTML page containing skip navigation, a cookie banner, `<nav>`, an ARIA menu popover, a heading permalink, KaTeX math with an `aria-hidden` duplicate, tracked and presigned links, a hidden telemetry block, a `1x1` tracking pixel, a line-numbered Rust code table, a `<pre>` copy button, an icon `<svg>`, a content `<svg>` diagram, a `<picture>` with a base64 placeholder and comma-bearing `srcset`, and a `<footer>`:
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <base href="https://docs.example.com/">
+  <title>Replication Notes | Example Docs</title>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to main content</a>
+  <div class="cookie-banner">We use cookies to personalize ads. <button>Accept</button></div>
+  <nav><a href="/">Home</a> <a href="/pricing">Pricing</a> <a href="/login">Sign in</a></nav>
+  <div role="menu"><span>Quick switch menu</span></div>
+  <main id="main">
+    <h1>Replication Notes</h1>
+    <h2 id="checksums">Checksums <a class="headerlink" href="#checksums">¶</a></h2>
+    <p>Each segment verifies integrity using
+      <span class="katex">
+        <span class="katex-mathml"><math><semantics><annotation encoding="application/x-tex">H(m) = \sum_{i=0}^{n-1} b_i</annotation></semantics></math></span>
+        <span class="katex-html" aria-hidden="true">H(m)=Σbi</span>
+      </span>
+      before commit. See the <a href="/spec?utm_source=nav&amp;fbclid=xyz">wire spec</a> or
+      <a href="https://s3.example.com/seg.bin?X-Amz-Signature=a%2Bb%3Dc">signed snapshot</a>.
+    </p>
+    <div style="display: none">Hidden telemetry banner</div>
+    <img width="1" height="1" src="https://track.example.net/pixel.gif" alt="pixel">
+    <div class="highlight highlight-source-rust">
+      <table class="hljs-ln"><tbody>
+        <tr><td class="hljs-ln-numbers" data-line-number="1">1</td><td><code>pub fn hash(data: &amp;[u8]) -&gt; u64 {</code></td></tr>
+        <tr><td class="hljs-ln-numbers" data-line-number="2">2</td><td><code>    data.iter().fold(0u64, |acc, &amp;b| acc.wrapping_add(b as u64))</code></td></tr>
+        <tr><td class="hljs-ln-numbers" data-line-number="3">3</td><td><code>}</code></td></tr>
+      </tbody></table>
+    </div>
+    <pre><button type="button">Copy</button><code class="language-bash">wick fetch --max-bytes 4096 https://docs.example.com/replication</code></pre>
+    <button aria-label="Close"><svg class="octicon" width="16" height="16"><text>x</text></svg></button>
+    <p><svg role="img" aria-label="Write Path" width="520" height="160">
+      <text>Leader</text><text>Quorum</text><text>Commit Log</text>
+    </svg></p>
+    <figure>
+      <picture>
+        <source srcset="/cdn-cgi/image/width=400,quality=75/arch.webp 400w, /cdn-cgi/image/width=800,quality=80/arch.webp 800w">
+        <img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" alt="Replication topology">
+      </picture>
+    </figure>
+  </main>
+  <footer>Example Corp · Privacy · Terms</footer>
+</body>
+</html>
+```
+
+`wick fetch` reduces this to `590` bytes (`76.9%` smaller) on `stdout`, plus a zero-request resource cue on `stderr`:
+
+````markdown
+# Replication Notes
+
+## Checksums
+
+Each segment verifies integrity using $H(m) = \sum_{i=0}^{n-1} b_i$ before commit. See the [wire spec](https://docs.example.com/spec) or [signed snapshot](https://s3.example.com/seg.bin?X-Amz-Signature=a%2Bb%3Dc).
+
+```rust
+pub fn hash(data: &[u8]) -> u64 {
+    data.iter().fold(0u64, |acc, &b| acc.wrapping_add(b as u64))
+}
+```
+
+```bash
+wick fetch --max-bytes 4096 https://docs.example.com/replication
+```
+
+[Diagram: Write Path — Leader, Quorum, Commit Log]
+
+![Replication topology](https://docs.example.com/cdn-cgi/image/width=800,quality=80/arch.webp)
+````
+
+```text
+Resources: 1 diagram (r1) — pass --resources manifest or --stage-resources <ids>
+```
+
+### Extraction Modes & Context Controls
+
+| Control | Behavior |
+| :--- | :--- |
+| `--extract clean` *(default)* | Prunes page chrome, hidden nodes, and non-landmark link clusters across `<body>` while preserving full page structure (docs, forums, indexes, feeds, and transcripts). |
+| `--extract article` | Applies all `clean` pruning, then scopes output to the primary `<article>` (single or `>= 65%` dominant), `<main>` / `[role="main"]`, or highest non-link-text container. |
+| `--extract full` | Keeps the full document body (including YAML frontmatter and verbatim feed/transcript payloads), stripping only executable `<script>`/`<style>`/`<noscript>`/`<template>` and `<pre>` UI noise. |
+| `--max-bytes <N>` | Hard UTF-8 byte cap with line-boundary and balanced code-fence closing before `[... truncated]`. |
+| `--no-images` / `--no-links` | Drops image tags or unwraps anchors to plain text when context budget is tight. |
+| `--resources <mode>` / `--stage-resources <ids>` | Defaults to `none` (index only, zero asset fetches); pulls transcripts or stages selected diagrams/documents locally into `<state_dir>/artifacts/` only on demand. |
+
+Extraction and cleanup regressions are enforced against HTML, Markdown, feed, transcript, and binary fixtures in [`tests/corpus/`](tests/corpus/) via `cargo test --test corpus_evaluation`.
+
 ## Build & Install
 
 Default (`reqwest` TLS fallback):
