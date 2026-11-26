@@ -86,20 +86,24 @@ wick crawl https://docs.example.com --depth 2 --max-pages 10
 wick map https://example.com --limit 100
 ```
 
-### Session and Status
+### Session, Daemon, and Status
 
 ```bash
 wick status
+wick daemon status
+wick daemon stop
 wick session clear
 ```
 
 ## Configuration
 
-- `MESH_WICK_HOME` / `--state-dir`: state directory for cookies, HTTP cache, CEF `cef-cache`, `site-cache.json`, and optional local `site-rules.json` overlay (default: `~/.mesh-wick`; `wick session clear` clears cookies, HTTP cache, `cef-cache`, and `site-cache.json`)
+- `MESH_WICK_HOME` / `--state-dir`: state directory for cookies, HTTP cache, CEF `cef-cache`, CEF daemon socket (`cef.sock`), `site-cache.json`, and optional local `site-rules.json` overlay (default: `~/.mesh-wick`; `wick session clear` stops any running CEF daemon and clears cookies, HTTP cache, `cef-cache`, and `site-cache.json`)
 - `MESH_WICK_PROXY` / `WICK_PROXY` / `--proxy`: SOCKS5/HTTP proxy URL
 - `BRAVE_API_KEY`: enables Brave Search API in `search`
 - `--timeout <SECS>`: network request timeout (default: `30`)
 - `--cef-timeout <SECS>`: CEF render timeout (default: `60`)
+- `--cef-idle-timeout <SECS>` / `MESH_WICK_CEF_IDLE_SECS`: auto-exit timeout for the warm Unix-socket CEF daemon (default: `300`)
+- `--no-cef-daemon` / `MESH_WICK_NO_CEF_DAEMON`: bypass the shared background CEF daemon and run CEF in-process
 
 ## Exit Codes
 

@@ -1,4 +1,6 @@
 pub mod cef;
+#[cfg(unix)]
+pub mod cef_daemon;
 #[cfg(feature = "cronet")]
 pub mod cronet;
 #[cfg(feature = "cronet")]

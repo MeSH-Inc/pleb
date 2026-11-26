@@ -36,19 +36,39 @@ pub struct CefRenderer {
     state_dir: PathBuf,
     proxy: Option<String>,
     timeout: Duration,
+    idle_timeout: Duration,
+    use_daemon: bool,
     verbose: bool,
     daemon: AsyncMutex<Option<DaemonProcess>>,
 }
 
 impl CefRenderer {
-    pub fn new(state_dir: PathBuf, proxy: Option<String>, timeout: Duration, verbose: bool) -> Self {
+    pub fn new(
+        state_dir: PathBuf,
+        proxy: Option<String>,
+        timeout: Duration,
+        idle_timeout: Duration,
+        use_daemon: bool,
+        verbose: bool,
+    ) -> Self {
         Self {
             state_dir,
             proxy,
             timeout,
+            idle_timeout,
+            use_daemon,
             verbose,
             daemon: AsyncMutex::new(None),
         }
+    }
+
+    pub fn new_direct(
+        state_dir: PathBuf,
+        proxy: Option<String>,
+        timeout: Duration,
+        verbose: bool,
+    ) -> Self {
+        Self::new(state_dir, proxy, timeout, Duration::ZERO, false, verbose)
     }
 
     pub fn is_available(&self) -> bool {
@@ -59,7 +79,35 @@ impl CefRenderer {
         find_renderer_in(&self.state_dir)
     }
 
+    pub fn has_live_process(&self) -> bool {
+        match self.daemon.try_lock() {
+            Ok(mut guard) => match guard.as_mut() {
+                Some(proc) => matches!(proc.child.try_wait(), Ok(None)),
+                None => false,
+            },
+            Err(_) => true,
+        }
+    }
+
     pub async fn render(&self, url: &str, opts: &CefRenderOptions) -> Result<String> {
+        #[cfg(unix)]
+        if self.use_daemon {
+            return super::cef_daemon::daemon_render(
+                &self.state_dir,
+                self.proxy.as_deref(),
+                self.timeout,
+                self.idle_timeout,
+                self.verbose,
+                url,
+                opts,
+            )
+            .await;
+        }
+
+        self.render_direct(url, opts).await
+    }
+
+    async fn render_direct(&self, url: &str, opts: &CefRenderOptions) -> Result<String> {
         let mut guard = self.daemon.lock().await;
         self.ensure_daemon(&mut guard)?;
 

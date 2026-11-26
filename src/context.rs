@@ -11,6 +11,8 @@ pub struct RuntimeConfig {
     pub proxy: Option<String>,
     pub timeout: Duration,
     pub cef_timeout: Duration,
+    pub cef_idle_timeout: Duration,
+    pub cef_daemon: bool,
     pub verbose: bool,
 }
 
@@ -21,6 +23,8 @@ impl Default for RuntimeConfig {
             proxy: None,
             timeout: Duration::from_secs(30),
             cef_timeout: Duration::from_secs(60),
+            cef_idle_timeout: Duration::from_secs(300),
+            cef_daemon: false,
             verbose: false,
         }
     }
@@ -58,6 +62,8 @@ impl RuntimeContext {
             config.state_dir.clone(),
             config.proxy.clone(),
             config.cef_timeout,
+            config.cef_idle_timeout,
+            config.cef_daemon,
             config.verbose,
         );
         let rules = SiteRules::load(&config.state_dir);

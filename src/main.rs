@@ -6,6 +6,8 @@ use mesh_wick::fetch::{self, FetchError, FetchOptions};
 use mesh_wick::policy::RenderMode;
 use mesh_wick::search::{self, SearchProvider};
 use mesh_wick::transport::cef;
+#[cfg(unix)]
+use mesh_wick::transport::cef_daemon;
 use mesh_wick::crawl;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -33,6 +35,14 @@ struct Cli {
     /// Directory for local cache and session state
     #[arg(long, global = true, env = "MESH_WICK_HOME")]
     state_dir: Option<PathBuf>,
+
+    /// Disable persistent background CEF daemon sharing for this command
+    #[arg(long, global = true, env = "MESH_WICK_NO_CEF_DAEMON")]
+    no_cef_daemon: bool,
+
+    /// Idle timeout in seconds for the auto-spawned CEF daemon
+    #[arg(long, global = true, env = "MESH_WICK_CEF_IDLE_SECS", default_value = "300")]
+    cef_idle_timeout: u64,
 
     /// Enable verbose diagnostic logging to stderr
     #[arg(short, long, global = true)]
@@ -143,6 +153,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Manage persistent background CEF renderer daemon
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
     /// Manage local browser/network session state
     Session {
         #[command(subcommand)]
@@ -150,6 +165,20 @@ enum Command {
     },
     /// Show binary, Cronet, CEF, and search configuration status
     Status,
+}
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Run the background CEF daemon (auto-started on demand)
+    Run {
+        /// Exit after this many seconds with no render requests
+        #[arg(long, default_value = "300")]
+        idle_secs: u64,
+    },
+    /// Show background CEF daemon status
+    Status,
+    /// Stop the running background CEF daemon
+    Stop,
 }
 
 #[derive(Subcommand)]
@@ -173,12 +202,67 @@ async fn main() -> Result<()> {
         proxy,
         timeout: Duration::from_secs(cli.timeout.max(1)),
         cef_timeout: Duration::from_secs(cli.cef_timeout.max(1)),
+        cef_idle_timeout: Duration::from_secs(cli.cef_idle_timeout.max(1)),
+        cef_daemon: !cli.no_cef_daemon,
         verbose: cli.verbose,
     };
 
     match cli.command {
+        Command::Daemon { action } => match action {
+            DaemonAction::Run { idle_secs } => {
+                #[cfg(unix)]
+                {
+                    let idle = Duration::from_secs(idle_secs.max(1));
+                    cef_daemon::run_daemon(config.state_dir, idle, cli.verbose).await
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = idle_secs;
+                    anyhow::bail!("CEF daemon mode is only supported on Unix systems")
+                }
+            }
+            DaemonAction::Status => {
+                #[cfg(unix)]
+                {
+                    match cef_daemon::daemon_ping(&config.state_dir).await {
+                        Some(st) => println!(
+                            "CEF daemon: running (pid {}, renderer {})",
+                            st.pid,
+                            if st.renderer_alive { "warm" } else { "idle" }
+                        ),
+                        None => println!("CEF daemon: stopped"),
+                    }
+                    Ok(())
+                }
+                #[cfg(not(unix))]
+                {
+                    println!("CEF daemon: unsupported on this OS");
+                    Ok(())
+                }
+            }
+            DaemonAction::Stop => {
+                #[cfg(unix)]
+                {
+                    let stopped = cef_daemon::daemon_stop(&config.state_dir).await?;
+                    if !cli.quiet {
+                        if stopped {
+                            println!("Stopped CEF daemon");
+                        } else {
+                            println!("CEF daemon not running");
+                        }
+                    }
+                    Ok(())
+                }
+                #[cfg(not(unix))]
+                {
+                    anyhow::bail!("CEF daemon mode is only supported on Unix systems")
+                }
+            }
+        },
         Command::Session { action } => match action {
             SessionAction::Clear => {
+                #[cfg(unix)]
+                let _ = cef_daemon::daemon_stop(&config.state_dir).await;
                 clear_state_dir(&config.state_dir)?;
                 if !cli.quiet {
                     eprintln!("Cleared session state at {}", config.state_dir.display());
@@ -200,6 +284,15 @@ async fn main() -> Result<()> {
             match renderer_path {
                 Some(path) => println!("CEF renderer: installed ({})", path.display()),
                 None => println!("CEF renderer: not installed"),
+            }
+            #[cfg(unix)]
+            match cef_daemon::daemon_ping(&config.state_dir).await {
+                Some(st) => println!(
+                    "CEF daemon: running (pid {}, renderer {})",
+                    st.pid,
+                    if st.renderer_alive { "warm" } else { "idle" }
+                ),
+                None => println!("CEF daemon: stopped"),
             }
             println!("State dir: {}", config.state_dir.display());
             println!(
