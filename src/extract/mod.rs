@@ -4,6 +4,7 @@ pub mod feed;
 pub mod markdown;
 pub mod native_markdown;
 pub mod resources;
+pub mod transcript;
 pub mod url;
 
 pub use charset::decode_text_bytes;
@@ -167,6 +168,10 @@ pub fn extract_document_parsed(
         return feed::extract_feed(body, page_url, mime.as_deref(), options);
     }
 
+    if transcript::is_transcript_document(mime.as_deref(), body) {
+        return transcript::extract_transcript(body, options);
+    }
+
     if is_passthrough_non_html(content_type) {
         let (content, truncated) = apply_utf8_limit(body, options.max_bytes);
         return Ok(ExtractedDocument {
@@ -178,16 +183,16 @@ pub fn extract_document_parsed(
     }
 
     if options.format == OutputFormat::Html {
-        let title = parsed
-            .as_ref()
-            .and_then(ParsedHtml::title)
-            .or_else(|| ParsedHtml::parse(body).title());
+        let doc = parsed.unwrap_or_else(|| ParsedHtml::parse(body));
+        let title = doc.title();
+        let effective_base = doc.effective_base_url(page_url);
+        let resources = doc.extract_resources(options.mode, &effective_base);
         let (content, truncated) = apply_utf8_limit(body, options.max_bytes);
         return Ok(ExtractedDocument {
             title,
             content,
             truncated,
-            resources: Vec::new(),
+            resources,
         });
     }
 
@@ -197,7 +202,8 @@ pub fn extract_document_parsed(
 
     match options.format {
         OutputFormat::Text => {
-            let raw_content = doc.into_plain_text(options.mode);
+            let (raw_content, resources) =
+                doc.into_plain_text_and_resources(options.mode, &effective_base);
             let (content, truncated) = match options.max_bytes {
                 Some(max) => truncate_utf8(&raw_content, max),
                 None => (raw_content, false),
@@ -206,11 +212,12 @@ pub fn extract_document_parsed(
                 title,
                 content,
                 truncated,
-                resources: Vec::new(),
+                resources,
             })
         }
         OutputFormat::Markdown => {
-            let pruned = doc.into_pruned_html(options.mode);
+            let (pruned, resources) =
+                doc.into_pruned_html_and_resources(options.mode, &effective_base);
             let md = markdown::html_to_compact_markdown(
                 &pruned,
                 &effective_base,
@@ -236,7 +243,7 @@ pub fn extract_document_parsed(
                 title,
                 content,
                 truncated,
-                resources: Vec::new(),
+                resources,
             })
         }
         OutputFormat::Html | OutputFormat::Raw => unreachable!(),

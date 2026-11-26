@@ -2,8 +2,8 @@ use mesh_wick::extract::markdown::{compact_markdown, open_fence_at};
 use mesh_wick::extract::url::{clean_url, resolve_and_clean_url, ResolvedUrl};
 use mesh_wick::extract::{
     decode_text_bytes, detect_binary_content, extract_document, extract_document_bytes,
-    truncate_markdown, truncate_utf8, wrap_raw_code_document, ExtractMode, ExtractOptions,
-    OutputFormat, ParsedHtml,
+    format_resource_manifest_markdown, truncate_markdown, truncate_utf8, wrap_raw_code_document,
+    ExtractMode, ExtractOptions, OutputFormat, ParsedHtml, ResourceKind, ResourceSalience,
 };
 use url::Url;
 
@@ -1075,4 +1075,308 @@ fn adversarial_m3_base_hijack_unclosed_frontmatter_five_tick_fence_and_feed_cap(
         !big_doc.content.contains("Entry 55"),
         "feed should cap items at <= 50"
     );
+}
+
+#[test]
+fn inline_svg_text_rescue_handles_labeled_unlabeled_and_chrome_filtering() {
+    let long_segment = "x".repeat(85);
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html>
+<head><title>SVG Diagrams</title></head>
+<body>
+  <header>
+    <h1>SVG Diagrams</h1>
+    <svg aria-label="Header Logo" width="120" height="120"><text>Brand</text></svg>
+  </header>
+  <main>
+    <svg aria-label="Write Path" width="400" height="200">
+      <style>.label {{ fill: black; }}</style>
+      <defs><text>Hidden Def</text></defs>
+      <desc>Ignored Desc</desc>
+      <text>Client</text>
+      <text>→</text>
+      <text>Sequencer</text>
+      <text>Client</text>
+      <foreignObject><div><span>WAL Storage</span></div></foreignObject>
+      <text>{long_segment}</text>
+    </svg>
+
+    <svg width="500" height="240">
+      <text>Ingest</text>
+      <text>Index</text>
+      <text>Query Engine</text>
+    </svg>
+
+    <svg width="200" height="100">
+      <text>Too</text>
+      <text>Few</text>
+    </svg>
+
+    <svg aria-label="Tiny Icon" width="16px" height="16px"><text>Should Skip</text></svg>
+    <svg class="octicon octicon-mark-github" width="128" height="128" aria-label="GitHub Mark"><text>Octicon</text></svg>
+    <svg class="lucide lucide-arrow" width="128" height="128" aria-label="Lucide"><text>Arrow</text></svg>
+    <svg class="fa-solid fa-star" width="128" height="128" aria-label="Star"><text>Star</text></svg>
+    <div role="button"><svg aria-label="Role Button Svg" width="128" height="128"><text>Click</text></svg></div>
+    <a href="/home"><svg aria-label="Link Svg" width="128" height="128"><text>Home</text></svg>Home</a>
+  </main>
+</body>
+</html>"#
+    );
+
+    let url = Url::parse("https://docs.example.com/svg").unwrap();
+    let md = extract_document(&html, &url, Some("text/html"), &ExtractOptions::default()).unwrap();
+    let txt = extract_document(
+        &html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions {
+            format: OutputFormat::Text,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    for out in [&md.content, &txt.content] {
+        assert!(
+            out.contains("[Diagram: Write Path — Client, Sequencer, WAL Storage]"),
+            "missing labeled SVG with rescued segments in:\n{out}"
+        );
+        assert!(
+            out.contains("[Diagram: Ingest, Index, Query Engine]"),
+            "missing unlabeled >=3-node SVG rescue in:\n{out}"
+        );
+        assert!(!out.contains("Hidden Def"));
+        assert!(!out.contains("Ignored Desc"));
+        assert!(!out.contains(&long_segment));
+        assert!(!out.contains("Too, Few"));
+        assert!(!out.contains("Tiny Icon"));
+        assert!(!out.contains("GitHub Mark"));
+        assert!(!out.contains("Lucide"));
+        assert!(!out.contains("Star"));
+        assert!(!out.contains("Role Button Svg"));
+        assert!(!out.contains("Link Svg"));
+        assert!(!out.contains("Header Logo"));
+    }
+}
+
+#[test]
+fn resource_descriptor_salience_indexing_and_manifest_formatting() {
+    let html = r#"<!DOCTYPE html>
+<html>
+<head><title>System Design</title></head>
+<body>
+  <main>
+    <h1>System Design</h1>
+    <h2>Architecture</h2>
+    <figure>
+      <picture>
+        <source srcset="/img/cluster-topology.webp?utm_source=x 1200w, /img/cluster-small.webp 400w">
+        <img src="/img/cluster-fallback.png" width="1200" height="600" alt="Fallback">
+      </picture>
+      <figcaption>Cluster Raft Topology | v2</figcaption>
+    </figure>
+
+    <img src="/img/banner-photo.jpg" alt="Detailed server rack installation photo in datacenter">
+    <img src="/img/decorative.png" alt="short">
+    <img src="/img/config.png" alt="cfg">
+    <img src="/img/tiny.png" width="48" height="48" alt="Tiny icon diagram">
+    <img src="/img/pres.png" role="presentation" width="600" height="400" alt="Presentation diagram">
+    <img src="https://img.shields.io/badge/build-passing-green.svg" width="320" height="180" alt="Build diagram">
+    <img src="/img/user-avatar.png" width="320" height="200" alt="User avatar diagram">
+    <img src="/favicon.ico" width="320" height="200" alt="Site icon diagram">
+    <img src="data:image/png;base64,AAAA" width="400" height="300" alt="Inline diagram">
+
+    <h2>Walkthrough Video</h2>
+    <video controls src="/media/demo.mp4">
+      <track kind="captions" srclang="en" label="English CC" src="/media/demo.vtt?fbclid=123">
+      <track kind="subtitles" srclang="es" src="/media/demo.srt">
+      <track kind="chapters" src="/media/chapters.txt">
+    </video>
+
+    <h2>Specs &amp; Data</h2>
+    <p>Download the <a href="/specs/protocol.pdf?utm_medium=doc">Protocol RFC</a>,
+       <a href="/specs/protocol.pdf">Duplicate RFC</a>,
+       <a href="/data/benchmarks.csv">Benchmark Results</a>,
+       <a href="/api/openapi.yaml">OpenAPI Spec</a>,
+       <a href="/llms.txt">LLMs Index</a>, and
+       <a href="/about">About Page</a>.</p>
+  </main>
+</body>
+</html>"#;
+
+    let url = Url::parse("https://docs.example.com/design").unwrap();
+    let md_doc =
+        extract_document(html, &url, Some("text/html"), &ExtractOptions::default()).unwrap();
+    let txt_doc = extract_document(
+        html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions {
+            format: OutputFormat::Text,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let html_doc = extract_document(
+        html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions {
+            format: OutputFormat::Html,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // All three output formats populate identical resources.
+    assert_eq!(md_doc.resources, txt_doc.resources);
+    assert_eq!(md_doc.resources, html_doc.resources);
+
+    // `<track>` must not leak junk into Markdown output.
+    assert!(!md_doc.content.contains("demo.vtt"));
+    assert!(!md_doc.content.contains("<track"));
+
+    let res = &md_doc.resources;
+    assert_eq!(res.len(), 8, "unexpected resources: {res:#?}");
+
+    // r1: figure picture diagram
+    assert_eq!(res[0].identifier, "r1");
+    assert_eq!(res[0].kind, ResourceKind::Diagram);
+    assert_eq!(res[0].salience, ResourceSalience::High);
+    assert_eq!(
+        res[0].url,
+        "https://docs.example.com/img/cluster-topology.webp"
+    );
+    assert_eq!(res[0].section_heading.as_deref(), Some("Architecture"));
+    assert_eq!(res[0].label.as_deref(), Some("Cluster Raft Topology | v2"));
+    assert_eq!(res[0].dimensions, Some((1200, 600)));
+
+    // r2: descriptive prose image (Medium)
+    assert_eq!(res[1].identifier, "r2");
+    assert_eq!(res[1].kind, ResourceKind::Image);
+    assert_eq!(res[1].salience, ResourceSalience::Medium);
+    assert_eq!(res[1].url, "https://docs.example.com/img/banner-photo.jpg");
+
+    // r3 & r4: video tracks
+    assert_eq!(res[2].identifier, "r3");
+    assert_eq!(res[2].kind, ResourceKind::Transcript);
+    assert_eq!(res[2].salience, ResourceSalience::High);
+    assert_eq!(res[2].url, "https://docs.example.com/media/demo.vtt");
+    assert_eq!(res[2].label.as_deref(), Some("English CC"));
+    assert_eq!(res[2].mime_hint.as_deref(), Some("text/vtt"));
+    assert_eq!(res[2].section_heading.as_deref(), Some("Walkthrough Video"));
+
+    assert_eq!(res[3].identifier, "r4");
+    assert_eq!(res[3].kind, ResourceKind::Transcript);
+    assert_eq!(res[3].url, "https://docs.example.com/media/demo.srt");
+    assert_eq!(res[3].label.as_deref(), Some("es"));
+    assert_eq!(res[3].mime_hint.as_deref(), Some("application/x-subrip"));
+
+    // r5..r8: PDF, CSV, OpenAPI YAML, llms.txt (deduplicated protocol.pdf)
+    assert_eq!(res[4].identifier, "r5");
+    assert_eq!(res[4].kind, ResourceKind::Document);
+    assert_eq!(res[4].url, "https://docs.example.com/specs/protocol.pdf");
+    assert_eq!(res[4].mime_hint.as_deref(), Some("application/pdf"));
+    assert_eq!(res[4].section_heading.as_deref(), Some("Specs & Data"));
+
+    assert_eq!(res[5].identifier, "r6");
+    assert_eq!(res[5].kind, ResourceKind::Dataset);
+    assert_eq!(res[5].url, "https://docs.example.com/data/benchmarks.csv");
+
+    assert_eq!(res[6].identifier, "r7");
+    assert_eq!(res[6].kind, ResourceKind::Schema);
+    assert_eq!(res[6].url, "https://docs.example.com/api/openapi.yaml");
+
+    assert_eq!(res[7].identifier, "r8");
+    assert_eq!(res[7].kind, ResourceKind::Schema);
+    assert_eq!(res[7].url, "https://docs.example.com/llms.txt");
+
+    // Manifest formatting
+    assert_eq!(format_resource_manifest_markdown(&[]), "");
+    let manifest = format_resource_manifest_markdown(res);
+    assert!(manifest.starts_with(
+        "## Linked Resources\n\n| ID | Kind | Salience | Section | Dimensions | Label | URL |\n"
+    ));
+    assert!(manifest.contains("| r1 | diagram | high | Architecture | 1200x600 | Cluster Raft Topology \\| v2 | https://docs.example.com/img/cluster-topology.webp |"));
+    assert!(manifest.contains("| r5 | document | high | Specs & Data | - | Protocol RFC | https://docs.example.com/specs/protocol.pdf |"));
+}
+
+#[test]
+fn transcript_extraction_handles_webvtt_srt_speakers_rolling_captions_and_passthrough() {
+    let url = Url::parse("https://media.example.com/talk.vtt").unwrap();
+    let vtt = "\u{FEFF}WEBVTT - Keynote Talk\nKind: captions\nLanguage: en\n\n\
+STYLE\n::cue { color: white; }\n\n\
+NOTE This is a comment block\nspanning two lines.\n\n\
+REGION\nid:top\n\n\
+intro-1\n\
+00:00:01.000 --> 00:00:03.000 align:start\n\
+<v Alice>Welcome &amp; <i>hello</i> <00:00:02.000><c.highlight>everyone</c>!\n\n\
+00:00:03.000 --> 00:00:05.000\n\
+<v Alice>Welcome &amp; hello everyone!\n\n\
+00:00:05.000 --> 00:00:08.000\n\
+<v Alice>It&#39;s &quot;great&quot;&nbsp;to be here.\n\n\
+00:00:08.000 --> 00:00:11.000\n\
+<v.loud Bob>Thanks &lt;Alice&gt;!</v>\n";
+
+    // Markdown Clean mode (sniffed via BOM + WEBVTT even with None MIME)
+    let md = extract_document(vtt, &url, None, &ExtractOptions::default()).unwrap();
+    assert_eq!(
+        md.content,
+        "**[Alice]:** Welcome & hello everyone!\nIt's \"great\" to be here.\n**[Bob]:** Thanks <Alice>!"
+    );
+
+    // Text Clean mode
+    let txt = extract_document(
+        vtt,
+        &url,
+        Some("text/vtt; charset=utf-8"),
+        &ExtractOptions {
+            format: OutputFormat::Text,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        txt.content,
+        "[Alice]: Welcome & hello everyone!\nIt's \"great\" to be here.\n[Bob]: Thanks <Alice>!"
+    );
+
+    // Full mode and Html format preserve verbatim passthrough
+    let full = extract_document(
+        vtt,
+        &url,
+        Some("text/vtt"),
+        &ExtractOptions {
+            mode: ExtractMode::Full,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(full.content, vtt);
+
+    let as_html = extract_document(
+        vtt,
+        &url,
+        Some("text/vtt"),
+        &ExtractOptions {
+            format: OutputFormat::Html,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(as_html.content, vtt);
+
+    // SubRip (.srt) extraction
+    let srt = "1\r\n00:00:01,000 --> 00:00:02,500\r\n<b>First</b> line\r\n\r\n\
+2\r\n00:00:02,500 --> 00:00:04,000\r\nFirst line\r\n\r\n\
+3\r\n00:00:04,000 --> 00:00:06,000\r\nSecond &amp; final line\r\n";
+    let srt_doc = extract_document(
+        srt,
+        &url,
+        Some("application/x-subrip"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(srt_doc.content, "First line\nSecond & final line");
 }

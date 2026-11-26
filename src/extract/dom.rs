@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use url::Url;
 
+use super::resources::{index_resources_in_subtree, ResourceDescriptor};
 use super::url::{normalize_crawl_url, resolve_and_clean_url, ResolvedUrl};
 use super::ExtractMode;
 
@@ -258,6 +259,22 @@ impl ParsedHtml {
         out
     }
 
+    pub fn into_pruned_html_and_resources(
+        mut self,
+        mode: ExtractMode,
+        base_url: &Url,
+    ) -> (String, Vec<ResourceDescriptor>) {
+        let metrics = prune_dom(&mut self.doc, mode);
+        let root_id = select_root_id(&self.doc, mode, &metrics);
+        let mut out = String::new();
+        let mut resources = Vec::new();
+        if let Some(root) = self.doc.tree.get(root_id) {
+            resources = index_resources_in_subtree(root, base_url);
+            serialize_pruned_html(root, false, &mut out);
+        }
+        (out, resources)
+    }
+
     pub fn into_plain_text(mut self, mode: ExtractMode) -> String {
         let metrics = prune_dom(&mut self.doc, mode);
         let root_id = select_root_id(&self.doc, mode, &metrics);
@@ -267,6 +284,37 @@ impl ParsedHtml {
             collect_plain_text(root, false, false, &mut raw);
         }
         normalize_plain_text(&raw)
+    }
+
+    pub fn into_plain_text_and_resources(
+        mut self,
+        mode: ExtractMode,
+        base_url: &Url,
+    ) -> (String, Vec<ResourceDescriptor>) {
+        let metrics = prune_dom(&mut self.doc, mode);
+        let root_id = select_root_id(&self.doc, mode, &metrics);
+
+        let mut raw = String::new();
+        let mut resources = Vec::new();
+        if let Some(root) = self.doc.tree.get(root_id) {
+            resources = index_resources_in_subtree(root, base_url);
+            collect_plain_text(root, false, false, &mut raw);
+        }
+        (normalize_plain_text(&raw), resources)
+    }
+
+    pub fn extract_resources(
+        mut self,
+        mode: ExtractMode,
+        base_url: &Url,
+    ) -> Vec<ResourceDescriptor> {
+        let metrics = prune_dom(&mut self.doc, mode);
+        let root_id = select_root_id(&self.doc, mode, &metrics);
+        self.doc
+            .tree
+            .get(root_id)
+            .map(|root| index_resources_in_subtree(root, base_url))
+            .unwrap_or_default()
     }
 }
 
@@ -756,15 +804,15 @@ fn serialize_pruned_html(node: NodeRef<'_, Node>, in_interactive: bool, out: &mu
         Node::Text(text) => push_escaped_text(text, out),
         Node::Element(el) => {
             let tag = el.name();
-            if matches!(tag, "script" | "style" | "noscript" | "template") {
+            if matches!(tag, "script" | "style" | "noscript" | "template" | "track") {
                 return;
             }
 
             if tag == "svg" {
                 if !in_interactive {
-                    if let Some(label) = extract_svg_label(node, el) {
+                    if let Some(summary) = extract_svg_diagram_summary(node, el) {
                         out.push_str("<svg aria-label=\"");
-                        push_escaped_attr(&label, out);
+                        push_escaped_attr(&summary, out);
                         out.push_str("\"></svg>");
                     }
                 }
@@ -829,7 +877,7 @@ fn serialize_pruned_html(node: NodeRef<'_, Node>, in_interactive: bool, out: &mu
                 return;
             }
 
-            let child_interactive = in_interactive || matches!(tag, "button" | "nav" | "a");
+            let child_interactive = in_interactive || is_svg_chrome_ancestor(el);
             for child in node.children() {
                 serialize_pruned_html(child, child_interactive, out);
             }
@@ -908,7 +956,7 @@ fn is_data_uri(url: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
 }
 
-fn resolve_img_src(el: &scraper::node::Element) -> Option<String> {
+pub(crate) fn resolve_img_src(el: &scraper::node::Element) -> Option<String> {
     for attr in ["data-src", "data-lazy-src", "data-original"] {
         if let Some(val) = el.attr(attr).map(str::trim) {
             if !val.is_empty() && !is_data_uri(val) {
@@ -931,7 +979,7 @@ fn resolve_img_src(el: &scraper::node::Element) -> Option<String> {
     None
 }
 
-fn resolve_picture_image(
+pub(crate) fn resolve_picture_image(
     picture: NodeRef<'_, Node>,
 ) -> Option<(String, Option<String>, Option<String>)> {
     let mut best_source: Option<String> = None;
@@ -1081,6 +1129,203 @@ fn is_display_math(node: NodeRef<'_, Node>, el: &scraper::node::Element) -> bool
             })
         )
     })
+}
+
+pub(crate) fn parse_html_dimension(raw: &str) -> Option<u32> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let bytes = trimmed.as_bytes();
+    let mut i = 0usize;
+    let mut seen_dot = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_digit() {
+            i += 1;
+        } else if b == b'.' && !seen_dot {
+            seen_dot = true;
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    if i == 0 {
+        return None;
+    }
+    let unit = trimmed[i..].trim();
+    if !unit.is_empty() && !unit.eq_ignore_ascii_case("px") {
+        return None;
+    }
+    let val = trimmed[..i].parse::<f64>().ok()?;
+    if !val.is_finite() || val < 0.0 || val > u32::MAX as f64 {
+        return None;
+    }
+    Some(val.round() as u32)
+}
+
+fn is_svg_chrome_ancestor(el: &scraper::node::Element) -> bool {
+    matches!(el.name(), "a" | "button" | "nav" | "header" | "footer")
+        || el
+            .attr("role")
+            .is_some_and(|r| r.trim().eq_ignore_ascii_case("button"))
+}
+
+fn has_svg_icon_class(el: &scraper::node::Element) -> bool {
+    el.attr("class").is_some_and(|cls| {
+        cls.split_whitespace().any(|raw| {
+            let tok = raw.to_ascii_lowercase();
+            tok == "icon"
+                || tok.starts_with("icon-")
+                || tok.ends_with("-icon")
+                || tok == "octicon"
+                || tok.starts_with("octicon-")
+                || tok == "lucide"
+                || tok.starts_with("lucide-")
+                || tok == "feather"
+                || tok.starts_with("feather-")
+                || tok.starts_with("fa-")
+        })
+    })
+}
+
+fn extract_svg_diagram_summary(
+    node: NodeRef<'_, Node>,
+    el: &scraper::node::Element,
+) -> Option<String> {
+    if el
+        .attr("role")
+        .is_some_and(|r| r.trim().eq_ignore_ascii_case("button"))
+    {
+        return None;
+    }
+    if has_svg_icon_class(el) {
+        return None;
+    }
+    if el
+        .attr("width")
+        .and_then(parse_html_dimension)
+        .is_some_and(|w| w < 64)
+        || el
+            .attr("height")
+            .and_then(parse_html_dimension)
+            .is_some_and(|h| h < 64)
+    {
+        return None;
+    }
+
+    let svg_label = extract_svg_label(node, el);
+    let segments = collect_svg_text_segments(node);
+
+    match svg_label {
+        Some(label) if segments.is_empty() => Some(label),
+        Some(label) => Some(format!("{label} — {}", segments.join(", "))),
+        None => {
+            let total_chars: usize = segments.iter().map(|s| s.chars().count()).sum();
+            if segments.len() >= 3 && total_chars >= 12 {
+                Some(segments.join(", "))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn collect_svg_text_segments(svg_node: NodeRef<'_, Node>) -> Vec<String> {
+    const MAX_SEGMENTS: usize = 32;
+    let mut segments = Vec::new();
+    let mut seen = HashSet::new();
+    walk_svg_text_segments(svg_node, &mut segments, &mut seen, MAX_SEGMENTS);
+    segments
+}
+
+fn walk_svg_text_segments(
+    node: NodeRef<'_, Node>,
+    segments: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    max_segments: usize,
+) {
+    if segments.len() >= max_segments {
+        return;
+    }
+    for child in node.children() {
+        if segments.len() >= max_segments {
+            return;
+        }
+        let Node::Element(el) = child.value() else {
+            continue;
+        };
+        let tag = el.name();
+        if tag.eq_ignore_ascii_case("style")
+            || tag.eq_ignore_ascii_case("script")
+            || tag.eq_ignore_ascii_case("defs")
+            || tag.eq_ignore_ascii_case("title")
+            || tag.eq_ignore_ascii_case("desc")
+        {
+            continue;
+        }
+        if tag.eq_ignore_ascii_case("text") || tag.eq_ignore_ascii_case("foreignobject") {
+            let mut raw = String::new();
+            collect_svg_visible_text(child, &mut raw);
+            let collapsed = collapse_inline_whitespace(&raw);
+            let trimmed = collapsed.trim();
+            if !trimmed.is_empty()
+                && !is_ignored_svg_segment(trimmed)
+                && seen.insert(trimmed.to_string())
+            {
+                segments.push(trimmed.to_string());
+            }
+        } else {
+            walk_svg_text_segments(child, segments, seen, max_segments);
+        }
+    }
+}
+
+fn collect_svg_visible_text(node: NodeRef<'_, Node>, out: &mut String) {
+    match node.value() {
+        Node::Text(text) => out.push_str(text),
+        Node::Element(el) => {
+            let tag = el.name();
+            if tag.eq_ignore_ascii_case("style")
+                || tag.eq_ignore_ascii_case("script")
+                || tag.eq_ignore_ascii_case("defs")
+                || tag.eq_ignore_ascii_case("title")
+                || tag.eq_ignore_ascii_case("desc")
+            {
+                return;
+            }
+            let sep = tag.eq_ignore_ascii_case("tspan")
+                || tag.eq_ignore_ascii_case("div")
+                || tag.eq_ignore_ascii_case("p")
+                || tag.eq_ignore_ascii_case("br")
+                || tag.eq_ignore_ascii_case("li");
+            if sep && !out.is_empty() && !out.ends_with(char::is_whitespace) {
+                out.push(' ');
+            }
+            for child in node.children() {
+                collect_svg_visible_text(child, out);
+            }
+        }
+        _ => {
+            for child in node.children() {
+                collect_svg_visible_text(child, out);
+            }
+        }
+    }
+}
+
+fn is_ignored_svg_segment(seg: &str) -> bool {
+    let char_count = seg.chars().count();
+    if char_count > 80 {
+        return true;
+    }
+    if char_count == 1 {
+        let ch = seg.chars().next().unwrap();
+        if !ch.is_alphanumeric() {
+            return true;
+        }
+    }
+    false
 }
 
 fn extract_svg_label(node: NodeRef<'_, Node>, el: &scraper::node::Element) -> Option<String> {
@@ -1243,7 +1488,7 @@ fn extract_lang_from_element(el: &scraper::node::Element) -> Option<String> {
     None
 }
 
-fn collect_raw_text(node: NodeRef<'_, Node>, out: &mut String) {
+pub(crate) fn collect_raw_text(node: NodeRef<'_, Node>, out: &mut String) {
     match node.value() {
         Node::Text(text) => out.push_str(text),
         _ => {
@@ -1282,12 +1527,12 @@ fn collect_plain_text(
             }
             if tag == "svg" {
                 if !in_interactive {
-                    if let Some(label) = extract_svg_label(node, el) {
+                    if let Some(summary) = extract_svg_diagram_summary(node, el) {
                         if !out.is_empty() && !out.ends_with([' ', '\n']) {
                             out.push(' ');
                         }
                         out.push_str("[Diagram: ");
-                        out.push_str(&label);
+                        out.push_str(&summary);
                         out.push(']');
                     }
                 }
@@ -1348,7 +1593,7 @@ fn collect_plain_text(
             }
 
             let child_pre = in_pre || tag == "pre";
-            let child_interactive = in_interactive || matches!(tag, "button" | "nav" | "a");
+            let child_interactive = in_interactive || is_svg_chrome_ancestor(el);
             for child in node.children() {
                 collect_plain_text(child, child_pre, child_interactive, out);
             }
@@ -1374,7 +1619,7 @@ fn trim_trailing_spaces(s: &mut String) {
     }
 }
 
-fn collapse_inline_whitespace(input: &str) -> String {
+pub(crate) fn collapse_inline_whitespace(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut prev_space = false;
     for ch in input.chars() {
