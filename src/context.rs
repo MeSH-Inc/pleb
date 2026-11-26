@@ -57,10 +57,38 @@ pub fn default_state_dir() -> PathBuf {
 }
 
 pub fn ensure_private_dir(path: &Path) -> Result<()> {
-    std::fs::create_dir_all(path)?;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(path)?;
+            std::fs::symlink_metadata(path)?
+        }
+        Err(err) => return Err(err.into()),
+    };
+    if meta.file_type().is_symlink() {
+        anyhow::bail!(
+            "refusing to use symlink as private directory: {}",
+            path.display()
+        );
+    }
+    if !meta.is_dir() {
+        anyhow::bail!(
+            "expected private directory, found non-directory: {}",
+            path.display()
+        );
+    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let current_uid = unsafe { libc::geteuid() };
+        if meta.uid() != current_uid {
+            anyhow::bail!(
+                "refusing to use private directory {} owned by uid {} (expected uid {})",
+                path.display(),
+                meta.uid(),
+                current_uid
+            );
+        }
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
@@ -79,6 +107,21 @@ pub fn acquire_private_lock(lock_path: &Path) -> std::io::Result<std::fs::File> 
         lock_opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let lock_file = lock_opts.open(lock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let meta = lock_file.metadata()?;
+        let current_uid = unsafe { libc::geteuid() };
+        if !meta.is_file() || meta.uid() != current_uid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("refusing to use lock file {}", lock_path.display()),
+            ));
+        }
+        if meta.mode() & 0o077 != 0 {
+            lock_file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
     lock_file.lock()?;
     Ok(lock_file)
 }
@@ -201,5 +244,17 @@ pub fn clear_state_dir(state_dir: &Path) -> Result<()> {
         Err(err) => return Err(err.into()),
     }
     drop(lock_file);
+
+    crate::search::clear_search_state(state_dir)?;
+    let search_state_file = state_dir.join("search-state.json");
+    if search_state_file.exists() {
+        let search_lock = acquire_private_lock(&state_dir.join("search-state.lock"))?;
+        match std::fs::remove_file(&search_state_file) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+        drop(search_lock);
+    }
     Ok(())
 }

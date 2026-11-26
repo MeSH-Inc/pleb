@@ -1,8 +1,40 @@
 use anyhow::{bail, Result};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::fmt;
+use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::atomic::{compiler_fence, Ordering};
+use std::sync::atomic::{compiler_fence, AtomicU64, Ordering};
+
+use crate::context::{acquire_private_lock, ensure_private_dir};
+
+pub const MAX_SECRET_BYTES: usize = 4096;
+
+#[cfg(target_os = "macos")]
+const KEYCHAIN_SERVICE: &str = "mesh-wick";
+#[cfg(target_os = "macos")]
+const ERR_SEC_ITEM_NOT_FOUND: i32 = 44;
+
+const CREDENTIALS_FILE_NAME: &str = "credentials.json";
+const CREDENTIALS_LOCK_NAME: &str = "credentials.lock";
+const NO_KEYCHAIN_ENV: &str = "WICK_NO_KEYCHAIN";
+
+static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn zeroize_bytes(bytes: &mut [u8]) {
+    for byte in bytes {
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
+struct ZeroizingBytes(Vec<u8>);
+
+impl Drop for ZeroizingBytes {
+    fn drop(&mut self) {
+        zeroize_bytes(&mut self.0);
+    }
+}
 
 pub struct SecretString(String);
 
@@ -26,10 +58,7 @@ impl Drop for SecretString {
     fn drop(&mut self) {
         // SAFETY: Writing 0x00 bytes to a String's buffer keeps it valid UTF-8.
         let bytes = unsafe { self.0.as_bytes_mut() };
-        for byte in bytes {
-            unsafe { std::ptr::write_volatile(byte, 0) };
-        }
-        compiler_fence(Ordering::SeqCst);
+        zeroize_bytes(bytes);
     }
 }
 
@@ -112,21 +141,463 @@ impl fmt::Debug for ResolvedCredential {
     }
 }
 
+fn trim_secret_edges(raw: &str) -> &str {
+    raw.trim_matches([' ', '\r', '\n'])
+}
+
+pub fn validate_credential(provider: CredentialProvider, raw: &str) -> Result<SecretString> {
+    let trimmed = trim_secret_edges(raw);
+    if trimmed.is_empty() {
+        bail!("credential for {} must not be empty", provider.as_str());
+    }
+    if trimmed.len() > MAX_SECRET_BYTES {
+        bail!(
+            "credential for {} exceeds maximum length of {} bytes",
+            provider.as_str(),
+            MAX_SECRET_BYTES
+        );
+    }
+    if trimmed
+        .bytes()
+        .any(|b| !b.is_ascii() || b.is_ascii_control())
+    {
+        bail!(
+            "credential for {} must contain printable ASCII characters only",
+            provider.as_str()
+        );
+    }
+    if provider == CredentialProvider::Searxng {
+        let parsed = url::Url::parse(trimmed).map_err(|_| {
+            anyhow::anyhow!("invalid SEARXNG_URL: must be a valid http or https URL")
+        })?;
+        if parsed.scheme() != "http" && parsed.scheme() != "https" {
+            bail!("invalid SEARXNG_URL: scheme must be http or https");
+        }
+        if parsed.host_str().is_none() {
+            bail!("invalid SEARXNG_URL: URL must include a host");
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            bail!("invalid SEARXNG_URL: embedded userinfo credentials are not allowed");
+        }
+        if parsed.query().is_some() || parsed.fragment().is_some() {
+            bail!("invalid SEARXNG_URL: query strings and fragments are not allowed");
+        }
+    }
+    Ok(SecretString::new(trimmed.to_string()))
+}
+
+fn keychain_disabled() -> bool {
+    std::env::var(NO_KEYCHAIN_ENV).ok().as_deref() == Some("1")
+}
+
+fn keychain_enabled() -> bool {
+    cfg!(target_os = "macos") && !keychain_disabled()
+}
+
+fn require_keychain_available() -> Result<()> {
+    if !cfg!(target_os = "macos") {
+        bail!("keychain credential storage is only supported on macOS");
+    }
+    if keychain_disabled() {
+        bail!("keychain credential storage is disabled by {NO_KEYCHAIN_ENV}=1");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn encode_lowercase_hex(bytes: &[u8]) -> ZeroizingBytes {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = Vec::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize]);
+        out.push(HEX[(b & 0x0f) as usize]);
+    }
+    ZeroizingBytes(out)
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_set(provider: CredentialProvider, secret: &SecretString) -> Result<()> {
+    use std::process::{Command, Stdio};
+
+    let hex = encode_lowercase_hex(secret.as_str().as_bytes());
+    let mut cmd_buf = Vec::with_capacity(64 + hex.0.len());
+    cmd_buf.extend_from_slice(b"add-generic-password -U -a ");
+    cmd_buf.extend_from_slice(provider.as_str().as_bytes());
+    cmd_buf.extend_from_slice(b" -s ");
+    cmd_buf.extend_from_slice(KEYCHAIN_SERVICE.as_bytes());
+    cmd_buf.extend_from_slice(b" -X ");
+    cmd_buf.extend_from_slice(&hex.0);
+    cmd_buf.push(b'\n');
+    let cmd_buf = ZeroizingBytes(cmd_buf);
+    drop(hex);
+
+    let mut child = Command::new("/usr/bin/security")
+        .args(["-q", "-i"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| anyhow::anyhow!("failed to spawn /usr/bin/security: {err}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(&cmd_buf.0)?;
+        stdin.flush()?;
+    }
+    drop(cmd_buf);
+
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        if detail.is_empty() {
+            bail!(
+                "failed to store {} credential in macOS Keychain (exit {:?})",
+                provider.as_str(),
+                output.status.code()
+            );
+        }
+        bail!(
+            "failed to store {} credential in macOS Keychain (exit {:?}): {}",
+            provider.as_str(),
+            output.status.code(),
+            detail
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_get(provider: CredentialProvider) -> Result<Option<SecretString>> {
+    use std::process::{Command, Stdio};
+
+    let output = Command::new("/usr/bin/security")
+        .args([
+            "find-generic-password",
+            "-a",
+            provider.as_str(),
+            "-s",
+            KEYCHAIN_SERVICE,
+            "-w",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| anyhow::anyhow!("failed to run /usr/bin/security: {err}"))?;
+
+    if output.status.success() {
+        let stdout_buf = ZeroizingBytes(output.stdout);
+        let raw = std::str::from_utf8(&stdout_buf.0).map_err(|_| {
+            anyhow::anyhow!(
+                "macOS Keychain entry for {} is not valid UTF-8",
+                provider.as_str()
+            )
+        })?;
+        let validated = validate_credential(provider, raw)?;
+        return Ok(Some(validated));
+    }
+
+    if output.status.code() == Some(ERR_SEC_ITEM_NOT_FOUND) {
+        return Ok(None);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = stderr.trim();
+    if detail.is_empty() {
+        bail!(
+            "failed to read {} credential from macOS Keychain (exit {:?})",
+            provider.as_str(),
+            output.status.code()
+        );
+    }
+    bail!(
+        "failed to read {} credential from macOS Keychain (exit {:?}): {}",
+        provider.as_str(),
+        output.status.code(),
+        detail
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_delete(provider: CredentialProvider) -> Result<bool> {
+    use std::process::{Command, Stdio};
+
+    let output = Command::new("/usr/bin/security")
+        .args([
+            "delete-generic-password",
+            "-a",
+            provider.as_str(),
+            "-s",
+            KEYCHAIN_SERVICE,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| anyhow::anyhow!("failed to run /usr/bin/security: {err}"))?;
+
+    if output.status.success() {
+        return Ok(true);
+    }
+    if output.status.code() == Some(ERR_SEC_ITEM_NOT_FOUND) {
+        return Ok(false);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = stderr.trim();
+    if detail.is_empty() {
+        bail!(
+            "failed to delete {} credential from macOS Keychain (exit {:?})",
+            provider.as_str(),
+            output.status.code()
+        );
+    }
+    bail!(
+        "failed to delete {} credential from macOS Keychain (exit {:?}): {}",
+        provider.as_str(),
+        output.status.code(),
+        detail
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_set(_provider: CredentialProvider, _secret: &SecretString) -> Result<()> {
+    require_keychain_available()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_get(_provider: CredentialProvider) -> Result<Option<SecretString>> {
+    Ok(None)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_delete(_provider: CredentialProvider) -> Result<bool> {
+    require_keychain_available()?;
+    Ok(false)
+}
+
+struct ZeroizingCredentialMap(BTreeMap<String, String>);
+
+impl Drop for ZeroizingCredentialMap {
+    fn drop(&mut self) {
+        for value in self.0.values_mut() {
+            // SAFETY: Writing 0x00 bytes to a String's buffer keeps it valid UTF-8.
+            let bytes = unsafe { value.as_bytes_mut() };
+            zeroize_bytes(bytes);
+        }
+    }
+}
+
+fn read_credentials_map_locked(creds_path: &Path) -> Result<(ZeroizingCredentialMap, bool)> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = match opts.open(creds_path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((ZeroizingCredentialMap(BTreeMap::new()), false));
+        }
+        Err(err) => {
+            bail!(
+                "failed to open credentials file {}: {}",
+                creds_path.display(),
+                err
+            );
+        }
+    };
+
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        bail!(
+            "refusing to read credentials from non-regular file {}",
+            creds_path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let current_uid = unsafe { libc::geteuid() };
+        if meta.uid() != current_uid {
+            bail!(
+                "refusing to read {} owned by uid {} (expected uid {})",
+                creds_path.display(),
+                meta.uid(),
+                current_uid
+            );
+        }
+        if meta.mode() & 0o077 != 0 {
+            bail!(
+                "refusing to read {} with insecure permissions {:04o} (expected 0600)",
+                creds_path.display(),
+                meta.mode() & 0o7777
+            );
+        }
+    }
+
+    let mut raw_bytes = Vec::new();
+    file.read_to_end(&mut raw_bytes)?;
+    let raw_bytes = ZeroizingBytes(raw_bytes);
+    let parsed: BTreeMap<String, String> = serde_json::from_slice(&raw_bytes.0).map_err(|err| {
+        anyhow::anyhow!(
+            "corrupt credentials file {}: invalid JSON ({err})",
+            creds_path.display()
+        )
+    })?;
+    Ok((ZeroizingCredentialMap(parsed), true))
+}
+
+fn write_credentials_map_locked(
+    state_dir: &Path,
+    creds_path: &Path,
+    map: &BTreeMap<String, String>,
+) -> Result<()> {
+    let mut json_bytes = serde_json::to_vec_pretty(map)?;
+    json_bytes.push(b'\n');
+    let json_bytes = ZeroizingBytes(json_bytes);
+
+    let pid = std::process::id();
+    let mut temp_path = None;
+    let mut temp_file = None;
+    for _ in 0..16 {
+        let seq = TEMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let candidate = state_dir.join(format!("{CREDENTIALS_FILE_NAME}.tmp.{pid}.{seq}"));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        match opts.open(&candidate) {
+            Ok(file) => {
+                temp_path = Some(candidate);
+                temp_file = Some(file);
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    let temp_path = temp_path.ok_or_else(|| {
+        anyhow::anyhow!(
+            "failed to allocate temporary credentials file in {}",
+            state_dir.display()
+        )
+    })?;
+    let mut temp_file = temp_file.expect("temp_file set alongside temp_path");
+
+    let write_result = (|| -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            temp_file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        temp_file.write_all(&json_bytes.0)?;
+        temp_file.sync_all()?;
+        Ok(())
+    })();
+
+    drop(temp_file);
+    drop(json_bytes);
+
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err);
+    }
+
+    if let Err(err) = std::fs::rename(&temp_path, creds_path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err.into());
+    }
+
+    Ok(())
+}
+
+fn file_get(state_dir: &Path, provider: CredentialProvider) -> Result<Option<SecretString>> {
+    match std::fs::symlink_metadata(state_dir) {
+        Ok(_) => ensure_private_dir(state_dir)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    }
+    let _lock = acquire_private_lock(&state_dir.join(CREDENTIALS_LOCK_NAME))?;
+    let (mut map, _) = read_credentials_map_locked(&state_dir.join(CREDENTIALS_FILE_NAME))?;
+    let Some(raw) = map.0.remove(provider.as_str()) else {
+        return Ok(None);
+    };
+    let raw = SecretString::new(raw);
+    let validated = validate_credential(provider, raw.as_str())?;
+    Ok(Some(validated))
+}
+
+fn file_set(state_dir: &Path, provider: CredentialProvider, secret: &SecretString) -> Result<()> {
+    ensure_private_dir(state_dir)?;
+    let _lock = acquire_private_lock(&state_dir.join(CREDENTIALS_LOCK_NAME))?;
+    let creds_path = state_dir.join(CREDENTIALS_FILE_NAME);
+    let (mut map, _) = read_credentials_map_locked(&creds_path)?;
+    map.0
+        .insert(provider.as_str().to_string(), secret.as_str().to_string());
+    write_credentials_map_locked(state_dir, &creds_path, &map.0)
+}
+
+fn file_delete(state_dir: &Path, provider: CredentialProvider) -> Result<bool> {
+    match std::fs::symlink_metadata(state_dir) {
+        Ok(_) => ensure_private_dir(state_dir)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    }
+    let _lock = acquire_private_lock(&state_dir.join(CREDENTIALS_LOCK_NAME))?;
+    let creds_path = state_dir.join(CREDENTIALS_FILE_NAME);
+    let (mut map, existed) = read_credentials_map_locked(&creds_path)?;
+    if !existed {
+        return Ok(false);
+    }
+    let Some(removed_val) = map.0.remove(provider.as_str()) else {
+        return Ok(false);
+    };
+    drop(SecretString::new(removed_val));
+    write_credentials_map_locked(state_dir, &creds_path, &map.0)?;
+    Ok(true)
+}
+
 pub fn resolve_credential(
     state_dir: &Path,
     provider: CredentialProvider,
 ) -> Result<Option<ResolvedCredential>> {
-    let _ = state_dir;
     if let Ok(raw) = std::env::var(provider.env_var()) {
-        let trimmed = raw.trim();
-        if !trimmed.is_empty() {
+        let raw = SecretString::new(raw);
+        if !trim_secret_edges(raw.as_str()).is_empty() {
+            let value = validate_credential(provider, raw.as_str())?;
             return Ok(Some(ResolvedCredential {
                 provider,
-                value: SecretString::new(trimmed.to_string()),
+                value,
                 source: CredentialSource::Environment,
             }));
         }
     }
+
+    if keychain_enabled() {
+        if let Some(value) = keychain_get(provider)? {
+            return Ok(Some(ResolvedCredential {
+                provider,
+                value,
+                source: CredentialSource::Keychain,
+            }));
+        }
+    }
+
+    if let Some(value) = file_get(state_dir, provider)? {
+        return Ok(Some(ResolvedCredential {
+            provider,
+            value,
+            source: CredentialSource::File,
+        }));
+    }
+
     Ok(None)
 }
 
@@ -136,8 +607,27 @@ pub fn set_credential(
     secret: &str,
     storage: CredentialStorage,
 ) -> Result<CredentialSource> {
-    let _ = (state_dir, provider, secret, storage);
-    bail!("credential storage is not yet implemented")
+    let validated = validate_credential(provider, secret)?;
+    match storage {
+        CredentialStorage::Keychain => {
+            require_keychain_available()?;
+            keychain_set(provider, &validated)?;
+            Ok(CredentialSource::Keychain)
+        }
+        CredentialStorage::File => {
+            file_set(state_dir, provider, &validated)?;
+            Ok(CredentialSource::File)
+        }
+        CredentialStorage::Auto => {
+            if keychain_enabled() {
+                keychain_set(provider, &validated)?;
+                Ok(CredentialSource::Keychain)
+            } else {
+                file_set(state_dir, provider, &validated)?;
+                Ok(CredentialSource::File)
+            }
+        }
+    }
 }
 
 pub fn remove_credential(
@@ -145,8 +635,33 @@ pub fn remove_credential(
     provider: CredentialProvider,
     storage: CredentialStorage,
 ) -> Result<Vec<CredentialSource>> {
-    let _ = (state_dir, provider, storage);
-    bail!("credential storage is not yet implemented")
+    match storage {
+        CredentialStorage::Keychain => {
+            require_keychain_available()?;
+            if keychain_delete(provider)? {
+                Ok(vec![CredentialSource::Keychain])
+            } else {
+                Ok(vec![])
+            }
+        }
+        CredentialStorage::File => {
+            if file_delete(state_dir, provider)? {
+                Ok(vec![CredentialSource::File])
+            } else {
+                Ok(vec![])
+            }
+        }
+        CredentialStorage::Auto => {
+            let mut removed = Vec::new();
+            if keychain_enabled() && keychain_delete(provider)? {
+                removed.push(CredentialSource::Keychain);
+            }
+            if file_delete(state_dir, provider)? {
+                removed.push(CredentialSource::File);
+            }
+            Ok(removed)
+        }
+    }
 }
 
 pub fn all_credential_statuses(state_dir: &Path) -> Result<Vec<CredentialStatus>> {
