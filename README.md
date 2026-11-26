@@ -30,7 +30,7 @@ This builds the `mesh-wick` crate and installs the canonical `wick` binary onto 
 
 ## CEF Renderer (Optional)
 
-When installed at `~/.mesh-wick/cef/wick-renderer.app` (or `$MESH_WICK_HOME/cef`) with protocol `v4-meta`, `wick` automatically escalates blocked responses (`403`/`503`) and JS-only shells to CEF in `--render auto` mode.
+When installed at `~/.mesh-wick/cef/wick-renderer.app` (or `$MESH_WICK_HOME/cef`) with protocol `v4-meta`, `wick` automatically escalates blocked responses (`403`/`503`) and JS-only shells to CEF in `--render auto` mode. The renderer runs offscreen with minimal OSR viewport/screen/language defaults (no synthetic challenge clicking).
 
 To build and install (or upgrade to `v4-meta`) on macOS from this checkout:
 
@@ -99,13 +99,13 @@ wick session clear
 
 ## Configuration
 
-- `MESH_WICK_HOME` / `--state-dir`: state directory for cookies, HTTP cache, CEF `cef-cache`, CEF daemon socket (`cef.sock`), `site-cache.json`, and optional local `site-rules.json` overlay (default: `~/.mesh-wick`; `wick session clear` stops any running CEF daemon and clears cookies, HTTP cache, `cef-cache`, and `site-cache.json`)
+- `MESH_WICK_HOME` / `--state-dir`: private (`0o700`) state directory for cookies, HTTP cache, CEF `cef-cache`, CEF daemon socket (`cef.sock`), `site-cache.json` (`0o600`), and optional local `site-rules.json` overlay over bundled structural rules (`reddit.com` -> `old.reddit.com`, `x.com`/`twitter.com`) (default: `~/.mesh-wick`; `wick session clear` stops any running CEF daemon and clears cookies, HTTP cache, `cef-cache`, and `site-cache.json`)
 - `MESH_WICK_PROXY` / `--proxy`: SOCKS5/HTTP proxy URL
 - `MESH_WICK_TIMEZONE`: optional IANA timezone override injected into CEF `Intl.DateTimeFormat`
 - `BRAVE_API_KEY`: enables Brave Search API in `search`
 - `--timeout <SECS>`: network request timeout (default: `30`)
 - `--cef-timeout <SECS>`: CEF render timeout (default: `60`)
-- `--daemon-idle-timeout <SECS>` / `MESH_WICK_DAEMON_IDLE_SECONDS`: auto-exit timeout for the warm Unix-socket daemon (default: `300`)
+- `--daemon-idle-timeout <SECS>` / `MESH_WICK_DAEMON_IDLE_SECONDS`: auto-exit timeout for the warm Unix-socket daemon (also honored by `wick daemon run`; default: `300`)
 - `--no-daemon` / `MESH_WICK_NO_DAEMON`: bypass the shared background daemon and run in-process
 
 ## Exit Codes

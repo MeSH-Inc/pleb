@@ -316,7 +316,7 @@ fn select_root_id(doc: &Html, mode: ExtractMode) -> NodeId {
             .map(|a| visible_text_len_of(Some(*a)))
             .sum();
         let score = text_len.saturating_sub(link_len);
-        if score >= 150 && best.map_or(true, |(_, b)| score > b) {
+        if score >= 150 && best.is_none_or(|(_, b)| score > b) {
             best = Some((el.id(), score));
         }
     }

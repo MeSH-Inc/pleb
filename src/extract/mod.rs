@@ -157,10 +157,7 @@ pub fn extract_document_parsed(
 /// Detect binary payloads by MIME type or leading magic/NUL bytes (for missing/octet-stream MIMEs).
 /// Returns `Some(detected_mime)` when the payload is binary and unsafe for text extraction.
 pub fn detect_binary_content(content_type: Option<&str>, body: &[u8]) -> Option<Option<String>> {
-    let mime = content_type.and_then(|ct| {
-        let m = ct.split(';').next()?.trim().to_ascii_lowercase();
-        (!m.is_empty()).then_some(m)
-    });
+    let mime = extract_mime(content_type);
 
     if let Some(ref m) = mime {
         let is_binary_mime = matches!(
@@ -261,17 +258,25 @@ fn starts_with_title_heading(md: &str, title: &str) -> bool {
         .unwrap_or(false)
 }
 
+pub fn extract_mime(content_type: Option<&str>) -> Option<String> {
+    let ct = content_type?;
+    let mime = ct.split(';').next()?.trim().to_ascii_lowercase();
+    (!mime.is_empty()).then_some(mime)
+}
+
+pub fn is_html_content_type(content_type: Option<&str>) -> bool {
+    match extract_mime(content_type).as_deref() {
+        None => true,
+        Some("text/html" | "application/xhtml+xml") => true,
+        Some(_) => false,
+    }
+}
+
 fn is_passthrough_non_html(content_type: Option<&str>) -> bool {
-    let Some(ct) = content_type else {
+    let Some(mime) = extract_mime(content_type) else {
         return false;
     };
-    let mime = ct
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    if mime.is_empty() || mime == "text/html" || mime == "application/xhtml+xml" {
+    if mime == "text/html" || mime == "application/xhtml+xml" {
         return false;
     }
     mime.starts_with("text/")

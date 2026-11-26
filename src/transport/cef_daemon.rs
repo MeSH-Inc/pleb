@@ -78,6 +78,7 @@ pub async fn run_daemon(state_dir: PathBuf, idle_timeout: Duration, verbose: boo
     let lp = lock_path(&state_dir);
     let lock_file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lp)
@@ -374,10 +375,10 @@ fn spawn_detached_daemon(state_dir: &Path, idle_timeout: Duration, verbose: bool
     let mut cmd = Command::new(exe);
     cmd.arg("--state-dir")
         .arg(state_dir)
+        .arg("--daemon-idle-timeout")
+        .arg(&idle_secs)
         .arg("daemon")
         .arg("run")
-        .arg("--idle-timeout")
-        .arg(&idle_secs)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

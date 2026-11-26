@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use mesh_wick::transport::cef_daemon::{daemon_ping, daemon_stop, run_daemon, socket_path};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn short_temp_dir(tag: &str) -> PathBuf {
@@ -14,7 +14,7 @@ fn short_temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
-async fn wait_for_ping(dir: &PathBuf) -> mesh_wick::transport::cef_daemon::DaemonStatus {
+async fn wait_for_ping(dir: &Path) -> mesh_wick::transport::cef_daemon::DaemonStatus {
     for _ in 0..80 {
         if let Some(status) = daemon_ping(dir).await {
             return status;

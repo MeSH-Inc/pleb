@@ -28,13 +28,7 @@ impl HttpResponse {
     }
 
     pub fn is_html(&self) -> bool {
-        match self.content_type.as_deref() {
-            Some(ct) => {
-                let mime = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
-                mime.is_empty() || mime == "text/html" || mime == "application/xhtml+xml"
-            }
-            None => true,
-        }
+        crate::extract::is_html_content_type(self.content_type.as_deref())
     }
 }
 
@@ -58,7 +52,7 @@ impl TransportClient {
             let _ = storage_path;
             let mut builder = reqwest::Client::builder()
                 .user_agent(chrome_user_agent())
-                .default_headers(chrome_headers_reqwest())
+                .default_headers(chrome_headers_reqwest()?)
                 .gzip(true)
                 .brotli(true)
                 .deflate(true)
@@ -85,7 +79,7 @@ impl TransportClient {
     pub async fn get(&self, url: &str) -> Result<HttpResponse> {
         #[cfg(feature = "cronet")]
         {
-            let headers = chrome_header_pairs();
+            let headers = chrome_header_pairs(true);
             let resp = self
                 .engine
                 .get(url, &headers, DEFAULT_MAX_RESPONSE_BYTES)
@@ -157,8 +151,12 @@ fn sec_ch_ua_platform() -> &'static str {
     }
 }
 
-#[cfg(feature = "cronet")]
-fn chrome_header_pairs() -> Vec<(&'static str, String)> {
+fn chrome_header_pairs(include_zstd: bool) -> Vec<(&'static str, String)> {
+    let accept_encoding = if include_zstd {
+        "gzip, deflate, br, zstd"
+    } else {
+        "gzip, deflate, br"
+    };
     vec![
         (
             "Accept",
@@ -166,7 +164,7 @@ fn chrome_header_pairs() -> Vec<(&'static str, String)> {
                 .to_string(),
         ),
         ("Accept-Language", "en-US,en;q=0.9".to_string()),
-        ("Accept-Encoding", "gzip, deflate, br, zstd".to_string()),
+        ("Accept-Encoding", accept_encoding.to_string()),
         ("Cache-Control", "max-age=0".to_string()),
         ("Sec-Ch-Ua", sec_ch_ua_value()),
         ("Sec-Ch-Ua-Mobile", "?0".to_string()),
@@ -180,34 +178,14 @@ fn chrome_header_pairs() -> Vec<(&'static str, String)> {
 }
 
 #[cfg(not(feature = "cronet"))]
-fn chrome_headers_reqwest() -> reqwest::header::HeaderMap {
-    use reqwest::header::{HeaderMap, HeaderValue};
-    let mut h = HeaderMap::new();
-    h.insert(
-        "Accept",
-        HeaderValue::from_static(
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        ),
-    );
-    h.insert("Accept-Language", HeaderValue::from_static("en-US,en;q=0.9"));
-    h.insert(
-        "Accept-Encoding",
-        HeaderValue::from_static("gzip, deflate, br"),
-    );
-    h.insert("Cache-Control", HeaderValue::from_static("max-age=0"));
-    h.insert(
-        "Sec-Ch-Ua",
-        HeaderValue::from_str(&sec_ch_ua_value()).unwrap(),
-    );
-    h.insert("Sec-Ch-Ua-Mobile", HeaderValue::from_static("?0"));
-    h.insert(
-        "Sec-Ch-Ua-Platform",
-        HeaderValue::from_static(sec_ch_ua_platform()),
-    );
-    h.insert("Sec-Fetch-Dest", HeaderValue::from_static("document"));
-    h.insert("Sec-Fetch-Mode", HeaderValue::from_static("navigate"));
-    h.insert("Sec-Fetch-Site", HeaderValue::from_static("none"));
-    h.insert("Sec-Fetch-User", HeaderValue::from_static("?1"));
-    h.insert("Upgrade-Insecure-Requests", HeaderValue::from_static("1"));
-    h
+fn chrome_headers_reqwest() -> Result<reqwest::header::HeaderMap> {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+    let mut headers = HeaderMap::new();
+    for (name, value) in chrome_header_pairs(false) {
+        headers.insert(
+            HeaderName::from_bytes(name.as_bytes())?,
+            HeaderValue::from_str(&value)?,
+        );
+    }
+    Ok(headers)
 }

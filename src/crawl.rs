@@ -76,7 +76,7 @@ pub async fn crawl(
         }
 
         let page_url = Url::parse(&html_result.url).unwrap_or_else(|_| parsed.clone());
-        let is_html = is_html_content_type(html_result.content_type.as_deref());
+        let is_html = extract::is_html_content_type(html_result.content_type.as_deref());
         let parsed_doc = if is_html {
             Some(
                 html_result
@@ -256,7 +256,7 @@ pub async fn map(
         };
         pages_fetched += 1;
 
-        if !is_html_content_type(html_result.content_type.as_deref()) {
+        if !extract::is_html_content_type(html_result.content_type.as_deref()) {
             continue;
         }
 
@@ -347,16 +347,6 @@ fn parse_sitemap_xml(xml: &str) -> Vec<String> {
     }
 
     urls
-}
-
-fn is_html_content_type(content_type: Option<&str>) -> bool {
-    match content_type {
-        Some(ct) => {
-            let mime = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
-            mime.is_empty() || mime == "text/html" || mime == "application/xhtml+xml"
-        }
-        None => true,
-    }
 }
 
 fn normalize_url(url: &str) -> String {

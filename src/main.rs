@@ -171,11 +171,7 @@ enum Command {
 #[derive(Subcommand)]
 enum DaemonAction {
     /// Run the background CEF daemon (auto-started on demand)
-    Run {
-        /// Exit after this many seconds with no render requests
-        #[arg(long, default_value = "300")]
-        idle_timeout: u64,
-    },
+    Run,
     /// Show background CEF daemon status
     Status,
     /// Stop the running background CEF daemon
@@ -333,18 +329,16 @@ async fn run(cli: Cli) -> Result<(), CliError> {
 
     match cli.command {
         Command::Daemon { action } => match action {
-            DaemonAction::Run { idle_timeout } => {
+            DaemonAction::Run => {
                 #[cfg(unix)]
                 {
-                    let idle = Duration::from_secs(idle_timeout.max(1));
-                    cef_daemon::run_daemon(config.state_dir, idle, config.verbose)
+                    cef_daemon::run_daemon(config.state_dir, config.cef_idle_timeout, config.verbose)
                         .await
                         .map_err(|e| CliError::runtime("daemon_error", e))?;
                     Ok(())
                 }
                 #[cfg(not(unix))]
                 {
-                    let _ = idle_timeout;
                     Err(CliError::invalid_input(
                         "CEF daemon mode is only supported on Unix systems",
                     ))
