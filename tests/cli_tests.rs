@@ -479,3 +479,46 @@ async fn cli_batch_fetch_modes_stdin_and_flag_conflicts() {
         .output()
         .await;
 }
+
+#[tokio::test]
+async fn adversarial_status_json_defaults_and_readme_contract_parity() {
+    let wick_bin = env!("CARGO_BIN_EXE_wick");
+    let state_dir = TempDir::new();
+
+    // `wick status --json` must emit clean default daemon fields when no daemon is running.
+    let out = Command::new(wick_bin)
+        .args(["--state-dir"])
+        .arg(state_dir.path())
+        .args(["status", "--json"])
+        .env("WICK_NO_HOME_CEF", "1")
+        .output()
+        .await
+        .unwrap();
+    assert!(out.status.success(), "status --json failed");
+    let val: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(val["daemon"]["running"], false);
+    assert_eq!(val["daemon"]["active_requests"], 0);
+    assert_eq!(val["cef_renderer"]["expected_protocol"], "v5-meta");
+
+    // README.md must stay in sync with v5-meta, env overrides, and batch/search flags.
+    let readme =
+        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+            .unwrap();
+    for required in [
+        "v5-meta",
+        "WICK_CEF_RENDERER",
+        "WICK_DAEMON_EXECUTABLE",
+        "--jsonl",
+        "--urls-only",
+        "daemon.sock",
+    ] {
+        assert!(
+            readme.contains(required),
+            "README.md missing documented capability: {required}"
+        );
+    }
+    assert!(
+        !readme.contains("v4-meta"),
+        "README.md contains stale v4-meta reference"
+    );
+}
