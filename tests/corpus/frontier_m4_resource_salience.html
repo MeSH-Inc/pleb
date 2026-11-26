@@ -1,0 +1,33 @@
+<!-- wick-fixture: {"tier":"frontier","url":"https://raft.example.com/guide/consensus","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"Raft Consensus Protocol","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["Leader election and log replication keep cluster state consistent.","RFC PDF","OpenAPI Spec"],"expected_resource_urls":["https://raft.example.com/assets/raft-state.png","https://raft.example.com/media/talk.vtt","https://raft.example.com/specs/consensus.pdf","https://raft.example.com/specs/openapi.yaml"],"expected_resource_kinds":["diagram","transcript","document","schema"],"forbidden_resource_urls":["https://img.shields.io/badge/build-passing.svg","https://raft.example.com/img/avatar.png","https://raft.example.com/logo.png","https://raft.example.com/decor.png"],"minimum_output_bytes":100,"maximum_output_bytes":2000,"expected_structure":{"minimum_headings":1,"minimum_links":2}}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><title>Raft Consensus Protocol</title></head>
+<body>
+  <nav>
+    <img src="/logo.png" width="200" height="60" alt="Site Logo">
+    <a href="/">Home</a>
+  </nav>
+  <main>
+    <article>
+      <h1>Raft Consensus Protocol</h1>
+      <p>
+        <img src="https://img.shields.io/badge/build-passing.svg" alt="Build Status">
+        <img src="/img/avatar.png" width="32" height="32" alt="Author">
+        <img src="/decor.png" role="presentation" width="400" height="200" alt="Decorative">
+      </p>
+      <p>Leader election and log replication keep cluster state consistent.</p>
+      <h2>State Machine</h2>
+      <figure>
+        <img src="/assets/raft-state.png" width="1200" height="700" alt="State transitions">
+        <figcaption>Figure 1: Raft state machine</figcaption>
+      </figure>
+      <h2>Walkthrough Video</h2>
+      <video controls>
+        <track kind="captions" src="/media/talk.vtt?utm_source=player" srclang="en" label="English">
+      </video>
+      <h2>Specifications</h2>
+      <p>Download the <a href="/specs/consensus.pdf">RFC PDF</a> and inspect the <a href="/specs/openapi.yaml">OpenAPI Spec</a>.</p>
+    </article>
+  </main>
+</body>
+</html>

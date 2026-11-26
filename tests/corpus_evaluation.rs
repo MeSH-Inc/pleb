@@ -1,6 +1,6 @@
 use mesh_wick::extract::{
     decode_text_bytes, detect_binary_content, extract_document_parsed, is_html_content_type,
-    ExtractMode, ExtractOptions, OutputFormat, ParsedHtml,
+    ExtractMode, ExtractOptions, OutputFormat, ParsedHtml, ResourceKind,
 };
 use mesh_wick::policy::{classify_response_with_context, ResponseClassification};
 use serde::Deserialize;
@@ -55,6 +55,12 @@ struct VariantSpec {
     expected_images: Vec<String>,
     #[serde(default)]
     forbidden_substrings: Vec<String>,
+    #[serde(default)]
+    expected_resource_urls: Vec<String>,
+    #[serde(default)]
+    expected_resource_kinds: Vec<String>,
+    #[serde(default)]
+    forbidden_resource_urls: Vec<String>,
     minimum_output_bytes: Option<usize>,
     maximum_output_bytes: Option<usize>,
     expected_structure: Option<ExpectedStructure>,
@@ -78,6 +84,17 @@ struct ExpectedStructure {
     minimum_list_items: usize,
     #[serde(default)]
     minimum_links: usize,
+}
+
+fn resource_kind_name(kind: ResourceKind) -> &'static str {
+    match kind {
+        ResourceKind::Diagram => "diagram",
+        ResourceKind::Image => "image",
+        ResourceKind::Transcript => "transcript",
+        ResourceKind::Document => "document",
+        ResourceKind::Dataset => "dataset",
+        ResourceKind::Schema => "schema",
+    }
 }
 
 fn default_status() -> u16 {
@@ -536,6 +553,44 @@ fn evaluate_fixture(path: &Path) -> (String, FixtureSpec, FixtureOutcome) {
             if norm_full_lower.contains(&needle) {
                 out.failures
                     .push(format!("{}: forbidden substring {:?}", v.name, forb));
+            } else {
+                out.forbidden_clean += 1;
+            }
+        }
+
+        let res_urls: Vec<&str> = doc.resources.iter().map(|r| r.url.as_str()).collect();
+        let res_kinds: Vec<&str> = doc
+            .resources
+            .iter()
+            .map(|r| resource_kind_name(r.kind))
+            .collect();
+        for url in &v.expected_resource_urls {
+            out.expected_total += 1;
+            if res_urls.iter().any(|&u| u == url) {
+                out.expected_hits += 1;
+            } else {
+                out.failures.push(format!(
+                    "{}: missing resource url {url} (found {res_urls:?})",
+                    v.name
+                ));
+            }
+        }
+        for kind in &v.expected_resource_kinds {
+            out.expected_total += 1;
+            if res_kinds.iter().any(|&k| k == kind) {
+                out.expected_hits += 1;
+            } else {
+                out.failures.push(format!(
+                    "{}: missing resource kind {kind} (found {res_kinds:?})",
+                    v.name
+                ));
+            }
+        }
+        for forb_url in &v.forbidden_resource_urls {
+            out.forbidden_total += 1;
+            if res_urls.iter().any(|&u| u == forb_url) {
+                out.failures
+                    .push(format!("{}: forbidden resource url {forb_url}", v.name));
             } else {
                 out.forbidden_clean += 1;
             }

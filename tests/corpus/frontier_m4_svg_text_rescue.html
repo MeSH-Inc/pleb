@@ -1,0 +1,27 @@
+<!-- wick-fixture: {"tier":"frontier","url":"https://arch.example.com/replication","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"Replication Pipeline Architecture","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["Every write passes through the replication stages below.","[Diagram: Replication Pipeline — Leader, Follower Quorum, Commit Log]","[Diagram: Ingress, Router, Worker Pool]"],"forbidden_substrings":["[Diagram: x]"],"minimum_output_bytes":120,"maximum_output_bytes":2000,"expected_structure":{"minimum_headings":1}}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><title>Replication Pipeline Architecture</title></head>
+<body>
+  <main>
+    <article>
+      <h1>Replication Pipeline Architecture</h1>
+      <button type="button" aria-label="Dismiss">
+        <svg class="octicon" width="16" height="16"><text>x</text></svg>
+      </button>
+      <p>Every write passes through the replication stages below.</p>
+      <svg role="img" aria-label="Replication Pipeline" width="600" height="200">
+        <text>Leader</text>
+        <text>Follower Quorum</text>
+        <text>Commit Log</text>
+      </svg>
+      <p>Request routing fans out across stateless workers:</p>
+      <svg width="500" height="180">
+        <text>Ingress</text>
+        <text>Router</text>
+        <text>Worker Pool</text>
+      </svg>
+    </article>
+  </main>
+</body>
+</html>
