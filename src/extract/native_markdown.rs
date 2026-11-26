@@ -27,6 +27,7 @@ pub fn extract_native_markdown(
             title: None,
             content,
             truncated,
+            resources: Vec::new(),
         });
     }
 
@@ -86,6 +87,7 @@ pub fn extract_native_markdown(
                 title,
                 content,
                 truncated,
+                resources: Vec::new(),
             })
         }
         OutputFormat::Text => {
@@ -105,6 +107,7 @@ pub fn extract_native_markdown(
                 title,
                 content,
                 truncated,
+                resources: Vec::new(),
             })
         }
         OutputFormat::Html | OutputFormat::Raw => unreachable!(),

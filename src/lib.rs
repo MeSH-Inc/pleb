@@ -1,3 +1,4 @@
+pub mod artifacts;
 pub mod context;
 pub mod crawl;
 pub mod daemon;

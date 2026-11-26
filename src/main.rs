@@ -258,6 +258,8 @@ struct FetchMetadataOutput<'a> {
     truncated: bool,
     timing_ms: u64,
     content_bytes: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    resources: Vec<mesh_wick::extract::ResourceDescriptor>,
 }
 
 impl<'a> From<&'a FetchOutput> for FetchMetadataOutput<'a> {
@@ -273,6 +275,7 @@ impl<'a> From<&'a FetchOutput> for FetchMetadataOutput<'a> {
             truncated: res.truncated,
             timing_ms: res.timing_ms,
             content_bytes: res.content_bytes,
+            resources: res.resources.clone(),
         }
     }
 }
@@ -630,6 +633,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 wait_for_selector,
                 respect_robots,
                 apply_rewrites: !no_rewrite,
+                ..Default::default()
             };
 
             if !batch_mode {

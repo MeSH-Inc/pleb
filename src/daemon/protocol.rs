@@ -3,9 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::transport::TransportErrorKind;
+use crate::transport::{SubresourceDest, TransportErrorKind};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const BUILD_ID: &str = env!("WICK_BUILD_ID");
 pub const SOCKET_NAME: &str = "daemon.sock";
 pub const LOCK_NAME: &str = "daemon.lock";
@@ -60,6 +60,10 @@ pub enum DaemonRequest {
         max_body_bytes: usize,
         #[serde(default)]
         accept_markdown: bool,
+        #[serde(default)]
+        referer: Option<String>,
+        #[serde(default)]
+        subresource_dest: Option<SubresourceDest>,
     },
     CefRender {
         url: String,

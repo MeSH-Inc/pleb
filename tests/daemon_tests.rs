@@ -695,7 +695,7 @@ async fn transport_captures_multiple_link_headers_and_accept_markdown_direct_and
 
 #[tokio::test]
 async fn daemon_restarts_automatically_on_protocol_version_mismatch() {
-    assert_eq!(PROTOCOL_VERSION, 2);
+    assert_eq!(PROTOCOL_VERSION, 3);
     let (base, _, _) = spawn_daemon_test_server().await;
     let dir = TempStateDir::new();
     let sock = socket_path(dir.path());
@@ -755,8 +755,8 @@ async fn daemon_restarts_automatically_on_protocol_version_mismatch() {
     assert_eq!(resp.text(), "alpha");
     let status = daemon_ping(dir.path())
         .await
-        .expect("v2 daemon should be running");
-    assert_eq!(status.protocol_version, 2);
+        .expect("v3 daemon should be running");
+    assert_eq!(status.protocol_version, 3);
 
     let _ = mock_task.await;
     let _ = daemon_stop(dir.path()).await;

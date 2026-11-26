@@ -3,11 +3,15 @@ pub mod dom;
 pub mod feed;
 pub mod markdown;
 pub mod native_markdown;
+pub mod resources;
 pub mod url;
 
 pub use charset::decode_text_bytes;
 pub use dom::ParsedHtml;
 pub use markdown::truncate_markdown;
+pub use resources::{
+    format_resource_manifest_markdown, ResourceDescriptor, ResourceKind, ResourceSalience,
+};
 
 use anyhow::{bail, Result};
 
@@ -58,6 +62,7 @@ pub struct ExtractedDocument {
     pub title: Option<String>,
     pub content: String,
     pub truncated: bool,
+    pub resources: Vec<ResourceDescriptor>,
 }
 
 pub fn format_page_section(
@@ -94,6 +99,7 @@ pub fn wrap_raw_code_document(
             title: Some(filename.to_string()),
             content,
             truncated,
+            resources: Vec::new(),
         };
     }
 
@@ -102,6 +108,7 @@ pub fn wrap_raw_code_document(
         title: Some(filename.to_string()),
         content,
         truncated,
+        resources: Vec::new(),
     }
 }
 
@@ -166,6 +173,7 @@ pub fn extract_document_parsed(
             title: None,
             content,
             truncated,
+            resources: Vec::new(),
         });
     }
 
@@ -179,6 +187,7 @@ pub fn extract_document_parsed(
             title,
             content,
             truncated,
+            resources: Vec::new(),
         });
     }
 
@@ -197,6 +206,7 @@ pub fn extract_document_parsed(
                 title,
                 content,
                 truncated,
+                resources: Vec::new(),
             })
         }
         OutputFormat::Markdown => {
@@ -226,6 +236,7 @@ pub fn extract_document_parsed(
                 title,
                 content,
                 truncated,
+                resources: Vec::new(),
             })
         }
         OutputFormat::Html | OutputFormat::Raw => unreachable!(),

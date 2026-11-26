@@ -12,7 +12,7 @@ use crate::policy::{
     classify_response_with_context, detect_interstitial_challenge, is_markdown_content_type,
     is_mirror_acceptable_content_type, parse_markdown_link_header, plan_strategy,
     resolve_raw_source_candidate, PrimaryTransport, RawSourceCandidate, RawSourceKind, RenderMode,
-    ResponseClassification, SourceMode,
+    ResourcePolicy, ResponseClassification, SourceMode,
 };
 use crate::transport::cef::{
     CefProtocolError, CefRenderOptions, CefRenderResult, CefRenderer, CefTimeoutError,
@@ -105,6 +105,9 @@ pub struct FetchOptions {
     pub extract: ExtractOptions,
     pub render: RenderMode,
     pub source: SourceMode,
+    pub resources: ResourcePolicy,
+    pub stage_resources: Vec<String>,
+    pub referer: Option<String>,
     pub wait_for_selector: Option<String>,
     pub respect_robots: bool,
     pub apply_rewrites: bool,
@@ -116,6 +119,9 @@ impl Default for FetchOptions {
             extract: ExtractOptions::default(),
             render: RenderMode::Auto,
             source: SourceMode::Auto,
+            resources: ResourcePolicy::None,
+            stage_resources: Vec::new(),
+            referer: None,
             wait_for_selector: None,
             respect_robots: false,
             apply_rewrites: true,
@@ -136,6 +142,8 @@ pub struct FetchOutput {
     pub escalated: bool,
     pub truncated: bool,
     pub timing_ms: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<crate::extract::ResourceDescriptor>,
 }
 
 pub struct FetchHtmlResult {
@@ -237,6 +245,7 @@ pub async fn fetch_document(
         escalated: page.escalated,
         truncated: extracted.truncated,
         timing_ms: start.elapsed().as_millis() as u64,
+        resources: extracted.resources,
     })
 }
 
@@ -394,6 +403,7 @@ async fn try_fetch_raw_source(
         escalated: false,
         truncated: extracted.truncated,
         timing_ms,
+        resources: extracted.resources,
     })
 }
 
@@ -959,6 +969,8 @@ pub struct BatchItemSuccess {
     pub content_bytes: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<crate::extract::ResourceDescriptor>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -997,6 +1009,7 @@ impl BatchItemResult {
                 timing_ms: out.timing_ms,
                 content_bytes: out.content_bytes,
                 content: (!metadata_only).then_some(out.content),
+                resources: out.resources,
             }),
             Err(err) => Self::Failure(BatchItemFailure {
                 url: url.to_string(),

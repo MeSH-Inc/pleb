@@ -145,6 +145,8 @@ pub async fn daemon_http_get_with_options(
         timeout_ms: timeout.as_millis().min(u128::from(u64::MAX)) as u64,
         max_body_bytes,
         accept_markdown,
+        referer: None,
+        subresource_dest: None,
     };
     let io_timeout = timeout.saturating_add(CLIENT_IO_GRACE);
     let (hdr, body) = send_daemon_rpc(

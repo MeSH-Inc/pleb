@@ -17,6 +17,23 @@ pub const DEFAULT_RAW_MAX_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum SubresourceDest {
+    Image,
+    Asset,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct RequestHeaderOptions {
+    #[serde(default)]
+    pub accept_markdown: bool,
+    #[serde(default)]
+    pub referer: Option<String>,
+    #[serde(default)]
+    pub subresource_dest: Option<SubresourceDest>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TransportErrorKind {
     Timeout,
     LoadError,
@@ -200,6 +217,17 @@ impl TransportClient {
         max_body_bytes: usize,
     ) -> Result<HttpResponse> {
         self.get_with_options(url, timeout, max_body_bytes, false)
+            .await
+    }
+
+    pub async fn get_with_request_options(
+        &self,
+        url: &str,
+        timeout: Duration,
+        max_body_bytes: usize,
+        opts: &RequestHeaderOptions,
+    ) -> Result<HttpResponse> {
+        self.get_with_options(url, timeout, max_body_bytes, opts.accept_markdown)
             .await
     }
 

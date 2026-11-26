@@ -11,9 +11,20 @@ pub use classify::{
 };
 pub use rules::{parent_domain, SiteRule, SiteRules};
 pub use source::{
-    is_markdown_content_type, is_mirror_acceptable_content_type, is_safe_alternate_url,
-    parse_markdown_link_header, resolve_raw_source_candidate, RawSourceCandidate, RawSourceKind,
+    compute_safe_referer, is_markdown_content_type, is_mirror_acceptable_content_type,
+    is_safe_alternate_url, is_safe_subresource_url, parse_markdown_link_header,
+    resolve_raw_source_candidate, RawSourceCandidate, RawSourceKind,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ResourcePolicy {
+    #[default]
+    None,
+    Manifest,
+    Transcripts,
+    Diagrams,
+    All,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum RenderMode {

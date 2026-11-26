@@ -177,6 +177,14 @@ pub fn is_safe_alternate_url(base: &Url, target: &Url) -> bool {
         && base.port_or_known_default() == target.port_or_known_default()
 }
 
+pub fn is_safe_subresource_url(parent: &Url, target: &Url) -> bool {
+    is_safe_alternate_url(parent, target)
+}
+
+pub fn compute_safe_referer(_parent: &Url, _target: &Url) -> Option<String> {
+    None
+}
+
 fn classify_filename(filename: &str) -> Option<RawSourceKind> {
     let lower = filename.to_ascii_lowercase();
 

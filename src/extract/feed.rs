@@ -36,6 +36,7 @@ pub fn extract_feed(
             title: None,
             content,
             truncated,
+            resources: Vec::new(),
         });
     }
 
@@ -51,6 +52,7 @@ pub fn extract_feed(
             title: None,
             content,
             truncated,
+            resources: Vec::new(),
         });
     };
 
@@ -67,6 +69,7 @@ pub fn extract_feed(
                 title,
                 content,
                 truncated,
+                resources: Vec::new(),
             })
         }
         OutputFormat::Text => {
@@ -76,6 +79,7 @@ pub fn extract_feed(
                 title,
                 content,
                 truncated,
+                resources: Vec::new(),
             })
         }
         OutputFormat::Html | OutputFormat::Raw => unreachable!(),
