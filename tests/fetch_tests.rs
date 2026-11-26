@@ -1702,3 +1702,93 @@ async fn fetch_staged_asset_and_session_clear_artifact_lifecycle() {
     clear_state_dir(state_dir.path()).unwrap();
     assert!(!state_dir.path().join("artifacts").exists());
 }
+
+#[test]
+fn adversarial_artifact_staging_traversal_bom_html_magic_mismatch_and_perms() {
+    use mesh_wick::artifacts::stage_artifact;
+    use mesh_wick::extract::ResourceKind;
+
+    let state_dir = temp_state_dir();
+    let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+
+    // 1. Path traversal + oversized stem stays confined inside `<state_dir>/artifacts/` with <= 40-char stem and 0o600 perms.
+    let nasty_url = url::Url::parse(
+        "https://cdn.example.com/..%2F..%2Fetc%2Fpasswd_0123456789_0123456789_0123456789_0123456789.png",
+    )
+    .unwrap();
+    let staged = stage_artifact(
+        state_dir.path(),
+        &nasty_url,
+        Some("image/png"),
+        png,
+        Some(ResourceKind::Diagram),
+    )
+    .unwrap();
+    assert_eq!(
+        staged.path.parent().unwrap(),
+        state_dir.path().join("artifacts")
+    );
+    let fname = staged.path.file_name().unwrap().to_str().unwrap();
+    assert!(!fname.contains(".."));
+    assert!(!fname.contains('/'));
+    let (hash_part, rest) = fname.split_once('-').unwrap();
+    assert_eq!(hash_part.len(), 16);
+    let stem_part = rest.strip_suffix(".png").unwrap();
+    assert!(stem_part.len() <= 40, "stem exceeded 40 chars: {stem_part}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&staged.path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "staged artifact must be 0o600, got {mode:o}");
+    }
+
+    // 2. UTF-8 BOM-prefixed uppercase <HTML> disguised as application/pdf is rejected.
+    let pdf_url = url::Url::parse("https://docs.example.com/spec.pdf").unwrap();
+    let bom_html = b"\xEF\xBB\xBF  \n<HTML><body>Access Denied</body></HTML>";
+    assert!(
+        stage_artifact(
+            state_dir.path(),
+            &pdf_url,
+            Some("application/pdf"),
+            bom_html,
+            Some(ResourceKind::Document),
+        )
+        .is_err(),
+        "BOM-prefixed HTML disguised as PDF must be rejected"
+    );
+
+    // 3. JPEG magic bytes claiming image/png must be rejected by magic validation.
+    let jpeg = &[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+    assert!(
+        stage_artifact(
+            state_dir.path(),
+            &nasty_url,
+            Some("image/png"),
+            jpeg,
+            Some(ResourceKind::Image),
+        )
+        .is_err(),
+        "JPEG payload claiming image/png must be rejected"
+    );
+
+    // 4. application/octet-stream with %PDF- magic resolves to .pdf and application/pdf.
+    let pdf_bytes = b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n";
+    let octet_url = url::Url::parse("https://cdn.example.com/download?id=42").unwrap();
+    let pdf_staged = stage_artifact(
+        state_dir.path(),
+        &octet_url,
+        Some("application/octet-stream"),
+        pdf_bytes,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        pdf_staged.path.extension().and_then(|e| e.to_str()),
+        Some("pdf")
+    );
+    assert_eq!(pdf_staged.content_type.as_deref(), Some("application/pdf"));
+}
