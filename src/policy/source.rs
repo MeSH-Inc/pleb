@@ -479,6 +479,14 @@ pub fn is_local_or_private_host(host: &str) -> bool {
     false
 }
 
+pub(crate) fn canonical_url_host(url: &Url) -> Option<String> {
+    Some(match url.host()? {
+        url::Host::Ipv6(ip) => format!("[{ip}]"),
+        url::Host::Ipv4(ip) => ip.to_string(),
+        url::Host::Domain(d) => d.to_ascii_lowercase(),
+    })
+}
+
 pub(crate) fn same_origin_or_parent_domain(base_host: &str, target_host: &str) -> bool {
     let a = base_host.trim_end_matches('.').to_ascii_lowercase();
     let b = target_host.trim_end_matches('.').to_ascii_lowercase();

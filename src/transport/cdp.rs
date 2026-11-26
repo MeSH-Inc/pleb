@@ -15,12 +15,13 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{client_async_tls_with_config, Connector, MaybeTlsStream, WebSocketStream};
-use url::{Host, Url};
+use url::Url;
 
 use super::{ResponseTooLargeError, TransportError, TransportErrorKind};
 use crate::auth::{resolve_credentials, CredentialProvider};
 use crate::extract::webmcp::sanitize_webmcp_tool;
 use crate::extract::{WebMcpToolAnnotations, WebMcpToolDescriptor, WebMcpToolSource};
+use crate::policy::source::canonical_url_host;
 use crate::policy::{is_local_or_private_host, is_loopback_host, is_safe_redirect_url};
 
 pub const MAX_HTML_BYTES: usize = 64 * 1024 * 1024;
@@ -87,12 +88,10 @@ impl CdpRenderer {
     }
 
     fn rustls_client_config(&self) -> Result<Arc<rustls::ClientConfig>> {
-        let mut guard = self.tls_config.lock().map_err(|_| {
-            anyhow::Error::new(TransportError::new(
-                TransportErrorKind::Network,
-                "CDP TLS config lock poisoned",
-            ))
-        })?;
+        let mut guard = self
+            .tls_config
+            .lock()
+            .map_err(|_| cdp_err(TransportErrorKind::Network, "CDP TLS config lock poisoned"))?;
         if let Some(ref cfg) = *guard {
             return Ok(Arc::clone(cfg));
         }
@@ -107,19 +106,19 @@ impl CdpRenderer {
         }
         let (added, _) = root_store.add_parsable_certificates(cert_res.certs);
         if added == 0 {
-            return Err(anyhow::Error::new(TransportError::new(
+            return Err(cdp_err(
                 TransportErrorKind::Network,
                 "no native root CA certificates available for wss:// CDP connection",
-            )));
+            ));
         }
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let cfg = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .map_err(|e| {
-                anyhow::Error::new(TransportError::new(
+                cdp_err(
                     TransportErrorKind::Network,
                     format!("failed to initialize CDP TLS protocol versions: {e}"),
-                ))
+                )
             })?
             .with_root_certificates(root_store)
             .with_no_client_auth();
@@ -135,10 +134,10 @@ impl CdpRenderer {
         timeout: Duration,
     ) -> Result<CdpRenderResult> {
         if self.proxy.is_some() {
-            return Err(anyhow::Error::new(TransportError::new(
+            return Err(cdp_err(
                 TransportErrorKind::Network,
                 "CDP renderer refuses to connect while --proxy is configured",
-            )));
+            ));
         }
 
         let cdp_url = validate_cdp_url(&self.cdp_url)?;
@@ -146,18 +145,18 @@ impl CdpRenderer {
 
         if let Some(selector) = options.wait_for_selector.as_deref() {
             scraper::Selector::parse(selector).map_err(|_| {
-                anyhow::Error::new(TransportError::new(
+                cdp_err(
                     TransportErrorKind::InvalidSelector,
                     format!("invalid CSS selector for --wait-for-selector: {selector}"),
-                ))
+                )
             })?;
         }
 
         if timeout.is_zero() {
-            return Err(anyhow::Error::new(TransportError::new(
+            return Err(cdp_err(
                 TransportErrorKind::Timeout,
                 format!("CDP render timed out before connecting for {url}"),
-            )));
+            ));
         }
 
         let deadline = Instant::now() + timeout;
@@ -170,17 +169,14 @@ impl CdpRenderer {
             None
         };
 
-        let host = ws_url.host_str().ok_or_else(|| {
-            anyhow::Error::new(TransportError::new(
-                TransportErrorKind::Network,
-                "CDP URL must include a host",
-            ))
-        })?;
+        let host = ws_url
+            .host_str()
+            .ok_or_else(|| cdp_err(TransportErrorKind::Network, "CDP URL must include a host"))?;
         let port = ws_url.port_or_known_default().ok_or_else(|| {
-            anyhow::Error::new(TransportError::new(
+            cdp_err(
                 TransportErrorKind::Network,
                 "CDP URL must include a valid port",
-            ))
+            )
         })?;
         let connect_addr = format!("{host}:{port}");
 
@@ -196,45 +192,45 @@ impl CdpRenderer {
         let peer_ip = tcp_stream
             .peer_addr()
             .map_err(|e| {
-                anyhow::Error::new(TransportError::new(
+                cdp_err(
                     TransportErrorKind::Network,
                     format!("failed to inspect CDP socket peer address: {e}"),
-                ))
+                )
             })?
             .ip();
 
         if ws_url.scheme() == "ws" && !is_loopback_ip(peer_ip) {
-            return Err(anyhow::Error::new(TransportError::new(
+            return Err(cdp_err(
                 TransportErrorKind::RedirectBlocked,
                 "plaintext ws:// CDP connection resolved to non-loopback IP address",
-            )));
+            ));
         }
 
         if is_ip_self_ssrf(&target_url, peer_ip, port) {
-            return Err(anyhow::Error::new(TransportError::new(
+            return Err(cdp_err(
                 TransportErrorKind::RedirectBlocked,
                 "target URL resolves to the configured CDP endpoint (self-SSRF blocked)",
-            )));
+            ));
         }
 
         let mut request = ws_url.as_str().into_client_request().map_err(|_| {
-            anyhow::Error::new(TransportError::new(
+            cdp_err(
                 TransportErrorKind::Network,
                 "invalid CDP WebSocket upgrade request",
-            ))
+            )
         })?;
         if let Some((client_id, client_secret)) = access_headers {
             let id_val = HeaderValue::from_str(&client_id).map_err(|_| {
-                anyhow::Error::new(TransportError::new(
+                cdp_err(
                     TransportErrorKind::Network,
                     "invalid CF-Access-Client-Id header value",
-                ))
+                )
             })?;
             let secret_val = HeaderValue::from_str(&client_secret).map_err(|_| {
-                anyhow::Error::new(TransportError::new(
+                cdp_err(
                     TransportErrorKind::Network,
                     "invalid CF-Access-Client-Secret header value",
-                ))
+                )
             })?;
             request.headers_mut().insert("CF-Access-Client-Id", id_val);
             request
@@ -281,47 +277,43 @@ impl CdpRenderer {
 pub fn validate_cdp_url(raw: &str) -> Result<Url> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err(anyhow::Error::new(TransportError::new(
+        return Err(cdp_err(
             TransportErrorKind::Network,
             "CDP URL must not be empty",
-        )));
+        ));
     }
-    let parsed = Url::parse(trimmed).map_err(|_| {
-        anyhow::Error::new(TransportError::new(
-            TransportErrorKind::Network,
-            "invalid CDP URL",
-        ))
-    })?;
+    let parsed =
+        Url::parse(trimmed).map_err(|_| cdp_err(TransportErrorKind::Network, "invalid CDP URL"))?;
     let scheme = parsed.scheme();
     if scheme != "ws" && scheme != "wss" {
-        return Err(anyhow::Error::new(TransportError::new(
+        return Err(cdp_err(
             TransportErrorKind::Network,
             "CDP URL scheme must be ws:// or wss://",
-        )));
+        ));
     }
     let Some(host) = parsed.host_str() else {
-        return Err(anyhow::Error::new(TransportError::new(
+        return Err(cdp_err(
             TransportErrorKind::Network,
             "CDP URL must include a host",
-        )));
+        ));
     };
     if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(anyhow::Error::new(TransportError::new(
+        return Err(cdp_err(
             TransportErrorKind::Network,
             "CDP URL must not embed userinfo credentials",
-        )));
+        ));
     }
     if parsed.fragment().is_some() {
-        return Err(anyhow::Error::new(TransportError::new(
+        return Err(cdp_err(
             TransportErrorKind::Network,
             "CDP URL must not include a fragment",
-        )));
+        ));
     }
     if scheme == "ws" && !is_loopback_host(host) {
-        return Err(anyhow::Error::new(TransportError::new(
+        return Err(cdp_err(
             TransportErrorKind::Network,
             "plaintext ws:// CDP URL is permitted for loopback hosts only; use wss:// for remote endpoints",
-        )));
+        ));
     }
     Ok(parsed)
 }
@@ -330,10 +322,9 @@ pub fn sanitize_cdp_url_for_display(raw: &str) -> String {
     let Ok(parsed) = Url::parse(raw.trim()) else {
         return "[invalid-cdp-url]".to_string();
     };
-    let Some(host) = parsed.host_str() else {
+    let Some(formatted_host) = canonical_url_host(&parsed) else {
         return "[invalid-cdp-url]".to_string();
     };
-    let formatted_host = format_url_host(&parsed, host);
     match parsed.port() {
         Some(port) => format!(
             "{}://{formatted_host}:{port}{}",
@@ -341,15 +332,6 @@ pub fn sanitize_cdp_url_for_display(raw: &str) -> String {
             parsed.path()
         ),
         None => format!("{}://{formatted_host}{}", parsed.scheme(), parsed.path()),
-    }
-}
-
-fn format_url_host(url: &Url, fallback_host: &str) -> String {
-    match url.host() {
-        Some(Host::Ipv6(ip)) => format!("[{ip}]"),
-        Some(Host::Ipv4(ip)) => ip.to_string(),
-        Some(Host::Domain(d)) => d.to_ascii_lowercase(),
-        None => fallback_host.to_ascii_lowercase(),
     }
 }
 
@@ -383,10 +365,10 @@ fn resolve_cdp_access_headers(state_dir: &Path, cdp_url: &Url) -> Result<Option<
         ],
     )
     .map_err(|e| {
-        anyhow::Error::new(TransportError::new(
+        cdp_err(
             TransportErrorKind::Network,
             format!("failed to resolve CDP Access credentials: {e}"),
-        ))
+        )
     })?;
 
     if resolved.is_empty() {
@@ -419,13 +401,13 @@ fn resolve_cdp_access_headers(state_dir: &Path, cdp_url: &Url) -> Result<Option<
             if host.is_none() {
                 missing.push(CredentialProvider::CdpAccessHost.as_str());
             }
-            Err(anyhow::Error::new(TransportError::new(
+            Err(cdp_err(
                 TransportErrorKind::Network,
                 format!(
                     "incomplete CDP Access configuration; missing: {}",
                     missing.join(", ")
                 ),
-            )))
+            ))
         }
     }
 }
@@ -446,15 +428,12 @@ fn cdp_access_host_matches(cdp_url: &Url, allowed_host: &str) -> bool {
     let Ok(allowed_parsed) = Url::parse(&format!("wss://{trimmed}")) else {
         return false;
     };
-    let Some(allowed_host_raw) = allowed_parsed.host_str() else {
+    let (Some(allowed_host_norm), Some(cdp_host_norm)) = (
+        canonical_url_host(&allowed_parsed),
+        canonical_url_host(cdp_url),
+    ) else {
         return false;
     };
-    let allowed_host_norm = format_url_host(&allowed_parsed, allowed_host_raw);
-
-    let Some(cdp_host_raw) = cdp_url.host_str() else {
-        return false;
-    };
-    let cdp_host_norm = format_url_host(cdp_url, cdp_host_raw);
     if cdp_host_norm != allowed_host_norm {
         return false;
     }
@@ -467,46 +446,48 @@ fn cdp_access_host_matches(cdp_url: &Url, allowed_host: &str) -> bool {
 
 fn validate_target_url(url: &str, cdp_url: &Url, options: &CdpRenderOptions) -> Result<Url> {
     let parsed = Url::parse(url).map_err(|e| {
-        anyhow::Error::new(TransportError::new(
+        cdp_err(
             TransportErrorKind::LoadError,
             format!("invalid target URL: {e}"),
-        ))
+        )
     })?;
     if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(anyhow::Error::new(TransportError::new(
+        return Err(cdp_err(
             TransportErrorKind::LoadError,
             format!(
                 "unsupported URL scheme {:?} for CDP render (only http and https)",
                 parsed.scheme()
             ),
-        )));
+        ));
     }
     let Some(target_host) = parsed.host_str() else {
-        return Err(anyhow::Error::new(TransportError::new(
+        return Err(cdp_err(
             TransportErrorKind::LoadError,
             "target URL must include a host",
-        )));
+        ));
     };
     if is_url_self_ssrf(&parsed, cdp_url) {
-        return Err(anyhow::Error::new(TransportError::new(
+        return Err(cdp_err(
             TransportErrorKind::RedirectBlocked,
             "target URL matches the configured CDP endpoint (self-SSRF blocked)",
-        )));
+        ));
     }
     if cdp_url.scheme() == "wss"
         && !options.allow_local_targets
         && is_local_or_private_host(target_host)
     {
-        return Err(anyhow::Error::new(TransportError::new(
+        return Err(cdp_err(
             TransportErrorKind::RedirectBlocked,
             "remote wss:// CDP renderer refuses local or private target URLs",
-        )));
+        ));
     }
     Ok(parsed)
 }
 
 fn is_url_self_ssrf(target: &Url, cdp_url: &Url) -> bool {
-    let (Some(target_raw), Some(cdp_raw)) = (target.host_str(), cdp_url.host_str()) else {
+    let (Some(target_norm), Some(cdp_norm)) =
+        (canonical_url_host(target), canonical_url_host(cdp_url))
+    else {
         return false;
     };
     let (Some(target_port), Some(cdp_port)) = (
@@ -515,12 +496,9 @@ fn is_url_self_ssrf(target: &Url, cdp_url: &Url) -> bool {
     ) else {
         return false;
     };
-    if target_port != cdp_port {
-        return false;
-    }
-    let target_norm = format_url_host(target, target_raw);
-    let cdp_norm = format_url_host(cdp_url, cdp_raw);
-    target_norm == cdp_norm || (is_loopback_host(&target_norm) && is_loopback_host(&cdp_norm))
+    target_port == cdp_port
+        && (target_norm == cdp_norm
+            || (is_loopback_host(&target_norm) && is_loopback_host(&cdp_norm)))
 }
 
 fn is_ip_self_ssrf(target: &Url, cdp_peer_ip: IpAddr, cdp_port: u16) -> bool {
@@ -574,14 +552,36 @@ where
     }
 }
 
+fn cdp_err(kind: TransportErrorKind, msg: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(TransportError::new(kind, msg))
+}
+
+fn rpc_failure_err(method: &str, err: &RpcError, other_kind: TransportErrorKind) -> anyhow::Error {
+    let kind = if err.code == CDP_ERR_METHOD_NOT_FOUND {
+        TransportErrorKind::ProtocolMismatch
+    } else {
+        other_kind
+    };
+    cdp_err(
+        kind,
+        format!("{method} failed ({}): {}", err.code, err.message),
+    )
+}
+
+fn parse_event_params<T: for<'de> Deserialize<'de>>(raw: &str) -> Option<T> {
+    serde_json::from_str::<RpcEventEnvelope<T>>(raw)
+        .ok()
+        .and_then(|ev| ev.params)
+}
+
 fn map_connect_io_or_transport(err: anyhow::Error, _url: &str) -> anyhow::Error {
     if err.is::<TransportError>() {
         return err;
     }
-    anyhow::Error::new(TransportError::new(
+    cdp_err(
         TransportErrorKind::Network,
         format!("CDP TCP connect failed: {err}"),
-    ))
+    )
 }
 
 fn map_ws_or_transport_error(err: anyhow::Error, url: &str) -> anyhow::Error {
@@ -590,51 +590,49 @@ fn map_ws_or_transport_error(err: anyhow::Error, url: &str) -> anyhow::Error {
     }
     match err.downcast::<WsError>() {
         Ok(ws_err) => map_tungstenite_error(ws_err, url),
-        Err(other) => anyhow::Error::new(TransportError::new(
+        Err(other) => cdp_err(
             TransportErrorKind::Network,
             format!("CDP WebSocket error: {other}"),
-        )),
+        ),
     }
 }
 
 fn map_tungstenite_error(err: WsError, _url: &str) -> anyhow::Error {
     match err {
-        WsError::Http(resp) => anyhow::Error::new(TransportError::new(
+        WsError::Http(resp) => cdp_err(
             TransportErrorKind::Network,
             format!(
                 "CDP WebSocket upgrade failed with HTTP {}",
                 resp.status().as_u16()
             ),
-        )),
-        WsError::Capacity(_) => anyhow::Error::new(TransportError::new(
+        ),
+        WsError::Capacity(_) => cdp_err(
             TransportErrorKind::ResponseTooLarge,
             "CDP WebSocket message or frame exceeded 64 MiB limit",
-        )),
-        WsError::Protocol(proto) => anyhow::Error::new(TransportError::new(
+        ),
+        WsError::Protocol(proto) => cdp_err(
             TransportErrorKind::ProtocolMismatch,
             format!("CDP WebSocket protocol error: {proto}"),
-        )),
-        WsError::Tls(_) => anyhow::Error::new(TransportError::new(
+        ),
+        WsError::Tls(_) => cdp_err(
             TransportErrorKind::Network,
             "CDP WebSocket TLS handshake or transport failed",
-        )),
-        WsError::Io(io_err) => anyhow::Error::new(TransportError::new(
+        ),
+        WsError::Io(io_err) => cdp_err(
             TransportErrorKind::Network,
             format!("CDP WebSocket I/O error: {}", io_err.kind()),
-        )),
-        WsError::Url(_) | WsError::HttpFormat(_) => anyhow::Error::new(TransportError::new(
+        ),
+        WsError::Url(_) | WsError::HttpFormat(_) => cdp_err(
             TransportErrorKind::Network,
             "invalid CDP WebSocket URL or handshake headers",
-        )),
-        WsError::ConnectionClosed | WsError::AlreadyClosed => {
-            anyhow::Error::new(TransportError::new(
-                TransportErrorKind::Network,
-                "CDP WebSocket connection closed",
-            ))
-        }
-        WsError::Utf8 | WsError::AttackAttempt | WsError::WriteBufferFull(_) => anyhow::Error::new(
-            TransportError::new(TransportErrorKind::Network, "CDP WebSocket transport error"),
         ),
+        WsError::ConnectionClosed | WsError::AlreadyClosed => cdp_err(
+            TransportErrorKind::Network,
+            "CDP WebSocket connection closed",
+        ),
+        WsError::Utf8 | WsError::AttackAttempt | WsError::WriteBufferFull(_) => {
+            cdp_err(TransportErrorKind::Network, "CDP WebSocket transport error")
+        }
     }
 }
 
@@ -969,17 +967,17 @@ impl CdpSession {
             session_id,
         };
         let encoded = serde_json::to_string(&req).map_err(|e| {
-            anyhow::Error::new(TransportError::new(
+            cdp_err(
                 TransportErrorKind::ProtocolMismatch,
                 format!("failed to serialize CDP request {method}: {e}"),
-            ))
+            )
         })?;
         let now = Instant::now();
         if now >= deadline {
-            return Err(anyhow::Error::new(TransportError::new(
+            return Err(cdp_err(
                 TransportErrorKind::Timeout,
                 format!("CDP send timed out for {method}"),
-            )));
+            ));
         }
         match tokio::time::timeout_at(deadline, self.ws.send(Message::Text(encoded.into()))).await {
             Ok(Ok(())) => Ok(()),
@@ -990,11 +988,24 @@ impl CdpSession {
                     self.initial_target_url.as_str(),
                 ))
             }
-            Err(_) => Err(anyhow::Error::new(TransportError::new(
+            Err(_) => Err(cdp_err(
                 TransportErrorKind::Timeout,
                 format!("CDP send timed out for {method}"),
-            ))),
+            )),
         }
+    }
+
+    async fn send_ignored_session_cmd<P: Serialize>(
+        &mut self,
+        method: &str,
+        params: P,
+        deadline: Instant,
+    ) -> Result<()> {
+        let cmd_id = self.alloc_id();
+        self.ignored_reply_ids.insert(cmd_id);
+        let sid = self.session_id.clone();
+        self.send_raw(cmd_id, method, params, sid.as_deref(), deadline)
+            .await
     }
 
     async fn call_typed<P: Serialize, R: for<'de> Deserialize<'de>>(
@@ -1004,11 +1015,7 @@ impl CdpSession {
         use_session: bool,
     ) -> Result<RpcCallOutcome<R>> {
         let id = self.alloc_id();
-        let sid = if use_session {
-            self.session_id.clone()
-        } else {
-            None
-        };
+        let sid = use_session.then(|| self.session_id.clone()).flatten();
         self.send_raw(id, method, params, sid.as_deref(), self.deadline)
             .await?;
 
@@ -1017,19 +1024,19 @@ impl CdpSession {
         }
         let text = self.read_until_reply(id, self.deadline).await?;
         let envelope: RpcEnvelope<R> = serde_json::from_str(&text).map_err(|e| {
-            anyhow::Error::new(TransportError::new(
+            cdp_err(
                 TransportErrorKind::ProtocolMismatch,
                 format!("malformed CDP reply for {method}: {e}"),
-            ))
+            )
         })?;
         if let Some(rpc_err) = envelope.error {
             return Ok(RpcCallOutcome::RpcErr(rpc_err));
         }
         let result = envelope.result.ok_or_else(|| {
-            anyhow::Error::new(TransportError::new(
+            cdp_err(
                 TransportErrorKind::ProtocolMismatch,
                 format!("CDP reply for {method} missing result payload"),
-            ))
+            )
         })?;
         Ok(RpcCallOutcome::Ok(result))
     }
@@ -1042,74 +1049,31 @@ impl CdpSession {
     ) -> Result<R> {
         match self.call_typed(method, params, use_session).await? {
             RpcCallOutcome::Ok(r) => Ok(r),
-            RpcCallOutcome::RpcErr(err) => {
-                let kind = if err.code == CDP_ERR_METHOD_NOT_FOUND {
-                    TransportErrorKind::ProtocolMismatch
-                } else {
-                    TransportErrorKind::LoadError
-                };
-                Err(anyhow::Error::new(TransportError::new(
-                    kind,
-                    format!("CDP {method} failed ({}): {}", err.code, err.message),
-                )))
-            }
+            RpcCallOutcome::RpcErr(err) => Err(rpc_failure_err(
+                &format!("CDP {method}"),
+                &err,
+                TransportErrorKind::LoadError,
+            )),
         }
     }
 
-    async fn pump_until(&mut self, stop_at: Instant) -> Result<()> {
-        let target_deadline = self.deadline.min(stop_at);
-        loop {
-            if let Some(err) = self.state.terminal_error.take() {
-                return Err(anyhow::Error::new(err));
-            }
-            if Instant::now() >= target_deadline {
-                return Ok(());
-            }
-            match tokio::time::timeout_at(target_deadline, self.ws.next()).await {
-                Ok(Some(Ok(msg))) => {
-                    self.process_ws_message(msg, None, target_deadline).await?;
-                }
-                Ok(Some(Err(ws_err))) => {
-                    self.ws_broken = true;
-                    return Err(map_tungstenite_error(
-                        ws_err,
-                        self.initial_target_url.as_str(),
-                    ));
-                }
-                Ok(None) => {
-                    self.ws_broken = true;
-                    return Err(anyhow::Error::new(TransportError::new(
-                        TransportErrorKind::Network,
-                        "CDP WebSocket closed unexpectedly",
-                    )));
-                }
-                Err(_) => {
-                    if Instant::now() >= self.deadline {
-                        return Err(anyhow::Error::new(TransportError::new(
-                            TransportErrorKind::Timeout,
-                            format!("CDP render timed out for {}", self.initial_target_url),
-                        )));
-                    }
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    async fn read_next_message(
+    async fn poll_ws_step(
         &mut self,
         awaited_id: Option<i64>,
         deadline: Instant,
-    ) -> Result<Option<String>> {
+        allow_slice_timeout: bool,
+    ) -> Result<Option<Option<String>>> {
         if let Some(err) = self.state.terminal_error.take() {
             return Err(anyhow::Error::new(err));
         }
-        let now = Instant::now();
-        if now >= deadline {
-            return Err(anyhow::Error::new(TransportError::new(
+        if Instant::now() >= deadline {
+            if allow_slice_timeout && Instant::now() < self.deadline {
+                return Ok(None);
+            }
+            return Err(cdp_err(
                 TransportErrorKind::Timeout,
                 format!("CDP operation timed out for {}", self.initial_target_url),
-            )));
+            ));
         }
         match tokio::time::timeout_at(deadline, self.ws.next()).await {
             Ok(Some(Ok(msg))) => {
@@ -1117,7 +1081,7 @@ impl CdpSession {
                 if let Some(err) = self.state.terminal_error.take() {
                     return Err(anyhow::Error::new(err));
                 }
-                Ok(matched)
+                Ok(Some(matched))
             }
             Ok(Some(Err(ws_err))) => {
                 self.ws_broken = true;
@@ -1128,16 +1092,43 @@ impl CdpSession {
             }
             Ok(None) => {
                 self.ws_broken = true;
-                Err(anyhow::Error::new(TransportError::new(
+                Err(cdp_err(
                     TransportErrorKind::Network,
                     "CDP WebSocket closed before response completed",
-                )))
+                ))
             }
-            Err(_) => Err(anyhow::Error::new(TransportError::new(
-                TransportErrorKind::Timeout,
-                format!("CDP operation timed out for {}", self.initial_target_url),
-            ))),
+            Err(_) => {
+                if allow_slice_timeout && Instant::now() < self.deadline {
+                    Ok(None)
+                } else {
+                    Err(cdp_err(
+                        TransportErrorKind::Timeout,
+                        format!("CDP operation timed out for {}", self.initial_target_url),
+                    ))
+                }
+            }
         }
+    }
+
+    async fn pump_until(&mut self, stop_at: Instant) -> Result<()> {
+        let target_deadline = self.deadline.min(stop_at);
+        while self
+            .poll_ws_step(None, target_deadline, true)
+            .await?
+            .is_some()
+        {}
+        Ok(())
+    }
+
+    async fn read_next_message(
+        &mut self,
+        awaited_id: Option<i64>,
+        deadline: Instant,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .poll_ws_step(awaited_id, deadline, false)
+            .await?
+            .flatten())
     }
 
     async fn read_until_reply(&mut self, awaited_id: i64, deadline: Instant) -> Result<String> {
@@ -1158,10 +1149,10 @@ impl CdpSession {
             Message::Text(text) => {
                 let raw = text.as_str();
                 let header: RpcHeader = serde_json::from_str(raw).map_err(|e| {
-                    anyhow::Error::new(TransportError::new(
+                    cdp_err(
                         TransportErrorKind::ProtocolMismatch,
                         format!("malformed JSON from CDP endpoint: {e}"),
-                    ))
+                    )
                 })?;
 
                 if let Some(msg_id) = header.id {
@@ -1181,10 +1172,10 @@ impl CdpSession {
                         self.handle_event(method, raw, reply_deadline).await?;
                     }
                 } else if let Some(err) = header.error {
-                    return Err(anyhow::Error::new(TransportError::new(
+                    return Err(cdp_err(
                         TransportErrorKind::ProtocolMismatch,
                         format!("CDP error ({}): {}", err.code, err.message),
-                    )));
+                    ));
                 }
                 Ok(None)
             }
@@ -1192,20 +1183,16 @@ impl CdpSession {
                 self.account_unsolicited(bin.len())?;
                 Ok(None)
             }
-            Message::Ping(payload) => {
-                self.account_unsolicited(payload.len())?;
-                Ok(None)
-            }
-            Message::Pong(payload) => {
+            Message::Ping(payload) | Message::Pong(payload) => {
                 self.account_unsolicited(payload.len())?;
                 Ok(None)
             }
             Message::Close(_) => {
                 self.ws_broken = true;
-                Err(anyhow::Error::new(TransportError::new(
+                Err(cdp_err(
                     TransportErrorKind::Network,
                     "CDP WebSocket closed by remote endpoint",
-                )))
+                ))
             }
             Message::Frame(_) => Ok(None),
         }
@@ -1217,43 +1204,43 @@ impl CdpSession {
         if self.unsolicited_events > MAX_UNSOLICITED_EVENTS
             || self.unsolicited_event_bytes > MAX_EVENT_BYTES
         {
-            return Err(anyhow::Error::new(TransportError::new(
+            return Err(cdp_err(
                 TransportErrorKind::ResponseTooLarge,
                 "CDP event stream exceeded safety bounds",
-            )));
+            ));
         }
         Ok(())
     }
 
     fn validate_event_url(&self, raw_url: &str, context: &str) -> Result<Url> {
         let parsed = Url::parse(raw_url).map_err(|_| {
-            anyhow::Error::new(TransportError::new(
+            cdp_err(
                 TransportErrorKind::RedirectBlocked,
                 format!("CDP blocked invalid URL during {context}"),
-            ))
+            )
         })?;
         if !is_safe_redirect_url(&self.initial_target_url, &parsed) {
-            return Err(anyhow::Error::new(TransportError::new(
+            return Err(cdp_err(
                 TransportErrorKind::RedirectBlocked,
                 format!("CDP blocked unsafe URL pivot during {context}"),
-            )));
+            ));
         }
         if is_url_self_ssrf(&parsed, &self.cdp_url)
             || is_ip_self_ssrf(&parsed, self.cdp_peer_ip, self.cdp_port)
         {
-            return Err(anyhow::Error::new(TransportError::new(
+            return Err(cdp_err(
                 TransportErrorKind::RedirectBlocked,
                 "CDP blocked self-SSRF request to CDP endpoint",
-            )));
+            ));
         }
         if self.cdp_url.scheme() == "wss"
             && !self.allow_local_targets
             && parsed.host_str().is_some_and(is_local_or_private_host)
         {
-            return Err(anyhow::Error::new(TransportError::new(
+            return Err(cdp_err(
                 TransportErrorKind::RedirectBlocked,
                 "remote wss:// CDP blocked local or private URL",
-            )));
+            ));
         }
         Ok(parsed)
     }
@@ -1266,12 +1253,7 @@ impl CdpSession {
     ) -> Result<()> {
         match method {
             "Fetch.requestPaused" => {
-                let Ok(ev) =
-                    serde_json::from_str::<RpcEventEnvelope<FetchRequestPausedParams>>(raw)
-                else {
-                    return Ok(());
-                };
-                let Some(params) = ev.params else {
+                let Some(params) = parse_event_params::<FetchRequestPausedParams>(raw) else {
                     return Ok(());
                 };
                 let is_main_frame = params.resource_type.as_deref() == Some("Document")
@@ -1280,14 +1262,9 @@ impl CdpSession {
 
                 match self.validate_event_url(&params.request.url, "Fetch.requestPaused") {
                     Ok(_) => {
-                        let cmd_id = self.alloc_id();
-                        self.ignored_reply_ids.insert(cmd_id);
-                        let sid = self.session_id.clone();
-                        self.send_raw(
-                            cmd_id,
+                        self.send_ignored_session_cmd(
                             "Fetch.continueRequest",
                             serde_json::json!({ "requestId": params.request_id }),
-                            sid.as_deref(),
                             reply_deadline,
                         )
                         .await?;
@@ -1296,38 +1273,23 @@ impl CdpSession {
                         self.state
                             .blocked_interception_ids
                             .insert(params.request_id.clone());
-                        let cmd_id = self.alloc_id();
-                        self.ignored_reply_ids.insert(cmd_id);
-                        let sid = self.session_id.clone();
-                        self.send_raw(
-                            cmd_id,
+                        self.send_ignored_session_cmd(
                             "Fetch.failRequest",
                             serde_json::json!({
                                 "requestId": params.request_id,
                                 "errorReason": "BlockedByClient"
                             }),
-                            sid.as_deref(),
                             reply_deadline,
                         )
                         .await?;
                         if is_main_frame {
-                            let te = err.downcast::<TransportError>().unwrap_or_else(|e| {
-                                TransportError::new(
-                                    TransportErrorKind::RedirectBlocked,
-                                    e.to_string(),
-                                )
-                            });
-                            self.state.terminal_error = Some(te);
+                            self.set_terminal_error(err);
                         }
                     }
                 }
             }
             "Network.requestWillBeSent" => {
-                let Ok(ev) = serde_json::from_str::<RpcEventEnvelope<RequestWillBeSentParams>>(raw)
-                else {
-                    return Ok(());
-                };
-                let Some(params) = ev.params else {
+                let Some(params) = parse_event_params::<RequestWillBeSentParams>(raw) else {
                     return Ok(());
                 };
                 let matches_main = self.state.main_frame_id.as_deref().is_some_and(|mf| {
@@ -1353,11 +1315,7 @@ impl CdpSession {
                 }
             }
             "Network.responseReceived" => {
-                let Ok(ev) = serde_json::from_str::<RpcEventEnvelope<ResponseReceivedParams>>(raw)
-                else {
-                    return Ok(());
-                };
-                let Some(params) = ev.params else {
+                let Some(params) = parse_event_params::<ResponseReceivedParams>(raw) else {
                     return Ok(());
                 };
                 let matches_main = self.state.main_frame_id.as_deref().is_some_and(|mf| {
@@ -1400,11 +1358,7 @@ impl CdpSession {
                 }
             }
             "Page.frameNavigated" => {
-                let Ok(ev) = serde_json::from_str::<RpcEventEnvelope<FrameNavigatedParams>>(raw)
-                else {
-                    return Ok(());
-                };
-                let Some(params) = ev.params else {
+                let Some(params) = parse_event_params::<FrameNavigatedParams>(raw) else {
                     return Ok(());
                 };
                 if self.state.main_frame_id.as_deref() != Some(params.frame.id.as_str()) {
@@ -1425,12 +1379,7 @@ impl CdpSession {
                 }
             }
             "Page.navigatedWithinDocument" => {
-                let Ok(ev) =
-                    serde_json::from_str::<RpcEventEnvelope<NavigatedWithinDocumentParams>>(raw)
-                else {
-                    return Ok(());
-                };
-                let Some(params) = ev.params else {
+                let Some(params) = parse_event_params::<NavigatedWithinDocumentParams>(raw) else {
                     return Ok(());
                 };
                 if self.state.main_frame_id.as_deref() != Some(params.frame_id.as_str()) {
@@ -1448,11 +1397,7 @@ impl CdpSession {
                 self.state.load_fired = true;
             }
             "Network.loadingFailed" => {
-                let Ok(ev) = serde_json::from_str::<RpcEventEnvelope<LoadingFailedParams>>(raw)
-                else {
-                    return Ok(());
-                };
-                let Some(params) = ev.params else {
+                let Some(params) = parse_event_params::<LoadingFailedParams>(raw) else {
                     return Ok(());
                 };
                 if self.state.main_request_id.as_deref() == Some(params.request_id.as_str())
@@ -1472,11 +1417,7 @@ impl CdpSession {
                 }
             }
             "WebMCP.toolsAdded" => {
-                let Ok(ev) = serde_json::from_str::<RpcEventEnvelope<WebMcpToolsAddedParams>>(raw)
-                else {
-                    return Ok(());
-                };
-                let Some(params) = ev.params else {
+                let Some(params) = parse_event_params::<WebMcpToolsAddedParams>(raw) else {
                     return Ok(());
                 };
                 let Some(main_fid) = self.state.main_frame_id.as_deref() else {
@@ -1521,12 +1462,7 @@ impl CdpSession {
                 }
             }
             "WebMCP.toolsRemoved" => {
-                let Ok(ev) =
-                    serde_json::from_str::<RpcEventEnvelope<WebMcpToolsRemovedParams>>(raw)
-                else {
-                    return Ok(());
-                };
-                let Some(params) = ev.params else {
+                let Some(params) = parse_event_params::<WebMcpToolsRemovedParams>(raw) else {
                     return Ok(());
                 };
                 let Some(main_fid) = self.state.main_frame_id.as_deref() else {
@@ -1747,15 +1683,11 @@ impl CdpSession {
                 RpcCallOutcome::Ok(doc) => doc.root.node_id,
                 RpcCallOutcome::RpcErr(err) if err.code == CDP_ERR_SERVER_ERROR => 0,
                 RpcCallOutcome::RpcErr(err) => {
-                    let kind = if err.code == CDP_ERR_METHOD_NOT_FOUND {
-                        TransportErrorKind::ProtocolMismatch
-                    } else {
-                        TransportErrorKind::LoadError
-                    };
-                    return Err(anyhow::Error::new(TransportError::new(
-                        kind,
-                        format!("DOM.getDocument failed ({}): {}", err.code, err.message),
-                    )));
+                    return Err(rpc_failure_err(
+                        "DOM.getDocument",
+                        &err,
+                        TransportErrorKind::LoadError,
+                    ));
                 }
             };
 
@@ -1770,10 +1702,10 @@ impl CdpSession {
                 match query_reply {
                     RpcCallOutcome::Ok(res) => {
                         if let Some(err_msg) = res.error.filter(|s| !s.is_empty()) {
-                            return Err(anyhow::Error::new(TransportError::new(
+                            return Err(cdp_err(
                                 TransportErrorKind::InvalidSelector,
                                 format!("invalid CSS selector {selector:?}: {err_msg}"),
-                            )));
+                            ));
                         }
                         if res.node_id > 0 {
                             return Ok(());
@@ -1781,35 +1713,31 @@ impl CdpSession {
                     }
                     RpcCallOutcome::RpcErr(err) if err.code == CDP_ERR_SERVER_ERROR => {
                         if err.message.contains("DOM Error while querying") {
-                            return Err(anyhow::Error::new(TransportError::new(
+                            return Err(cdp_err(
                                 TransportErrorKind::InvalidSelector,
                                 format!("invalid CSS selector {selector:?}: {}", err.message),
-                            )));
+                            ));
                         }
                         // Otherwise transient stale node id; retry DOM.getDocument next tick.
                     }
                     RpcCallOutcome::RpcErr(err) => {
-                        let kind = if err.code == CDP_ERR_METHOD_NOT_FOUND {
-                            TransportErrorKind::ProtocolMismatch
-                        } else {
-                            TransportErrorKind::InvalidSelector
-                        };
-                        return Err(anyhow::Error::new(TransportError::new(
-                            kind,
-                            format!("DOM.querySelector failed ({}): {}", err.code, err.message),
-                        )));
+                        return Err(rpc_failure_err(
+                            "DOM.querySelector",
+                            &err,
+                            TransportErrorKind::InvalidSelector,
+                        ));
                     }
                 }
             }
 
             if Instant::now() >= self.deadline {
-                return Err(anyhow::Error::new(TransportError::new(
+                return Err(cdp_err(
                     TransportErrorKind::Timeout,
                     format!(
                         "timed out waiting for selector {selector:?} on {}",
                         self.initial_target_url
                     ),
-                )));
+                ));
             }
             self.pump_until(Instant::now() + SELECTOR_POLL_INTERVAL)
                 .await?;
@@ -1879,10 +1807,10 @@ impl CdpSession {
                 if attempt == 0 {
                     continue;
                 }
-                return Err(anyhow::Error::new(TransportError::new(
+                return Err(cdp_err(
                     TransportErrorKind::ProtocolMismatch,
                     "DOM.getDocument returned nodeId 0",
-                )));
+                ));
             }
             match self
                 .call_typed::<_, OuterHtmlReply>(
@@ -1897,22 +1825,18 @@ impl CdpSession {
                     continue;
                 }
                 RpcCallOutcome::RpcErr(err) => {
-                    let kind = if err.code == CDP_ERR_METHOD_NOT_FOUND {
-                        TransportErrorKind::ProtocolMismatch
-                    } else {
-                        TransportErrorKind::LoadError
-                    };
-                    return Err(anyhow::Error::new(TransportError::new(
-                        kind,
-                        format!("DOM.getOuterHTML failed ({}): {}", err.code, err.message),
-                    )));
+                    return Err(rpc_failure_err(
+                        "DOM.getOuterHTML",
+                        &err,
+                        TransportErrorKind::LoadError,
+                    ));
                 }
             }
         }
-        Err(anyhow::Error::new(TransportError::new(
+        Err(cdp_err(
             TransportErrorKind::LoadError,
             "DOM.getOuterHTML failed after retry",
-        )))
+        ))
     }
 
     async fn read_axtree(&mut self, max_bytes: usize) -> Result<String> {
@@ -1926,10 +1850,10 @@ impl CdpSession {
         {
             RpcCallOutcome::Ok(val) => {
                 let raw_json = serde_json::to_string(&val).map_err(|e| {
-                    anyhow::Error::new(TransportError::new(
+                    cdp_err(
                         TransportErrorKind::ProtocolMismatch,
                         format!("failed to serialize Accessibility.getFullAXTree payload: {e}"),
-                    ))
+                    )
                 })?;
                 crate::extract::axtree::format_axtree_from_cdp_json(&raw_json)
             }
@@ -1938,20 +1862,11 @@ impl CdpSession {
                     limit_bytes: max_bytes,
                 }))
             }
-            RpcCallOutcome::RpcErr(err) => {
-                let kind = if err.code == CDP_ERR_METHOD_NOT_FOUND {
-                    TransportErrorKind::ProtocolMismatch
-                } else {
-                    TransportErrorKind::LoadError
-                };
-                Err(anyhow::Error::new(TransportError::new(
-                    kind,
-                    format!(
-                        "Accessibility.getFullAXTree failed ({}): {}",
-                        err.code, err.message
-                    ),
-                )))
-            }
+            RpcCallOutcome::RpcErr(err) => Err(rpc_failure_err(
+                "Accessibility.getFullAXTree",
+                &err,
+                TransportErrorKind::LoadError,
+            )),
         }
     }
 

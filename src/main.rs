@@ -1234,25 +1234,20 @@ fn validate_secret_input(
     let result = match std::str::from_utf8(raw) {
         Ok(text) => {
             let trimmed = text.trim();
+            let allow_json_ws = provider == CredentialProvider::WebBotAuthJwk;
+            let has_disallowed_byte = trimmed.bytes().any(|b| {
+                !b.is_ascii()
+                    || (b.is_ascii_control()
+                        && !(allow_json_ws && matches!(b, b'\n' | b'\r' | b'\t')))
+            });
             if trimmed.is_empty() {
                 Err(CliError::invalid_input("credential cannot be empty"))
-            } else if provider == CredentialProvider::WebBotAuthJwk {
-                if trimmed.bytes().any(|b| {
-                    !b.is_ascii() || (b.is_ascii_control() && !matches!(b, b'\n' | b'\r' | b'\t'))
-                }) {
-                    Err(CliError::invalid_input(
-                        "credential must contain printable ASCII or JSON whitespace only",
-                    ))
+            } else if has_disallowed_byte {
+                Err(CliError::invalid_input(if allow_json_ws {
+                    "credential must contain printable ASCII or JSON whitespace only"
                 } else {
-                    Ok(SecretString::new(trimmed.to_string()))
-                }
-            } else if trimmed
-                .bytes()
-                .any(|b| !b.is_ascii() || b.is_ascii_control())
-            {
-                Err(CliError::invalid_input(
-                    "credential must be a single line of printable ASCII characters",
-                ))
+                    "credential must be a single line of printable ASCII characters"
+                }))
             } else {
                 Ok(SecretString::new(trimmed.to_string()))
             }

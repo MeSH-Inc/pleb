@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-use super::webmcp::is_bidi_control;
+use super::webmcp::is_stripped_control;
 
 const MAX_AX_DEPTH: usize = 512;
 
@@ -189,7 +189,7 @@ fn escape_ax_text(raw: &str) -> String {
             '\\' => out.push_str("\\\\"),
             '\r' => out.push_str("\\r"),
             '\n' => out.push_str("\\n"),
-            c if c < '\x20' || c == '\x7f' || is_bidi_control(c) => {}
+            c if is_stripped_control(c) => {}
             c => out.push(c),
         }
     }

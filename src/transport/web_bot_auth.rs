@@ -200,14 +200,7 @@ impl WebBotAuthSigner {
 }
 
 fn format_authority(url: &Url) -> Option<String> {
-    let host = match url.host()? {
-        url::Host::Domain(d) => d.to_ascii_lowercase(),
-        url::Host::Ipv4(ip) => ip.to_string(),
-        url::Host::Ipv6(ip) => format!("[{ip}]"),
-    };
-    if host.is_empty() {
-        return None;
-    }
+    let host = crate::policy::source::canonical_url_host(url).filter(|h| !h.is_empty())?;
     Some(match url.port() {
         Some(port) => format!("{host}:{port}"),
         None => host,

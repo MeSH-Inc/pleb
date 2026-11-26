@@ -1588,6 +1588,73 @@ async fn acquire_via_cdp(
     classify_cdp_result(ctx, host, url, start, res, escalated)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn classify_rendered_result(
+    ctx: &RuntimeContext,
+    host: &str,
+    requested_url: &str,
+    start: Instant,
+    strategy: &'static str,
+    final_url: String,
+    status_code: u16,
+    html: String,
+    content_type: Option<String>,
+    axtree_text: Option<String>,
+    imperative_tools: Vec<crate::extract::WebMcpToolDescriptor>,
+    escalated: bool,
+) -> std::result::Result<AcquiredPage, FetchError> {
+    if status_code == 0 {
+        return Err(FetchError::Transport(anyhow::anyhow!(
+            "{} render did not capture an HTTP status code for {final_url}",
+            strategy.to_ascii_uppercase()
+        )));
+    }
+
+    let mut parsed_html = None;
+    match classify_response_with_context(
+        status_code,
+        true,
+        Some(requested_url),
+        Some(&final_url),
+        &html,
+        &mut parsed_html,
+    ) {
+        ResponseClassification::Ok | ResponseClassification::JavaScriptShell { .. } => {
+            let timing_ms = start.elapsed().as_millis() as u64;
+            ctx.site_cache.record(host, strategy, timing_ms);
+            Ok(AcquiredPage {
+                body: html,
+                final_url,
+                extract_base_url: None,
+                status_code,
+                content_type,
+                strategy: strategy.to_string(),
+                escalated,
+                parsed: parsed_html,
+                axtree_text,
+                imperative_tools,
+            })
+        }
+        ResponseClassification::Blocked { status } => Err(FetchError::Blocked {
+            url: final_url,
+            status,
+            detail: format!(
+                "site blocked the request after {} render",
+                strategy.to_ascii_uppercase()
+            ),
+        }),
+        ResponseClassification::Challenge { status, reason } => Err(FetchError::Challenge {
+            url: final_url,
+            status,
+            reason,
+        }),
+        ResponseClassification::HttpError { status } => Err(FetchError::HttpError {
+            url: final_url,
+            status,
+        }),
+    }
+}
+
 fn classify_cdp_result(
     ctx: &RuntimeContext,
     host: &str,
@@ -1596,57 +1663,24 @@ fn classify_cdp_result(
     res: CdpRenderResult,
     escalated: bool,
 ) -> std::result::Result<AcquiredPage, FetchError> {
-    if res.status_code == 0 {
-        return Err(FetchError::Transport(anyhow::anyhow!(
-            "CDP render did not capture an HTTP status code for {}",
-            res.final_url
-        )));
-    }
-
-    let mut parsed_html = None;
-    match classify_response_with_context(
+    let content_type = res
+        .content_type
+        .filter(|c| extract::is_html_content_type(Some(c)))
+        .or_else(|| Some("text/html".to_string()));
+    classify_rendered_result(
+        ctx,
+        host,
+        requested_url,
+        start,
+        "cdp",
+        res.final_url,
         res.status_code,
-        true,
-        Some(requested_url),
-        Some(&res.final_url),
-        &res.html,
-        &mut parsed_html,
-    ) {
-        ResponseClassification::Ok | ResponseClassification::JavaScriptShell { .. } => {
-            let timing_ms = start.elapsed().as_millis() as u64;
-            ctx.site_cache.record(host, "cdp", timing_ms);
-            let content_type = res
-                .content_type
-                .filter(|c| extract::is_html_content_type(Some(c)))
-                .or_else(|| Some("text/html".to_string()));
-            Ok(AcquiredPage {
-                body: res.html,
-                final_url: res.final_url,
-                extract_base_url: None,
-                status_code: res.status_code,
-                content_type,
-                strategy: "cdp".to_string(),
-                escalated,
-                parsed: parsed_html,
-                axtree_text: res.axtree_text,
-                imperative_tools: res.imperative_tools,
-            })
-        }
-        ResponseClassification::Blocked { status } => Err(FetchError::Blocked {
-            url: res.final_url,
-            status,
-            detail: "site blocked the request after CDP render".to_string(),
-        }),
-        ResponseClassification::Challenge { status, reason } => Err(FetchError::Challenge {
-            url: res.final_url,
-            status,
-            reason,
-        }),
-        ResponseClassification::HttpError { status } => Err(FetchError::HttpError {
-            url: res.final_url,
-            status,
-        }),
-    }
+        res.html,
+        content_type,
+        res.axtree_text,
+        res.imperative_tools,
+        escalated,
+    )
 }
 
 fn challenge_error_from_cdp(result: CdpRenderResult, reason: String) -> FetchError {
@@ -1685,53 +1719,20 @@ fn classify_cef_result(
     res: CefRenderResult,
     escalated: bool,
 ) -> std::result::Result<AcquiredPage, FetchError> {
-    if res.status_code == 0 {
-        return Err(FetchError::Transport(anyhow::anyhow!(
-            "CEF render did not capture an HTTP status code for {}",
-            res.final_url
-        )));
-    }
-
-    let mut parsed_html = None;
-    match classify_response_with_context(
+    classify_rendered_result(
+        ctx,
+        host,
+        requested_url,
+        start,
+        "cef",
+        res.final_url,
         res.status_code,
-        true,
-        Some(requested_url),
-        Some(&res.final_url),
-        &res.html,
-        &mut parsed_html,
-    ) {
-        ResponseClassification::Ok | ResponseClassification::JavaScriptShell { .. } => {
-            let timing_ms = start.elapsed().as_millis() as u64;
-            ctx.site_cache.record(host, "cef", timing_ms);
-            Ok(AcquiredPage {
-                body: res.html,
-                final_url: res.final_url,
-                extract_base_url: None,
-                status_code: res.status_code,
-                content_type: Some("text/html".to_string()),
-                strategy: "cef".to_string(),
-                escalated,
-                parsed: parsed_html,
-                axtree_text: None,
-                imperative_tools: Vec::new(),
-            })
-        }
-        ResponseClassification::Blocked { status } => Err(FetchError::Blocked {
-            url: res.final_url,
-            status,
-            detail: "site blocked the request after CEF render".to_string(),
-        }),
-        ResponseClassification::Challenge { status, reason } => Err(FetchError::Challenge {
-            url: res.final_url,
-            status,
-            reason,
-        }),
-        ResponseClassification::HttpError { status } => Err(FetchError::HttpError {
-            url: res.final_url,
-            status,
-        }),
-    }
+        res.html,
+        Some("text/html".to_string()),
+        None,
+        Vec::new(),
+        escalated,
+    )
 }
 
 async fn render_cef_checked(
