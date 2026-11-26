@@ -761,3 +761,96 @@ async fn daemon_restarts_automatically_on_protocol_version_mismatch() {
     let _ = mock_task.await;
     let _ = daemon_stop(dir.path()).await;
 }
+
+#[tokio::test]
+async fn adversarial_accept_markdown_no_sticky_leak_and_absent_link_is_none() {
+    use mesh_wick::transport::{TransportClient, MARKDOWN_ACCEPT_HEADER};
+
+    let base = spawn_link_and_accept_server().await;
+
+    // Direct client: accept_markdown=true followed by accept_markdown=false must restore Chrome Accept
+    let direct_dir = TempStateDir::new();
+    let direct = TransportClient::new_direct(direct_dir.path(), None, Duration::from_secs(5))
+        .expect("direct transport should initialize");
+
+    let first = direct
+        .get_with_options(
+            &format!("{base}/echo-accept"),
+            Duration::from_secs(5),
+            64 * 1024,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.link_header, None);
+    assert!(first
+        .text()
+        .contains(&format!("accept={MARKDOWN_ACCEPT_HEADER}")));
+
+    let second = direct
+        .get_with_options(
+            &format!("{base}/echo-accept"),
+            Duration::from_secs(5),
+            64 * 1024,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.link_header, None);
+    let second_text = second.text();
+    assert!(
+        second_text.contains("accept=text/html,application/xhtml+xml")
+            && !second_text.contains("text/markdown"),
+        "accept_markdown leaked into subsequent direct request: {second_text}"
+    );
+
+    // Daemon client: same non-sticky invariant across pooled daemon.sock slot
+    let daemon_dir = TempStateDir::new();
+    let daemon_dir_clone = daemon_dir.to_path_buf();
+    let handle =
+        tokio::spawn(
+            async move { run_daemon(daemon_dir_clone, Duration::from_secs(30), false).await },
+        );
+    let _ = wait_for_ping(daemon_dir.path()).await;
+
+    let daemon_client = TransportClient::new_daemon(
+        daemon_dir.to_path_buf(),
+        None,
+        Duration::from_secs(5),
+        Duration::from_secs(30),
+        false,
+    );
+    let d1 = daemon_client
+        .get_with_options(
+            &format!("{base}/echo-accept"),
+            Duration::from_secs(5),
+            64 * 1024,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(d1.link_header, None);
+    assert!(d1
+        .text()
+        .contains(&format!("accept={MARKDOWN_ACCEPT_HEADER}")));
+
+    let d2 = daemon_client
+        .get_with_options(
+            &format!("{base}/echo-accept"),
+            Duration::from_secs(5),
+            64 * 1024,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(d2.link_header, None);
+    let d2_text = d2.text();
+    assert!(
+        d2_text.contains("accept=text/html,application/xhtml+xml")
+            && !d2_text.contains("text/markdown"),
+        "accept_markdown leaked into subsequent daemon request: {d2_text}"
+    );
+
+    assert!(daemon_stop(daemon_dir.path()).await.unwrap());
+    let _ = handle.await;
+}
