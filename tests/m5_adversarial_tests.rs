@@ -4,8 +4,11 @@ use mesh_wick::auth::{
 };
 use mesh_wick::context::clear_state_dir;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 static ADV_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -208,4 +211,102 @@ fn adversarial_session_clear_preserves_credentials_and_lock_files() {
         .unwrap()
         .expect("credential must still resolve after clear");
     assert_eq!(resolved.value.as_str(), "tavily-survives-clear");
+}
+
+#[tokio::test]
+async fn adversarial_cli_zero_secret_leakage_in_json_and_verbose_logs() {
+    let wick_bin = env!("CARGO_BIN_EXE_wick");
+    let state_dir = TempStateDir::new();
+
+    let brave_secret = "BSA-adversarial-top-secret-918273645";
+    let tavily_secret = "tvly-adversarial-secret-5544332211";
+    let searxng_url = "http://127.0.0.1:19999";
+
+    // 1. Positional secret argument must be rejected by clap (exit 2).
+    let positional = Command::new(wick_bin)
+        .env("WICK_NO_KEYCHAIN", "1")
+        .env("WICK_NO_HOME_CEF", "1")
+        .args(["--state-dir"])
+        .arg(&state_dir.path)
+        .args(["auth", "set", "brave", brave_secret])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(positional.status.code(), Some(2));
+
+    // 2. `wick status --json --verbose` and `wick auth status --json --verbose` must never leak
+    //    configured secrets, prefixes, or SEARXNG_URL on stdout or stderr.
+    for args in [
+        vec!["--verbose", "--json", "status"],
+        vec!["--verbose", "auth", "status", "--json"],
+    ] {
+        let out = Command::new(wick_bin)
+            .env("WICK_NO_KEYCHAIN", "1")
+            .env("WICK_NO_HOME_CEF", "1")
+            .env("BRAVE_API_KEY", brave_secret)
+            .env("TAVILY_API_KEY", tavily_secret)
+            .env("SEARXNG_URL", searxng_url)
+            .env_remove("SERPER_API_KEY")
+            .env_remove("EXA_API_KEY")
+            .args(["--state-dir"])
+            .arg(&state_dir.path)
+            .args(&args)
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "args={args:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        for forbidden in [
+            brave_secret,
+            "918273645",
+            tavily_secret,
+            "5544332211",
+            searxng_url,
+            "19999",
+        ] {
+            assert!(
+                !stdout.contains(forbidden),
+                "leaked {forbidden} on stdout for {args:?}"
+            );
+            assert!(
+                !stderr.contains(forbidden),
+                "leaked {forbidden} on stderr for {args:?}"
+            );
+        }
+    }
+
+    // 3. Rejected `--stdin` input with `--verbose --json` must not echo any part of the rejected secret.
+    let bad_secret = "secret-with-\x07-control-byte-998877";
+    let mut child = Command::new(wick_bin)
+        .env("WICK_NO_KEYCHAIN", "1")
+        .env("WICK_NO_HOME_CEF", "1")
+        .args(["--state-dir"])
+        .arg(&state_dir.path)
+        .args([
+            "--verbose",
+            "--json",
+            "auth",
+            "set",
+            "brave",
+            "--stdin",
+            "--storage",
+            "file",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(bad_secret.as_bytes())
+        .await
+        .unwrap();
+    let out = child.wait_with_output().await.unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("998877"));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("998877"));
 }
