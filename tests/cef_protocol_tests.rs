@@ -353,3 +353,37 @@ int main(void) {
         .expect("failed to execute C protocol harness");
     assert!(run.success(), "C protocol harness assertions failed");
 }
+
+#[test]
+fn adversarial_explicit_missing_renderer_override_does_not_fallback_to_state_dir() {
+    let dir = TempStateDir::new();
+    let cef_dir = dir.path().join("cef");
+    fs::create_dir_all(&cef_dir).unwrap();
+    let state_renderer = cef_dir.join("wick-renderer");
+    fs::write(
+        &state_renderer,
+        b"#!/bin/sh\n# WICK_RENDERER_PROTOCOL=v4-meta\n",
+    )
+    .unwrap();
+
+    // Nonexistent explicit override must NOT silently fall back to state_dir/cef/wick-renderer.
+    let missing = dir.path().join("does-not-exist-renderer");
+    assert!(
+        mesh_wick::transport::cef::find_renderer_with_override(dir.path(), Some(&missing))
+            .is_none(),
+        "explicit missing renderer override must not fall back to state_dir"
+    );
+    assert!(matches!(
+        mesh_wick::transport::cef::probe_renderer_with_override(dir.path(), Some(&missing)),
+        RendererProbe::NotInstalled
+    ));
+
+    // Empty path override falls through cleanly to state_dir/cef/wick-renderer.
+    assert_eq!(
+        mesh_wick::transport::cef::find_renderer_with_override(
+            dir.path(),
+            Some(std::path::Path::new(""))
+        ),
+        Some(state_renderer)
+    );
+}
