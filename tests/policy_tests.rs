@@ -200,3 +200,23 @@ fn response_classifier_covers_challenges_js_shells_and_normal_pages() {
     );
     assert!(parsed.is_some());
 }
+
+#[cfg(unix)]
+#[test]
+fn site_cache_file_has_private_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_dir("cache-perms");
+    let cache_path = dir.join("site-cache.json");
+    let cache = SiteCache::load(cache_path.clone());
+    cache.record_at("example.com", "cronet", 42, 1_000_000);
+
+    let mode = std::fs::metadata(&cache_path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
+
+    let _ = std::fs::remove_dir_all(dir);
+}

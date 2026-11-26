@@ -37,8 +37,27 @@ pub fn default_state_dir() -> PathBuf {
             return path;
         }
     }
-    let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-    PathBuf::from(home).join(".mesh-wick")
+    if let Some(home) = std::env::var_os("HOME") {
+        let path = PathBuf::from(home);
+        if !path.as_os_str().is_empty() {
+            return path.join(".mesh-wick");
+        }
+    }
+    let user = std::env::var("USER")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| std::process::id().to_string());
+    std::env::temp_dir().join(format!("mesh-wick-{user}"))
+}
+
+pub fn ensure_private_dir(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 pub struct RuntimeContext {
@@ -52,6 +71,7 @@ pub struct RuntimeContext {
 
 impl RuntimeContext {
     pub fn new(config: RuntimeConfig) -> Result<Self> {
+        ensure_private_dir(&config.state_dir)?;
         let storage_path = config.state_dir.join("data");
         let client = TransportClient::new(
             &storage_path,
@@ -81,11 +101,12 @@ impl RuntimeContext {
 }
 
 pub fn clear_state_dir(state_dir: &Path) -> Result<()> {
+    ensure_private_dir(state_dir)?;
     let data_dir = state_dir.join("data");
     if data_dir.exists() {
         std::fs::remove_dir_all(&data_dir)?;
     }
-    std::fs::create_dir_all(&data_dir)?;
+    ensure_private_dir(&data_dir)?;
     let cef_cache_dir = state_dir.join("cef-cache");
     if cef_cache_dir.exists() {
         std::fs::remove_dir_all(&cef_cache_dir)?;

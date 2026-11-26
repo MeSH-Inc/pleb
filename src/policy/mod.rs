@@ -204,7 +204,26 @@ fn save_atomic(path: &Path, entries: &HashMap<String, SiteCacheEntry>) -> std::i
         .and_then(|n| n.to_str())
         .unwrap_or("site-cache.json");
     let tmp = path.with_file_name(format!("{}.tmp.{}", file_name, std::process::id()));
-    std::fs::write(&tmp, data.as_bytes())?;
+
+    let write_res = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp)?;
+        file.write_all(data.as_bytes())?;
+        file.flush()?;
+        Ok(())
+    })();
+    if let Err(err) = write_res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+
     if let Err(err) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(err);
@@ -311,7 +330,8 @@ pub fn classify_response_with_parsed(
     parsed: &mut Option<dom::ParsedHtml>,
 ) -> ResponseClassification {
     if status == 403 || status == 503 {
-        if let Some(reason) = detect_challenge(body) {
+        let lower = body.to_ascii_lowercase();
+        if let Some(reason) = detect_challenge_lower(&lower) {
             return ResponseClassification::Challenge { status, reason };
         }
         return ResponseClassification::Blocked { status };
@@ -322,10 +342,11 @@ pub fn classify_response_with_parsed(
     }
 
     if is_html {
-        if let Some(reason) = detect_interstitial_challenge(body) {
+        let lower = body.to_ascii_lowercase();
+        if let Some(reason) = detect_interstitial_challenge_lower(&lower, body.len()) {
             return ResponseClassification::Challenge { status, reason };
         }
-        if let Some(reason) = detect_js_shell_with_parsed(body, parsed) {
+        if let Some(reason) = detect_js_shell_with_parsed_lower(body, &lower, parsed) {
             return ResponseClassification::JavaScriptShell { reason };
         }
     }
@@ -334,7 +355,10 @@ pub fn classify_response_with_parsed(
 }
 
 pub fn detect_challenge(body: &str) -> Option<String> {
-    let lower = body.to_ascii_lowercase();
+    detect_challenge_lower(&body.to_ascii_lowercase())
+}
+
+fn detect_challenge_lower(lower: &str) -> Option<String> {
     let signals = [
         ("challenges.cloudflare.com", "Cloudflare Turnstile/challenge"),
         ("cf-browser-verification", "Cloudflare browser verification"),
@@ -355,7 +379,10 @@ pub fn detect_challenge(body: &str) -> Option<String> {
 }
 
 pub fn detect_interstitial_challenge(body: &str) -> Option<String> {
-    let lower = body.to_ascii_lowercase();
+    detect_interstitial_challenge_lower(&body.to_ascii_lowercase(), body.len())
+}
+
+fn detect_interstitial_challenge_lower(lower: &str, body_len: usize) -> Option<String> {
     if lower.contains("just a moment")
         && (lower.contains("performing security verification")
             || lower.contains("checking your browser")
@@ -363,7 +390,7 @@ pub fn detect_interstitial_challenge(body: &str) -> Option<String> {
     {
         return Some("Cloudflare challenge interstitial".to_string());
     }
-    if lower.contains("captcha-delivery.com") && body.len() < 50_000 {
+    if lower.contains("captcha-delivery.com") && body_len < 50_000 {
         return Some("DataDome interstitial".to_string());
     }
     None
@@ -371,18 +398,19 @@ pub fn detect_interstitial_challenge(body: &str) -> Option<String> {
 
 pub fn detect_js_shell(body: &str) -> Option<String> {
     let mut parsed = None;
-    detect_js_shell_with_parsed(body, &mut parsed)
+    let lower = body.to_ascii_lowercase();
+    detect_js_shell_with_parsed_lower(body, &lower, &mut parsed)
 }
 
-fn detect_js_shell_with_parsed(
+fn detect_js_shell_with_parsed_lower(
     body: &str,
+    lower: &str,
     parsed: &mut Option<dom::ParsedHtml>,
 ) -> Option<String> {
     if body.len() > 2_000_000 {
         return None;
     }
 
-    let lower = body.to_ascii_lowercase();
     const SIGNALS: &[&str] = &[
         "javascript is not available",
         "we've detected that javascript is disabled",

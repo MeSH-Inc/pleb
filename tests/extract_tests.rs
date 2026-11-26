@@ -344,3 +344,10 @@ fn binary_detection_handles_mimes_magic_svg_and_latin1() {
     assert!(detect_binary_content(Some("image/svg+xml"), b"<svg></svg>").is_none());
     assert!(detect_binary_content(Some("text/html; charset=iso-8859-1"), b"<p>Caf\xe9</p>").is_none());
 }
+
+#[test]
+fn table_compaction_handles_backslash_before_multibyte_utf8() {
+    let md = "| a\\é | b\\|c |\n| --- | --- |\n| 1 | 2\\ |";
+    let compacted = compact_markdown(md);
+    assert_eq!(compacted, "| a\\é | b\\|c |\n| --- | --- |\n| 1 | 2\\ |");
+}

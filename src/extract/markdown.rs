@@ -372,18 +372,20 @@ fn compact_table_row(line: &str) -> Option<String> {
 fn split_table_cells(inner: &str) -> Vec<&str> {
     let mut cells = Vec::new();
     let mut start = 0usize;
-    let bytes = inner.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' {
-            i += 2;
+    let mut escaped = false;
+    for (idx, ch) in inner.char_indices() {
+        if escaped {
+            escaped = false;
             continue;
         }
-        if bytes[i] == b'|' {
-            cells.push(&inner[start..i]);
-            start = i + 1;
+        match ch {
+            '\\' => escaped = true,
+            '|' => {
+                cells.push(&inner[start..idx]);
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
         }
-        i += 1;
     }
     cells.push(&inner[start..]);
     cells

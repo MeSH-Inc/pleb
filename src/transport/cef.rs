@@ -253,40 +253,27 @@ impl CefRenderer {
             }
             Ok(Ok((_, _, Err(e)))) => {
                 drop(kill_guard);
-                let tail = read_stderr_tail(&stderr_tail);
-                if tail.is_empty() {
-                    Err(e)
-                } else {
-                    Err(anyhow::anyhow!("{}\nRenderer stderr:\n{}", e, tail))
-                }
+                Err(anyhow::anyhow!(append_stderr_tail(e.to_string(), &stderr_tail)))
             }
             Ok(Err(_)) => {
                 drop(kill_guard);
-                let tail = read_stderr_tail(&stderr_tail);
-                if tail.is_empty() {
-                    bail!(
-                        "CEF renderer I/O worker terminated unexpectedly for {}",
-                        url_for_err
+                bail!(
+                    "{}",
+                    append_stderr_tail(
+                        format!(
+                            "CEF renderer I/O worker terminated unexpectedly for {}",
+                            url_for_err
+                        ),
+                        &stderr_tail,
                     )
-                } else {
-                    bail!(
-                        "CEF renderer I/O worker terminated unexpectedly for {}\nRenderer stderr:\n{}",
-                        url_for_err,
-                        tail
-                    )
-                }
+                )
             }
             Err(_) => {
                 drop(kill_guard);
-                let tail = read_stderr_tail(&stderr_tail);
-                let msg = if tail.is_empty() {
-                    format!("CEF render timed out after {:?} for {}", timeout, url_for_err)
-                } else {
-                    format!(
-                        "CEF render timed out after {:?} for {}\nRenderer stderr:\n{}",
-                        timeout, url_for_err, tail
-                    )
-                };
+                let msg = append_stderr_tail(
+                    format!("CEF render timed out after {:?} for {}", timeout, url_for_err),
+                    &stderr_tail,
+                );
                 Err(anyhow::Error::new(CefTimeoutError(msg)))
             }
         }
@@ -346,7 +333,7 @@ impl CefRenderer {
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .spawn();
-                std::thread::sleep(Duration::from_secs(1));
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
             cmd.env("DISPLAY", ":99");
         }
@@ -418,36 +405,24 @@ impl CefRenderer {
             }
             Ok(Ok((_, Err(e)))) => {
                 drop(kill_guard);
-                let tail = read_stderr_tail(&stderr_tail);
-                if tail.is_empty() {
-                    Err(e)
-                } else {
-                    Err(anyhow::anyhow!("{}\nRenderer stderr:\n{}", e, tail))
-                }
+                Err(anyhow::anyhow!(append_stderr_tail(e.to_string(), &stderr_tail)))
             }
             Ok(Err(_)) => {
                 drop(kill_guard);
-                let tail = read_stderr_tail(&stderr_tail);
-                if tail.is_empty() {
-                    bail!("CEF renderer exited before ready handshake")
-                } else {
-                    bail!(
-                        "CEF renderer exited before ready handshake\nRenderer stderr:\n{}",
-                        tail
+                bail!(
+                    "{}",
+                    append_stderr_tail(
+                        "CEF renderer exited before ready handshake".to_string(),
+                        &stderr_tail,
                     )
-                }
+                )
             }
             Err(_) => {
                 drop(kill_guard);
-                let tail = read_stderr_tail(&stderr_tail);
-                let msg = if tail.is_empty() {
-                    format!("CEF renderer ready handshake timed out after {:?}", timeout)
-                } else {
-                    format!(
-                        "CEF renderer ready handshake timed out after {:?}\nRenderer stderr:\n{}",
-                        timeout, tail
-                    )
-                };
+                let msg = append_stderr_tail(
+                    format!("CEF renderer ready handshake timed out after {:?}", timeout),
+                    &stderr_tail,
+                );
                 Err(anyhow::Error::new(CefTimeoutError(msg)))
             }
         }
@@ -457,6 +432,18 @@ impl CefRenderer {
 impl Drop for CefRenderer {
     fn drop(&mut self) {
         if let Some(mut proc) = self.daemon.get_mut().take() {
+            // Close stdin first so wick-renderer observes EOF and runs cef_shutdown().
+            drop(proc.stdin);
+            let deadline = Instant::now() + Duration::from_millis(300);
+            loop {
+                match proc.child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    _ => break,
+                }
+            }
             let _ = proc.child.kill();
             let _ = proc.child.wait();
         }
@@ -591,10 +578,16 @@ fn spawn_stderr_drain(
         });
 }
 
-fn read_stderr_tail(tail: &Arc<Mutex<Vec<u8>>>) -> String {
-    tail.lock()
+fn append_stderr_tail(msg: String, tail: &Arc<Mutex<Vec<u8>>>) -> String {
+    let stderr = tail
+        .lock()
         .map(|buf| String::from_utf8_lossy(&buf).trim().to_string())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if stderr.is_empty() {
+        msg
+    } else {
+        format!("{}\nRenderer stderr:\n{}", msg, stderr)
+    }
 }
 
 pub fn rebuild_command_hint() -> &'static str {

@@ -231,3 +231,40 @@ async fn fetch_pipeline_end_to_end_against_local_server() {
 
     let _ = std::fs::remove_dir_all(state_dir);
 }
+
+#[tokio::test]
+async fn fetch_concurrent_requests_and_clean_teardown() {
+    let base = spawn_mock_server().await;
+    let state_dir = temp_state_dir("concurrent");
+    let ctx = RuntimeContext::new(RuntimeConfig {
+        state_dir: state_dir.clone(),
+        timeout: Duration::from_secs(5),
+        cef_timeout: Duration::from_secs(5),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let opts = FetchOptions {
+        render: RenderMode::Cronet,
+        ..Default::default()
+    };
+
+    let u1 = format!("{base}/page");
+    let u2 = format!("{base}/data.json");
+    let u3 = format!("{base}/redirect");
+    let u4 = format!("{base}/logo.svg");
+    let (r1, r2, r3, r4) = tokio::join!(
+        fetch_document(&ctx, &u1, &opts),
+        fetch_document(&ctx, &u2, &opts),
+        fetch_document(&ctx, &u3, &opts),
+        fetch_document(&ctx, &u4, &opts),
+    );
+
+    assert_eq!(r1.unwrap().status_code, 200);
+    assert_eq!(r2.unwrap().content, r#"{"ok":true,"count":42}"#);
+    assert!(r3.unwrap().final_url.ends_with("/docs/sub/entry"));
+    assert!(r4.unwrap().content.contains("<svg"));
+
+    drop(ctx);
+    let _ = std::fs::remove_dir_all(state_dir);
+}

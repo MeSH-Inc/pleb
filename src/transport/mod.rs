@@ -12,6 +12,7 @@ use std::time::Duration;
 
 const CHROME_MAJOR: &str = "143";
 const CHROME_FULL: &str = "143.0.7499.109";
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
@@ -85,7 +86,10 @@ impl TransportClient {
         #[cfg(feature = "cronet")]
         {
             let headers = chrome_header_pairs();
-            let resp = self.engine.get(url, &headers).await?;
+            let resp = self
+                .engine
+                .get(url, &headers, DEFAULT_MAX_RESPONSE_BYTES)
+                .await?;
             Ok(HttpResponse {
                 status: resp.status_code,
                 final_url: resp.final_url,
@@ -95,7 +99,7 @@ impl TransportClient {
         }
         #[cfg(not(feature = "cronet"))]
         {
-            let resp = self.inner.get(url).send().await?;
+            let mut resp = self.inner.get(url).send().await?;
             let final_url = resp.url().to_string();
             let status = resp.status().as_u16();
             let content_type = resp
@@ -103,7 +107,16 @@ impl TransportClient {
                 .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
-            let body = resp.bytes().await?.to_vec();
+            let mut body = Vec::new();
+            while let Some(chunk) = resp.chunk().await? {
+                if body.len().saturating_add(chunk.len()) > DEFAULT_MAX_RESPONSE_BYTES {
+                    anyhow::bail!(
+                        "response body exceeded {} byte limit",
+                        DEFAULT_MAX_RESPONSE_BYTES
+                    );
+                }
+                body.extend_from_slice(&chunk);
+            }
             Ok(HttpResponse {
                 status,
                 final_url,

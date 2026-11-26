@@ -73,7 +73,7 @@ fn lock_path(state_dir: &Path) -> PathBuf {
 }
 
 pub async fn run_daemon(state_dir: PathBuf, idle_timeout: Duration, verbose: bool) -> Result<()> {
-    std::fs::create_dir_all(&state_dir)?;
+    crate::context::ensure_private_dir(&state_dir)?;
 
     let lp = lock_path(&state_dir);
     let lock_file = OpenOptions::new()
