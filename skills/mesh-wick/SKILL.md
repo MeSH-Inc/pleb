@@ -32,7 +32,8 @@ Expected markers: `"cronet_enabled": true`, `"cef_renderer": { "expected_protoco
    - Skips `robots.txt` by default on single-URL fetches (pass `--respect-robots` to enforce).
    - **Structured source resolution (`--source auto`):** automatically rewrites GitHub `/blob/`, GitLab `/-/blob/`, and Gist URLs to lossless raw source (`strategy: "raw_source"`, with automatic HTML fallback on `404`/binary), and follows RFC 8288 `Link` / HTML `<link rel="alternate" type="text/markdown">` mirrors (`strategy: "markdown_mirror"`).
    - **First-class non-HTML extraction:** handles native `text/markdown` (YAML frontmatter `title` + relative link resolution + fence-safe truncation), RSS 2.0 / Atom 1.0 / JSON Feed 1.1 digests, and WebVTT (`.vtt`) / SubRip (`.srt`) transcripts.
-   - **Automatic CEF escalation:** escalates `403`/`503` blocks and unhydrated JS/SvelteKit/React SPA shells to the warm `v5-meta` offscreen Chromium renderer.
+   - **Transport & redirect SSRF guard:** both Cronet (Chromium 154) and `reqwest` block `3xx` redirects to non-HTTP(S) schemes or private/loopback/IMDS hosts from public origins (`redirect_blocked` transport error).
+   - **Automatic CEF escalation:** escalates `403`/`503` blocks and unhydrated JS/SvelteKit/React SPA shells to the warm `v5-meta` offscreen Chromium renderer. Active bot challenges fail fast (exit `2`) without CEF retries.
 2. **Documentation Markdown negotiation (`--source negotiate`):**
    ```bash
    wick fetch --source negotiate <url>
@@ -114,5 +115,5 @@ Expected markers: `"cronet_enabled": true`, `"cef_renderer": { "expected_protoco
 
 - **State directory (`MESH_WICK_HOME` / `--state-dir`, default `~/.mesh-wick`, `0o700`):** holds `data/`, `cef-cache/`, `artifacts/`, `daemon.sock`, `daemon.log`, `site-cache.json`, `search-state.json`, `credentials.json` (`0o600`), and optional local `site-rules.json`.
 - **Daemon controls:** auto-starts `daemon.sock` (idle exit `--daemon-idle-timeout` / `MESH_WICK_DAEMON_IDLE_SECONDS`, default `300`; bypass via `--no-daemon` / `MESH_WICK_NO_DAEMON`). Manage with `wick daemon status`, `wick daemon stop`, and `wick session clear` (stops daemon and clears `data/`, `cef-cache/`, `artifacts/`, `site-cache.json`, and `search-state.json` while preserving `credentials.json` and Keychain items).
-- **CEF `v5-meta` installer & overrides:** rebuild via `bash ~/apps/mesh-wick/scripts/install-cef-mac.sh --force` (supports `--prefix <dir>`). Override binaries in tests/scripts with `WICK_CEF_RENDERER`, `WICK_DAEMON_EXECUTABLE`, and `WICK_NO_HOME_CEF=1`.
+- **CEF `v5-meta` installer & overrides:** rebuild via `bash ~/apps/mesh-wick/scripts/install-cef-mac.sh --force` (macOS arm64) or `bash ~/apps/mesh-wick/scripts/install-cef-linux.sh --force` (Linux `x86_64` / `aarch64`, runs natively under Ozone headless without Xvfb when `DISPLAY` is unset or empty; both support `--prefix <dir>`). Override binaries in tests/scripts with `WICK_CEF_RENDERER`, `WICK_DAEMON_EXECUTABLE`, and `WICK_NO_HOME_CEF=1`.
 - **Emit this exact version-locked skill from any machine with `wick` installed:** `wick skill print`.

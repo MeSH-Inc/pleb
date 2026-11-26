@@ -6,7 +6,7 @@ By default, `wick` makes HTTP requests using Chrome's network stack (Cronet) or 
 
 ## Capabilities
 
-- **Browser-grade transport and rendering**: Sends requests over Cronet (or `reqwest`) through a shared local Unix-socket daemon, and escalates unhydrated JavaScript pages or `403`/`503` responses to an optional local CEF renderer. Active bot challenges fail fast without CAPTCHA solving or bypass scripts. See [Transport and Rendering](README-FULL.md#transport-and-rendering).
+- **Browser-grade transport and rendering**: Sends requests over Cronet (or `reqwest`) with redirect-time SSRF protection through a shared local Unix-socket daemon, and escalates unhydrated JavaScript pages or `403`/`503` responses to an optional local CEF renderer (native Ozone headless on Linux without Xvfb). Active bot challenges fail fast without CAPTCHA solving or bypass scripts. See [Transport and Rendering](README-FULL.md#transport-and-rendering).
 - **Deterministic HTML cleanup and source bypass**: Removes navigation, hidden nodes, cookie banners, tracking parameters, and code-gutter tables while rescuing formulas, code blocks, SVG diagram labels, and responsive images. Automatically uses raw files for GitHub/GitLab/Gist URLs, advertised Markdown mirrors, RSS/Atom/JSON feeds, YouTube captions, and WebVTT/SRT transcripts. See [Extraction and Source Negotiation](README-FULL.md#extraction-and-source-negotiation).
 - **On-demand asset staging**: Indexes diagrams, transcripts, PDFs, datasets, and schemas during the initial parse without making extra requests, and downloads selected assets into a local cache only when requested. See [Resource Indexing and Staging](README-FULL.md#resource-indexing-and-staging).
 - **Multi-provider search and local credentials**: Routes search queries across Brave, Tavily, Serper, Exa, SearXNG, or DuckDuckGo with cooldown tracking, burst pacing, Reciprocal Rank Fusion, and local credential storage (`wick auth`). See [Search and Credentials](README-FULL.md#search-and-credentials).
@@ -32,7 +32,7 @@ cargo build --release
 Optional components:
 
 ```bash
-# Install the local offscreen CEF renderer (macOS arm64; use install-cef-linux.sh on Linux)
+# Install the local offscreen CEF renderer (macOS arm64; use install-cef-linux.sh on Linux x86_64/aarch64)
 bash scripts/install-cef-mac.sh --force
 
 # Symlink the bundled agent skill into local agent directories
