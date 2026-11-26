@@ -1467,3 +1467,133 @@ async fn source_negotiation_follows_http_link_html_alternate_and_accept_markdown
     assert_ne!(bin_fallback.strategy, "markdown_mirror");
     assert!(bin_fallback.content.contains("Safe HTML fallback."));
 }
+
+#[tokio::test]
+async fn adversarial_source_mirror_404_binary_fallback_ssrf_and_forge_binary_skip() {
+    // 1. Forge raw-source resolver skips binary extensions & non-gist paths, resolves GitLab nested groups & Dockerfile.
+    for skipped in [
+        "https://github.com/org/repo/blob/main/assets/logo.png",
+        "https://github.com/org/repo/blob/main/dist/archive.zip",
+        "https://gitlab.com/group/sub/proj/-/blob/main/paper.pdf",
+        "https://gist.github.com/user/abcd1234/revisions",
+        "https://gist.github.com/user/short",
+    ] {
+        let u = url::Url::parse(skipped).unwrap();
+        assert!(
+            resolve_raw_source_candidate(&u).is_none(),
+            "expected {skipped} to be skipped"
+        );
+    }
+    let gl = url::Url::parse("https://gitlab.com/a/b/proj/-/blob/main/Dockerfile").unwrap();
+    let gl_cand = resolve_raw_source_candidate(&gl).unwrap();
+    assert_eq!(
+        gl_cand.raw_url.as_str(),
+        "https://gitlab.com/a/b/proj/-/raw/main/Dockerfile"
+    );
+    assert_eq!(
+        gl_cand.kind,
+        RawSourceKind::Code {
+            language: Some("dockerfile")
+        }
+    );
+
+    // 2. RFC 8288 Link header SSRF / cross-origin / HTTPS downgrade rejection.
+    let public_base = url::Url::parse("https://docs.example.com/api/ref").unwrap();
+    for bad_link in [
+        r#"<http://127.0.0.1/secret.md>; rel="alternate"; type="text/markdown""#,
+        r#"<https://169.254.169.254/latest/meta-data/>; rel="alternate"; type="text/markdown""#,
+        r#"<https://[::1]/secret.md>; rel="alternate"; type="text/markdown""#,
+        r#"<http://docs.example.com/api/ref.md>; rel="alternate"; type="text/markdown""#,
+        r#"<https://evil.example.org/api/ref.md>; rel="alternate"; type="text/markdown""#,
+    ] {
+        assert!(
+            parse_markdown_link_header(bad_link, &public_base).is_none(),
+            "expected Link header {bad_link} to be rejected"
+        );
+    }
+
+    // 3. End-to-end loopback: 404 or binary PNG mirror transparently falls back to original HTML.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let resp: Vec<u8> = match path {
+                    "/broken-mirror" => {
+                        let body = b"<html><head><title>Fallback Page</title></head><body><main><p>Original HTML survives 404 mirror.</p></main></body></html>";
+                        let hdr = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nLink: </does-not-exist.md>; rel=\"alternate\"; type=\"text/markdown\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let mut out = hdr.into_bytes();
+                        out.extend_from_slice(body);
+                        out
+                    }
+                    "/binary-mirror" => {
+                        let body = b"<html><head><title>Binary Mirror Fallback</title></head><body><main><p>Original HTML survives binary mirror.</p></main></body></html>";
+                        let hdr = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nLink: </png-as-md.md>; rel=\"alternate\"; type=\"text/markdown\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let mut out = hdr.into_bytes();
+                        out.extend_from_slice(body);
+                        out
+                    }
+                    "/png-as-md.md" => http_response(
+                        "200 OK",
+                        "text/markdown; charset=utf-8",
+                        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR",
+                    ),
+                    _ => http_response("404 Not Found", "text/plain", b"not found"),
+                };
+                let _ = socket.write_all(&resp).await;
+            });
+        }
+    });
+
+    let state_dir = temp_state_dir();
+    let ctx = RuntimeContext::new(RuntimeConfig {
+        state_dir: state_dir.path().to_path_buf(),
+        timeout: Duration::from_secs(5),
+        cef_timeout: Duration::from_secs(5),
+        use_daemon: false,
+        ..Default::default()
+    })
+    .unwrap();
+    let opts = FetchOptions {
+        render: RenderMode::Cronet,
+        source: SourceMode::Auto,
+        ..Default::default()
+    };
+
+    let res404 = fetch_document(&ctx, &format!("{base}/broken-mirror"), &opts)
+        .await
+        .unwrap();
+    assert_ne!(res404.strategy, "markdown_mirror");
+    assert!(res404
+        .content
+        .contains("Original HTML survives 404 mirror."));
+
+    let res_bin = fetch_document(&ctx, &format!("{base}/binary-mirror"), &opts)
+        .await
+        .unwrap();
+    assert_ne!(res_bin.strategy, "markdown_mirror");
+    assert!(res_bin
+        .content
+        .contains("Original HTML survives binary mirror."));
+}
