@@ -201,6 +201,7 @@ fn detect_js_shell_with_parsed_lower(
         "please enable javascript to continue",
         "enable javascript and cookies to continue",
         "this site requires javascript",
+        "necessary to enable javascript",
         "enable javascript to see google maps",
         "when you have eliminated the javascript",
     ];
@@ -212,7 +213,10 @@ fn detect_js_shell_with_parsed_lower(
 
     let doc = parsed.get_or_insert_with(|| dom::ParsedHtml::parse(body));
     let metrics = doc.text_metrics();
-    if metrics.visible_text_len < 200 && (metrics.has_empty_spa_root || metrics.script_count >= 3) {
+    if (metrics.visible_text_len == 0 && metrics.script_count >= 1)
+        || (metrics.visible_text_len < 200
+            && (metrics.has_empty_spa_root || metrics.script_count >= 3))
+    {
         return Some(format!(
             "empty SPA shell (visible_text_len={}, scripts={}, empty_root={})",
             metrics.visible_text_len, metrics.script_count, metrics.has_empty_spa_root

@@ -36,7 +36,12 @@ const BOILERPLATE_ATTR_PATTERNS: &[&str] = &[
     "cmp-container",
     "skip-link",
     "skip-to-content",
+    "skip-main",
     "skipnav",
+    "mw-jump-link",
+    "mw-editsection",
+    "wbc-editpage",
+    "printfooter",
 ];
 
 const CODE_GUTTER_CLASSES: &[&str] = &[
@@ -68,7 +73,11 @@ static ARIA_BOILERPLATE_SEL: LazyLock<Selector> = LazyLock::new(|| {
     .unwrap()
 });
 static PRE_NOISE_SEL: LazyLock<Selector> = LazyLock::new(|| {
-    Selector::parse("pre button, pre [role=\"button\"], pre .line-numbers-rows").unwrap()
+    Selector::parse(concat!(
+        "pre button, pre [role=\"button\"], pre .line-numbers-rows,",
+        "h1 button, h2 button, h3 button, h4 button, h5 button, h6 button"
+    ))
+    .unwrap()
 });
 static HEADER_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("header").unwrap());
 static H1_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("h1").unwrap());
@@ -245,7 +254,10 @@ pub fn extract_plain_text(html: &str, mode: ExtractMode) -> String {
 }
 
 fn is_spa_root(el: &scraper::node::Element) -> bool {
-    if el.name() == "app-root" || el.attr("data-reactroot").is_some() {
+    if el.name() == "app-root"
+        || el.attr("data-reactroot").is_some()
+        || el.attr("data-sveltekit-preload-data").is_some()
+    {
         return true;
     }
     matches!(el.attr("id"), Some("root" | "app" | "__next" | "__nuxt"))
@@ -256,6 +268,10 @@ fn is_landmark_element(el: &scraper::node::Element) -> bool {
         || el
             .attr("role")
             .is_some_and(|r| r.eq_ignore_ascii_case("main"))
+}
+
+fn is_protected_container(el: &scraper::node::Element) -> bool {
+    is_landmark_element(el) || el.name() == "table"
 }
 
 fn walk_node_metrics(
@@ -294,7 +310,7 @@ fn walk_node_metrics(
                 link_count: usize::from(entering_link),
                 heading_count: usize::from(matches!(tag, "h1" | "h2" | "h3" | "h4" | "h5" | "h6")),
                 form_count: usize::from(tag == "form"),
-                has_landmark: is_landmark_element(el),
+                has_landmark: is_protected_container(el),
                 ..Default::default()
             };
 
@@ -383,7 +399,7 @@ fn walk_dom_text_metrics(
                 link_count: usize::from(entering_link),
                 heading_count: usize::from(matches!(tag, "h1" | "h2" | "h3" | "h4" | "h5" | "h6")),
                 form_count: usize::from(tag == "form"),
-                has_landmark: is_landmark_element(el),
+                has_landmark: is_protected_container(el),
                 ..Default::default()
             };
 
