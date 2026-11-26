@@ -128,23 +128,14 @@ impl ParsedHtml {
     pub fn markdown_alternate_url(&self, page_url: &Url) -> Option<Url> {
         let base = self.effective_base_url(page_url);
         for el in self.doc.select(&HEAD_LINK_SEL) {
-            let rel = el.value().attr("rel")?;
-            let has_alternate = rel
-                .split_whitespace()
-                .any(|tok| tok.eq_ignore_ascii_case("alternate"));
-            if !has_alternate {
-                continue;
-            }
-            let Some(raw_type) = el.value().attr("type") else {
+            let Some(rel) = el.value().attr("rel") else {
                 continue;
             };
-            let mime = raw_type
-                .split(';')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_ascii_lowercase();
-            if mime != "text/markdown" && mime != "text/x-markdown" {
+            if !rel
+                .split_whitespace()
+                .any(|tok| tok.eq_ignore_ascii_case("alternate"))
+                || !crate::policy::is_markdown_content_type(el.value().attr("type"))
+            {
                 continue;
             }
             let Some(href) = el
@@ -158,7 +149,7 @@ impl ParsedHtml {
             let Ok(resolved) = base.join(href) else {
                 continue;
             };
-            if is_safe_alternate_url(&resolved, page_url) {
+            if resolved != *page_url && crate::policy::is_safe_alternate_url(page_url, &resolved) {
                 return Some(resolved);
             }
         }
@@ -293,98 +284,6 @@ pub fn prune_html_for_markdown(html: &str, mode: ExtractMode) -> String {
 
 pub fn extract_plain_text(html: &str, mode: ExtractMode) -> String {
     ParsedHtml::parse(html).into_plain_text(mode)
-}
-
-fn is_safe_alternate_url(resolved: &Url, page_url: &Url) -> bool {
-    if !matches!(resolved.scheme(), "http" | "https") {
-        return false;
-    }
-    if resolved == page_url {
-        return false;
-    }
-    if page_url.scheme() == "https" && resolved.scheme() != "https" {
-        return false;
-    }
-
-    if is_private_or_loopback_url(resolved) {
-        let same_host = match (resolved.host(), page_url.host()) {
-            (Some(url::Host::Domain(a)), Some(url::Host::Domain(b))) => a.eq_ignore_ascii_case(b),
-            (Some(a), Some(b)) => a == b,
-            _ => false,
-        };
-        if !same_host {
-            return false;
-        }
-    }
-
-    if resolved.origin() == page_url.origin() {
-        return true;
-    }
-
-    match (resolved.host(), page_url.host()) {
-        (Some(url::Host::Domain(a)), Some(url::Host::Domain(b))) => {
-            if is_localhost_domain(a) || is_localhost_domain(b) {
-                return false;
-            }
-            match (registrable_domain(a), registrable_domain(b)) {
-                (Some(ra), Some(rb)) => ra == rb,
-                _ => false,
-            }
-        }
-        _ => false,
-    }
-}
-
-fn is_private_or_loopback_url(u: &Url) -> bool {
-    match u.host() {
-        Some(url::Host::Domain(d)) => is_localhost_domain(d),
-        Some(url::Host::Ipv4(v4)) => is_private_or_loopback_ipv4(v4),
-        Some(url::Host::Ipv6(v6)) => is_private_or_loopback_ipv6(v6),
-        None => true,
-    }
-}
-
-fn is_localhost_domain(domain: &str) -> bool {
-    let trimmed = domain.trim_end_matches('.');
-    trimmed.eq_ignore_ascii_case("localhost")
-        || trimmed.to_ascii_lowercase().ends_with(".localhost")
-}
-
-fn is_private_or_loopback_ipv4(ip: std::net::Ipv4Addr) -> bool {
-    ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
-}
-
-fn is_private_or_loopback_ipv6(ip: std::net::Ipv6Addr) -> bool {
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        return is_private_or_loopback_ipv4(v4);
-    }
-    let seg0 = ip.segments()[0];
-    let is_unique_local = (seg0 & 0xfe00) == 0xfc00;
-    let is_link_local = (seg0 & 0xffc0) == 0xfe80;
-    ip.is_loopback() || ip.is_unspecified() || is_unique_local || is_link_local
-}
-
-fn registrable_domain(host: &str) -> Option<String> {
-    let lower = host.trim_end_matches('.').to_ascii_lowercase();
-    let labels: Vec<&str> = lower.split('.').filter(|s| !s.is_empty()).collect();
-    if labels.len() < 2 {
-        return None;
-    }
-    let last = labels[labels.len() - 1];
-    let second_last = labels[labels.len() - 2];
-    let is_multipart_cctld = last.len() == 2
-        && matches!(
-            second_last,
-            "co" | "com" | "org" | "net" | "gov" | "edu" | "ac" | "mil"
-        );
-    if is_multipart_cctld {
-        if labels.len() < 3 {
-            return None;
-        }
-        Some(labels[labels.len() - 3..].join("."))
-    } else {
-        Some(labels[labels.len() - 2..].join("."))
-    }
 }
 
 fn is_spa_root(el: &scraper::node::Element) -> bool {

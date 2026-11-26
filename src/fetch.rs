@@ -361,7 +361,12 @@ async fn try_fetch_raw_source(
     let raw_final_url =
         url::Url::parse(&resp.final_url).unwrap_or_else(|_| candidate.raw_url.clone());
     let extracted = match candidate.kind {
-        RawSourceKind::Markdown => extract::extract_document_parsed(
+        RawSourceKind::Code { language }
+            if !is_markdown_content_type(resp.content_type.as_deref()) =>
+        {
+            extract::wrap_raw_code_document(&candidate.filename, &body, language, &options.extract)
+        }
+        _ => extract::extract_document_parsed(
             &body,
             None,
             &raw_final_url,
@@ -369,25 +374,6 @@ async fn try_fetch_raw_source(
             &options.extract,
         )
         .ok()?,
-        RawSourceKind::Code { language } => {
-            if is_markdown_content_type(resp.content_type.as_deref()) {
-                extract::extract_document_parsed(
-                    &body,
-                    None,
-                    &raw_final_url,
-                    Some("text/markdown"),
-                    &options.extract,
-                )
-                .ok()?
-            } else {
-                extract::wrap_raw_code_document(
-                    &candidate.filename,
-                    &body,
-                    language,
-                    &options.extract,
-                )
-            }
-        }
     };
 
     let timing_ms = start.elapsed().as_millis() as u64;
@@ -409,6 +395,43 @@ async fn try_fetch_raw_source(
         truncated: extracted.truncated,
         timing_ms,
     })
+}
+
+async fn fetch_validated_mirror(
+    ctx: &RuntimeContext,
+    mirror_url: url::Url,
+    respect_robots: bool,
+    max_bytes: usize,
+    allow_plain_text: bool,
+) -> Option<(String, url::Url)> {
+    if respect_robots
+        && !ctx
+            .robots
+            .is_allowed(&ctx.client, mirror_url.as_str())
+            .await
+    {
+        return None;
+    }
+    let resp = ctx
+        .client
+        .get_with_options(mirror_url.as_str(), ctx.config.timeout, max_bytes, true)
+        .await
+        .ok()?;
+    let mime_ok = if allow_plain_text {
+        !resp.is_html() && is_mirror_acceptable_content_type(resp.content_type.as_deref())
+    } else {
+        is_markdown_content_type(resp.content_type.as_deref())
+    };
+    if resp.status != 200 || !mime_ok || extract::detect_binary_content(None, &resp.body).is_some()
+    {
+        return None;
+    }
+    let text = resp.text();
+    if text.trim().is_empty() {
+        return None;
+    }
+    let base = url::Url::parse(&resp.final_url).unwrap_or(mirror_url);
+    Some((text, base))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -433,34 +456,10 @@ async fn try_fetch_markdown_mirror(
         });
 
     if let Some(mirror_url) = advertised {
-        if mirror_url != final_url_parsed {
-            if respect_robots
-                && !ctx
-                    .robots
-                    .is_allowed(&ctx.client, mirror_url.as_str())
-                    .await
-            {
-                return None;
-            }
-            if let Ok(resp) = ctx
-                .client
-                .get_with_options(mirror_url.as_str(), ctx.config.timeout, max_bytes, true)
-                .await
-            {
-                if resp.status == 200
-                    && !resp.is_html()
-                    && is_mirror_acceptable_content_type(resp.content_type.as_deref())
-                    && extract::detect_binary_content(None, &resp.body).is_none()
-                {
-                    let text = resp.text();
-                    if !text.trim().is_empty() {
-                        let base = url::Url::parse(&resp.final_url).unwrap_or(mirror_url);
-                        return Some((text, base));
-                    }
-                }
-            }
+        if mirror_url == final_url_parsed {
+            return None;
         }
-        return None;
+        return fetch_validated_mirror(ctx, mirror_url, respect_robots, max_bytes, true).await;
     }
 
     if source_mode == SourceMode::Negotiate {
@@ -475,25 +474,7 @@ async fn try_fetch_markdown_mirror(
             let mut probe = final_url_parsed.clone();
             probe.set_path(&format!("{path}.md"));
             probe.set_fragment(None);
-            if respect_robots && !ctx.robots.is_allowed(&ctx.client, probe.as_str()).await {
-                return None;
-            }
-            if let Ok(resp) = ctx
-                .client
-                .get_with_options(probe.as_str(), ctx.config.timeout, max_bytes, true)
-                .await
-            {
-                if resp.status == 200
-                    && is_markdown_content_type(resp.content_type.as_deref())
-                    && extract::detect_binary_content(None, &resp.body).is_none()
-                {
-                    let text = resp.text();
-                    if !text.trim().is_empty() {
-                        let base = url::Url::parse(&resp.final_url).unwrap_or(probe);
-                        return Some((text, base));
-                    }
-                }
-            }
+            return fetch_validated_mirror(ctx, probe, respect_robots, max_bytes, false).await;
         }
     }
 

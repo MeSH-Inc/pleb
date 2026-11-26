@@ -137,22 +137,20 @@ pub fn parse_markdown_link_header(header: &str, base: &Url) -> Option<Url> {
     None
 }
 
+fn mime_prefix(content_type: Option<&str>) -> Option<&str> {
+    let mime = content_type?.split(';').next()?.trim();
+    (!mime.is_empty()).then_some(mime)
+}
+
 pub fn is_markdown_content_type(content_type: Option<&str>) -> bool {
-    let Some(ct) = content_type else {
-        return false;
-    };
-    let mime = ct.split(';').next().unwrap_or("").trim();
-    mime.eq_ignore_ascii_case("text/markdown") || mime.eq_ignore_ascii_case("text/x-markdown")
+    mime_prefix(content_type).is_some_and(|mime| {
+        mime.eq_ignore_ascii_case("text/markdown") || mime.eq_ignore_ascii_case("text/x-markdown")
+    })
 }
 
 pub fn is_mirror_acceptable_content_type(content_type: Option<&str>) -> bool {
-    let Some(ct) = content_type else {
-        return false;
-    };
-    let mime = ct.split(';').next().unwrap_or("").trim();
-    mime.eq_ignore_ascii_case("text/markdown")
-        || mime.eq_ignore_ascii_case("text/x-markdown")
-        || mime.eq_ignore_ascii_case("text/plain")
+    is_markdown_content_type(content_type)
+        || mime_prefix(content_type).is_some_and(|mime| mime.eq_ignore_ascii_case("text/plain"))
 }
 
 pub fn is_safe_alternate_url(base: &Url, target: &Url) -> bool {
@@ -368,6 +366,15 @@ fn unquote_param(val: &str) -> &str {
         .unwrap_or(val)
 }
 
+fn is_private_v4(v4: std::net::Ipv4Addr) -> bool {
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || (v4.octets()[0] == 100 && (v4.octets()[1] & 0b1100_0000) == 64)
+}
+
 fn is_local_or_private_host(host: &str) -> bool {
     let normalized = host
         .trim_start_matches('[')
@@ -383,15 +390,11 @@ fn is_local_or_private_host(host: &str) -> bool {
     }
     if let Ok(ip) = normalized.parse::<IpAddr>() {
         return match ip {
-            IpAddr::V4(v4) => {
-                v4.is_loopback()
-                    || v4.is_private()
-                    || v4.is_link_local()
-                    || v4.is_unspecified()
-                    || v4.is_broadcast()
-                    || (v4.octets()[0] == 100 && (v4.octets()[1] & 0b1100_0000) == 64)
-            }
+            IpAddr::V4(v4) => is_private_v4(v4),
             IpAddr::V6(v6) => {
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    return is_private_v4(v4);
+                }
                 v6.is_loopback()
                     || v6.is_unspecified()
                     || (v6.segments()[0] & 0xfe00) == 0xfc00
