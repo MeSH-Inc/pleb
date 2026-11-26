@@ -440,3 +440,27 @@ fn adversarial_auth_path_segment_boundary_does_not_flag_login_guide_or_oauth2_do
         );
     }
 }
+
+#[test]
+fn adversarial_sveltekit_hydrated_and_zero_script_pages_not_flagged_as_js_shell() {
+    use mesh_wick::policy::classify_response_with_context;
+
+    // Empty HTML with zero <script> tags must stay Ok (not JavaScriptShell).
+    let no_script = "<html><head><title>Blank</title></head><body></body></html>";
+    let mut p1 = None;
+    assert_eq!(
+        classify_response_with_context(200, true, None, None, no_script, &mut p1),
+        ResponseClassification::Ok
+    );
+
+    // Hydrated SvelteKit page with >= 200 visible prose bytes must stay Ok.
+    let prose = "Hydrated SvelteKit documentation content rendered on the server side. ".repeat(5);
+    let hydrated = format!(
+        "<html><head><title>Docs</title></head><body data-sveltekit-preload-data=\"hover\"><main><h1>Docs</h1><p>{prose}</p></main><script>window.__kit = 1;</script></body></html>"
+    );
+    let mut p2 = None;
+    assert_eq!(
+        classify_response_with_context(200, true, None, None, &hydrated, &mut p2),
+        ResponseClassification::Ok
+    );
+}
