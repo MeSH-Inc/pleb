@@ -1,7 +1,9 @@
+pub mod charset;
 pub mod dom;
 pub mod markdown;
 pub mod url;
 
+pub use charset::decode_text_bytes;
 pub use dom::ParsedHtml;
 pub use markdown::truncate_markdown;
 
@@ -68,6 +70,16 @@ pub fn format_page_section(
         "\n---\n## [{}/{}] {}\n**URL:** {}\n\n{}\n",
         index, total, title, url, content
     )
+}
+
+pub fn extract_document_bytes(
+    body: &[u8],
+    page_url: &::url::Url,
+    content_type: Option<&str>,
+    options: &ExtractOptions,
+) -> Result<ExtractedDocument> {
+    let decoded = decode_text_bytes(body, content_type);
+    extract_document(&decoded, page_url, content_type, options)
 }
 
 pub fn extract_document(

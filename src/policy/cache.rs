@@ -26,7 +26,21 @@ pub struct SiteCache {
 
 impl SiteCache {
     pub fn load(path: PathBuf) -> Self {
-        let entries = read_cache_map(&path);
+        let entries = match read_cache_map(&path) {
+            Ok(map) => map,
+            Err(CacheReadError::Corrupt(err)) => {
+                tracing::warn!(
+                    "site cache {} contains corrupted JSON, starting empty: {}",
+                    path.display(),
+                    err
+                );
+                HashMap::new()
+            }
+            Err(CacheReadError::Io(err)) => {
+                tracing::warn!("failed to read site cache {}: {}", path.display(), err);
+                HashMap::new()
+            }
+        };
         Self {
             path,
             entries: Mutex::new(entries),
@@ -62,7 +76,27 @@ impl SiteCache {
             }
         };
 
-        let mut merged = read_cache_map(&self.path);
+        let mut merged = match read_cache_map(&self.path) {
+            Ok(map) => map,
+            Err(CacheReadError::Corrupt(err)) => {
+                tracing::warn!(
+                    "site cache {} contains corrupted JSON, rebuilding: {}",
+                    self.path.display(),
+                    err
+                );
+                HashMap::new()
+            }
+            Err(CacheReadError::Io(err)) => {
+                tracing::warn!(
+                    "failed to read site cache {} before update, refusing to overwrite: {}",
+                    self.path.display(),
+                    err
+                );
+                drop(lock_file);
+                return;
+            }
+        };
+
         let entry = merged
             .entry(host.to_string())
             .or_insert_with(|| SiteCacheEntry {
@@ -92,18 +126,26 @@ impl SiteCache {
         if let Ok(mut guard) = self.entries.lock() {
             guard.clear();
         }
-        if self.path.exists() {
-            std::fs::remove_file(&self.path)?;
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
         }
         drop(lock_file);
         Ok(())
     }
 }
 
-fn read_cache_map(path: &Path) -> HashMap<String, SiteCacheEntry> {
+enum CacheReadError {
+    Io(std::io::Error),
+    Corrupt(serde_json::Error),
+}
+
+fn read_cache_map(path: &Path) -> Result<HashMap<String, SiteCacheEntry>, CacheReadError> {
     match std::fs::read_to_string(path) {
-        Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
-        Err(_) => HashMap::new(),
+        Ok(data) => serde_json::from_str(&data).map_err(CacheReadError::Corrupt),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+        Err(err) => Err(CacheReadError::Io(err)),
     }
 }
 

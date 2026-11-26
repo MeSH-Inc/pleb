@@ -3,21 +3,20 @@ use mesh_wick::policy::{
     classify_response, classify_response_with_parsed, plan_strategy, PrimaryTransport, RenderMode,
     ResponseClassification, SiteCache, SiteCacheEntry, SiteRule, SiteRules,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
 use url::Url;
 
-fn temp_dir(name: &str) -> std::path::PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "mesh-wick-{}-{}-{}",
-        name,
-        std::process::id(),
-        nanos
-    ));
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn temp_dir(_name: &str) -> std::path::PathBuf {
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::path::PathBuf::from(format!("/tmp/wick-t-{}-{}", std::process::id(), seq));
     std::fs::create_dir_all(&dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
     dir
 }
 
@@ -45,7 +44,8 @@ fn strategy_router_precedence() {
     };
 
     // Forced modes win over rules and cache.
-    let p_forced_cronet = plan_strategy(RenderMode::Cronet, Some(&cef_rule), Some(&cef_cached), true);
+    let p_forced_cronet =
+        plan_strategy(RenderMode::Cronet, Some(&cef_rule), Some(&cef_cached), true);
     assert_eq!(p_forced_cronet.primary, PrimaryTransport::Cronet);
     assert!(!p_forced_cronet.allow_cef_escalation);
 
@@ -63,7 +63,12 @@ fn strategy_router_precedence() {
     assert_eq!(p_rule_cef.primary, PrimaryTransport::Cef);
     assert!(p_rule_cef.allow_cronet_fallback);
 
-    let p_rule_cronet = plan_strategy(RenderMode::Auto, Some(&cronet_rule), Some(&cef_cached), true);
+    let p_rule_cronet = plan_strategy(
+        RenderMode::Auto,
+        Some(&cronet_rule),
+        Some(&cef_cached),
+        true,
+    );
     assert_eq!(p_rule_cronet.primary, PrimaryTransport::Cronet);
     assert!(p_rule_cronet.allow_cef_escalation);
 
@@ -161,7 +166,8 @@ fn response_classifier_covers_challenges_js_shells_and_normal_pages() {
         ResponseClassification::JavaScriptShell { .. }
     ));
 
-    let next_spa_shell = r#"<html><body><div id="__next"></div><script src="/a.js"></script></body></html>"#;
+    let next_spa_shell =
+        r#"<html><body><div id="__next"></div><script src="/a.js"></script></body></html>"#;
     assert!(matches!(
         classify_response(200, true, next_spa_shell),
         ResponseClassification::JavaScriptShell { .. }
@@ -178,7 +184,10 @@ fn response_classifier_covers_challenges_js_shells_and_normal_pages() {
         "<p>article</p>".repeat(200_000)
     );
     assert!(huge.len() > 2_000_000);
-    assert_eq!(classify_response(200, true, &huge), ResponseClassification::Ok);
+    assert_eq!(
+        classify_response(200, true, &huge),
+        ResponseClassification::Ok
+    );
 
     // Lazy parsing only populates ParsedHtml when DOM metrics are actually evaluated.
     let mut parsed: Option<ParsedHtml> = None;
@@ -211,11 +220,7 @@ fn site_cache_file_has_private_permissions() {
     let cache = SiteCache::load(cache_path.clone());
     cache.record_at("example.com", "cronet", 42, 1_000_000);
 
-    let mode = std::fs::metadata(&cache_path)
-        .unwrap()
-        .permissions()
-        .mode()
-        & 0o777;
+    let mode = std::fs::metadata(&cache_path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
 
     let _ = std::fs::remove_dir_all(dir);
@@ -231,7 +236,12 @@ fn site_cache_concurrent_multi_writer_merges_without_loss() {
             let path = cache_path.clone();
             std::thread::spawn(move || {
                 let cache = SiteCache::load(path);
-                cache.record_at(&format!("host-{i}.example"), "cronet", 10 + i as u64, 1_000_000);
+                cache.record_at(
+                    &format!("host-{i}.example"),
+                    "cronet",
+                    10 + i as u64,
+                    1_000_000,
+                );
             })
         })
         .collect();
@@ -248,6 +258,99 @@ fn site_cache_concurrent_multi_writer_merges_without_loss() {
                 .map(|e| e.strategy),
             Some("cronet".to_string()),
             "missing concurrent writer entry for host-{i}.example"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn site_cache_recovers_corrupt_json_and_preserves_lock_on_clear() {
+    let dir = temp_dir("cache-corrupt");
+    let cache_path = dir.join("site-cache.json");
+    let lock_path = dir.join("site-cache.lock");
+    std::fs::write(&cache_path, "{not valid json").unwrap();
+
+    let cache = SiteCache::load(cache_path.clone());
+    assert!(cache.get_at("example.com", 1_000_000).is_none());
+
+    cache.record_at("example.com", "cronet", 25, 1_000_000);
+    let reloaded = SiteCache::load(cache_path.clone());
+    assert_eq!(
+        reloaded
+            .get_at("example.com", 1_000_060)
+            .map(|e| e.strategy),
+        Some("cronet".to_string())
+    );
+
+    reloaded.clear().unwrap();
+    assert!(!cache_path.exists());
+    assert!(
+        lock_path.exists(),
+        "clear must never unlink site-cache.lock"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn site_cache_does_not_overwrite_unreadable_file() {
+    let dir = temp_dir("cache-io-err");
+    // Place a directory at the cache path so read_to_string fails with an IO error (IsADirectory).
+    let cache_path = dir.join("site-cache.json");
+    std::fs::create_dir(&cache_path).unwrap();
+
+    let cache = SiteCache::load(cache_path.clone());
+    cache.record_at("example.com", "cronet", 25, 1_000_000);
+
+    // Must still be a directory (not overwritten).
+    assert!(cache_path.is_dir());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[ignore]
+fn site_cache_subprocess_worker() {
+    let cache_path = std::env::var("WICK_TEST_CACHE_PATH").expect("WICK_TEST_CACHE_PATH");
+    let host = std::env::var("WICK_TEST_CACHE_HOST").expect("WICK_TEST_CACHE_HOST");
+    let cache = SiteCache::load(std::path::PathBuf::from(cache_path));
+    cache.record_at(&host, "cronet", 40, 1_000_000);
+}
+
+#[test]
+fn site_cache_eight_subprocess_contention_preserves_all_entries() {
+    let dir = temp_dir("cache-subproc");
+    let cache_path = dir.join("site-cache.json");
+    let exe = std::env::current_exe().unwrap();
+
+    let mut children: Vec<_> = (0..8)
+        .map(|i| {
+            std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "site_cache_subprocess_worker",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("WICK_TEST_CACHE_PATH", &cache_path)
+                .env("WICK_TEST_CACHE_HOST", format!("subproc-{i}.example"))
+                .spawn()
+                .expect("spawn subprocess worker")
+        })
+        .collect();
+
+    for (i, child) in children.iter_mut().enumerate() {
+        let status = child.wait().expect("wait subprocess worker");
+        assert!(status.success(), "subprocess {i} exited with {status}");
+    }
+
+    let reloaded = SiteCache::load(cache_path);
+    for i in 0..8 {
+        let host = format!("subproc-{i}.example");
+        assert_eq!(
+            reloaded.get_at(&host, 1_000_060).map(|e| e.strategy),
+            Some("cronet".to_string()),
+            "missing subprocess entry for {host}"
         );
     }
 

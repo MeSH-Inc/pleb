@@ -18,73 +18,79 @@ pub fn html_to_compact_markdown(
     let mut builder = HtmlToMarkdown::builder().skip_tags(tags_to_skip);
 
     let anchor_base = base_url.clone();
-    builder = builder.add_handler(vec!["a"], move |handlers: &dyn Handlers, element: Element| {
-        let mut href: Option<&str> = None;
-        let mut title: Option<&str> = None;
-        for attr in element.attrs.iter() {
-            let name: &str = attr.name.local.as_ref();
-            if name == "href" {
-                href = Some(&attr.value);
-            } else if name == "title" {
-                title = Some(&attr.value);
-            }
-        }
-
-        let inner = handlers.walk_children(element.node).content;
-        let (leading_ws, core, trailing_ws) = split_document_whitespace(&inner);
-        if core.is_empty() {
-            return Some(String::new().into());
-        }
-
-        if !include_links {
-            return Some(inner.into());
-        }
-
-        let Some(raw_href) = href else {
-            return Some(inner.into());
-        };
-
-        match resolve_and_clean_url(raw_href, &anchor_base) {
-            ResolvedUrl::Drop | ResolvedUrl::UnwrapText => Some(inner.into()),
-            ResolvedUrl::Resolved(dest) => {
-                let formatted_dest = format_destination(&dest);
-                let formatted_title = format_title(title);
-                let out = format!(
-                    "{leading_ws}[{core}]({formatted_dest}{formatted_title}){trailing_ws}"
-                );
-                Some(out.into())
-            }
-        }
-    });
-
-    if include_images {
-        let img_base = base_url.clone();
-        builder = builder.add_handler(vec!["img"], move |_handlers: &dyn Handlers, element: Element| {
-            let mut src: Option<&str> = None;
-            let mut alt: Option<&str> = None;
+    builder = builder.add_handler(
+        vec!["a"],
+        move |handlers: &dyn Handlers, element: Element| {
+            let mut href: Option<&str> = None;
             let mut title: Option<&str> = None;
             for attr in element.attrs.iter() {
                 let name: &str = attr.name.local.as_ref();
-                if name == "src" {
-                    src = Some(&attr.value);
-                } else if name == "alt" {
-                    alt = Some(&attr.value);
+                if name == "href" {
+                    href = Some(&attr.value);
                 } else if name == "title" {
                     title = Some(&attr.value);
                 }
             }
 
-            let raw_src = src?;
-            match resolve_and_clean_url(raw_src, &img_base) {
+            let inner = handlers.walk_children(element.node).content;
+            let (leading_ws, core, trailing_ws) = split_document_whitespace(&inner);
+            if core.is_empty() {
+                return Some(String::new().into());
+            }
+
+            if !include_links {
+                return Some(inner.into());
+            }
+
+            let Some(raw_href) = href else {
+                return Some(inner.into());
+            };
+
+            match resolve_and_clean_url(raw_href, &anchor_base) {
+                ResolvedUrl::Drop | ResolvedUrl::UnwrapText => Some(inner.into()),
                 ResolvedUrl::Resolved(dest) => {
-                    let clean_alt = alt.map(clean_alt_text).unwrap_or_default();
                     let formatted_dest = format_destination(&dest);
                     let formatted_title = format_title(title);
-                    Some(format!("![{clean_alt}]({formatted_dest}{formatted_title})").into())
+                    let out = format!(
+                        "{leading_ws}[{core}]({formatted_dest}{formatted_title}){trailing_ws}"
+                    );
+                    Some(out.into())
                 }
-                ResolvedUrl::Drop | ResolvedUrl::UnwrapText => Some(String::new().into()),
             }
-        });
+        },
+    );
+
+    if include_images {
+        let img_base = base_url.clone();
+        builder = builder.add_handler(
+            vec!["img"],
+            move |_handlers: &dyn Handlers, element: Element| {
+                let mut src: Option<&str> = None;
+                let mut alt: Option<&str> = None;
+                let mut title: Option<&str> = None;
+                for attr in element.attrs.iter() {
+                    let name: &str = attr.name.local.as_ref();
+                    if name == "src" {
+                        src = Some(&attr.value);
+                    } else if name == "alt" {
+                        alt = Some(&attr.value);
+                    } else if name == "title" {
+                        title = Some(&attr.value);
+                    }
+                }
+
+                let raw_src = src?;
+                match resolve_and_clean_url(raw_src, &img_base) {
+                    ResolvedUrl::Resolved(dest) => {
+                        let clean_alt = alt.map(clean_alt_text).unwrap_or_default();
+                        let formatted_dest = format_destination(&dest);
+                        let formatted_title = format_title(title);
+                        Some(format!("![{clean_alt}]({formatted_dest}{formatted_title})").into())
+                    }
+                    ResolvedUrl::Drop | ResolvedUrl::UnwrapText => Some(String::new().into()),
+                }
+            },
+        );
     }
 
     let raw = builder.build().convert(html)?;
@@ -117,7 +123,10 @@ fn has_unbalanced_parens(s: &str) -> bool {
 }
 
 fn format_destination(dest: &str) -> String {
-    if dest.chars().any(|c| c.is_ascii_whitespace() || c.is_ascii_control() || c == '<' || c == '>') {
+    if dest
+        .chars()
+        .any(|c| c.is_ascii_whitespace() || c.is_ascii_control() || c == '<' || c == '>')
+    {
         let mut out = String::with_capacity(dest.len() + 4);
         out.push('<');
         for ch in dest.chars() {
@@ -194,22 +203,31 @@ pub fn truncate_markdown(md: &str, max_bytes: usize) -> (String, bool) {
     if max_bytes == 0 {
         return (String::new(), !md.is_empty());
     }
-    if max_bytes <= TRUNCATED_SUFFIX.len() {
-        let end = floor_char_boundary(md, max_bytes);
-        return (md[..end].to_string(), true);
-    }
 
-    let raw_limit = max_bytes - TRUNCATED_SUFFIX.len();
-    let candidate_cut = choose_boundary_cut(md, raw_limit);
+    let suffix = if max_bytes <= TRUNCATED_SUFFIX.len() {
+        ""
+    } else {
+        TRUNCATED_SUFFIX
+    };
+    let raw_limit = max_bytes - suffix.len();
+    let candidate_cut = if suffix.is_empty() {
+        floor_char_boundary(md, raw_limit)
+    } else {
+        choose_boundary_cut(md, raw_limit)
+    };
 
-    if let Some((fc, fl, open_start, open_line_end)) = open_fence_at(md, candidate_cut) {
-        let reserve = 1 + fl + TRUNCATED_SUFFIX.len();
+    if let Some((fc, fl, open_start, open_line_end)) =
+        open_fence_at(&md[..candidate_cut], candidate_cut)
+    {
+        let reserve = 1 + fl + suffix.len();
         let fence_budget = max_bytes.saturating_sub(reserve);
         if candidate_cut <= open_line_end || fence_budget <= open_line_end {
-            return rewind_before_fence(md, open_start, max_bytes);
+            return rewind_before_fence(md, open_start, max_bytes, suffix);
         }
 
-        let inner_cut = {
+        let inner_cut = if suffix.is_empty() {
+            floor_char_boundary(md, fence_budget)
+        } else {
             let cut = choose_boundary_cut(md, fence_budget);
             if cut < open_line_end {
                 floor_char_boundary(md, fence_budget)
@@ -219,45 +237,58 @@ pub fn truncate_markdown(md: &str, max_bytes: usize) -> (String, bool) {
         };
         let prefix = md[..inner_cut].trim_end_matches('\n');
         if prefix.len() < open_line_end.saturating_sub(1) || prefix.len() <= open_start {
-            return rewind_before_fence(md, open_start, max_bytes);
+            return rewind_before_fence(md, open_start, max_bytes, suffix);
         }
 
-        let mut out = String::with_capacity(prefix.len() + 1 + fl + TRUNCATED_SUFFIX.len());
+        let mut out = String::with_capacity(prefix.len() + 1 + fl + suffix.len());
         out.push_str(prefix);
-        out.push('\n');
-        for _ in 0..fl {
-            out.push(fc);
+        if open_fence_at(prefix, prefix.len()).is_some() {
+            out.push('\n');
+            for _ in 0..fl {
+                out.push(fc);
+            }
         }
-        out.push_str(TRUNCATED_SUFFIX);
+        out.push_str(suffix);
         debug_assert!(out.len() <= max_bytes);
+        debug_assert!(open_fence_at(&out, out.len()).is_none());
         return (out, true);
     }
 
     let prefix = &md[..candidate_cut];
-    let mut out = String::with_capacity(prefix.len() + TRUNCATED_SUFFIX.len());
+    let mut out = String::with_capacity(prefix.len() + suffix.len());
     out.push_str(prefix);
-    out.push_str(TRUNCATED_SUFFIX);
+    out.push_str(suffix);
     debug_assert!(out.len() <= max_bytes);
+    debug_assert!(open_fence_at(&out, out.len()).is_none());
     (out, true)
 }
 
-fn rewind_before_fence(md: &str, open_start: usize, max_bytes: usize) -> (String, bool) {
+fn rewind_before_fence(
+    md: &str,
+    open_start: usize,
+    max_bytes: usize,
+    suffix: &str,
+) -> (String, bool) {
     let clean = md[..open_start].trim_end_matches(['\n', ' ']);
     if clean.is_empty() {
-        let trimmed_suffix = TRUNCATED_SUFFIX.trim_start_matches('\n');
+        if suffix.is_empty() {
+            return (String::new(), true);
+        }
+        let trimmed_suffix = suffix.trim_start_matches('\n');
         let end = floor_char_boundary(trimmed_suffix, max_bytes);
         return (trimmed_suffix[..end].to_string(), true);
     }
-    let mut out = String::with_capacity(clean.len() + TRUNCATED_SUFFIX.len());
+    let mut out = String::with_capacity(clean.len() + suffix.len());
     out.push_str(clean);
-    out.push_str(TRUNCATED_SUFFIX);
+    out.push_str(suffix);
     debug_assert!(out.len() <= max_bytes);
+    debug_assert!(open_fence_at(&out, out.len()).is_none());
     (out, true)
 }
 
 /// Returns `Some((fence_char, fence_len, open_line_start, open_line_end))` if `cut`
 /// lies inside an unclosed fenced code block.
-fn open_fence_at(md: &str, cut: usize) -> Option<(char, usize, usize, usize)> {
+pub fn open_fence_at(md: &str, cut: usize) -> Option<(char, usize, usize, usize)> {
     let mut fence: Option<(char, usize, usize, usize)> = None;
     let mut offset = 0usize;
 
