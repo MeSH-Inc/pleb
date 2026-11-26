@@ -520,3 +520,244 @@ fn adversarial_zero_untyped_error_matches_in_transport_and_daemon() {
         violations.join("\n")
     );
 }
+
+async fn spawn_link_and_accept_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let mut lines = req.lines();
+                let path = lines
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+
+                let mut accept_val = String::new();
+                let mut sec_fetch_mode = String::new();
+                for line in lines {
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some((name, val)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("accept") {
+                            accept_val = val.trim().to_string();
+                        } else if name.eq_ignore_ascii_case("sec-fetch-mode") {
+                            sec_fetch_mode = val.trim().to_string();
+                        }
+                    }
+                }
+
+                match path {
+                    "/links" => {
+                        let body = b"<html><body>ok</body></html>";
+                        let hdr = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nLink: </docs/page.md>; rel=\"alternate\"; type=\"text/markdown\"\r\nlink: </feed.xml>; rel=\"alternate\"; type=\"application/atom+xml\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = socket.write_all(hdr.as_bytes()).await;
+                        let _ = socket.write_all(body).await;
+                    }
+                    "/echo-accept" => {
+                        let body = format!("accept={accept_val}\nsec-fetch-mode={sec_fetch_mode}");
+                        let hdr = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = socket.write_all(hdr.as_bytes()).await;
+                        let _ = socket.write_all(body.as_bytes()).await;
+                    }
+                    _ => {
+                        let _ = socket
+                            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                    }
+                }
+            });
+        }
+    });
+
+    format!("http://{}", addr)
+}
+
+#[tokio::test]
+async fn transport_captures_multiple_link_headers_and_accept_markdown_direct_and_daemon() {
+    use mesh_wick::transport::{TransportClient, MARKDOWN_ACCEPT_HEADER};
+
+    let base = spawn_link_and_accept_server().await;
+    let expected_link = "</docs/page.md>; rel=\"alternate\"; type=\"text/markdown\", </feed.xml>; rel=\"alternate\"; type=\"application/atom+xml\"";
+
+    // Direct (non-daemon) TransportClient
+    let direct_dir = TempStateDir::new();
+    let direct = TransportClient::new_direct(direct_dir.path(), None, Duration::from_secs(5))
+        .expect("direct transport should initialize");
+
+    let link_resp = direct.get(&format!("{base}/links")).await.unwrap();
+    assert_eq!(link_resp.link_header.as_deref(), Some(expected_link));
+
+    let default_accept = direct
+        .get_with_options(
+            &format!("{base}/echo-accept"),
+            Duration::from_secs(5),
+            64 * 1024,
+            false,
+        )
+        .await
+        .unwrap()
+        .text();
+    assert!(
+        default_accept.contains("accept=text/html,application/xhtml+xml"),
+        "expected Chrome default Accept header, got: {default_accept}"
+    );
+    assert!(default_accept.contains("sec-fetch-mode=navigate"));
+
+    let md_accept = direct
+        .get_with_options(
+            &format!("{base}/echo-accept"),
+            Duration::from_secs(5),
+            64 * 1024,
+            true,
+        )
+        .await
+        .unwrap()
+        .text();
+    assert!(
+        md_accept.contains(&format!("accept={MARKDOWN_ACCEPT_HEADER}")),
+        "expected Markdown Accept header, got: {md_accept}"
+    );
+    assert!(md_accept.contains("sec-fetch-mode=navigate"));
+
+    // Daemon-backed TransportClient over daemon.sock
+    let daemon_dir = TempStateDir::new();
+    let daemon_dir_clone = daemon_dir.to_path_buf();
+    let handle =
+        tokio::spawn(
+            async move { run_daemon(daemon_dir_clone, Duration::from_secs(30), false).await },
+        );
+    let _ = wait_for_ping(daemon_dir.path()).await;
+
+    let daemon_client = TransportClient::new_daemon(
+        daemon_dir.to_path_buf(),
+        None,
+        Duration::from_secs(5),
+        Duration::from_secs(30),
+        false,
+    );
+
+    let daemon_link_resp = daemon_client.get(&format!("{base}/links")).await.unwrap();
+    assert_eq!(daemon_link_resp.link_header.as_deref(), Some(expected_link));
+
+    let daemon_default_accept = daemon_client
+        .get_with_options(
+            &format!("{base}/echo-accept"),
+            Duration::from_secs(5),
+            64 * 1024,
+            false,
+        )
+        .await
+        .unwrap()
+        .text();
+    assert!(
+        daemon_default_accept.contains("accept=text/html,application/xhtml+xml"),
+        "expected Chrome default Accept header over daemon.sock, got: {daemon_default_accept}"
+    );
+    assert!(daemon_default_accept.contains("sec-fetch-mode=navigate"));
+
+    let daemon_md_accept = daemon_client
+        .get_with_options(
+            &format!("{base}/echo-accept"),
+            Duration::from_secs(5),
+            64 * 1024,
+            true,
+        )
+        .await
+        .unwrap()
+        .text();
+    assert!(
+        daemon_md_accept.contains(&format!("accept={MARKDOWN_ACCEPT_HEADER}")),
+        "expected Markdown Accept header over daemon.sock, got: {daemon_md_accept}"
+    );
+    assert!(daemon_md_accept.contains("sec-fetch-mode=navigate"));
+
+    assert!(daemon_stop(daemon_dir.path()).await.unwrap());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn daemon_restarts_automatically_on_protocol_version_mismatch() {
+    assert_eq!(PROTOCOL_VERSION, 2);
+    let (base, _, _) = spawn_daemon_test_server().await;
+    let dir = TempStateDir::new();
+    let sock = socket_path(dir.path());
+
+    let listener = UnixListener::bind(&sock).unwrap();
+    let saw_shutdown = Arc::new(AtomicUsize::new(0));
+    let saw_shutdown_c = Arc::clone(&saw_shutdown);
+    let sock_c = sock.clone();
+
+    let mock_task = tokio::spawn(async move {
+        for _ in 0..2 {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let (read_half, mut write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line).await;
+            let val: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+            let mut hdr = DaemonResponseHeader::ok_empty();
+            hdr.protocol_version = 1;
+            hdr.build_id = BUILD_ID.to_string();
+            if val["op"] == "shutdown" {
+                saw_shutdown_c.fetch_add(1, Ordering::AcqRel);
+                let mut enc = serde_json::to_string(&hdr).unwrap();
+                enc.push('\n');
+                let _ = write_half.write_all(enc.as_bytes()).await;
+                let _ = write_half.flush().await;
+                drop(listener);
+                let _ = std::fs::remove_file(&sock_c);
+                break;
+            } else {
+                hdr.status_code = Some(200);
+                hdr.final_url = Some("http://mock/v1".to_string());
+                let mut enc = serde_json::to_string(&hdr).unwrap();
+                enc.push('\n');
+                let _ = write_half.write_all(enc.as_bytes()).await;
+                let _ = write_half.flush().await;
+            }
+        }
+    });
+
+    let resp = daemon_http_get_with_executable(
+        dir.path(),
+        None,
+        Duration::from_secs(5),
+        1024 * 1024,
+        Duration::from_secs(5),
+        false,
+        &format!("{base}/fast-a"),
+        Some(Path::new(env!("CARGO_BIN_EXE_wick"))),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(saw_shutdown.load(Ordering::Acquire), 1);
+    assert_eq!(resp.text(), "alpha");
+    let status = daemon_ping(dir.path())
+        .await
+        .expect("v2 daemon should be running");
+    assert_eq!(status.protocol_version, 2);
+
+    let _ = mock_task.await;
+    let _ = daemon_stop(dir.path()).await;
+}

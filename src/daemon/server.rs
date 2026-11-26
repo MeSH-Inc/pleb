@@ -433,7 +433,7 @@ async fn handle_connection(
             proxy,
             timeout_ms,
             max_body_bytes,
-            accept_markdown: _,
+            accept_markdown,
         } => {
             let _active = ActiveRequestGuard::new(active_requests, idle_notify);
             let timeout = Duration::from_millis(timeout_ms.max(1));
@@ -447,7 +447,9 @@ async fn handle_connection(
                 }
             };
 
-            let get_fut = slot.client.get_with_limits(&url, timeout, max_body_bytes);
+            let get_fut =
+                slot.client
+                    .get_with_options(&url, timeout, max_body_bytes, accept_markdown);
             tokio::select! {
                 biased;
                 _ = wait_for_client_disconnect(&mut reader) => {

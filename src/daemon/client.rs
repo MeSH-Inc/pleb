@@ -113,12 +113,38 @@ pub async fn daemon_http_get_with_executable(
     url: &str,
     daemon_executable: Option<&Path>,
 ) -> Result<HttpResponse> {
+    daemon_http_get_with_options(
+        state_dir,
+        proxy,
+        timeout,
+        max_body_bytes,
+        false,
+        idle_timeout,
+        verbose,
+        url,
+        daemon_executable,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn daemon_http_get_with_options(
+    state_dir: &Path,
+    proxy: Option<&str>,
+    timeout: Duration,
+    max_body_bytes: usize,
+    accept_markdown: bool,
+    idle_timeout: Duration,
+    verbose: bool,
+    url: &str,
+    daemon_executable: Option<&Path>,
+) -> Result<HttpResponse> {
     let req = DaemonRequest::HttpGet {
         url: url.to_string(),
         proxy: proxy.map(str::to_string),
         timeout_ms: timeout.as_millis().min(u128::from(u64::MAX)) as u64,
         max_body_bytes,
-        accept_markdown: false,
+        accept_markdown,
     };
     let io_timeout = timeout.saturating_add(CLIENT_IO_GRACE);
     let (hdr, body) = send_daemon_rpc(

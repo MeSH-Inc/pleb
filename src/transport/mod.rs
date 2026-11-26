@@ -10,6 +10,8 @@ use std::time::Duration;
 
 const CHROME_MAJOR: &str = "143";
 const CHROME_FULL: &str = "143.0.7499.109";
+pub const MARKDOWN_ACCEPT_HEADER: &str =
+    "text/markdown, text/x-markdown;q=0.95, text/html;q=0.9, application/xhtml+xml;q=0.8, */*;q=0.7";
 pub const DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_RAW_MAX_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
 
@@ -191,22 +193,22 @@ impl TransportClient {
         .await
     }
 
+    pub async fn get_with_limits(
+        &self,
+        url: &str,
+        timeout: Duration,
+        max_body_bytes: usize,
+    ) -> Result<HttpResponse> {
+        self.get_with_options(url, timeout, max_body_bytes, false)
+            .await
+    }
+
     pub async fn get_with_options(
         &self,
         url: &str,
         timeout: Duration,
         max_body_bytes: usize,
         accept_markdown: bool,
-    ) -> Result<HttpResponse> {
-        let _ = accept_markdown;
-        self.get_with_limits(url, timeout, max_body_bytes).await
-    }
-
-    pub async fn get_with_limits(
-        &self,
-        url: &str,
-        timeout: Duration,
-        max_body_bytes: usize,
     ) -> Result<HttpResponse> {
         match &self.backend {
             #[cfg(unix)]
@@ -217,11 +219,12 @@ impl TransportClient {
                 verbose,
                 daemon_executable,
             } => {
-                crate::daemon::daemon_http_get_with_executable(
+                crate::daemon::client::daemon_http_get_with_options(
                     state_dir,
                     proxy.as_deref(),
                     timeout,
                     max_body_bytes,
+                    accept_markdown,
                     *idle_timeout,
                     *verbose,
                     url,
@@ -237,20 +240,24 @@ impl TransportClient {
             } => {
                 #[cfg(feature = "cronet")]
                 {
-                    let headers = chrome_header_pairs(true);
+                    let headers = request_header_pairs(true, accept_markdown);
                     let resp = engine.get(url, &headers, timeout, max_body_bytes).await?;
                     Ok(HttpResponse {
                         status: resp.status_code,
                         final_url: resp.final_url,
                         content_type: resp.content_type,
-                        link_header: None,
+                        link_header: resp.link_header,
                         body: resp.body,
                     })
                 }
                 #[cfg(not(feature = "cronet"))]
                 {
                     let fut = async {
-                        let mut resp = inner.get(url).timeout(timeout).send().await?;
+                        let mut req = inner.get(url).timeout(timeout);
+                        if accept_markdown {
+                            req = req.header(reqwest::header::ACCEPT, MARKDOWN_ACCEPT_HEADER);
+                        }
+                        let mut resp = req.send().await?;
                         let final_url = resp.url().to_string();
                         let status = resp.status().as_u16();
                         let content_type = resp
@@ -258,6 +265,18 @@ impl TransportClient {
                             .get(reqwest::header::CONTENT_TYPE)
                             .and_then(|v| v.to_str().ok())
                             .map(|s| s.to_string());
+                        let link_values: Vec<&str> = resp
+                            .headers()
+                            .get_all(reqwest::header::LINK)
+                            .iter()
+                            .filter_map(|v| v.to_str().ok())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        let link_header = if link_values.is_empty() {
+                            None
+                        } else {
+                            Some(link_values.join(", "))
+                        };
                         let mut body = Vec::new();
                         while let Some(chunk) = resp.chunk().await? {
                             if body.len().saturating_add(chunk.len()) > max_body_bytes {
@@ -271,7 +290,7 @@ impl TransportClient {
                             status,
                             final_url,
                             content_type,
-                            link_header: None,
+                            link_header,
                             body,
                         })
                     };
@@ -317,6 +336,17 @@ fn sec_ch_ua_platform() -> &'static str {
     } else {
         "\"Windows\""
     }
+}
+
+#[cfg(feature = "cronet")]
+fn request_header_pairs(include_zstd: bool, accept_markdown: bool) -> Vec<(&'static str, String)> {
+    let mut pairs = chrome_header_pairs(include_zstd);
+    if accept_markdown {
+        if let Some((_, value)) = pairs.iter_mut().find(|(name, _)| *name == "Accept") {
+            *value = MARKDOWN_ACCEPT_HEADER.to_string();
+        }
+    }
+    pairs
 }
 
 fn chrome_header_pairs(include_zstd: bool) -> Vec<(&'static str, String)> {

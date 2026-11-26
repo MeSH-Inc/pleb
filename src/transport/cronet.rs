@@ -118,6 +118,7 @@ pub struct CronetResponse {
     pub status_code: u16,
     pub final_url: String,
     pub content_type: Option<String>,
+    pub link_header: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -234,6 +235,7 @@ impl Engine {
             status_code: AtomicI32::new(0),
             final_url: Mutex::new(url.to_string()),
             content_type: Mutex::new(None),
+            link_header: Mutex::new(None),
             sender: Mutex::new(Some(tx)),
             request: Mutex::new(std::ptr::null_mut()),
             callback: Mutex::new(std::ptr::null_mut()),
@@ -344,6 +346,7 @@ struct RequestState {
     status_code: AtomicI32,
     final_url: Mutex<String>,
     content_type: Mutex<Option<String>>,
+    link_header: Mutex<Option<String>>,
     sender: Mutex<Option<oneshot::Sender<Result<CronetResponse>>>>,
     request: Mutex<ffi::Cronet_UrlRequestPtr>,
     callback: Mutex<ffi::Cronet_UrlRequestCallbackPtr>,
@@ -399,6 +402,8 @@ unsafe extern "C" fn on_response_started(
     }
 
     let header_count = ffi::Cronet_UrlResponseInfo_all_headers_list_size(info);
+    let mut content_type: Option<String> = None;
+    let mut link_values: Vec<String> = Vec::new();
     for i in 0..header_count {
         let header = ffi::Cronet_UrlResponseInfo_all_headers_list_at(info, i);
         if header.is_null() {
@@ -408,12 +413,22 @@ unsafe extern "C" fn on_response_started(
         let value_ptr = ffi::Cronet_HttpHeader_value_get(header);
         if !name_ptr.is_null() && !value_ptr.is_null() {
             let name = CStr::from_ptr(name_ptr).to_string_lossy();
-            if name.eq_ignore_ascii_case("content-type") {
+            if name.eq_ignore_ascii_case("content-type") && content_type.is_none() {
                 let value = CStr::from_ptr(value_ptr).to_string_lossy().into_owned();
-                *lock_unpoisoned(&state.content_type) = Some(value);
-                break;
+                content_type = Some(value);
+            } else if name.eq_ignore_ascii_case("link") {
+                let value = CStr::from_ptr(value_ptr).to_string_lossy().into_owned();
+                if !value.is_empty() {
+                    link_values.push(value);
+                }
             }
         }
+    }
+    if content_type.is_some() {
+        *lock_unpoisoned(&state.content_type) = content_type;
+    }
+    if !link_values.is_empty() {
+        *lock_unpoisoned(&state.link_header) = Some(link_values.join(", "));
     }
 
     let buffer = ffi::Cronet_Buffer_Create();
@@ -506,6 +521,7 @@ unsafe extern "C" fn on_succeeded(
     let body = std::mem::take(&mut *lock_unpoisoned(&boxed.body));
     let final_url = std::mem::take(&mut *lock_unpoisoned(&boxed.final_url));
     let content_type = lock_unpoisoned(&boxed.content_type).take();
+    let link_header = lock_unpoisoned(&boxed.link_header).take();
 
     complete(
         &boxed,
@@ -513,6 +529,7 @@ unsafe extern "C" fn on_succeeded(
             status_code: code as u16,
             final_url,
             content_type,
+            link_header,
             body,
         }),
     );
