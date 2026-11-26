@@ -689,3 +689,107 @@ fn chromium_cronet_cef_version_and_keyring_parity() {
         "cef/renderer_linux.c must pass --password-store=basic to prevent headless keyring hangs"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires installed v5-meta CEF renderer; run explicitly via --ignored"]
+async fn live_cef_renderer_cold_start_static_and_spa_hydration() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let renderer_path = std::env::var_os("WICK_CEF_RENDERER")
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+        .or_else(|| {
+            let home = std::env::var_os("HOME").map(PathBuf::from)?;
+            find_renderer_in(&home.join(".mesh-wick"))
+        })
+        .expect(
+            "installed v5-meta CEF renderer not found; build with `bash scripts/install-cef-mac.sh --force` or set WICK_CEF_RENDERER",
+        );
+    assert_eq!(
+        probe_renderer_binary(&renderer_path),
+        RendererProbe::Ready(renderer_path.clone()),
+        "installed renderer at {} must match {EXPECTED_PROTOCOL}",
+        renderer_path.display()
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let body: &[u8] = match path {
+                    "/static" => b"<!DOCTYPE html><html><head><title>Local Static</title></head><body><main><h1>Local Static</h1><p>Static CEF render verified.</p></main></body></html>",
+                    "/spa" => b"<!DOCTYPE html><html><head><title>Local SPA</title></head><body><div id=\"root\"></div><script>setTimeout(function(){document.getElementById('root').innerHTML='<main><article data-ready=\"1\"><h1>Hydrated SPA</h1><p>Client-rendered content loaded asynchronously via script for verification.</p></article></main>';},150);</script></body></html>",
+                    _ => b"<!DOCTYPE html><html><body>not found</body></html>",
+                };
+                let status = if matches!(path, "/static" | "/spa") {
+                    "200 OK"
+                } else {
+                    "404 Not Found"
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.write_all(body).await;
+            });
+        }
+    });
+
+    // Allocate under /tmp to also exercise macOS /tmp -> /private/tmp cache path canonicalization.
+    let state_dir = TempStateDir::new();
+    let cache_dir = state_dir.path().join("cef-cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let renderer = CefRenderer::new_direct(state_dir.to_path_buf(), None, false)
+        .with_cache_dir(cache_dir)
+        .with_renderer_executable(Some(renderer_path));
+
+    let static_url = format!("http://{addr}/static");
+    let static_res = renderer
+        .render(
+            &static_url,
+            &CefRenderOptions::default(),
+            Duration::from_secs(15),
+        )
+        .await
+        .expect("cold-start static CEF render should succeed without keyring deadlock");
+    assert_eq!(static_res.status_code, 200);
+    assert!(static_res.html.contains("Static CEF render verified."));
+
+    let spa_url = format!("http://{addr}/spa");
+    let spa_res = renderer
+        .render(
+            &spa_url,
+            &CefRenderOptions {
+                wait_for_selector: Some("article[data-ready=\"1\"]".to_string()),
+            },
+            Duration::from_secs(15),
+        )
+        .await
+        .expect("JS-hydrated SPA render with selector wait should succeed");
+    assert_eq!(spa_res.status_code, 200);
+    assert!(spa_res
+        .html
+        .contains("Client-rendered content loaded asynchronously"));
+
+    drop(renderer);
+    server.abort();
+}

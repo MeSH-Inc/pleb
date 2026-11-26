@@ -695,11 +695,12 @@ fn parse_paren_destination(s: &str, open_paren: usize) -> Option<ParenDestinatio
 
 fn markdown_to_plain_text(md: &str) -> String {
     let defined_refs = collect_defined_ref_labels(md);
+    let cleaned_tags = strip_markdown_html_mdx_tags(md);
     let mut lines: Vec<String> = Vec::new();
     let mut fence: Option<(char, usize)> = None;
     let mut blank_run = 0usize;
 
-    for raw_line in md.lines() {
+    for raw_line in cleaned_tags.lines() {
         if let Some((fc, fl)) = fence {
             if is_closing_fence(raw_line, fc, fl) {
                 fence = None;
@@ -735,6 +736,213 @@ fn markdown_to_plain_text(md: &str) -> String {
     }
 
     lines.join("\n")
+}
+
+fn strip_markdown_html_mdx_tags(md: &str) -> String {
+    let bytes = md.as_bytes();
+    let mut out = String::with_capacity(md.len());
+    let mut fence: Option<(char, usize)> = None;
+    let mut i = 0usize;
+    let mut at_line_start = true;
+
+    while i < bytes.len() {
+        if at_line_start {
+            let line_end = md[i..].find('\n').map(|n| i + n + 1).unwrap_or(bytes.len());
+            let raw_line = md[i..line_end].trim_end_matches(['\r', '\n']);
+            if let Some((fc, fl)) = fence {
+                out.push_str(&md[i..line_end]);
+                if is_closing_fence(raw_line, fc, fl) {
+                    fence = None;
+                }
+                i = line_end;
+                continue;
+            }
+            if let Some(f) = parse_opening_fence(raw_line) {
+                fence = Some(f);
+                out.push_str(&md[i..line_end]);
+                i = line_end;
+                continue;
+            }
+            at_line_start = false;
+        }
+
+        if bytes[i] == b'\n' {
+            out.push('\n');
+            at_line_start = true;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'`' {
+            let run = count_byte_run(bytes, i, b'`');
+            if let Some(close_end) = find_closing_backticks(bytes, i + run, run) {
+                if !md[i..close_end].contains("\n\n") {
+                    out.push_str(&md[i..close_end]);
+                    i = close_end;
+                    continue;
+                }
+            }
+            out.push_str(&md[i..i + run]);
+            i += run;
+            continue;
+        }
+        if bytes[i] == b'<' {
+            if md[i..].starts_with("<!--") {
+                if let Some(end) = md[i + 4..].find("-->") {
+                    i += 4 + end + 3;
+                    continue;
+                }
+            }
+            let prev_is_ident = i > 0
+                && matches!(bytes[i - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b':');
+            if !prev_is_ident {
+                if let Some((tag_len, block_break)) = match_html_or_mdx_tag(&md[i..]) {
+                    if block_break && !out.is_empty() && !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    i += tag_len;
+                    continue;
+                }
+            }
+        }
+        let ch = md[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn match_html_or_mdx_tag(s: &str) -> Option<(usize, bool)> {
+    const HTML_TAGS: &[&str] = &[
+        "a",
+        "abbr",
+        "article",
+        "aside",
+        "audio",
+        "b",
+        "blockquote",
+        "br",
+        "caption",
+        "center",
+        "code",
+        "col",
+        "colgroup",
+        "dd",
+        "del",
+        "details",
+        "div",
+        "dl",
+        "dt",
+        "em",
+        "figcaption",
+        "figure",
+        "font",
+        "footer",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "hr",
+        "i",
+        "iframe",
+        "img",
+        "ins",
+        "kbd",
+        "li",
+        "main",
+        "mark",
+        "nav",
+        "ol",
+        "p",
+        "picture",
+        "pre",
+        "q",
+        "s",
+        "script",
+        "section",
+        "small",
+        "source",
+        "span",
+        "strong",
+        "style",
+        "sub",
+        "summary",
+        "sup",
+        "svg",
+        "table",
+        "tbody",
+        "td",
+        "tfoot",
+        "th",
+        "thead",
+        "tr",
+        "track",
+        "u",
+        "ul",
+        "video",
+    ];
+    const INLINE_TAGS: &[&str] = &[
+        "a", "abbr", "b", "code", "del", "em", "font", "i", "ins", "kbd", "mark", "q", "s",
+        "small", "span", "strong", "sub", "sup", "u",
+    ];
+
+    let bytes = s.as_bytes();
+    let is_close = bytes.get(1) == Some(&b'/');
+    let name_start = if is_close { 2 } else { 1 };
+    let first = *bytes.get(name_start)?;
+    if !first.is_ascii_alphabetic() {
+        return None;
+    }
+    let mut j = name_start + 1;
+    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'-') {
+        j += 1;
+    }
+    let name = &s[name_start..j];
+    let after = *bytes.get(j)?;
+    if !matches!(after, b'>' | b'/' | b' ' | b'\t' | b'\r' | b'\n') {
+        return None;
+    }
+    let lower = name.to_ascii_lowercase();
+    let is_html = HTML_TAGS.binary_search(&lower.as_str()).is_ok();
+    let is_mdx = first.is_ascii_uppercase()
+        && name.bytes().any(|b| b.is_ascii_lowercase())
+        && !name.contains('-');
+    if !is_html && !is_mdx {
+        return None;
+    }
+
+    let limit = bytes.len().min(2048);
+    let (mut quote, mut brace_depth) = (None, 0usize);
+    while j < limit {
+        let b = bytes[j];
+        if quote.is_none() && brace_depth == 0 && b == b'\n' && bytes.get(j + 1) == Some(&b'\n') {
+            return None;
+        }
+        match quote {
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None if b == b'"' || b == b'\'' => quote = Some(b),
+            None if b == b'{' => brace_depth += 1,
+            None if b == b'}' && brace_depth > 0 => brace_depth -= 1,
+            None if brace_depth == 0 && b == b'<' => return None,
+            None if brace_depth == 0 && b == b'>' => {
+                let mut total = j + 1;
+                if !is_close && matches!(lower.as_str(), "script" | "style") {
+                    let close_pat = format!("</{lower}>");
+                    if let Some(rel) = s[total..].to_ascii_lowercase().find(&close_pat) {
+                        total += rel + close_pat.len();
+                    }
+                }
+                let block_break = is_mdx || INLINE_TAGS.binary_search(&lower.as_str()).is_err();
+                return Some((total, block_break));
+            }
+            None => {}
+        }
+        j += 1;
+    }
+    None
 }
 
 fn collect_defined_ref_labels(md: &str) -> HashSet<String> {

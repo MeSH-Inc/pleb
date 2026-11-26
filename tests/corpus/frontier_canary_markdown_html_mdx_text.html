@@ -1,0 +1,29 @@
+<!-- wick-fixture: {"tier":"ratchet","url":"https://docs.example.org/guide/intro.md","status_code":200,"content_type":"text/markdown; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"Intro Guide","variants":[{"name":"clean_txt","format":"text","mode":"clean","expected_substrings":["Intro Guide","Website | Documentation","Looking to chat? Visit example.org.","Use Vec<String> with <uri-reference> when a < b and c > d, or <Tip> in code.","Check the status of services."],"forbidden_substrings":["<div align","<picture>","<source media","<img alt","</picture>","<Note>","</Note>","<CardGroup","<Card title","</Card>","hidden comment"],"minimum_output_bytes":100,"maximum_output_bytes":900}]} -->
+# Intro Guide
+
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://docs.example.org/dark.svg">
+    <img alt="Project Logo"
+         src="https://docs.example.org/light.svg"
+         width="50%">
+  </picture>
+[Website][site] | [Documentation][docs]
+</div>
+
+<!-- hidden comment -->
+
+<Note>
+  Looking to chat? Visit [example.org](https://example.org/).
+</Note>
+
+Use Vec<String> with <uri-reference> when a < b and c > d, or `<Tip>` in code.
+
+<CardGroup cols={2}>
+  <Card title="Status" href="https://status.example.org">
+    Check the status of services.
+  </Card>
+</CardGroup>
+
+[site]: https://example.org/
+[docs]: ./docs/index.md

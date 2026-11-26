@@ -1581,4 +1581,31 @@ fn adversarial_canary_inverse_false_positives_preserve_valid_content() {
         .content
         .contains("**fenced_bold** and [Keep]: ./keep.md"));
     assert!(!txt_doc.content.contains("defined.md"));
+
+    // 5. Native Markdown --format text HTML/MDX stripping preserves fenced HTML, autolinks,
+    // generics, single-letter <T>, and unclosed tags, while stripping <script> bodies.
+    let mdx_edge = concat!(
+        "See <https://example.org>, Option<Card>, and generic <T> with <div unclosed.\n",
+        "<script>alert(1)</script><style>.x{color:red}</style>Safe prose.\n\n",
+        "```html\n<div class=\"keep\"><Note>verbatim</Note></div>\n```\n"
+    );
+    let mdx_doc = extract_document(
+        mdx_edge,
+        &md_url,
+        Some("text/markdown"),
+        &ExtractOptions {
+            format: OutputFormat::Text,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(mdx_doc
+        .content
+        .contains("See <https://example.org>, Option<Card>, and generic <T> with <div unclosed."));
+    assert!(mdx_doc.content.contains("Safe prose."));
+    assert!(!mdx_doc.content.contains("alert(1)"));
+    assert!(!mdx_doc.content.contains("color:red"));
+    assert!(mdx_doc
+        .content
+        .contains("<div class=\"keep\"><Note>verbatim</Note></div>"));
 }
