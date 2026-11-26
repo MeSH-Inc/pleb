@@ -1028,3 +1028,206 @@ for raw in sys.stdin:
     assert_eq!(loaded.key_id(), RFC8037_THUMBPRINT);
     assert_eq!(loaded.signature_agent(), AGENT_URL);
 }
+
+#[tokio::test]
+async fn adversarial_wba_incomplete_state_header_injection_and_multihop_bounce() {
+    // 1. Debug representation must never leak key material.
+    let signer = rfc8037_signer();
+    let dbg = format!("{signer:?}");
+    assert!(!dbg.contains(RFC8037_D), "Debug leaked private d: {dbg}");
+
+    // 2. Incomplete state_dir configurations fail loudly with actionable commands; empty returns None.
+    {
+        let _clean = EnvGuard::new(&[
+            ("PLEB_WEB_BOT_AUTH_JWK", None),
+            ("PLEB_WEB_BOT_AUTH_AGENT", None),
+        ]);
+        let empty_dir = TempStateDir::new();
+        assert!(WebBotAuthSigner::from_state_dir(empty_dir.path())
+            .unwrap()
+            .is_none());
+
+        let jwk_only = TempStateDir::new();
+        set_credential(
+            jwk_only.path(),
+            CredentialProvider::WebBotAuthJwk,
+            &rfc8037_jwk_json(),
+            CredentialStorage::File,
+        )
+        .unwrap();
+        let err_missing_agent = WebBotAuthSigner::from_state_dir(jwk_only.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err_missing_agent.contains("web-bot-auth-agent"),
+            "unexpected incomplete error: {err_missing_agent}"
+        );
+
+        let agent_only = TempStateDir::new();
+        set_credential(
+            agent_only.path(),
+            CredentialProvider::WebBotAuthAgent,
+            AGENT_URL,
+            CredentialStorage::File,
+        )
+        .unwrap();
+        let err_missing_jwk = WebBotAuthSigner::from_state_dir(agent_only.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err_missing_jwk.contains("web-bot-auth-jwk"),
+            "unexpected incomplete error: {err_missing_jwk}"
+        );
+    }
+
+    // 3. Reject control/non-ASCII bytes in signature_input and signature_agent too.
+    let dir = TempStateDir::new();
+    let direct = TransportClient::new_direct(dir.path(), None, Duration::from_secs(5)).unwrap();
+    for bad_opts in [
+        WebBotAuthHeaders {
+            signature: "sig1=:dGVzdA==:".to_string(),
+            signature_input: "sig1=(\"@authority\");created=1\r\nX-Inject: 1".to_string(),
+            signature_agent: format!("\"{AGENT_URL}\""),
+        },
+        WebBotAuthHeaders {
+            signature: "sig1=:dGVzdA==:".to_string(),
+            signature_input: "sig1=(\"@authority\");created=1".to_string(),
+            signature_agent: format!("\"{AGENT_URL}\x1b[31m\""),
+        },
+        WebBotAuthHeaders {
+            signature: "sig1=:dGVzdA==:".to_string(),
+            signature_input: "sig1=(\"@authority\");created=1".to_string(),
+            signature_agent: format!("\"{AGENT_URL}/é\""),
+        },
+    ] {
+        let err = direct
+            .get_with_request_options(
+                "http://127.0.0.1:9/bad",
+                Duration::from_secs(2),
+                1024,
+                &RequestHeaderOptions {
+                    web_bot_auth: Some(bad_opts),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            transport_error_kind(&err),
+            Some(TransportErrorKind::Network)
+        );
+    }
+
+    // 4. Protocol-relative //host redirect + https -> http -> https bounce + empty vs malformed Location.
+    let mock_dir = TempStateDir::new();
+    let routes = vec![
+        (
+            "https://alpha.example/start".to_string(),
+            302,
+            Some("//cdn.example:8443/bounce".to_string()),
+            Vec::new(),
+        ),
+        (
+            "https://cdn.example:8443/bounce".to_string(),
+            302,
+            Some("http://plain.example/mid".to_string()),
+            Vec::new(),
+        ),
+        (
+            "http://plain.example/mid".to_string(),
+            307,
+            Some("https://gamma.example/done".to_string()),
+            Vec::new(),
+        ),
+        (
+            "https://gamma.example/done".to_string(),
+            200,
+            None,
+            b"bounced-ok".to_vec(),
+        ),
+        (
+            "https://alpha.example/empty-loc".to_string(),
+            302,
+            Some("   ".to_string()),
+            b"stay".to_vec(),
+        ),
+        (
+            "https://alpha.example/bad-loc".to_string(),
+            302,
+            Some("http://[::1".to_string()),
+            Vec::new(),
+        ),
+    ];
+    let (hops, srv) = spawn_mock_v4_daemon(mock_dir.path(), routes).await;
+    let daemon = TransportClient::new_daemon(
+        mock_dir.path().to_path_buf(),
+        None,
+        Duration::from_secs(5),
+        Duration::from_secs(30),
+        false,
+    );
+
+    let bounce_resp = execute_signed_get(
+        &daemon,
+        "https://alpha.example/start",
+        Duration::from_secs(5),
+        64 * 1024,
+        &RequestHeaderOptions {
+            referer: Some("https://alpha.example/ref".to_string()),
+            ..Default::default()
+        },
+        Some(&signer),
+    )
+    .await
+    .unwrap();
+    assert_eq!(bounce_resp.status, 200);
+    assert_eq!(bounce_resp.text(), "bounced-ok");
+
+    let empty_loc_resp = execute_signed_get(
+        &daemon,
+        "https://alpha.example/empty-loc",
+        Duration::from_secs(5),
+        64 * 1024,
+        &RequestHeaderOptions::default(),
+        Some(&signer),
+    )
+    .await
+    .unwrap();
+    assert_eq!(empty_loc_resp.status, 302);
+    assert_eq!(empty_loc_resp.text(), "stay");
+
+    let bad_loc_err = execute_signed_get(
+        &daemon,
+        "https://alpha.example/bad-loc",
+        Duration::from_secs(5),
+        64 * 1024,
+        &RequestHeaderOptions::default(),
+        Some(&signer),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        transport_error_kind(&bad_loc_err),
+        Some(TransportErrorKind::RedirectBlocked)
+    );
+
+    let recorded = hops.lock().unwrap();
+    assert_eq!(recorded.len(), 6);
+    verify_wba_headers(
+        "cdn.example:8443",
+        recorded[1].web_bot_auth.as_ref().unwrap(),
+        RFC8037_X,
+    )
+    .unwrap();
+    assert!(
+        recorded[2].web_bot_auth.is_none() && recorded[2].referer.is_none(),
+        "http:// hop must strip WBA headers and https Referer"
+    );
+    verify_wba_headers(
+        "gamma.example",
+        recorded[3].web_bot_auth.as_ref().unwrap(),
+        RFC8037_X,
+    )
+    .unwrap();
+    srv.abort();
+}
