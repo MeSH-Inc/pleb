@@ -529,7 +529,7 @@ async fn fetch_sitemap(
             _ => continue,
         };
 
-        let Some(xml) = decode_sitemap_body(&resp.body) else {
+        let Some(xml) = decode_sitemap_body(&resp.body, resp.content_type.as_deref()) else {
             continue;
         };
 
@@ -574,7 +574,7 @@ async fn fetch_sitemap(
     page_urls
 }
 
-fn decode_sitemap_body(body: &[u8]) -> Option<String> {
+fn decode_sitemap_body(body: &[u8], content_type: Option<&str>) -> Option<String> {
     if body.starts_with(&[0x1f, 0x8b]) {
         let decoder = GzDecoder::new(body);
         let mut limited = decoder.take(MAX_SITEMAP_DECOMPRESSED_BYTES + 1);
@@ -583,54 +583,15 @@ fn decode_sitemap_body(body: &[u8]) -> Option<String> {
         if out.len() as u64 > MAX_SITEMAP_DECOMPRESSED_BYTES {
             return None;
         }
-        Some(String::from_utf8_lossy(&out).into_owned())
+        Some(extract::decode_text_bytes(&out, None))
     } else {
-        Some(String::from_utf8_lossy(body).into_owned())
+        Some(extract::decode_text_bytes(body, content_type))
     }
 }
 
 fn parse_sitemap_xml(xml: &str) -> ParsedSitemap {
-    let is_index = contains_opening_local_tag(xml, "sitemapindex");
-    let locs = extract_loc_elements(xml);
-    if is_index {
-        ParsedSitemap::Index(locs)
-    } else {
-        ParsedSitemap::UrlSet(locs)
-    }
-}
-
-fn contains_opening_local_tag(xml: &str, target_local_name: &str) -> bool {
     let bytes = xml.as_bytes();
-    let mut idx = 0;
-    while idx < bytes.len() {
-        let Some(rel_lt) = xml[idx..].find('<') else {
-            break;
-        };
-        let tag_start = idx + rel_lt + 1;
-        if tag_start >= bytes.len() {
-            break;
-        }
-        let first = bytes[tag_start];
-        if first == b'?' || first == b'!' || first == b'/' {
-            idx = tag_start + 1;
-            continue;
-        }
-        let mut name_end = tag_start;
-        while name_end < bytes.len() && is_xml_name_char(bytes[name_end]) {
-            name_end += 1;
-        }
-        let raw_name = &xml[tag_start..name_end];
-        let local_name = raw_name.rsplit_once(':').map_or(raw_name, |(_, l)| l);
-        if local_name.eq_ignore_ascii_case(target_local_name) {
-            return true;
-        }
-        idx = name_end.max(tag_start + 1);
-    }
-    false
-}
-
-fn extract_loc_elements(xml: &str) -> Vec<String> {
-    let bytes = xml.as_bytes();
+    let mut is_index = false;
     let mut urls = Vec::new();
     let mut idx = 0;
 
@@ -655,6 +616,11 @@ fn extract_loc_elements(xml: &str) -> Vec<String> {
         let raw_name = &xml[tag_start..name_end];
         let local_name = raw_name.rsplit_once(':').map_or(raw_name, |(_, l)| l);
 
+        if local_name.eq_ignore_ascii_case("sitemapindex") {
+            is_index = true;
+            idx = name_end.max(tag_start + 1);
+            continue;
+        }
         if !local_name.eq_ignore_ascii_case("loc") {
             idx = name_end.max(tag_start + 1);
             continue;
@@ -686,7 +652,11 @@ fn extract_loc_elements(xml: &str) -> Vec<String> {
         idx = next_idx;
     }
 
-    urls
+    if is_index {
+        ParsedSitemap::Index(urls)
+    } else {
+        ParsedSitemap::UrlSet(urls)
+    }
 }
 
 fn find_closing_loc(xml: &str, mut search_from: usize) -> Option<(usize, usize)> {

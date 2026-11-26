@@ -173,19 +173,8 @@ pub async fn fetch_document(
         )));
     }
 
-    let parsed = parse_http_url(url)?;
-    let effective = resolve_target_url(ctx, &parsed, options.apply_rewrites);
-    let effective_str = effective.as_str();
-    let host = effective
-        .host_str()
-        .ok_or_else(|| FetchError::InvalidUrl("missing host".to_string()))?;
-
-    if options.respect_robots && !ctx.robots.is_allowed(&ctx.client, effective_str).await {
-        return Err(FetchError::RobotsDisallowed {
-            host: host.to_string(),
-            url: effective_str.to_string(),
-        });
-    }
+    let (effective, _) =
+        resolve_and_check_robots(ctx, url, options.apply_rewrites, options.respect_robots).await?;
 
     let page = acquire_page(
         ctx,
@@ -225,20 +214,7 @@ pub async fn fetch_html(
     url: &str,
     respect_robots: bool,
 ) -> std::result::Result<FetchHtmlResult, FetchError> {
-    let parsed = parse_http_url(url)?;
-    let effective = resolve_target_url(ctx, &parsed, true);
-    let effective_str = effective.as_str();
-    let host = effective
-        .host_str()
-        .ok_or_else(|| FetchError::InvalidUrl("missing host".to_string()))?;
-
-    if respect_robots && !ctx.robots.is_allowed(&ctx.client, effective_str).await {
-        return Err(FetchError::RobotsDisallowed {
-            host: host.to_string(),
-            url: effective_str.to_string(),
-        });
-    }
-
+    let (effective, _) = resolve_and_check_robots(ctx, url, true, respect_robots).await?;
     let page = acquire_page(ctx, &effective, RenderMode::Auto, None).await?;
     Ok(FetchHtmlResult {
         html: page.body,
@@ -255,17 +231,7 @@ pub async fn fetch_raw(
     respect_robots: bool,
 ) -> std::result::Result<FetchRawResult, FetchError> {
     let start = Instant::now();
-    let parsed = parse_http_url(url)?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| FetchError::InvalidUrl("missing host".to_string()))?;
-
-    if respect_robots && !ctx.robots.is_allowed(&ctx.client, parsed.as_str()).await {
-        return Err(FetchError::RobotsDisallowed {
-            host: host.to_string(),
-            url: url.to_string(),
-        });
-    }
+    let (parsed, host) = resolve_and_check_robots(ctx, url, false, respect_robots).await?;
 
     let max_bytes = ctx
         .config
@@ -286,7 +252,7 @@ pub async fn fetch_raw(
     }
 
     ctx.site_cache
-        .record(host, ctx.client.transport_name(), timing_ms);
+        .record(&host, ctx.client.transport_name(), timing_ms);
 
     Ok(FetchRawResult {
         bytes: resp.body,
@@ -296,6 +262,29 @@ pub async fn fetch_raw(
         content_type: resp.content_type,
         timing_ms,
     })
+}
+
+async fn resolve_and_check_robots(
+    ctx: &RuntimeContext,
+    url: &str,
+    apply_rewrites: bool,
+    respect_robots: bool,
+) -> std::result::Result<(url::Url, String), FetchError> {
+    let parsed = parse_http_url(url)?;
+    let effective = resolve_target_url(ctx, &parsed, apply_rewrites);
+    let host = effective
+        .host_str()
+        .ok_or_else(|| FetchError::InvalidUrl("missing host".to_string()))?
+        .to_string();
+
+    if respect_robots && !ctx.robots.is_allowed(&ctx.client, effective.as_str()).await {
+        return Err(FetchError::RobotsDisallowed {
+            host,
+            url: effective.to_string(),
+        });
+    }
+
+    Ok((effective, host))
 }
 
 async fn acquire_page(
@@ -326,8 +315,13 @@ async fn acquire_page(
 
     let mut cef_fallback = false;
     if plan.primary == PrimaryTransport::Cef {
-        match render_cef_checked(&ctx.cef, url_str, effective_selector, ctx.config.cef_timeout)
-            .await
+        match render_cef_checked(
+            &ctx.cef,
+            url_str,
+            effective_selector,
+            ctx.config.cef_timeout,
+        )
+        .await
         {
             Ok(cef_res) => return classify_cef_result(ctx, host, start, cef_res, false),
             Err(err) => {
@@ -376,8 +370,7 @@ async fn acquire_page(
 
     let body = resp.text();
     let mut parsed_html = None;
-    let classification =
-        classify_response_with_parsed(status, is_html, &body, &mut parsed_html);
+    let classification = classify_response_with_parsed(status, is_html, &body, &mut parsed_html);
 
     match classification {
         ResponseClassification::Ok => {
@@ -488,7 +481,9 @@ async fn try_cef_escalation(
     wait_for_selector: Option<&str>,
 ) -> CefEscalation {
     match render_cef_checked(&ctx.cef, url, wait_for_selector, ctx.config.cef_timeout).await {
-        Ok(cef_res) => CefEscalation::Completed(classify_cef_result(ctx, host, start, cef_res, true)),
+        Ok(cef_res) => {
+            CefEscalation::Completed(classify_cef_result(ctx, host, start, cef_res, true))
+        }
         Err(err @ FetchError::CefUnavailable(_)) => CefEscalation::Unavailable(err),
         Err(err) => CefEscalation::RenderFailed(err),
     }
@@ -784,7 +779,10 @@ where
                 )
             };
 
-            let _host_permit = host_sem.acquire_owned().await.expect("host semaphore closed");
+            let _host_permit = host_sem
+                .acquire_owned()
+                .await
+                .expect("host semaphore closed");
             let _global_permit = global_c
                 .acquire_owned()
                 .await

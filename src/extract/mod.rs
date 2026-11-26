@@ -103,10 +103,7 @@ pub fn extract_document_parsed(
     }
 
     if is_passthrough_non_html(content_type) {
-        let (content, truncated) = match options.max_bytes {
-            Some(max) => truncate_utf8(body, max),
-            None => (body.to_string(), false),
-        };
+        let (content, truncated) = apply_utf8_limit(body, options.max_bytes);
         return Ok(ExtractedDocument {
             title: None,
             content,
@@ -119,10 +116,7 @@ pub fn extract_document_parsed(
             .as_ref()
             .and_then(ParsedHtml::title)
             .or_else(|| ParsedHtml::parse(body).title());
-        let (content, truncated) = match options.max_bytes {
-            Some(max) => truncate_utf8(body, max),
-            None => (body.to_string(), false),
-        };
+        let (content, truncated) = apply_utf8_limit(body, options.max_bytes);
         return Ok(ExtractedDocument {
             title,
             content,
@@ -234,6 +228,13 @@ fn looks_like_binary_bytes(body: &[u8]) -> bool {
     }
     let inspect = &body[..body.len().min(8192)];
     inspect.contains(&0)
+}
+
+fn apply_utf8_limit(text: &str, max_bytes: Option<usize>) -> (String, bool) {
+    match max_bytes {
+        Some(max) => truncate_utf8(text, max),
+        None => (text.to_string(), false),
+    }
 }
 
 pub fn truncate_utf8(text: &str, max_bytes: usize) -> (String, bool) {

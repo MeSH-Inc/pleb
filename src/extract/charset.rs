@@ -48,16 +48,13 @@ const META_SNIFF_LIMIT: usize = 2048;
 /// back to lossy UTF-8 decoding.
 pub fn decode_text_bytes(body: &[u8], content_type: Option<&str>) -> String {
     if let Some(rest) = body.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
-        return match std::str::from_utf8(rest) {
-            Ok(s) => s.to_string(),
-            Err(_) => String::from_utf8_lossy(rest).into_owned(),
-        };
+        return String::from_utf8_lossy(rest).into_owned();
     }
     if let Some(rest) = body.strip_prefix(&[0xFF, 0xFE]) {
-        return decode_utf16_le(rest);
+        return decode_utf16(rest, u16::from_le_bytes);
     }
     if let Some(rest) = body.strip_prefix(&[0xFE, 0xFF]) {
-        return decode_utf16_be(rest);
+        return decode_utf16(rest, u16::from_be_bytes);
     }
 
     if let Ok(s) = std::str::from_utf8(body) {
@@ -72,8 +69,8 @@ pub fn decode_text_bytes(body: &[u8], content_type: Option<&str>) -> String {
             "windows-1252" | "cp1252" | "x-cp1252" | "iso-8859-1" | "iso_8859-1" | "latin1"
             | "latin-1" | "l1" | "us-ascii" | "ascii" | "ansi_x3.4-1968",
         ) => decode_windows_1252(body),
-        Some("utf-16" | "utf-16le") => decode_utf16_le(body),
-        Some("utf-16be") => decode_utf16_be(body),
+        Some("utf-16" | "utf-16le") => decode_utf16(body, u16::from_le_bytes),
+        Some("utf-16be") => decode_utf16(body, u16::from_be_bytes),
         _ => String::from_utf8_lossy(body).into_owned(),
     }
 }
@@ -90,21 +87,9 @@ fn decode_windows_1252(bytes: &[u8]) -> String {
     out
 }
 
-fn decode_utf16_le(bytes: &[u8]) -> String {
+fn decode_utf16(bytes: &[u8], from_bytes: fn([u8; 2]) -> u16) -> String {
     let (chunks, rem) = bytes.as_chunks::<2>();
-    let iter = chunks.iter().copied().map(u16::from_le_bytes);
-    let mut out: String = char::decode_utf16(iter)
-        .map(|res| res.unwrap_or(char::REPLACEMENT_CHARACTER))
-        .collect();
-    if !rem.is_empty() {
-        out.push(char::REPLACEMENT_CHARACTER);
-    }
-    out
-}
-
-fn decode_utf16_be(bytes: &[u8]) -> String {
-    let (chunks, rem) = bytes.as_chunks::<2>();
-    let iter = chunks.iter().copied().map(u16::from_be_bytes);
+    let iter = chunks.iter().copied().map(from_bytes);
     let mut out: String = char::decode_utf16(iter)
         .map(|res| res.unwrap_or(char::REPLACEMENT_CHARACTER))
         .collect();

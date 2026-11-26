@@ -29,7 +29,7 @@ pub struct HttpResponse {
 
 impl HttpResponse {
     pub fn text(&self) -> String {
-        String::from_utf8_lossy(&self.body).into_owned()
+        crate::extract::decode_text_bytes(&self.body, self.content_type.as_deref())
     }
 
     pub fn is_html(&self) -> bool {
