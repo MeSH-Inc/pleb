@@ -78,12 +78,6 @@ impl RuntimeContext {
             robots,
         })
     }
-
-    pub fn clear_session(&self) -> Result<()> {
-        clear_state_dir(&self.config.state_dir)?;
-        self.site_cache.clear()?;
-        Ok(())
-    }
 }
 
 pub fn clear_state_dir(state_dir: &Path) -> Result<()> {

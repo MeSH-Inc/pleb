@@ -109,14 +109,14 @@ fn site_cache_atomic_save_and_ttl_expiry() {
 #[test]
 fn site_rules_bundled_parent_rewrite_and_local_overlay() {
     let dir = temp_dir("site-rules");
-    let overlay = r#"{"rules":{"reuters.com":{"render":"cronet"},"custom.dev":{"render":"cef"}}}"#;
+    let overlay = r#"{"rules":{"x.com":{"render":"cronet"},"sub.example.com":{"render":"cef"},"custom.dev":{"render":"cef"}}}"#;
     std::fs::write(dir.join("site-rules.json"), overlay).unwrap();
 
     let rules = SiteRules::load(&dir);
 
-    // Local overlay overrides bundled reuters.com rule, preserving www. parent lookup.
+    // Local overlay overrides bundled x.com rule, preserving www. parent lookup.
     assert_eq!(
-        rules.get("www.reuters.com").and_then(|r| r.render.as_deref()),
+        rules.get("www.x.com").and_then(|r| r.render.as_deref()),
         Some("cronet")
     );
     assert_eq!(
@@ -125,8 +125,8 @@ fn site_rules_bundled_parent_rewrite_and_local_overlay() {
     );
 
     // Exact subdomain does not overreach.
-    assert!(rules.get("finance.yahoo.com").is_some());
-    assert!(rules.get("mail.yahoo.com").is_none());
+    assert!(rules.get("sub.example.com").is_some());
+    assert!(rules.get("other.example.com").is_none());
 
     // Bundled Reddit rewrite works once and does not rewrite old.reddit.com again.
     let reddit = Url::parse("https://www.reddit.com/r/rust/").unwrap();

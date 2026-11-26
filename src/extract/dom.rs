@@ -14,8 +14,6 @@ pub struct DomTextMetrics {
     pub has_empty_spa_root: bool,
 }
 
-const ALWAYS_STRIP_TAGS: &[&str] = &["script", "style", "noscript", "template"];
-const BOILERPLATE_TAGS: &[&str] = &["svg", "nav", "footer", "aside"];
 const BOILERPLATE_ATTR_PATTERNS: &[&str] = &[
     "cookie-banner",
     "cookie-consent",
@@ -195,8 +193,6 @@ pub fn extract_plain_text(html: &str, mode: ExtractMode) -> String {
 fn prune_dom(doc: &mut Html, mode: ExtractMode) {
     let mut to_detach: Vec<NodeId> = Vec::new();
 
-    let _ = ALWAYS_STRIP_TAGS;
-    let _ = BOILERPLATE_TAGS;
     collect_selector_ids(doc, &ALWAYS_STRIP_SEL, &mut to_detach);
 
     // Drop inline data: URI images that bloat markdown output without adding value.

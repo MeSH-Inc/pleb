@@ -17,14 +17,6 @@ pub enum SearchProvider {
     DuckDuckGo,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum Freshness {
-    Day,
-    Week,
-    Month,
-    Year,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SearchResult {
     pub title: String,

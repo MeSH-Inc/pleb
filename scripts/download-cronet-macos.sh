@@ -12,7 +12,7 @@ SHA256="828f9ce5595d3aa2c9be90e64e4e1b5f9120be70c101e1dbbdde4ef81cf67eed"
 case "$ARCH" in
     arm64)  DIR="darwin_arm64" ;;
     *)      echo "Error: static libcronet.a is only supported for macOS arm64 (Apple Silicon)."
-            echo "On Intel Macs, use 'make build-purego' with a libcronet.dylib instead."
+            echo "Build without --features cronet to use the reqwest fallback."
             exit 1 ;;
 esac
 
