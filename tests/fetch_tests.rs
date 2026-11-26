@@ -8,7 +8,8 @@ use pleb::fetch::{
     BatchItemResult, FetchError, FetchOptions,
 };
 use pleb::policy::{
-    parse_markdown_link_header, resolve_raw_source_candidate, RawSourceKind, RenderMode, SourceMode,
+    parse_markdown_link_header, resolve_raw_source_candidate, RawSourceKind, RenderMode,
+    SourceMode, ToolPolicy,
 };
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -1866,4 +1867,375 @@ fn adversarial_artifact_staging_traversal_bom_html_magic_mismatch_and_perms() {
         Some("pdf")
     );
     assert_eq!(pdf_staged.content_type.as_deref(), Some("application/pdf"));
+}
+
+async fn spawn_fetch_mock_cdp_server(
+    html_body: &'static str,
+    status_code: u16,
+    imperative_tool_name: Option<&'static str>,
+) -> String {
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::{json, Value};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                while let Some(Ok(Message::Text(text))) = ws.next().await {
+                    let Ok(val) = serde_json::from_str::<Value>(text.as_str()) else {
+                        continue;
+                    };
+                    let id = val["id"].as_i64().unwrap_or(0);
+                    let method = val["method"].as_str().unwrap_or("");
+                    let sid = val["sessionId"].as_str().map(|s| s.to_string());
+
+                    let send_frame =
+                        |id_opt: Option<i64>, ev_method: Option<&str>, result: Value| {
+                            let mut obj = serde_json::Map::new();
+                            if let Some(i) = id_opt {
+                                obj.insert("id".into(), json!(i));
+                                obj.insert("result".into(), result);
+                            } else if let Some(m) = ev_method {
+                                obj.insert("method".into(), json!(m));
+                                obj.insert("params".into(), result);
+                            }
+                            if let Some(ref s) = sid {
+                                obj.insert("sessionId".into(), json!(s));
+                            }
+                            Message::Text(Value::Object(obj).to_string().into())
+                        };
+
+                    let replies = match method {
+                        "Target.createTarget" => {
+                            vec![send_frame(Some(id), None, json!({ "targetId": "tgt-f" }))]
+                        }
+                        "Target.attachToTarget" => {
+                            vec![send_frame(Some(id), None, json!({ "sessionId": "sess-f" }))]
+                        }
+                        "Target.closeTarget" | "Page.enable" | "Network.enable"
+                        | "Fetch.enable" | "WebMCP.enable" => {
+                            vec![send_frame(Some(id), None, json!({}))]
+                        }
+                        "Page.getFrameTree" => vec![send_frame(
+                            Some(id),
+                            None,
+                            json!({ "frameTree": { "frame": { "id": "mf-f" } } }),
+                        )],
+                        "Page.navigate" => {
+                            let nav_url = val["params"]["url"]
+                                .as_str()
+                                .unwrap_or("http://127.0.0.1/")
+                                .to_string();
+                            let mut out = vec![send_frame(
+                                None,
+                                Some("Network.responseReceived"),
+                                json!({
+                                    "requestId": "req-f",
+                                    "frameId": "mf-f",
+                                    "type": "Document",
+                                    "response": {
+                                        "url": nav_url,
+                                        "status": status_code,
+                                        "headers": { "Content-Type": "text/html; charset=utf-8" }
+                                    }
+                                }),
+                            )];
+                            if let Some(tool_name) = imperative_tool_name {
+                                out.push(send_frame(
+                                    None,
+                                    Some("WebMCP.toolsAdded"),
+                                    json!({
+                                        "tools": [{
+                                            "name": tool_name,
+                                            "description": "Search catalog",
+                                            "frameId": "mf-f",
+                                            "inputSchema": { "type": "object" }
+                                        }]
+                                    }),
+                                ));
+                            }
+                            out.push(send_frame(Some(id), None, json!({})));
+                            out.push(send_frame(None, Some("Page.loadEventFired"), json!({})));
+                            out
+                        }
+                        "DOM.getDocument" => {
+                            vec![send_frame(
+                                Some(id),
+                                None,
+                                json!({ "root": { "nodeId": 3 } }),
+                            )]
+                        }
+                        "DOM.getOuterHTML" => {
+                            vec![send_frame(
+                                Some(id),
+                                None,
+                                json!({ "outerHTML": html_body }),
+                            )]
+                        }
+                        _ => {
+                            let mut obj = json!({
+                                "id": id,
+                                "error": { "code": -32601, "message": "not found" }
+                            });
+                            if let Some(ref s) = sid {
+                                obj["sessionId"] = json!(s);
+                            }
+                            vec![Message::Text(obj.to_string().into())]
+                        }
+                    };
+                    for msg in replies {
+                        if ws.send(msg).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    format!("ws://127.0.0.1:{}/devtools/browser", addr.port())
+}
+
+async fn spawn_escalation_origin_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let resp = match path {
+                    "/blocked-page" => http_response(
+                        "403 Forbidden",
+                        "text/html",
+                        b"<html><body>Access Denied</body></html>",
+                    ),
+                    "/js-shell" => http_response(
+                        "200 OK",
+                        "text/html",
+                        b"<html><head><title>App</title></head><body><div id=\"root\"></div><script>window.__APP__=1</script><noscript>Please enable JavaScript</noscript></body></html>",
+                    ),
+                    "/challenge" => http_response(
+                        "403 Forbidden",
+                        "text/html",
+                        b"<html><head><title>Just a moment...</title></head><body>Checking your browser before accessing... /cdn-cgi/challenge-platform/</body></html>",
+                    ),
+                    _ => http_response(
+                        "200 OK",
+                        "text/html",
+                        b"<html><head><title>Origin</title></head><body><main>Plain HTML</main></body></html>",
+                    ),
+                };
+                let _ = socket.write_all(&resp).await;
+            });
+        }
+    });
+
+    format!("http://127.0.0.1:{}", addr.port())
+}
+
+#[tokio::test]
+async fn fetch_cdp_render_escalation_challenge_proxy_and_batch_tools() {
+    let state_dir = temp_state_dir();
+    let origin = spawn_escalation_origin_server().await;
+    let cdp_ws = spawn_fetch_mock_cdp_server(
+        "<html><head><title>CDP Rendered</title></head><body><main><h1>CDP Content</h1><p>Hydrated article body with substantial text.</p></main></body></html>",
+        200,
+        Some("query_catalog"),
+    )
+    .await;
+
+    let ctx = Arc::new(
+        RuntimeContext::new(RuntimeConfig {
+            state_dir: state_dir.path().to_path_buf(),
+            cdp_url: Some(cdp_ws.clone()),
+            cdp_timeout: Duration::from_secs(5),
+            no_web_bot_auth: true,
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+
+    // 1. Direct RenderMode::Cdp returns CDP strategy, populated imperative tools, and records "cdp".
+    let direct = fetch_document(
+        &ctx,
+        &format!("{origin}/plain"),
+        &FetchOptions {
+            render: RenderMode::Cdp,
+            tools: ToolPolicy::Manifest,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(direct.strategy, "cdp");
+    assert!(!direct.escalated);
+    assert!(direct.content.contains("Hydrated article body"));
+    assert_eq!(direct.tools.len(), 1);
+    assert_eq!(direct.tools[0].name, "query_catalog");
+    let manifest_md = pleb::extract::webmcp::format_webmcp_manifest_markdown(&direct.tools);
+    if !manifest_md.is_empty() {
+        assert!(direct.content.contains("query_catalog"));
+    }
+
+    // Cached "cdp" in ctx routes Auto directly to PrimaryTransport::Cdp without escalation.
+    let cached_hit = fetch_document(
+        &ctx,
+        &format!("{origin}/blocked-page"),
+        &FetchOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(cached_hit.strategy, "cdp");
+    assert!(!cached_hit.escalated);
+
+    // 2. Cold RenderMode::Auto escalates on 403 Blocked and 200 JavaScriptShell when CDP is available.
+    let make_cold_ctx = |dir: &Path| {
+        RuntimeContext::new(RuntimeConfig {
+            state_dir: dir.to_path_buf(),
+            cdp_url: Some(cdp_ws.clone()),
+            cdp_timeout: Duration::from_secs(5),
+            no_web_bot_auth: true,
+            ..Default::default()
+        })
+        .unwrap()
+    };
+
+    let blocked_dir = temp_state_dir();
+    let blocked_ctx = make_cold_ctx(blocked_dir.path());
+    let blocked_esc = fetch_document(
+        &blocked_ctx,
+        &format!("{origin}/blocked-page"),
+        &FetchOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(blocked_esc.strategy, "cdp");
+    assert!(blocked_esc.escalated);
+
+    let js_dir = temp_state_dir();
+    let js_ctx = make_cold_ctx(js_dir.path());
+    let js_esc = fetch_document(
+        &js_ctx,
+        &format!("{origin}/js-shell"),
+        &FetchOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(js_esc.strategy, "cdp");
+    assert!(js_esc.escalated);
+
+    // 3. Challenge fast-fail exits with FetchError::Challenge without bypassing via CDP.
+    let chal_dir = temp_state_dir();
+    let chal_ctx = make_cold_ctx(chal_dir.path());
+    let challenge_err = fetch_document(
+        &chal_ctx,
+        &format!("{origin}/challenge"),
+        &FetchOptions::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(challenge_err, FetchError::Challenge { .. }));
+    assert_eq!(challenge_err.exit_code(), 2);
+
+    // 4. --format axtree pre-flight validation errors.
+    for (bad_render, bad_cdp) in [
+        (RenderMode::Cronet, Some(cdp_ws.clone())),
+        (RenderMode::Cef, Some(cdp_ws.clone())),
+        (RenderMode::Auto, None),
+    ] {
+        let state_sub = temp_state_dir();
+        let sub_ctx = RuntimeContext::new(RuntimeConfig {
+            state_dir: state_sub.path().to_path_buf(),
+            cdp_url: bad_cdp,
+            no_web_bot_auth: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let err = fetch_document(
+            &sub_ctx,
+            &format!("{origin}/plain"),
+            &FetchOptions {
+                render: bad_render,
+                extract: ExtractOptions {
+                    format: OutputFormat::Axtree,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, FetchError::CdpUnavailable(_)));
+    }
+
+    // 5. Proxy blocks CDP explicitly and suppresses CDP in Auto.
+    let proxy_state = temp_state_dir();
+    let proxy_ctx = RuntimeContext::new(RuntimeConfig {
+        state_dir: proxy_state.path().to_path_buf(),
+        cdp_url: Some(cdp_ws.clone()),
+        proxy: Some("http://127.0.0.1:18080".to_string()),
+        no_web_bot_auth: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let proxy_err = fetch_document(
+        &proxy_ctx,
+        &format!("{origin}/plain"),
+        &FetchOptions {
+            render: RenderMode::Cdp,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(proxy_err, FetchError::CdpUnavailable(_)));
+
+    // 6. Batch fetch propagates tools to BatchItemSuccess.
+    let batch = fetch_batch(
+        Arc::clone(&ctx),
+        vec![format!("{origin}/plain")],
+        BatchFetchOptions {
+            fetch: FetchOptions {
+                render: RenderMode::Cdp,
+                ..Default::default()
+            },
+            concurrency: 1,
+            metadata_only: true,
+        },
+        |_, _| {},
+    )
+    .await;
+    assert_eq!(batch.len(), 1);
+    match &batch[0].1 {
+        BatchItemResult::Success(item) => {
+            assert_eq!(item.strategy, "cdp");
+            assert_eq!(item.tools.len(), 1);
+            assert_eq!(item.tools[0].name, "query_catalog");
+            assert!(item.content.is_none());
+        }
+        BatchItemResult::Failure(f) => panic!("unexpected batch failure: {f:?}"),
+    }
 }

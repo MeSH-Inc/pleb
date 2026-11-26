@@ -9,14 +9,14 @@ pleb status --json
 pleb skill print
 ```
 
-Healthy Cronet + CEF installations report `"cronet_enabled": true`, `"cef_renderer": { "status": "ready", "expected_protocol": "v5-meta" }`, and `"state_dir": "<home>/.pleb"`. Standard builds without `--features cronet` report `"cronet_enabled": false` and use `reqwest` (`rustls`).
+Healthy Cronet + CEF installations report `"cronet_enabled": true`, `"cef_renderer": { "status": "ready", "expected_protocol": "v5-meta" }`, `"cdp_renderer"`, `"agent_identity"`, and `"state_dir": "<home>/.pleb"`. Standard builds without `--features cronet` report `"cronet_enabled": false` and use `reqwest` (`rustls`).
 
 ## Behavioral Boundaries
 
 - **Zero telemetry**: All upstream telemetry pings and remote `site-rules.json` fetches from `wickproject/wick` are removed. Bundled rules live in [data/site-rules.json](data/site-rules.json) with an optional local overlay at `<state_dir>/site-rules.json`.
-- **Fail fast on bot challenges**: `pleb` never solves CAPTCHAs, clicks challenge widgets, or runs anti-bot evasion scripts. Active challenges return exit code `2` (`kind: "challenge"`) immediately without duplicate CEF retries.
-- **Redirect SSRF protection**: Both Cronet and `reqwest` validate `3xx` redirects against non-HTTP(S) schemes and private/loopback/IMDS/`.local`/`.internal` targets from public origins (`redirect_blocked` transport error).
-- **Private local state (`0o700` / `0o600`)**: Credentials resolve `environment -> macOS Keychain (service "pleb") -> <state_dir>/credentials.json`, never accept secrets as positional CLI args, zeroize in memory, and never appear in JSON or `-v` logs.
+- **Fail fast on bot challenges**: `pleb` never solves CAPTCHAs, clicks challenge widgets, or runs anti-bot evasion scripts. Active challenges return exit code `2` (`kind: "challenge"`) immediately without duplicate CEF or CDP retries.
+- **Redirect & CDP SSRF protection**: Cronet, `reqwest`, and CDP (`Fetch.enable` + navigation events) validate URLs against non-HTTP(S) schemes, self-SSRF, and private/loopback/IMDS/`.local`/`.internal` targets (`redirect_blocked` transport error). Plaintext `ws://` CDP is restricted to loopback hosts with post-connect `peer_addr().ip().is_loopback()` verification, and CDP refuses `--proxy` bypasses. Local Docker/`wrangler` Kitesurf runs page JS in `workerd`, which is not a hardened sandbox — target Cloudflare Workers Dynamic Workers (or an OS-sandboxed browser) for untrusted public sites.
+- **Private local state (`0o700` / `0o600`) & strictly read-only WebMCP**: Credentials resolve `environment -> macOS Keychain (service "pleb") -> <state_dir>/credentials.json`, never accept secrets as positional CLI args, zeroize in memory, scrub credential env vars and `PLEB_CDP_URL` from `daemon.sock` and CEF child processes, and never appear in JSON or `-v` logs. Discovered WebMCP tools are read-only (`untrusted_content: true`) and never executed automatically.
 
 ## Installation Modes
 
@@ -83,6 +83,10 @@ Notes:
 - `--timeout <SECS>`: Network request timeout (default `30`).
 - `--max-response-bytes <BYTES>`: Body cap (default `16 MiB` document / `128 MiB` raw).
 - `--cef-timeout <SECS>`: CEF render timeout (default `60`).
+- `--no-web-bot-auth` (`PLEB_NO_WEB_BOT_AUTH`): Disable RFC 9421 Ed25519 Web Bot Auth signing.
+- `--cdp-url <URL>` (`PLEB_CDP_URL`): WebSocket CDP / Kitesurf endpoint (`ws://` loopback or `wss://`).
+- `--cdp-timeout <SECS>` (`PLEB_CDP_TIMEOUT`): CDP render timeout (default `60`).
+- `--prefer-cdp` (`PLEB_PREFER_CDP`): Prefer CDP ahead of local CEF in `--render auto`.
 - `--state-dir <DIR>` (`PLEB_HOME`): Private (`0o700`) state directory (default `~/.pleb`).
 - `--no-daemon` (`PLEB_NO_DAEMON`): Bypass `daemon.sock` and run in-process.
 - `--daemon-idle-timeout <SECS>` (`PLEB_DAEMON_IDLE_SECONDS`): Daemon idle exit seconds (default `300`).
@@ -91,11 +95,12 @@ Notes:
 ### Subcommands
 
 - `pleb fetch [OPTIONS] <URLS>...` (or `-` to read URLs from `stdin`):
-  - `--format <markdown|html|text|raw>` (aliases: `md`, `txt`)
+  - `--format <markdown|html|text|axtree|raw>` (aliases: `md`, `txt`, `ax`; `axtree` requires CDP)
   - `--extract <clean|article|full>` (default `clean`)
-  - `--render <auto|cef|cronet>` (aliases: `browser`/`render`/`js` -> `cef`; `network`/`fast`/`no-js`/`nojs` -> `cronet`)
+  - `--render <auto|cef|cdp|cronet>` (aliases: `browser`/`render`/`js` -> `cef`; `kitesurf`/`remote` -> `cdp`; `network`/`fast`/`no-js`/`nojs` -> `cronet`)
   - `--source <auto|negotiate|none>` (default `auto`: raw forge URLs + RFC 8288/HTML Markdown mirrors; `negotiate` sends `Accept: text/markdown` and probes `<path>.md`)
   - `--resources <none|manifest|transcripts|diagrams|all>` (default `none`: zero subresource requests, indexes into JSON/`stderr` cue)
+  - `--tools <none|manifest>` (default `none`: indexes declarative/imperative WebMCP tools into `tools` and `stderr` cue; `manifest` appends `## Page Tools (WebMCP)`)
   - `--stage-resources <r1,r2>` / `--stage` / `--referer <URL>` (content-addressed `0o600` files in `<state_dir>/artifacts/`, magic-byte validated, `256 MiB` LRU eviction)
   - `--wait-for-selector <CSS>`, `--respect-robots`, `--no-rewrite`, `--no-images`, `--no-links`, `--max-bytes <N>`
   - Batch options: `--concurrency <1..=16>` (default `4`, host cap `2`), `--jsonl`, `--metadata-only`, `-o <PATH>` (single URL only)
@@ -104,7 +109,7 @@ Notes:
   - `--provider <auto|brave|tavily|serper|exa|searxng|duckduckgo|federated>` (`ddg` alias; `federated` merges with deterministic RRF `k = 60`)
   - `--mode <auto|exact|semantic>`
   - `--freshness <day|week|month|year>`, `--site <DOMAIN>`, `--extra-snippets`, `--urls-only`
-- `pleb auth set <brave|tavily|serper|exa|searxng> [--stdin] [--storage <auto|keychain|file>]`, `pleb auth remove <provider>`, `pleb auth status [--json]` (interactive `set` reads `/dev/tty` with echo off)
+- `pleb auth set <brave|tavily|serper|exa|searxng|web-bot-auth-jwk|web-bot-auth-agent|cdp-access-client-id|cdp-access-client-secret|cdp-access-host> [--stdin] [--storage <auto|keychain|file>]`, `pleb auth remove <provider>`, `pleb auth status [--json]` (interactive `set` reads `/dev/tty` with echo off; multi-line JSON allowed for `web-bot-auth-jwk`)
 - `pleb crawl <URL> [-d 2] [-n 10] [--extract clean|article|full] [--path-filter PREFIX] [--no-robots]` (respects `robots.txt` + `Crawl-delay` by default; max `--depth 5`, `--max-pages 50`)
 - `pleb map <URL> [-n 100] [--path-filter PREFIX] [--no-sitemap] [--no-robots]` (max `--limit 5000`)
 - `pleb status [--json]`, `pleb daemon <status|stop|run>`, `pleb session clear`, `pleb skill print [--json]`
@@ -122,12 +127,12 @@ Notes:
 | `130` | Interrupted interactive TTY secret prompt (`SIGINT`/`SIGTERM`) |
 
 Key JSON schemas (`--json` / `--jsonl`):
-- **`FetchOutput`**: `url`, `final_url`, `status_code`, `content_type`, `title`, `content` (omitted with `--metadata-only`), `content_bytes`, `strategy` (`cronet`, `reqwest`, `cef`, `raw_source`, `markdown_mirror`, `markdown_negotiated`), `escalated`, `truncated`, `timing_ms`, optional `resources` (`ResourceDescriptor[]`).
+- **`FetchOutput`**: `url`, `final_url`, `status_code`, `content_type`, `title`, `content` (omitted with `--metadata-only`), `content_bytes`, `strategy` (`cronet`, `reqwest`, `cef`, `cdp`, `raw_source`, `markdown_mirror`, `markdown_negotiated`), `escalated`, `truncated`, `timing_ms`, optional `resources` (`ResourceDescriptor[]`), optional `tools` (`WebMcpToolDescriptor[]`).
 - **`BatchItemResult`**: untagged union on `ok` (`true` matches `FetchOutput`; `false` has `url`, `ok`, `error`, `kind`, `exit_code`).
 - **`StagedAssetOutput`**: `url`, `final_url`, `status_code`, `content_type`, `byte_count`, `staged_path`, `timing_ms`.
 - **`ResourceDescriptor`**: `identifier` (`r1`, ...), `kind` (`diagram`, `image`, `transcript`, `document`, `dataset`, `schema`), `url`, `salience` (`high`, `medium`), plus optional `mime_hint`, `section_heading`, `label`, `dimensions`, `staged_path`, `byte_count`, `content_type`.
 - **`SearchResponse`**: `provider`, optional `providers_used`, `results` (`[{ title, url, snippet, extra_snippets? }]`).
-- **`StatusJson`**: `version`, `cronet_enabled`, `cef_renderer` (`status`, `path`, `found_protocol`, `expected_protocol`), `daemon` (`supported`, `running`, `pid`, `protocol_version`, `build_id`, `active_requests`, `cronet_slots`, `cef_renderers_alive`), `state_dir`, `search_providers`.
+- **`StatusJson`**: `version`, `cronet_enabled`, `cef_renderer` (`status`, `path`, `found_protocol`, `expected_protocol`), `cdp_renderer` (`configured`, `url`, `prefer_cdp`, `proxy_blocked`, `access`, `status_error`), `daemon` (`supported`, `running`, `pid`, `protocol_version`, `build_id`, `active_requests`, `cronet_slots`, `cef_renderers_alive`), `state_dir`, `search_providers`, `agent_identity`.
 - **`CrawlResult`** / **`MapResult`**: `pages` (`[{ url, title, content, depth }]`), `urls_discovered`, `timing_ms` / `urls`, `timing_ms`, `from_sitemap`.
 
 ## Agent Composition Patterns

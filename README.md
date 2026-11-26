@@ -2,14 +2,14 @@
 
 `pleb`, developed by Memory Sync Hub LLC, is a local, zero-telemetry web acquisition and search CLI for AI agents and scripts that need clean, compact page text instead of raw HTML. It is a zero-telemetry fork of [wickproject/wick](https://github.com/wickproject/wick).
 
-By default, `pleb` makes HTTP requests using Chrome's network stack (Cronet) or a `reqwest` fallback, strips page chrome into compact Markdown or plain text in a single DOM pass, and optionally escalates JavaScript-heavy or blocked pages to a local offscreen Chromium (CEF) renderer.
+By default, `pleb` makes HTTP requests using Chrome's network stack (Cronet) or a `reqwest` fallback, optionally signs public HTTPS fetches with RFC 9421 Web Bot Auth Ed25519 credentials, strips page chrome into compact Markdown or plain text in a single DOM pass, indexes WebMCP page tools (`--tools`), and optionally escalates JavaScript-heavy or blocked pages to a local offscreen Chromium (CEF) or remote CDP / Kitesurf WebSocket renderer (`--render cdp`).
 
 ## Capabilities
 
-- **Browser-grade transport and rendering**: Sends requests over Cronet (or `reqwest`) with redirect-time SSRF protection through a shared local Unix-socket daemon, and escalates unhydrated JavaScript pages or `403`/`503` responses to an optional local CEF renderer (native Ozone headless on Linux without Xvfb). Active bot challenges fail fast without CAPTCHA solving or bypass scripts. See [Transport and Rendering](README-FULL.md#transport-and-rendering).
-- **Deterministic HTML cleanup and source bypass**: Removes navigation, hidden nodes, cookie banners, tracking parameters, and code-gutter tables while rescuing formulas, code blocks, SVG diagram labels, and responsive images. Automatically uses raw files for GitHub/GitLab/Gist URLs, advertised Markdown mirrors, RSS/Atom/JSON feeds, YouTube captions, and WebVTT/SRT transcripts. See [Extraction and Source Negotiation](README-FULL.md#extraction-and-source-negotiation).
+- **Browser-grade transport, Web Bot Auth, and pluggable CDP/CEF rendering**: Sends requests over Cronet (or `reqwest`) with redirect-time SSRF protection through a shared local Unix-socket daemon (`daemon.sock`), optional RFC 9421 Ed25519 request signing (`--no-web-bot-auth`), escalation to local CEF (`v5-meta`) or a remote CDP / Cloudflare Kitesurf WebSocket endpoint (`--render cdp`, `--cdp-url`, `--format axtree`), and host-scoped Cloudflare Access auth. Active bot challenges fail fast without CAPTCHA solving or bypass scripts. See [Transport and Rendering](README-FULL.md#transport-and-rendering).
+- **Deterministic HTML cleanup, WebMCP discovery, and source bypass**: Removes navigation, hidden nodes, cookie banners, tracking parameters, and code-gutter tables while rescuing formulas, code blocks, SVG diagram labels, and responsive images. Indexes read-only declarative and imperative WebMCP tools (`--tools manifest`, `FetchOutput.tools`), and automatically uses raw files for GitHub/GitLab/Gist URLs, advertised Markdown mirrors, RSS/Atom/JSON feeds, YouTube captions, and WebVTT/SRT transcripts. See [Extraction and Source Negotiation](README-FULL.md#extraction-and-source-negotiation).
 - **On-demand asset staging**: Indexes diagrams, transcripts, PDFs, datasets, and schemas during the initial parse without making extra requests, and downloads selected assets into a local cache only when requested. See [Resource Indexing and Staging](README-FULL.md#resource-indexing-and-staging).
-- **Multi-provider search and local credentials**: Routes search queries across Brave, Tavily, Serper, Exa, SearXNG, or DuckDuckGo with cooldown tracking, burst pacing, Reciprocal Rank Fusion, and local credential storage (`pleb auth`). See [Search and Credentials](README-FULL.md#search-and-credentials).
+- **Multi-provider search and local credentials**: Routes search queries across Brave, Tavily, Serper, Exa, SearXNG, or DuckDuckGo with cooldown tracking, burst pacing, Reciprocal Rank Fusion, and local credential storage (`pleb auth`) for search, Web Bot Auth, and CDP Access credentials. See [Search and Credentials](README-FULL.md#search-and-credentials).
 - **Site crawling and mapping**: Crawls links with bounded concurrency and `Crawl-delay` pacing, and discovers site URLs from sitemaps and `robots.txt`. See [Crawl and Map](README-FULL.md#crawl-and-map).
 
 ## Benchmarks
@@ -76,6 +76,13 @@ pleb fetch https://example.com
 
 # Scope extraction to the main article and omit images
 pleb fetch --extract article --no-images https://example.com/post
+
+# Render over a remote CDP / Kitesurf endpoint or inspect the accessibility tree
+pleb fetch --render cdp --cdp-url wss://kitesurf.example.com/devtools/browser https://example.com
+pleb fetch --format axtree --cdp-url ws://127.0.0.1:8787/devtools/browser https://example.com
+
+# Include discovered WebMCP tools in Markdown or JSON
+pleb fetch --tools manifest https://example.com
 
 # Search and pipe URLs into a concurrent batch fetch
 pleb search --urls-only -n 5 "rust async runtime" | pleb fetch - --jsonl --concurrency 4

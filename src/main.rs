@@ -8,10 +8,11 @@ use pleb::extract::{format_page_section, ExtractMode, OutputFormat};
 use pleb::fetch::{
     self, BatchFetchOptions, BatchItemResult, FetchError, FetchOptions, FetchOutput,
 };
-use pleb::policy::{RenderMode, ResourcePolicy, SourceMode};
+use pleb::policy::{RenderMode, ResourcePolicy, SourceMode, ToolPolicy};
 use pleb::search::{
     self, Freshness, SearchMode, SearchOptions, SearchProvider, SearchProviderStatus,
 };
+use pleb::transport::cdp;
 use pleb::transport::cef::{self, RendererProbe};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -44,6 +45,22 @@ struct Cli {
     /// CEF render timeout in seconds
     #[arg(long, global = true, default_value = "60")]
     cef_timeout: u64,
+
+    /// Disable RFC 9421 Web Bot Auth request signing
+    #[arg(long, global = true, env = "PLEB_NO_WEB_BOT_AUTH")]
+    no_web_bot_auth: bool,
+
+    /// WebSocket CDP / Kitesurf endpoint URL (ws:// loopback or wss:// remote)
+    #[arg(long, global = true, env = "PLEB_CDP_URL")]
+    cdp_url: Option<String>,
+
+    /// CDP render timeout in seconds
+    #[arg(long, global = true, env = "PLEB_CDP_TIMEOUT", default_value = "60")]
+    cdp_timeout: u64,
+
+    /// Prefer CDP over local CEF during --render auto escalation
+    #[arg(long, global = true, env = "PLEB_PREFER_CDP")]
+    prefer_cdp: bool,
 
     /// Directory for local cache and session state
     #[arg(long, global = true, env = "PLEB_HOME")]
@@ -100,6 +117,9 @@ enum Command {
         /// Linked resource indexing and staging policy
         #[arg(long, value_enum, default_value_t = ResourcePolicy::None, ignore_case = true)]
         resources: ResourcePolicy,
+        /// WebMCP tool indexing policy
+        #[arg(long, value_enum, default_value_t = ToolPolicy::None, ignore_case = true)]
+        tools: ToolPolicy,
         /// Selectively stage or inline specific resource IDs (comma-separated, e.g. r1,r3)
         #[arg(long, value_delimiter = ',')]
         stage_resources: Vec<String>,
@@ -109,7 +129,7 @@ enum Command {
         /// Stage a single fetched asset into <state_dir>/artifacts/ and print its local path
         #[arg(long, conflicts_with_all = ["output", "metadata_only", "jsonl"])]
         stage: bool,
-        /// CSS selector to wait for when CEF renders
+        /// CSS selector to wait for when CEF or CDP renders
         #[arg(long)]
         wait_for_selector: Option<String>,
         /// Enforce robots.txt for this fetch (skipped by default)
@@ -166,7 +186,7 @@ enum Command {
         #[arg(long)]
         extra_snippets: bool,
     },
-    /// Manage stored search provider credentials
+    /// Manage stored search, agent identity, and CDP Access credentials
     Auth {
         #[command(subcommand)]
         action: AuthAction,
@@ -218,7 +238,7 @@ enum Command {
         #[command(subcommand)]
         action: SessionAction,
     },
-    /// Show binary, Cronet, CEF, and search configuration status
+    /// Show binary, Cronet, CEF, CDP, agent identity, and search configuration status
     Status,
     /// Emit the canonical version-locked pleb agent skill
     Skill {
@@ -369,13 +389,33 @@ struct DaemonStatusJson {
 }
 
 #[derive(Serialize)]
+struct CdpStatusJson {
+    configured: bool,
+    url: Option<String>,
+    prefer_cdp: bool,
+    proxy_blocked: bool,
+    access: auth::CdpAccessStatus,
+    status_error: Option<String>,
+}
+
+#[derive(Serialize)]
 struct StatusJson {
     version: &'static str,
     cronet_enabled: bool,
     cef_renderer: RendererStatusJson,
+    cdp_renderer: CdpStatusJson,
     daemon: DaemonStatusJson,
     state_dir: String,
     search_providers: BTreeMap<String, SearchProviderStatus>,
+    agent_identity: auth::AgentIdentityStatus,
+}
+
+#[derive(Serialize)]
+struct AuthStatusJson {
+    #[serde(flatten)]
+    search_providers: BTreeMap<String, SearchProviderStatus>,
+    agent_identity: auth::AgentIdentityStatus,
+    cdp_access: auth::CdpAccessStatus,
 }
 
 fn main() -> ExitCode {
@@ -430,6 +470,10 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
         daemon_idle_timeout: Duration::from_secs(cli.daemon_idle_timeout.max(1)),
         use_daemon: !cli.no_daemon,
         verbose: cli.verbose,
+        no_web_bot_auth: cli.no_web_bot_auth,
+        cdp_url: cli.cdp_url.filter(|s| !s.trim().is_empty()),
+        cdp_timeout: Duration::from_secs(cli.cdp_timeout.max(1)),
+        prefer_cdp: cli.prefer_cdp,
         ..Default::default()
     };
 
@@ -547,15 +591,21 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             let daemon_json = daemon_status_json(&config.state_dir).await;
             let search_providers = search::search_provider_statuses(&config.state_dir)
                 .map_err(|e| CliError::runtime("status_error", e))?;
+            let agent_identity =
+                auth::resolve_agent_identity_status(&config.state_dir, config.no_web_bot_auth);
+            let cdp_access = auth::resolve_cdp_access_status(&config.state_dir);
+            let cdp_renderer = build_cdp_status(&config, cdp_access);
 
             if json {
                 let payload = StatusJson {
                     version: env!("CARGO_PKG_VERSION"),
                     cronet_enabled: cfg!(feature = "cronet"),
                     cef_renderer: renderer_json,
+                    cdp_renderer,
                     daemon: daemon_json,
                     state_dir: config.state_dir.display().to_string(),
                     search_providers,
+                    agent_identity,
                 };
                 print_json(&payload)?;
             } else {
@@ -587,8 +637,13 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     ),
                     RendererProbe::NotInstalled => println!("CEF renderer: not installed"),
                 }
+                print_cdp_status(&cdp_renderer);
                 print_daemon_status(&daemon_json);
                 println!("State dir: {}", config.state_dir.display());
+                println!(
+                    "Agent identity: {}",
+                    format_agent_identity_summary(&agent_identity)
+                );
                 let configured: Vec<&str> = search_providers
                     .iter()
                     .filter(|(_, st)| st.configured)
@@ -626,6 +681,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             render,
             source,
             resources,
+            tools,
             stage_resources,
             referer,
             stage,
@@ -662,6 +718,28 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 return Err(CliError::invalid_input(
                     "--stage cannot be combined with --format raw",
                 ));
+            }
+            if tools == ToolPolicy::Manifest && (stage || format == OutputFormat::Raw) {
+                return Err(CliError::invalid_input(
+                    "--tools manifest cannot be combined with --stage or --format raw",
+                ));
+            }
+            if format == OutputFormat::Axtree {
+                if stage {
+                    return Err(CliError::invalid_input(
+                        "--format axtree cannot be combined with --stage",
+                    ));
+                }
+                if matches!(render, RenderMode::Cronet | RenderMode::Cef) {
+                    return Err(CliError::invalid_input(
+                        "--format axtree requires CDP rendering (cannot use --render cronet or --render cef)",
+                    ));
+                }
+                if config.cdp_url.is_none() {
+                    return Err(CliError::invalid_input(
+                        "--format axtree requires --cdp-url or PLEB_CDP_URL",
+                    ));
+                }
             }
             if format == OutputFormat::Raw && (json || jsonl || metadata_only || batch_mode) {
                 return Err(CliError::invalid_input(
@@ -757,12 +835,12 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 render,
                 source,
                 resources,
+                tools,
                 stage_resources,
                 referer,
                 wait_for_selector,
                 respect_robots,
                 apply_rewrites: !no_rewrite,
-                ..Default::default()
             };
 
             if !batch_mode {
@@ -798,6 +876,12 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                         if opts.resources == ResourcePolicy::None && opts.stage_resources.is_empty()
                         {
                             if let Some(cue) = fetch::format_resource_cue(&res.resources) {
+                                eprintln!("{cue}");
+                            }
+                        }
+                        if opts.tools == ToolPolicy::None {
+                            if let Some(cue) = pleb::extract::webmcp::format_webmcp_cue(&res.tools)
+                            {
                                 eprintln!("{cue}");
                             }
                         }
@@ -912,7 +996,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 storage,
             } => {
                 let secret = if stdin {
-                    read_secret_from_stdin()?
+                    read_secret_from_stdin(provider)?
                 } else {
                     read_secret_from_tty(provider)?
                 };
@@ -981,12 +1065,20 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 Ok(ExitCode::SUCCESS)
             }
             AuthAction::Status => {
-                let statuses = search::search_provider_statuses(&config.state_dir)
+                let search_providers = search::search_provider_statuses(&config.state_dir)
                     .map_err(|e| CliError::runtime("auth_error", e))?;
+                let agent_identity =
+                    auth::resolve_agent_identity_status(&config.state_dir, config.no_web_bot_auth);
+                let cdp_access = auth::resolve_cdp_access_status(&config.state_dir);
+                let payload = AuthStatusJson {
+                    search_providers,
+                    agent_identity,
+                    cdp_access,
+                };
                 if json {
-                    print_json(&statuses)?;
+                    print_json(&payload)?;
                 } else {
-                    print_auth_statuses(&statuses);
+                    print_auth_statuses(&payload);
                 }
                 Ok(ExitCode::SUCCESS)
             }
@@ -1129,7 +1221,10 @@ fn zeroize_bytes(bytes: &mut [u8]) {
     compiler_fence(Ordering::SeqCst);
 }
 
-fn validate_secret_input(raw: &mut [u8]) -> Result<SecretString, CliError> {
+fn validate_secret_input(
+    provider: CredentialProvider,
+    raw: &mut [u8],
+) -> Result<SecretString, CliError> {
     if raw.len() > MAX_SECRET_INPUT_BYTES {
         zeroize_bytes(raw);
         return Err(CliError::invalid_input(
@@ -1141,6 +1236,16 @@ fn validate_secret_input(raw: &mut [u8]) -> Result<SecretString, CliError> {
             let trimmed = text.trim();
             if trimmed.is_empty() {
                 Err(CliError::invalid_input("credential cannot be empty"))
+            } else if provider == CredentialProvider::WebBotAuthJwk {
+                if trimmed.bytes().any(|b| {
+                    !b.is_ascii() || (b.is_ascii_control() && !matches!(b, b'\n' | b'\r' | b'\t'))
+                }) {
+                    Err(CliError::invalid_input(
+                        "credential must contain printable ASCII or JSON whitespace only",
+                    ))
+                } else {
+                    Ok(SecretString::new(trimmed.to_string()))
+                }
             } else if trimmed
                 .bytes()
                 .any(|b| !b.is_ascii() || b.is_ascii_control())
@@ -1160,14 +1265,14 @@ fn validate_secret_input(raw: &mut [u8]) -> Result<SecretString, CliError> {
     result
 }
 
-fn read_secret_from_stdin() -> Result<SecretString, CliError> {
+fn read_secret_from_stdin(provider: CredentialProvider) -> Result<SecretString, CliError> {
     let mut buf = Vec::new();
     let mut limited = std::io::stdin().take((MAX_SECRET_INPUT_BYTES + 1) as u64);
     if let Err(err) = limited.read_to_end(&mut buf) {
         zeroize_bytes(&mut buf);
         return Err(CliError::runtime("io_error", err));
     }
-    validate_secret_input(&mut buf)
+    validate_secret_input(provider, &mut buf)
 }
 
 #[cfg(unix)]
@@ -1308,7 +1413,7 @@ fn read_secret_from_tty(provider: CredentialProvider) -> Result<SecretString, Cl
         });
     }
 
-    validate_secret_input(&mut buf)
+    validate_secret_input(provider, &mut buf)
 }
 
 #[cfg(not(unix))]
@@ -1331,8 +1436,100 @@ fn credential_source_label(source: CredentialSource) -> &'static str {
     }
 }
 
-fn print_auth_statuses(statuses: &BTreeMap<String, SearchProviderStatus>) {
-    for (provider, status) in statuses {
+fn build_cdp_status(config: &RuntimeConfig, access: auth::CdpAccessStatus) -> CdpStatusJson {
+    let configured = config.cdp_url.is_some();
+    let url = config
+        .cdp_url
+        .as_deref()
+        .map(cdp::sanitize_cdp_url_for_display);
+    let proxy_blocked = configured && config.proxy.is_some();
+    let status_error = if let Some(raw) = config.cdp_url.as_deref() {
+        if let Err(err) = cdp::validate_cdp_url(raw) {
+            Some(err.to_string())
+        } else if config.proxy.is_some() {
+            Some("CDP renderer disabled while --proxy / PLEB_PROXY is active".to_string())
+        } else {
+            access.status_error.clone()
+        }
+    } else {
+        access.status_error.clone()
+    };
+    CdpStatusJson {
+        configured,
+        url,
+        prefer_cdp: config.prefer_cdp,
+        proxy_blocked,
+        access,
+        status_error,
+    }
+}
+
+fn print_cdp_status(status: &CdpStatusJson) {
+    if !status.configured {
+        println!("CDP renderer: not configured");
+    } else {
+        let mut line = format!(
+            "CDP renderer: {} (prefer_cdp: {})",
+            status.url.as_deref().unwrap_or("[invalid-cdp-url]"),
+            status.prefer_cdp
+        );
+        if status.proxy_blocked {
+            line.push_str(" [blocked by proxy]");
+        }
+        if status.access.configured {
+            if let Some(ref host) = status.access.access_host {
+                line.push_str(&format!(" | access_host: {host}"));
+            }
+        }
+        if let Some(ref err) = status.status_error {
+            line.push_str(&format!(" | error: {err}"));
+        }
+        println!("{line}");
+    }
+}
+
+fn format_agent_identity_summary(status: &auth::AgentIdentityStatus) -> String {
+    let mode = if !status.web_bot_auth_enabled {
+        "disabled (--no-web-bot-auth)"
+    } else if status.jwk_configured && status.agent_configured {
+        "configured"
+    } else if status.jwk_configured || status.agent_configured {
+        "incomplete"
+    } else {
+        "not configured"
+    };
+    let mut summary = mode.to_string();
+    if let Some(ref keyid) = status.keyid {
+        summary.push_str(&format!(" (keyid: {keyid})"));
+    }
+    if let Some(ref err) = status.status_error {
+        summary.push_str(&format!(" | error: {err}"));
+    }
+    summary
+}
+
+fn format_cdp_access_summary(status: &auth::CdpAccessStatus) -> String {
+    let mut summary = if status.configured {
+        match status.access_host.as_deref() {
+            Some(host) => format!("configured (host: {host})"),
+            None => "configured".to_string(),
+        }
+    } else if status.client_id_configured
+        || status.client_secret_configured
+        || status.host_configured
+    {
+        "incomplete".to_string()
+    } else {
+        "not configured".to_string()
+    };
+    if let Some(ref err) = status.status_error {
+        summary.push_str(&format!(" | error: {err}"));
+    }
+    summary
+}
+
+fn print_auth_statuses(statuses: &AuthStatusJson) {
+    for (provider, status) in &statuses.search_providers {
         let mut line = if status.configured {
             let source = status
                 .source
@@ -1353,6 +1550,14 @@ fn print_auth_statuses(statuses: &BTreeMap<String, SearchProviderStatus>) {
         }
         println!("{line}");
     }
+    println!(
+        "web-bot-auth: {}",
+        format_agent_identity_summary(&statuses.agent_identity)
+    );
+    println!(
+        "cdp-access: {}",
+        format_cdp_access_summary(&statuses.cdp_access)
+    );
 }
 
 fn init_tracing(verbose: bool) {
@@ -1380,5 +1585,29 @@ fn emit_cli_error(err: &CliError, json: bool) {
         eprintln!("{}", payload);
     } else {
         eprintln!("error: {}", err.message);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_secret_input_allows_multiline_only_for_web_bot_auth_jwk() {
+        let mut multiline_jwk =
+            b"{\n  \"kty\": \"OKP\",\n  \"crv\": \"Ed25519\",\n  \"x\": \"abc\",\n  \"d\": \"def\"\n}\n"
+                .to_vec();
+        let ok = validate_secret_input(CredentialProvider::WebBotAuthJwk, &mut multiline_jwk)
+            .expect("WebBotAuthJwk should accept JSON whitespace");
+        assert!(ok.as_str().contains("\"kty\""));
+        assert!(multiline_jwk.iter().all(|&b| b == 0));
+
+        let mut multiline_brave = b"secret-1\nsecret-2\n".to_vec();
+        assert!(validate_secret_input(CredentialProvider::Brave, &mut multiline_brave).is_err());
+        assert!(multiline_brave.iter().all(|&b| b == 0));
+
+        let mut nul_jwk = b"{\"kty\":\"OKP\"\x00}".to_vec();
+        assert!(validate_secret_input(CredentialProvider::WebBotAuthJwk, &mut nul_jwk).is_err());
+        assert!(nul_jwk.iter().all(|&b| b == 0));
     }
 }

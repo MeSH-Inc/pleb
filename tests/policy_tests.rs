@@ -109,6 +109,47 @@ fn strategy_router_precedence() {
     );
     assert_eq!(p_cached_timeout.primary, PrimaryTransport::Cronet);
     assert_eq!(p_cached_timeout.escalation, EscalationBackend::Cef);
+
+    // Explicit CDP render never falls back to Cronet.
+    let p_cdp = plan_strategy(RenderMode::Cdp, None, None, true, true, false);
+    assert_eq!(p_cdp.primary, PrimaryTransport::Cdp);
+    assert_eq!(p_cdp.escalation, EscalationBackend::None);
+    assert!(!p_cdp.allow_cronet_fallback);
+
+    // site-rules "render": "cdp" uses Cdp when configured, otherwise falls back cleanly.
+    let cdp_rule = SiteRule {
+        render: Some("cdp".to_string()),
+        ..Default::default()
+    };
+    let p_rule_cdp = plan_strategy(RenderMode::Auto, Some(&cdp_rule), None, true, true, false);
+    assert_eq!(p_rule_cdp.primary, PrimaryTransport::Cdp);
+    assert!(p_rule_cdp.allow_cronet_fallback);
+
+    let p_rule_cdp_missing =
+        plan_strategy(RenderMode::Auto, Some(&cdp_rule), None, true, false, false);
+    assert_eq!(p_rule_cdp_missing.primary, PrimaryTransport::Cronet);
+    assert_eq!(p_rule_cdp_missing.escalation, EscalationBackend::Cef);
+
+    // prefer_cdp redirects CEF-preferred rules and caches toward CDP.
+    let p_rule_cef_prefer_cdp =
+        plan_strategy(RenderMode::Auto, Some(&cef_rule), None, true, true, true);
+    assert_eq!(p_rule_cef_prefer_cdp.primary, PrimaryTransport::Cdp);
+    assert!(p_rule_cef_prefer_cdp.allow_cronet_fallback);
+
+    // Cached "cdp" strategy selects Cdp primary when available, else Cronet.
+    let cdp_cached = SiteCacheEntry {
+        strategy: "cdp".to_string(),
+        avg_time_ms: 420,
+        successes: 1,
+        updated_at_epoch_secs: 1_000,
+    };
+    let p_cached_cdp = plan_strategy(RenderMode::Auto, None, Some(&cdp_cached), true, true, false);
+    assert_eq!(p_cached_cdp.primary, PrimaryTransport::Cdp);
+    assert!(p_cached_cdp.allow_cronet_fallback);
+
+    let p_cached_cef_prefer_cdp =
+        plan_strategy(RenderMode::Auto, None, Some(&cef_cached), true, true, true);
+    assert_eq!(p_cached_cef_prefer_cdp.primary, PrimaryTransport::Cdp);
 }
 
 #[test]
@@ -120,7 +161,7 @@ fn site_cache_atomic_save_and_ttl_expiry() {
     cache.record_at("example.com", "cef", 1200, 1_000_000);
     cache.record_at("slow.example.org", "cef_timeout", 60_000, 1_000_000);
 
-    let reloaded = SiteCache::load(cache_path);
+    let reloaded = SiteCache::load(cache_path.clone());
     assert_eq!(
         reloaded
             .get_at("www.example.com", 1_000_000 + 3600)
@@ -137,6 +178,22 @@ fn site_cache_atomic_save_and_ttl_expiry() {
     assert!(reloaded
         .get_at("slow.example.org", 1_000_000 + 24 * 3600 + 1)
         .is_none());
+
+    cache.record_at("slow-cdp.example.org", "cdp_timeout", 60_000, 2_000_000);
+    cache.record_at("ok-cdp.example.org", "cdp", 350, 2_000_000);
+    let reloaded_cdp = SiteCache::load(cache_path);
+    assert!(reloaded_cdp
+        .get_at("slow-cdp.example.org", 2_000_000 + 12 * 3600)
+        .is_some());
+    assert!(reloaded_cdp
+        .get_at("slow-cdp.example.org", 2_000_000 + 24 * 3600 + 1)
+        .is_none());
+    assert_eq!(
+        reloaded_cdp
+            .get_at("ok-cdp.example.org", 2_000_000 + 48 * 3600)
+            .map(|e| e.strategy),
+        Some("cdp".to_string())
+    );
 
     // Repeated same-strategy record within the refresh interval skips disk rewrite,
     // while a strategy change or post-interval refresh persists immediately.
@@ -512,4 +569,51 @@ fn adversarial_sveltekit_hydrated_and_zero_script_pages_not_flagged_as_js_shell(
         classify_response_with_context(200, true, None, None, &hydrated, &mut p2),
         ResponseClassification::Ok
     );
+}
+
+#[test]
+fn is_local_or_private_host_blocks_hardened_ipv4_and_ipv6_ranges() {
+    use pleb::policy::is_local_or_private_host;
+
+    for blocked in [
+        "localhost",
+        "api.localhost",
+        "printer.local",
+        "metadata.internal",
+        "0.0.0.0",
+        "0.12.34.56",
+        "127.0.0.1",
+        "10.0.0.1",
+        "100.64.0.1",
+        "169.254.169.254",
+        "172.16.0.1",
+        "192.168.1.1",
+        "224.0.0.1",
+        "240.0.0.1",
+        "::",
+        "::1",
+        "[::ffff:127.0.0.1]",
+        "64:ff9b::1",
+        "ff02::1",
+        "fec0::1",
+        "fc00::1",
+        "fe80::1",
+    ] {
+        assert!(
+            is_local_or_private_host(blocked),
+            "expected private/local block for {blocked}"
+        );
+    }
+
+    for public in [
+        "1.1.1.1",
+        "93.184.216.34",
+        "2606:4700:4700::1111",
+        "example.com",
+    ] {
+        assert!(
+            !is_local_or_private_host(public),
+            "expected public host allowance for {public}"
+        );
+    }
 }

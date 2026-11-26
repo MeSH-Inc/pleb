@@ -26,20 +26,21 @@
 
 ## Overview and Design Boundaries
 
-`pleb` acquires public web documents over browser-grade network and offscreen-rendering transports and emits compact, structurally faithful Markdown, plain text, HTML, or raw bytes with deterministic metadata and exit codes.
+`pleb` acquires public web documents over browser-grade network and offscreen-rendering transports and emits compact, structurally faithful Markdown, plain text, HTML, accessibility trees (`axtree`), or raw bytes with deterministic metadata and exit codes.
 
 Key capabilities beyond upstream `wickproject/wick`:
 
 - **Zero telemetry and local-only configuration**: All upstream telemetry pings and remote `site-rules.json` sync calls are removed. Per-site routing rules are bundled statically and optionally overlaid from `<state_dir>/site-rules.json`.
 - **Unified warm transport daemon (`daemon.sock`, protocol `4`)**: Shares persistent Cronet engines and warm CEF renderer processes across invocations, partitioned by proxy configuration, with automatic restart on binary rebuild (`PLEB_BUILD_ID`).
-- **CEF `v5-meta` offscreen renderer**: Reports real HTTP status codes, final redirect URLs, and typed transport error kinds over a framed stdio protocol, using subresource and `MutationObserver` quiet-window readiness.
+- **CEF `v5-meta` and external CDP/Kitesurf renderers**: Local CEF reports real HTTP status codes, final redirect URLs, and typed transport error kinds over a framed stdio protocol; `--cdp-url` / `PLEB_CDP_URL` connects over WebSocket (`ws://` loopback or `wss://` with optional Cloudflare Access service tokens) to Chrome DevTools Protocol / Kitesurf for DOM, `--format axtree`, and imperative WebMCP discovery (`--tools manifest`).
+- **HTTP Message Signatures (`web-bot-auth`)**: Optional RFC 9421 Ed25519 request signing on outbound HTTPS requests (`pleb auth set web-bot-auth-jwk`, disabled per invocation with `--no-web-bot-auth`).
 - **Structured source negotiation and first-class non-HTML parsing**: Rewrites GitHub, GitLab, and Gist pages to raw source, follows advertised Markdown mirrors, negotiates `text/markdown`, converts RSS/Atom/JSON feeds to Markdown digests, extracts YouTube metadata and captions, and cleans WebVTT/SRT transcripts.
 - **Single-parse `O(N)` DOM extraction and zero-fetch resource indexing**: Prunes chrome, rescues code tables, math, and SVG labels, indexes high-salience linked assets without extra requests, and stages binary artifacts on demand with magic-byte verification.
 - **Multi-provider search and local credential storage (`pleb auth`)**: Balances queries across `brave`, `tavily`, `serper`, `exa`, `searxng`, `duckduckgo`, and `federated` modes with cooldown tracking, burst pacing, intent routing, and tool-owned credentials.
 
 ### Behavioral Boundaries
 
-`pleb` does not solve CAPTCHAs, click challenge widgets, or inject anti-bot evasion scripts. When an origin returns an active bot challenge, `pleb` classifies it immediately into a challenge error (exit code `2`) without issuing duplicate CEF retries.
+`pleb` does not solve CAPTCHAs, click challenge widgets, or inject anti-bot evasion scripts. When an origin returns an active bot challenge, `pleb` classifies it immediately into a challenge error (exit code `2`) without issuing duplicate CEF or CDP retries. When connecting to Cloudflare Workers / `workerd` Kitesurf endpoints, note that Cloudflare's Worker runtime enforces outbound network isolation — do not expose unauthenticated local CDP endpoints without Cloudflare Access (`cdp-access-*`) or loopback binding.
 
 ---
 
@@ -203,10 +204,10 @@ CLI / Library Call
 | `src/context.rs` | `RuntimeConfig`, `RuntimeContext`, private directory/lock helpers (`0o700`/`0o600`), atomic writes, and `session clear` |
 | `src/fetch.rs` | Single-URL, raw, direct-stage, and concurrent batch fetch orchestration, resource enrichment, and `FetchError` exit mapping |
 | `src/crawl.rs` | Bounded concurrent wave crawler (`pleb crawl`) and sitemap/`robots.txt` URL mapper (`pleb map`) |
-| `src/transport/` | `TransportClient`, Chrome 154 User-Agent and greased `Sec-Ch-Ua` headers, Cronet FFI (`cronet.rs`, `cronet_ffi.rs`), CEF process/probe manager (`cef.rs`), typed `TransportError` |
+| `src/transport/` | `TransportClient`, Chrome 154 headers, RFC 9421 Web Bot Auth (`web_bot_auth.rs`), Cronet FFI (`cronet.rs`, `cronet_ffi.rs`), CEF manager (`cef.rs`), async WebSocket CDP / Kitesurf renderer (`cdp.rs`), typed `TransportError` |
 | `src/daemon/` | Persistent Unix-socket transport daemon (`protocol.rs`, `server.rs`, `client.rs`) handling `Ping`, `Shutdown`, `HttpGet`, and `CefRender` |
 | `src/policy/` | Response classifier (`classify.rs`), strategy planner (`mod.rs`), host/mirror/raw-source resolver (`source.rs`), `site-rules.json` loader (`rules.rs`), per-site strategy cache (`cache.rs`), and `robots.txt` cache (`robots.rs`) |
-| `src/extract/` | Single-parse HTML pruning (`dom.rs`), Markdown conversion and compaction (`markdown.rs`), native Markdown (`native_markdown.rs`), URL hygiene (`url.rs`), charset decoding (`charset.rs`), feeds (`feed.rs`), transcripts (`transcript.rs`), YouTube watch extraction (`youtube.rs`), and resource salience indexing (`resources.rs`) |
+| `src/extract/` | Single-parse HTML pruning (`dom.rs`), Markdown conversion and compaction (`markdown.rs`), WebMCP tool indexing (`webmcp.rs`), CDP accessibility tree formatter (`axtree.rs`), native Markdown (`native_markdown.rs`), URL hygiene (`url.rs`), charset decoding (`charset.rs`), feeds (`feed.rs`), transcripts (`transcript.rs`), YouTube watch extraction (`youtube.rs`), and resource salience indexing (`resources.rs`) |
 | `src/artifacts.rs` | Content-addressed `<state_dir>/artifacts/` store, magic-byte validation, disguised-HTML rejection, and `256 MiB` LRU eviction |
 | `src/search/` | Multi-provider search dispatch, intent routing, Reciprocal Rank Fusion (`mod.rs`), provider HTTP adapters (`providers.rs`), and locked health/cooldown/pacing state (`state.rs`) |
 | `src/auth.rs` | 3-tier credential resolution (`env` -> macOS Keychain -> `credentials.json`), secret zeroization, and status reporting |
@@ -217,7 +218,7 @@ CLI / Library Call
 | `packaging/homebrew/pleb.rb` | Homebrew tap formula template (`reqwest` default build + setup caveats) |
 | `scripts/` | Cronet downloaders, CEF build/install scripts, and agent skill symlink installer |
 | `skills/pleb/SKILL.md` | Canonical version-locked skill embedded in `pleb skill print` |
-| `docs/` | Milestone architecture specifications (`01` through `05`) |
+| `docs/` | Milestone architecture specifications (`01` through `06`) |
 | `tests/` | Integration suites, CLI/parity checks, and corpus fixtures (`tests/corpus/`, `tests/corpus_evaluation.rs`) |
 
 ---
@@ -254,7 +255,19 @@ In `--render auto` mode (default):
    - Other `4xx`/`5xx` statuses -> `HttpError` (exit code `3`).
 3. Successful escalations are recorded in `site-cache.json` so subsequent requests to the same host avoid repeating failed probes.
 
-Use `--render cef` (aliases: `browser`, `render`, `js`) to force Chromium rendering, or `--render cronet` (aliases: `network`, `fast`, `no-js`, `nojs`) to force network-only transport.
+Use `--render cef` (aliases: `browser`, `render`, `js`) to force local Chromium rendering, `--render cdp` (aliases: `kitesurf`, `remote`) to force remote/local WebSocket CDP rendering, or `--render cronet` (aliases: `network`, `fast`, `no-js`, `nojs`) to force network-only transport. Pass `--prefer-cdp` (`PLEB_PREFER_CDP`) to escalate to CDP ahead of local CEF in `--render auto`.
+
+### Pluggable CDP / Kitesurf Renderer (`--render cdp`, `--format axtree`)
+
+When `--cdp-url` (`PLEB_CDP_URL`) is configured (and `--proxy` is unset so WebSockets never bypass `--proxy`), `pleb` connects directly from the CLI process over `tokio-tungstenite` (`rustls` `ring` provider + native root CAs):
+
+- **Endpoint security**: Plaintext `ws://` is restricted to loopback hosts (`localhost`, `127.0.0.1`, `[::1]`) and verified via post-TCP-connect `peer_addr().ip().is_loopback()` before WebSocket upgrade. Remote `wss://` endpoints reject local/private target URLs, sanitize non-`101` HTTP errors to status code only, redact query parameters (`?token=...`) in logs/`status`, and attach host-scoped `CF-Access-Client-Id` / `CF-Access-Client-Secret` headers only when the `wss://` host matches `cdp-access-host`.
+- **Kitesurf fast mode & isolation**: Automatically appends `?layout=off` on `/devtools/browser` (or sends `Kitesurf.setLayoutMode({ mode: "off" })` on `/devtools/page/<id>`) unless `--format axtree` needs CSS visibility layout. Intercepts sub-navigations via `Fetch.enable` (`Fetch.requestPaused`) and navigation events against SSRF and CDP self-SSRF, captures `WebMCP.enable` imperative tools, polls `Kitesurf.getPageState` (`125ms` ticks, max `1s`, or `250ms` fallback), and closes owned targets cleanly (`Target.closeTarget`, `500ms` grace) without invoking `Browser.close`.
+- **`--format axtree` (alias `ax`)**: Requests `Accessibility.getFullAXTree`, skips ignored/generic wrapper nodes while promoting children, escapes control bytes, and truncates safely via `--max-bytes`. Requires CDP (rejects `--stage`, `--render cronet`, `--render cef`, `--proxy`, and unset `--cdp-url`).
+
+### Web Bot Auth (RFC 9421 Ed25519)
+
+When `web-bot-auth-jwk` (Ed25519 private JWK) and `web-bot-auth-agent` (`https://` signature-agent URL) are configured via `pleb auth set`, `pleb fetch` signs public `https://` acquisition requests with RFC 9421 `Signature`, `Signature-Input` (`@authority` and `signature-agent`, `tag="web-bot-auth"`, RFC 7638 `keyid`), and `Signature-Agent` headers. Plaintext `http://`, local/private targets, `pleb search`, `robots.txt`, `sitemap.xml`, and CDP handshakes stay unsigned, and cross-authority / downgrade redirects strip or re-sign headers hop-by-hop. Pass `--no-web-bot-auth` (`PLEB_NO_WEB_BOT_AUTH`) to disable signing.
 
 ### Unified Transport Daemon (`daemon.sock`)
 
@@ -280,7 +293,7 @@ Raw HTML spends most of its bytes on navigation menus, hidden popovers, cookie b
 | :--- | :--- |
 | `--source auto` *(default)* | Preserves Chrome's primary `Accept` header while rewriting GitHub `/blob/`, GitLab `/-/blob/`, and Gist URLs to lossless raw sources (`strategy: "raw_source"`, with automatic HTML fallback on `404` or binary responses) and following advertised RFC 8288 `Link` or HTML `<link rel="alternate" type="text/markdown">` mirrors (`strategy: "markdown_mirror"`). |
 | `--source negotiate` | Sends `Accept: text/markdown` on the primary HTTP GET (`strategy: "markdown_negotiated"`) and probes `<path>.md` on documentation paths when HTML lacks an alternate link. |
-| `--source none` | Disables raw-source rewrites, Markdown mirror discovery, and `Accept: text/markdown` negotiation. Automatically applied for `--format html`, `--format raw`, and `--render cef`. |
+| `--source none` | Disables raw-source rewrites, Markdown mirror discovery, and `Accept: text/markdown` negotiation. Automatically applied for `--format html`, `--format raw`, `--format axtree`, `--render cef`, and `--render cdp`. |
 
 ### Five-Stage Cleanup Pipeline
 
@@ -435,21 +448,32 @@ Staged files are written atomically to `<state_dir>/artifacts/<hash>-<name>.<ext
 
 Provider health, monthly UTC request counts, error cooldowns, and Brave burst pacing (`1100ms` window, spilling to the next healthy provider in `auto` mode) are tracked in `<state_dir>/search-state.json` under an exclusive `search-state.lock`.
 
+### WebMCP Tool Indexing (`--tools`)
+
+Pages declaring HTML `<form toolname="..." tooldescription="...">` controls or registering imperative tools via `navigator.modelContext.registerTool(...)` (captured over CDP `WebMCP.enable`) are indexed read-only into `tools` (`WebMcpToolDescriptor[]`, capped at `32` tools per page with `untrusted_content: true` enforced):
+
+- `--tools none` *(default)*: Populates `tools` in `--json`/`--jsonl`/`--metadata-only` and prints a concise one-line `stderr` cue (`Tools: ...`) on non-JSON fetches.
+- `--tools manifest`: Appends a `## Page Tools (WebMCP)` Markdown section and tool input JSON Schemas (conflicts with `--stage` and `--format raw`).
+
 ### Credential Storage (`pleb auth`)
 
-Store provider API keys or SearXNG URLs locally without exporting secrets in shell profiles or passing them on the command line:
+Store search provider keys, Web Bot Auth credentials, or Cloudflare Access CDP service tokens locally without exporting secrets in shell profiles or passing them on the command line:
 
 ```bash
 pleb auth set brave
 op read "op://Vault/Tavily/credential" | pleb auth set tavily --stdin
 pleb auth set searxng --stdin --storage file <<< "http://127.0.0.1:8888"
+cat agent.jwk | pleb auth set web-bot-auth-jwk --stdin
+pleb auth set web-bot-auth-agent --stdin <<< "https://agent.example.com"
+pleb auth set cdp-access-host --stdin <<< "kitesurf.example.com"
 pleb auth status
 pleb auth status --json
 pleb auth remove tavily
 ```
 
-- **Resolution precedence**: Environment variable (`BRAVE_API_KEY`, `TAVILY_API_KEY`, `SERPER_API_KEY`, `EXA_API_KEY`, `SEARXNG_URL`) -> macOS Keychain (service `pleb`, skipped when `PLEB_NO_KEYCHAIN=1`) -> `<state_dir>/credentials.json` (`0o600`).
-- **Input hygiene**: `pleb auth set` never accepts secrets as positional arguments. Interactive mode reads from `/dev/tty` with echo disabled; `--stdin` accepts a single line of printable ASCII up to `4096` bytes. In-memory secret buffers are zeroized on drop, and `pleb auth status` never prints secret values, URLs, prefixes, or lengths.
+- **Supported providers**: `brave`, `tavily`, `serper`, `exa`, `searxng`, `web-bot-auth-jwk`, `web-bot-auth-agent`, `cdp-access-client-id`, `cdp-access-client-secret`, `cdp-access-host`.
+- **Resolution precedence**: Environment variable (`BRAVE_API_KEY`, `TAVILY_API_KEY`, `SERPER_API_KEY`, `EXA_API_KEY`, `SEARXNG_URL`, `PLEB_WEB_BOT_AUTH_JWK`, `PLEB_WEB_BOT_AUTH_AGENT`, `PLEB_CDP_ACCESS_CLIENT_ID`, `PLEB_CDP_ACCESS_CLIENT_SECRET`, `PLEB_CDP_ACCESS_HOST`) -> macOS Keychain (service `pleb`, skipped when `PLEB_NO_KEYCHAIN=1`) -> `<state_dir>/credentials.json` (`0o600`).
+- **Input hygiene**: `pleb auth set` never accepts secrets as positional arguments. Interactive mode reads from `/dev/tty` with echo disabled; `--stdin` accepts printable ASCII up to `4096` bytes (multi-line JSON whitespace is allowed solely for `web-bot-auth-jwk` and canonicalized on store). Child `daemon.sock` and CEF processes explicitly scrub all credential env vars and `PLEB_CDP_URL`. In-memory secret buffers are zeroized on drop, and `pleb auth status` never prints secret values, private keys, or Access tokens.
 - **Cooldown reset**: `pleb auth set` and `pleb auth remove` clear any stale cooldown entry for that provider. `pleb auth remove` warns on `stderr` if the provider's environment variable is still set.
 
 ---
@@ -478,6 +502,10 @@ pleb map https://example.com --limit 100
 | `--timeout <SECS>` | — | `30` | Network request timeout in seconds |
 | `--max-response-bytes <BYTES>` | — | `16 MiB` doc / `128 MiB` raw | Maximum HTTP response body size |
 | `--cef-timeout <SECS>` | — | `60` | CEF render timeout in seconds |
+| `--no-web-bot-auth` | `PLEB_NO_WEB_BOT_AUTH` | `false` | Disable RFC 9421 Web Bot Auth request signing |
+| `--cdp-url <URL>` | `PLEB_CDP_URL` | none | WebSocket CDP / Kitesurf endpoint (`ws://` loopback or `wss://`) |
+| `--cdp-timeout <SECS>` | `PLEB_CDP_TIMEOUT` | `60` | CDP render timeout in seconds |
+| `--prefer-cdp` | `PLEB_PREFER_CDP` | `false` | Prefer CDP ahead of local CEF in `--render auto` |
 | `--state-dir <DIR>` | `PLEB_HOME` | `~/.pleb` | Private (`0o700`) local cache and state directory |
 | `--no-daemon` | `PLEB_NO_DAEMON` | `false` | Bypass `daemon.sock` and run transport in-process |
 | `--daemon-idle-timeout <SECS>` | `PLEB_DAEMON_IDLE_SECONDS` | `300` | Idle exit timeout for the background transport daemon |
@@ -503,15 +531,16 @@ pleb search --urls-only "rust async runtime" | pleb fetch -
 
 | Flag | Values / Default | Notes |
 | :--- | :--- | :--- |
-| `--format <FMT>` | `markdown` *(default)*, `html`, `text`, `raw` | Aliases: `md`, `txt`. `raw` rejects `--json`, `--jsonl`, `--metadata-only`, `--stage`, batch mode, and writing to a TTY without `-o`. |
+| `--format <FMT>` | `markdown` *(default)*, `html`, `text`, `axtree`, `raw` | Aliases: `md`, `txt`, `ax`. `axtree` requires CDP (`--cdp-url`); `raw` rejects `--json`, `--jsonl`, `--metadata-only`, `--stage`, batch mode, and writing to a TTY without `-o`. |
 | `--extract <MODE>` | `clean` *(default)*, `article`, `full` | Extraction scope for HTML, Markdown, feeds, and transcripts. |
-| `--render <MODE>` | `auto` *(default)*, `cef`, `cronet` | Aliases: `browser`/`render`/`js` (`cef`), `network`/`fast`/`no-js`/`nojs` (`cronet`). |
+| `--render <MODE>` | `auto` *(default)*, `cef`, `cdp`, `cronet` | Aliases: `browser`/`render`/`js` (`cef`), `kitesurf`/`remote` (`cdp`), `network`/`fast`/`no-js`/`nojs` (`cronet`). |
 | `--source <MODE>` | `auto` *(default)*, `negotiate`, `none` | Structured source and Markdown mirror policy. |
 | `--resources <POLICY>` | `none` *(default)*, `manifest`, `transcripts`, `diagrams`, `all` | Linked resource enrichment policy. |
+| `--tools <POLICY>` | `none` *(default)*, `manifest` | WebMCP tool indexing policy (`manifest` appends `## Page Tools (WebMCP)`). |
 | `--stage-resources <IDS>` | comma-separated IDs (e.g., `r1,r3`) | Selectively stage or inline indexed resources from the page. |
 | `--referer <URL>` | URL | Parent page URL used to compute `Referer` and `Sec-Fetch-*` headers. |
 | `--stage` | flag | Stage a single binary/document URL into `<state_dir>/artifacts/` and print its path (or JSON). |
-| `--wait-for-selector <CSS>` | CSS selector | Selector to wait for during CEF rendering. |
+| `--wait-for-selector <CSS>` | CSS selector | Selector to wait for during CEF or CDP rendering. |
 | `--respect-robots` | flag | Enforce `robots.txt` on `fetch` (skipped by default). |
 | `--no-rewrite` | flag | Disable host rewrites (`reddit.com` -> `old.reddit.com`) and forge raw-source rewrites. |
 | `--no-images` / `--no-links` | flags | Omit images or unwrap links in Markdown output. |
@@ -549,9 +578,9 @@ pleb search --extra-snippets "cronet http2"
 
 | Subcommand | Description |
 | :--- | :--- |
-| `pleb auth set <brave\|tavily\|serper\|exa\|searxng> [--stdin] [--storage <auto\|keychain\|file>]` | Stores a credential via hidden TTY prompt or `--stdin` and clears stale provider cooldowns. |
-| `pleb auth remove <brave\|tavily\|serper\|exa\|searxng> [--storage <auto\|keychain\|file>]` | Deletes stored credentials, clears cooldowns, and warns if an env var still overrides the provider. |
-| `pleb auth status` | Reports configuration source, monthly request count, cooldown remaining, and last HTTP error status per provider (supports `--json`). |
+| `pleb auth set <provider> [--stdin] [--storage <auto\|keychain\|file>]` | Stores a credential (`brave`, `tavily`, `serper`, `exa`, `searxng`, `web-bot-auth-jwk`, `web-bot-auth-agent`, `cdp-access-client-id`, `cdp-access-client-secret`, `cdp-access-host`) via hidden TTY prompt or `--stdin` and clears stale search cooldowns. |
+| `pleb auth remove <provider> [--storage <auto\|keychain\|file>]` | Deletes stored credentials, clears cooldowns, and warns if an env var still overrides the provider. |
+| `pleb auth status` | Reports search provider statuses, `agent_identity` (`keyid`), and `cdp_access` (`access_host`) configuration (supports `--json`). |
 
 ### `pleb crawl` and `pleb map`
 
@@ -592,6 +621,10 @@ pleb skill print            # Emit bundled skills/pleb/SKILL.md (--json supporte
 | `PLEB_DAEMON_IDLE_SECONDS` | Default for `--daemon-idle-timeout` (seconds, default `300`). |
 | `PLEB_TIMEZONE` | Optional IANA timezone override injected into CEF `Intl.DateTimeFormat`. |
 | `BRAVE_API_KEY`, `TAVILY_API_KEY`, `SERPER_API_KEY`, `EXA_API_KEY`, `SEARXNG_URL` | Search provider credentials; take precedence over macOS Keychain and `<state_dir>/credentials.json`. |
+| `PLEB_WEB_BOT_AUTH_JWK`, `PLEB_WEB_BOT_AUTH_AGENT` | Ed25519 private JWK and `https://` signature-agent URL for RFC 9421 Web Bot Auth signing. |
+| `PLEB_CDP_ACCESS_CLIENT_ID`, `PLEB_CDP_ACCESS_CLIENT_SECRET`, `PLEB_CDP_ACCESS_HOST` | Host-scoped Cloudflare Access service-token credentials attached only when `wss://` CDP host matches `PLEB_CDP_ACCESS_HOST`. |
+| `PLEB_NO_WEB_BOT_AUTH` | Disables RFC 9421 Web Bot Auth signing (`--no-web-bot-auth`). |
+| `PLEB_CDP_URL`, `PLEB_CDP_TIMEOUT`, `PLEB_PREFER_CDP` | Default WebSocket CDP endpoint, render timeout (seconds), and `--render auto` CDP priority. |
 | `PLEB_NO_KEYCHAIN=1` | Disables macOS Keychain reads/writes (forces `credentials.json` under `--storage auto`; required for hermetic tests). |
 | `PLEB_CEF_RENDERER` | Explicit path to a `v5-meta` `pleb-renderer` binary (overrides `<state_dir>/cef` discovery). |
 | `PLEB_NO_HOME_CEF=1` | Disables fallback discovery of `~/.pleb/cef` (used in hermetic tests). |
@@ -649,17 +682,18 @@ All `--json` and `--jsonl` payloads serialize directly from `pleb`'s Rust output
 | `title` | `string \| null` | Extracted document title if present |
 | `content` | `string` | Extracted Markdown, text, or HTML (**omitted** with `--metadata-only`) |
 | `content_bytes` | `number` | Byte length of `content` (still populated with `--metadata-only`) |
-| `strategy` | `string` | Acquisition strategy (`cronet`, `reqwest`, `cef`, `raw_source`, `markdown_mirror`, `markdown_negotiated`) |
-| `escalated` | `boolean` | `true` when transport escalated from primary HTTP to CEF |
+| `strategy` | `string` | Acquisition strategy (`cronet`, `reqwest`, `cef`, `cdp`, `raw_source`, `markdown_mirror`, `markdown_negotiated`) |
+| `escalated` | `boolean` | `true` when transport escalated from primary HTTP to CEF or CDP |
 | `truncated` | `boolean` | `true` when `--max-bytes` truncated output |
 | `timing_ms` | `number` | End-to-end fetch duration in milliseconds |
 | `resources` | `ResourceDescriptor[]` | Indexed linked resources (**omitted** when empty) |
+| `tools` | `WebMcpToolDescriptor[]` | Indexed WebMCP page tools (**omitted** when empty; `untrusted_content: true`) |
 
 ### `BatchItemResult` (`pleb fetch --jsonl` and multi-URL `pleb fetch --json`)
 
 Multi-URL and `stdin` (`-`) fetches emit an array (`--json`) or newline-delimited stream (`--jsonl`) of untagged `BatchItemResult` objects discriminated by `ok`:
 
-- **Success (`ok: true`)**: `url`, `ok`, `final_url`, `status_code`, `content_type`, `title`, `strategy`, `escalated`, `truncated`, `timing_ms`, `content_bytes`, plus `content` (omitted with `--metadata-only`) and `resources` (omitted when empty).
+- **Success (`ok: true`)**: `url`, `ok`, `final_url`, `status_code`, `content_type`, `title`, `strategy`, `escalated`, `truncated`, `timing_ms`, `content_bytes`, plus `content` (omitted with `--metadata-only`), `resources` (omitted when empty), and `tools` (omitted when empty).
 - **Failure (`ok: false`)**: `url`, `ok`, `error`, `kind`, `exit_code`.
 
 ### `StagedAssetOutput` (`pleb fetch --stage --json`)
@@ -692,9 +726,9 @@ Multi-URL and `stdin` (`-`) fetches emit an array (`--json`) or newline-delimite
 
 ### `StatusJson`, `DaemonStatusJson`, and `SearchProviderStatus`
 
-- **`pleb status --json`** (`StatusJson`): `version` (`string`), `cronet_enabled` (`boolean`), `cef_renderer` (`{ status, path, found_protocol, expected_protocol }`), `daemon` (`DaemonStatusJson`), `state_dir` (`string`), `search_providers` (map of provider name to `SearchProviderStatus`).
+- **`pleb status --json`** (`StatusJson`): `version` (`string`), `cronet_enabled` (`boolean`), `cef_renderer` (`{ status, path, found_protocol, expected_protocol }`), `cdp_renderer` (`{ configured, url, prefer_cdp, proxy_blocked, access, status_error }`), `daemon` (`DaemonStatusJson`), `state_dir` (`string`), `search_providers` (map of provider name to `SearchProviderStatus`), `agent_identity` (`AgentIdentityStatus`).
 - **`pleb daemon status --json`** (`DaemonStatusJson`): `supported` (`boolean`), `running` (`boolean`), `pid` (`number | null`), `protocol_version` (`number | null`), `build_id` (`string | null`), `active_requests` (`number`), `cronet_slots` (`number`), `cef_renderers_alive` (`number`).
-- **`pleb auth status --json`** (map of provider name to `SearchProviderStatus`): `configured` (`boolean`), `source` (`"environment" | "keychain" | "file" | null`), `cooldown_remaining_secs` (`number`), `month_requests` (`number`), `last_error_status` (`number | null`).
+- **`pleb auth status --json`** (`AuthStatusJson`): flattened top-level search provider keys (`brave`, `tavily`, `serper`, `exa`, `searxng` -> `SearchProviderStatus`), plus `agent_identity` (`web_bot_auth_enabled`, `jwk_configured`, `jwk_source`, `agent_configured`, `agent_source`, `keyid`, `status_error`) and `cdp_access` (`configured`, `client_id_configured`, `client_id_source`, `client_secret_configured`, `client_secret_source`, `host_configured`, `host_source`, `access_host`, `status_error`).
 
 ### `CrawlResult`, `MapResult`, and Control Commands
 
@@ -735,6 +769,7 @@ cargo test --test cef_protocol_tests -- --ignored  # opt-in live v5-meta CEF smo
 - [docs/03-structured-source-negotiation.md](docs/03-structured-source-negotiation.md) — Forge raw-source resolution, Markdown mirror negotiation, native Markdown, and feed extraction.
 - [docs/04-resource-indexing-and-staging.md](docs/04-resource-indexing-and-staging.md) — Resource salience indexing, SVG/transcript rescue, and content-addressed artifact staging.
 - [docs/05-multi-provider-search-and-auth.md](docs/05-multi-provider-search-and-auth.md) — `pleb auth` credential storage and multi-provider search routing/federation.
+- [docs/06-agent-identity-webmcp-and-cdp-renderer.md](docs/06-agent-identity-webmcp-and-cdp-renderer.md) — RFC 9421 Web Bot Auth signing, WebMCP tool discovery, and pluggable CDP / Kitesurf renderer transport.
 
 ---
 

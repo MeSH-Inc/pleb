@@ -2,7 +2,7 @@
 
 > Local, MIT-licensed, zero-telemetry web acquisition and search CLI (`pleb`) and Rust library (`pleb`) by Memory Sync Hub LLC.
 
-`pleb` converts public web pages, Markdown mirrors, syndication feeds, YouTube captions, and transcripts into compact Markdown or plain text in a single `O(N)` DOM pass. Primary HTTP runs over Chromium 154 Cronet (or `reqwest` with `rustls` by default when compiled without `--features cronet`) with redirect-time SSRF protection, optional offscreen Chromium rendering (`pleb-renderer`, protocol `v5-meta`) via a shared Unix-socket daemon (`daemon.sock`), zero-fetch resource indexing with selective staging, and local multi-provider search (`pleb search`, `pleb auth`). Active anti-bot challenges fail fast (exit code `2`) without CAPTCHA solving or evasion scripts.
+`pleb` converts public web pages, Markdown mirrors, syndication feeds, YouTube captions, and transcripts into compact Markdown, plain text, or CDP accessibility trees in a single `O(N)` DOM pass. Primary HTTP runs over Chromium 154 Cronet (or `reqwest` with `rustls` by default when compiled without `--features cronet`) with redirect-time SSRF protection, optional RFC 9421 Ed25519 Web Bot Auth signing, offscreen CEF (`pleb-renderer`, protocol `v5-meta`) via a shared Unix-socket daemon (`daemon.sock`), pluggable WebSocket CDP / Kitesurf rendering (`--render cdp`, `--format axtree`), zero-fetch resource and WebMCP tool indexing (`--tools`), and local multi-provider search (`pleb search`, `pleb auth`). Active anti-bot challenges fail fast (exit code `2`) without CAPTCHA solving or evasion scripts.
 
 ## Core Documentation
 
@@ -20,6 +20,7 @@
 - [docs/03-structured-source-negotiation.md](docs/03-structured-source-negotiation.md): GitHub/GitLab/Gist raw source resolution, Markdown mirrors, feeds, and native Markdown
 - [docs/04-resource-indexing-and-staging.md](docs/04-resource-indexing-and-staging.md): Resource salience indexing, SVG/transcript rescue, and artifact staging
 - [docs/05-multi-provider-search-and-auth.md](docs/05-multi-provider-search-and-auth.md): `pleb auth` credential resolution and multi-provider search routing
+- [docs/06-agent-identity-webmcp-and-cdp-renderer.md](docs/06-agent-identity-webmcp-and-cdp-renderer.md): RFC 9421 Web Bot Auth, WebMCP tool indexing, and pluggable CDP / Kitesurf renderer transport
 
 ## Packaging and Distribution
 

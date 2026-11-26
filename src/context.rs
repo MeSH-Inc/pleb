@@ -2,10 +2,13 @@ use anyhow::Result;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::policy::{robots::RobotsCache, SiteCache, SiteRules};
-use crate::transport::{cef::CefRenderer, TransportClient};
+use crate::transport::{
+    cdp::CdpRenderer, cef::CefRenderer, web_bot_auth::WebBotAuthSigner, TransportClient,
+};
 
 static ATOMIC_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -229,7 +232,9 @@ pub struct RuntimeContext {
     pub rules: SiteRules,
     pub site_cache: SiteCache,
     pub robots: RobotsCache,
-    http_client: std::sync::Mutex<Option<reqwest::Client>>,
+    http_client: Mutex<Option<reqwest::Client>>,
+    web_bot_auth_signer: Mutex<Option<Option<Arc<WebBotAuthSigner>>>>,
+    cdp_renderer: Mutex<Option<Option<Arc<CdpRenderer>>>>,
 }
 
 impl RuntimeContext {
@@ -289,8 +294,69 @@ impl RuntimeContext {
             rules,
             site_cache,
             robots,
-            http_client: std::sync::Mutex::new(None),
+            http_client: Mutex::new(None),
+            web_bot_auth_signer: Mutex::new(None),
+            cdp_renderer: Mutex::new(None),
         })
+    }
+
+    pub fn web_bot_auth_signer_for_url(
+        &self,
+        url: &url::Url,
+    ) -> Result<Option<Arc<WebBotAuthSigner>>> {
+        if self.config.no_web_bot_auth || url.scheme() != "https" {
+            return Ok(None);
+        }
+        let Some(host) = url.host_str() else {
+            return Ok(None);
+        };
+        if crate::policy::is_local_or_private_host(host) {
+            return Ok(None);
+        }
+        let mut guard = self
+            .web_bot_auth_signer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Web Bot Auth signer lock poisoned"))?;
+        if let Some(ref cached) = *guard {
+            return Ok(cached.clone());
+        }
+        let resolved = WebBotAuthSigner::from_state_dir(&self.config.state_dir)?.map(Arc::new);
+        *guard = Some(resolved.clone());
+        Ok(resolved)
+    }
+
+    pub fn configured_cdp_url(&self) -> Option<String> {
+        self.config
+            .cdp_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                std::env::var("PLEB_CDP_URL")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+    }
+
+    pub fn cdp_renderer(&self) -> Option<Arc<CdpRenderer>> {
+        if self.config.proxy.is_some() {
+            return None;
+        }
+        let mut guard = self.cdp_renderer.lock().ok()?;
+        if let Some(ref cached) = *guard {
+            return cached.clone();
+        }
+        let renderer = self.configured_cdp_url().map(|cdp_url| {
+            Arc::new(CdpRenderer::new(
+                cdp_url,
+                self.config.state_dir.clone(),
+                self.config.proxy.clone(),
+            ))
+        });
+        *guard = Some(renderer.clone());
+        renderer
     }
 
     pub fn http_client(&self) -> Result<reqwest::Client> {

@@ -173,7 +173,7 @@ fn acquire_cache_lock(cache_path: &Path) -> std::io::Result<std::fs::File> {
 
 fn is_expired(entry: &SiteCacheEntry, now_secs: u64) -> bool {
     let ttl = match entry.strategy.as_str() {
-        "cef_timeout" => TIMEOUT_TTL_SECS,
+        "cef_timeout" | "cdp_timeout" => TIMEOUT_TTL_SECS,
         _ => STRATEGY_TTL_SECS,
     };
     now_secs.saturating_sub(entry.updated_at_epoch_secs) > ttl

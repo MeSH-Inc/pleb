@@ -19,7 +19,9 @@ use crate::policy::{
     PrimaryTransport, RawSourceCandidate, RawSourceKind, RenderMode, ResourcePolicy,
     ResponseClassification, SourceMode, ToolPolicy,
 };
+use crate::transport::cdp::{CdpRenderOptions, CdpRenderResult, CdpRenderer};
 use crate::transport::cef::{CefRenderOptions, CefRenderResult, CefRenderer};
+use crate::transport::web_bot_auth::execute_signed_get;
 use crate::transport::{
     transport_error_kind, RequestHeaderOptions, ResponseTooLargeError, SubresourceDest,
     TransportErrorKind, DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES, DEFAULT_RAW_MAX_RESPONSE_BYTES,
@@ -200,6 +202,8 @@ struct AcquiredPage {
     strategy: String,
     escalated: bool,
     parsed: Option<ParsedHtml>,
+    axtree_text: Option<String>,
+    imperative_tools: Vec<crate::extract::WebMcpToolDescriptor>,
 }
 
 pub async fn fetch_document(
@@ -214,15 +218,42 @@ pub async fn fetch_document(
         )));
     }
 
+    let is_axtree = options.extract.format == OutputFormat::Axtree;
+    if is_axtree {
+        if matches!(options.render, RenderMode::Cronet | RenderMode::Cef) {
+            return Err(FetchError::CdpUnavailable(
+                "--format axtree requires CDP rendering (cannot be used with --render cronet or --render cef)"
+                    .to_string(),
+            ));
+        }
+        if ctx.config.proxy.is_some() {
+            return Err(FetchError::CdpUnavailable(
+                "CDP renderer cannot be used with --proxy because WebSocket CDP connections would bypass the proxy"
+                    .to_string(),
+            ));
+        }
+        if ctx.configured_cdp_url().is_none() {
+            return Err(FetchError::CdpUnavailable(
+                "--format axtree requires --cdp-url or PLEB_CDP_URL".to_string(),
+            ));
+        }
+    }
+
+    let effective_render = if is_axtree && options.render == RenderMode::Auto {
+        RenderMode::Cdp
+    } else {
+        options.render
+    };
+
     let (effective, _) =
         resolve_and_check_robots(ctx, url, options.apply_rewrites, options.respect_robots).await?;
 
     let effective_source_mode = if options.source == SourceMode::None
         || matches!(
             options.extract.format,
-            OutputFormat::Html | OutputFormat::Raw
+            OutputFormat::Html | OutputFormat::Raw | OutputFormat::Axtree
         )
-        || options.render == RenderMode::Cef
+        || matches!(effective_render, RenderMode::Cef | RenderMode::Cdp)
     {
         SourceMode::None
     } else {
@@ -232,7 +263,7 @@ pub async fn fetch_document(
     if options.apply_rewrites && effective_source_mode != SourceMode::None {
         if let Some(candidate) = resolve_raw_source_candidate(&effective) {
             if let Some(output) =
-                try_fetch_raw_source(ctx, url, &effective, &candidate, options, start).await
+                try_fetch_raw_source(ctx, url, &effective, &candidate, options, start).await?
             {
                 return Ok(output);
             }
@@ -242,18 +273,26 @@ pub async fn fetch_document(
     let page = acquire_page(
         ctx,
         &effective,
-        options.render,
+        effective_render,
         effective_source_mode,
         options.wait_for_selector.as_deref(),
         options.respect_robots,
+        is_axtree,
     )
     .await?;
 
     let final_url_parsed = url::Url::parse(&page.final_url).unwrap_or_else(|_| effective.clone());
     let extract_url = page.extract_base_url.as_ref().unwrap_or(&final_url_parsed);
-    let needs_enrichment =
-        options.resources != ResourcePolicy::None || !options.stage_resources.is_empty();
-    let initial_extract_opts = if needs_enrichment && options.extract.max_bytes.is_some() {
+    let needs_enrichment = options.resources != ResourcePolicy::None
+        || !options.stage_resources.is_empty()
+        || options.tools == ToolPolicy::Manifest;
+    let initial_extract_opts = if is_axtree {
+        ExtractOptions {
+            format: OutputFormat::Html,
+            max_bytes: None,
+            ..options.extract.clone()
+        }
+    } else if needs_enrichment && options.extract.max_bytes.is_some() {
         ExtractOptions {
             max_bytes: None,
             ..options.extract.clone()
@@ -269,6 +308,22 @@ pub async fn fetch_document(
         &initial_extract_opts,
     )?;
 
+    if is_axtree {
+        extracted.content = page.axtree_text.ok_or_else(|| {
+            FetchError::CdpUnavailable("CDP render did not capture accessibility tree".to_string())
+        })?;
+        extracted.truncated = false;
+    }
+
+    if !page.imperative_tools.is_empty() {
+        let imperative: Vec<_> = page
+            .imperative_tools
+            .into_iter()
+            .filter(|t| t.source == extract::WebMcpToolSource::Imperative)
+            .collect();
+        extracted.tools = extract::webmcp::merge_webmcp_tools(extracted.tools, imperative);
+    }
+
     if needs_enrichment {
         enrich_document_resources(
             ctx,
@@ -277,16 +332,26 @@ pub async fn fetch_document(
             &mut extracted.resources,
             options,
         )
-        .await;
-        if options.extract.max_bytes.is_some() {
-            let (truncated_content, did_truncate) = extract::apply_format_limit(
-                &extracted.content,
-                options.extract.format,
-                options.extract.max_bytes,
-            );
-            extracted.content = truncated_content;
-            extracted.truncated |= did_truncate;
+        .await?;
+        if options.tools == ToolPolicy::Manifest && !extracted.tools.is_empty() {
+            let manifest = extract::webmcp::format_webmcp_manifest_markdown(&extracted.tools);
+            if !manifest.trim().is_empty() {
+                if !extracted.content.trim().is_empty() {
+                    extracted.content.push_str("\n\n");
+                }
+                extracted.content.push_str(manifest.trim());
+            }
         }
+    }
+
+    if (needs_enrichment || is_axtree) && options.extract.max_bytes.is_some() {
+        let (truncated_content, did_truncate) = extract::apply_format_limit(
+            &extracted.content,
+            options.extract.format,
+            options.extract.max_bytes,
+        );
+        extracted.content = truncated_content;
+        extracted.truncated |= did_truncate;
     }
 
     let content_bytes = extracted.content.len();
@@ -320,6 +385,7 @@ pub async fn fetch_html(
         SourceMode::None,
         None,
         respect_robots,
+        false,
     )
     .await?;
     Ok(FetchHtmlResult {
@@ -343,11 +409,20 @@ pub async fn fetch_raw(
         .config
         .max_response_bytes
         .unwrap_or(DEFAULT_RAW_MAX_RESPONSE_BYTES);
-    let resp = ctx
-        .client
-        .get_with_limits(parsed.as_str(), ctx.config.timeout, max_bytes)
-        .await
-        .map_err(|e| map_transport_error(parsed.as_str(), e, max_bytes))?;
+    let signer = ctx
+        .web_bot_auth_signer_for_url(&parsed)
+        .map_err(FetchError::Transport)?;
+    let req_opts = RequestHeaderOptions::default();
+    let resp = execute_signed_get(
+        &ctx.client,
+        parsed.as_str(),
+        ctx.config.timeout,
+        max_bytes,
+        &req_opts,
+        signer.as_deref(),
+    )
+    .await
+    .map_err(|e| map_transport_error(parsed.as_str(), e, max_bytes))?;
     let timing_ms = start.elapsed().as_millis() as u64;
 
     if resp.status >= 400 {
@@ -397,11 +472,19 @@ pub async fn fetch_staged_asset(
         .config
         .max_response_bytes
         .unwrap_or(DEFAULT_RAW_MAX_RESPONSE_BYTES);
-    let resp = ctx
-        .client
-        .get_with_request_options(parsed.as_str(), ctx.config.timeout, max_bytes, &req_opts)
-        .await
-        .map_err(|e| map_transport_error(parsed.as_str(), e, max_bytes))?;
+    let signer = ctx
+        .web_bot_auth_signer_for_url(&parsed)
+        .map_err(FetchError::Transport)?;
+    let resp = execute_signed_get(
+        &ctx.client,
+        parsed.as_str(),
+        ctx.config.timeout,
+        max_bytes,
+        &req_opts,
+        signer.as_deref(),
+    )
+    .await
+    .map_err(|e| map_transport_error(parsed.as_str(), e, max_bytes))?;
     let timing_ms = start.elapsed().as_millis() as u64;
 
     if resp.status >= 400 {
@@ -549,7 +632,7 @@ async fn enrich_document_resources(
     content: &mut String,
     resources: &mut [ResourceDescriptor],
     options: &FetchOptions,
-) {
+) -> std::result::Result<(), FetchError> {
     if options.resources == ResourcePolicy::Manifest && !resources.is_empty() {
         let manifest = extract::format_resource_manifest_markdown(resources);
         if !manifest.trim().is_empty() {
@@ -570,7 +653,7 @@ async fn enrich_document_resources(
         ResourcePolicy::None | ResourcePolicy::Manifest
     ) && explicit_ids.is_empty()
     {
-        return;
+        return Ok(());
     }
 
     let mut selected = Vec::new();
@@ -635,7 +718,19 @@ async fn enrich_document_resources(
     }
 
     if selected.is_empty() {
-        return;
+        return Ok(());
+    }
+
+    let mut subresource_signer: Option<Arc<crate::transport::web_bot_auth::WebBotAuthSigner>> =
+        None;
+    for item in &selected {
+        if let Some(signer) = ctx
+            .web_bot_auth_signer_for_url(&item.url)
+            .map_err(FetchError::Transport)?
+        {
+            subresource_signer = Some(signer);
+            break;
+        }
     }
 
     let max_sub_bytes = ctx
@@ -655,6 +750,7 @@ async fn enrich_document_resources(
                 .map(str::to_ascii_lowercase)
                 .unwrap_or_default();
             let sem = host_semaphore(&host_sems, host_key);
+            let signer = subresource_signer.clone();
             async move {
                 let _permit = sem.acquire_owned().await.ok()?;
                 if respect_robots && !ctx.robots.is_allowed(&ctx.client, item.url.as_str()).await {
@@ -669,15 +765,15 @@ async fn enrich_document_resources(
                     }),
                     ..Default::default()
                 };
-                match ctx
-                    .client
-                    .get_with_request_options(
-                        item.url.as_str(),
-                        ctx.config.timeout,
-                        max_sub_bytes,
-                        &req_opts,
-                    )
-                    .await
+                match execute_signed_get(
+                    &ctx.client,
+                    item.url.as_str(),
+                    ctx.config.timeout,
+                    max_sub_bytes,
+                    &req_opts,
+                    signer.as_deref(),
+                )
+                .await
                 {
                     Ok(resp) if resp.status < 400 => Some((item, resp)),
                     Ok(resp) => {
@@ -779,6 +875,7 @@ async fn enrich_document_resources(
         content.push_str("\n\n## Staged Resources\n\n");
         content.push_str(&staged_lines.join("\n"));
     }
+    Ok(())
 }
 
 async fn resolve_and_check_robots(
@@ -811,28 +908,39 @@ async fn try_fetch_raw_source(
     candidate: &RawSourceCandidate,
     options: &FetchOptions,
     start: Instant,
-) -> Option<FetchOutput> {
+) -> std::result::Result<Option<FetchOutput>, FetchError> {
     let raw_str = candidate.raw_url.as_str();
     if options.respect_robots && !ctx.robots.is_allowed(&ctx.client, raw_str).await {
-        return None;
+        return Ok(None);
     }
 
     let max_bytes = ctx
         .config
         .max_response_bytes
         .unwrap_or(DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES);
-    let resp = ctx
-        .client
-        .get_with_options(raw_str, ctx.config.timeout, max_bytes, false)
-        .await
-        .ok()?;
+    let signer = ctx
+        .web_bot_auth_signer_for_url(&candidate.raw_url)
+        .map_err(FetchError::Transport)?;
+    let req_opts = RequestHeaderOptions::default();
+    let Ok(resp) = execute_signed_get(
+        &ctx.client,
+        raw_str,
+        ctx.config.timeout,
+        max_bytes,
+        &req_opts,
+        signer.as_deref(),
+    )
+    .await
+    else {
+        return Ok(None);
+    };
     if resp.status >= 400 || resp.is_html() {
-        return None;
+        return Ok(None);
     }
     if extract::detect_binary_content(resp.content_type.as_deref(), &resp.body).is_some()
         || extract::detect_binary_content(None, &resp.body).is_some()
     {
-        return None;
+        return Ok(None);
     }
 
     let body = resp.text();
@@ -844,14 +952,16 @@ async fn try_fetch_raw_source(
         {
             extract::wrap_raw_code_document(&candidate.filename, &body, language, &options.extract)
         }
-        _ => extract::extract_document_parsed(
+        _ => match extract::extract_document_parsed(
             &body,
             None,
             &raw_final_url,
             Some("text/markdown"),
             &options.extract,
-        )
-        .ok()?,
+        ) {
+            Ok(doc) => doc,
+            Err(_) => return Ok(None),
+        },
     };
 
     let timing_ms = start.elapsed().as_millis() as u64;
@@ -860,7 +970,7 @@ async fn try_fetch_raw_source(
             .record(host, ctx.client.transport_name(), timing_ms);
     }
     let content_bytes = extracted.content.len();
-    Some(FetchOutput {
+    Ok(Some(FetchOutput {
         url: original_url.to_string(),
         final_url: resp.final_url,
         status_code: resp.status,
@@ -874,7 +984,7 @@ async fn try_fetch_raw_source(
         timing_ms,
         resources: extracted.resources,
         tools: extracted.tools,
-    })
+    }))
 }
 
 async fn fetch_validated_mirror(
@@ -883,20 +993,34 @@ async fn fetch_validated_mirror(
     respect_robots: bool,
     max_bytes: usize,
     allow_plain_text: bool,
-) -> Option<(String, url::Url)> {
+) -> std::result::Result<Option<(String, url::Url)>, FetchError> {
     if respect_robots
         && !ctx
             .robots
             .is_allowed(&ctx.client, mirror_url.as_str())
             .await
     {
-        return None;
+        return Ok(None);
     }
-    let resp = ctx
-        .client
-        .get_with_options(mirror_url.as_str(), ctx.config.timeout, max_bytes, true)
-        .await
-        .ok()?;
+    let signer = ctx
+        .web_bot_auth_signer_for_url(&mirror_url)
+        .map_err(FetchError::Transport)?;
+    let req_opts = RequestHeaderOptions {
+        accept_markdown: true,
+        ..Default::default()
+    };
+    let Ok(resp) = execute_signed_get(
+        &ctx.client,
+        mirror_url.as_str(),
+        ctx.config.timeout,
+        max_bytes,
+        &req_opts,
+        signer.as_deref(),
+    )
+    .await
+    else {
+        return Ok(None);
+    };
     let mime_ok = if allow_plain_text {
         !resp.is_html() && is_mirror_acceptable_content_type(resp.content_type.as_deref())
     } else {
@@ -904,14 +1028,14 @@ async fn fetch_validated_mirror(
     };
     if resp.status != 200 || !mime_ok || extract::detect_binary_content(None, &resp.body).is_some()
     {
-        return None;
+        return Ok(None);
     }
     let text = resp.text();
     if text.trim().is_empty() {
-        return None;
+        return Ok(None);
     }
     let base = url::Url::parse(&resp.final_url).unwrap_or(mirror_url);
-    Some((text, base))
+    Ok(Some((text, base)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -925,7 +1049,7 @@ async fn try_fetch_markdown_mirror(
     source_mode: SourceMode,
     respect_robots: bool,
     max_bytes: usize,
-) -> Option<(String, url::Url)> {
+) -> std::result::Result<Option<(String, url::Url)>, FetchError> {
     let final_url_parsed = url::Url::parse(final_url).unwrap_or_else(|_| requested.clone());
 
     let advertised = link_header
@@ -937,7 +1061,7 @@ async fn try_fetch_markdown_mirror(
 
     if let Some(mirror_url) = advertised {
         if mirror_url == final_url_parsed {
-            return None;
+            return Ok(None);
         }
         return fetch_validated_mirror(ctx, mirror_url, respect_robots, max_bytes, true).await;
     }
@@ -958,7 +1082,7 @@ async fn try_fetch_markdown_mirror(
         }
     }
 
-    None
+    Ok(None)
 }
 
 async fn acquire_page(
@@ -968,6 +1092,7 @@ async fn acquire_page(
     source_mode: SourceMode,
     wait_for_selector: Option<&str>,
     respect_robots: bool,
+    capture_axtree: bool,
 ) -> std::result::Result<AcquiredPage, FetchError> {
     let start = Instant::now();
     let url_str = parsed.as_str();
@@ -978,6 +1103,8 @@ async fn acquire_page(
     let rule = ctx.rules.get(host);
     let cached = ctx.site_cache.get(host);
     let cef_available = ctx.cef.is_available();
+    let cdp_renderer = ctx.cdp_renderer();
+    let cdp_available = cdp_renderer.is_some();
     let effective_selector =
         wait_for_selector.or_else(|| rule.and_then(|r| r.wait_for_selector.as_deref()));
 
@@ -987,9 +1114,17 @@ async fn acquire_page(
         ));
     }
     if render_mode == RenderMode::Cdp {
-        return Err(FetchError::CdpUnavailable(
-            "CDP renderer is not yet configured".to_string(),
-        ));
+        if ctx.config.proxy.is_some() {
+            return Err(FetchError::CdpUnavailable(
+                "CDP renderer cannot be used with --proxy because WebSocket CDP connections would bypass the proxy"
+                    .to_string(),
+            ));
+        }
+        if !cdp_available {
+            return Err(FetchError::CdpUnavailable(
+                "render=cdp requested but --cdp-url / PLEB_CDP_URL is not configured".to_string(),
+            ));
+        }
     }
 
     let plan = plan_strategy(
@@ -997,12 +1132,47 @@ async fn acquire_page(
         rule,
         cached.as_ref(),
         cef_available,
-        false,
+        cdp_available,
         ctx.config.prefer_cdp,
     );
 
-    let mut cef_fallback = false;
-    if plan.primary == PrimaryTransport::Cef {
+    let mut fallback_used = false;
+    if plan.primary == PrimaryTransport::Cdp {
+        let Some(cdp) = cdp_renderer.as_deref() else {
+            return Err(FetchError::CdpUnavailable(
+                "CDP renderer is not configured".to_string(),
+            ));
+        };
+        match acquire_via_cdp(
+            ctx,
+            cdp,
+            host,
+            url_str,
+            effective_selector,
+            capture_axtree,
+            start,
+            false,
+        )
+        .await
+        {
+            Ok(page) => return Ok(page),
+            Err(err) => {
+                let timing_ms = start.elapsed().as_millis() as u64;
+                if matches!(err, FetchError::Timeout { .. }) {
+                    ctx.site_cache.record(host, "cdp_timeout", timing_ms);
+                }
+                if is_non_fallback_cdp_fetch_error(&err) || !plan.allow_cronet_fallback {
+                    return Err(err);
+                }
+                tracing::warn!(
+                    "CDP render failed for {}: {}; falling back to network transport",
+                    host,
+                    err
+                );
+                fallback_used = true;
+            }
+        }
+    } else if plan.primary == PrimaryTransport::Cef {
         match render_cef_checked(
             &ctx.cef,
             url_str,
@@ -1025,7 +1195,7 @@ async fn acquire_page(
                     host,
                     err
                 );
-                cef_fallback = true;
+                fallback_used = true;
             }
         }
     }
@@ -1037,16 +1207,29 @@ async fn acquire_page(
     let accept_markdown = source_mode == SourceMode::Negotiate
         || (source_mode == SourceMode::Auto && rule.is_some_and(|r| r.accept_markdown));
     let mut current_url = url_str.to_string();
+    let mut current_parsed = parsed.clone();
     let mut visited_refresh = std::collections::HashSet::from([current_url.clone()]);
     let (status, final_url, content_type, link_header, is_html, body, mut parsed_html) = {
         const MAX_META_REFRESH_HOPS: usize = 3;
         let mut hop = 0usize;
         loop {
-            let resp = ctx
-                .client
-                .get_with_options(&current_url, ctx.config.timeout, max_bytes, accept_markdown)
-                .await
-                .map_err(|e| map_transport_error(&current_url, e, max_bytes))?;
+            let signer = ctx
+                .web_bot_auth_signer_for_url(&current_parsed)
+                .map_err(FetchError::Transport)?;
+            let req_opts = RequestHeaderOptions {
+                accept_markdown,
+                ..Default::default()
+            };
+            let resp = execute_signed_get(
+                &ctx.client,
+                &current_url,
+                ctx.config.timeout,
+                max_bytes,
+                &req_opts,
+                signer.as_deref(),
+            )
+            .await
+            .map_err(|e| map_transport_error(&current_url, e, max_bytes))?;
             let status = resp.status;
             let final_url = resp.final_url.clone();
             let content_type = resp.content_type.clone();
@@ -1086,6 +1269,7 @@ async fn acquire_page(
                             });
                         }
                         current_url = next_str;
+                        current_parsed = next_url;
                         hop += 1;
                         continue;
                     }
@@ -1126,8 +1310,10 @@ async fn acquire_page(
                 status_code: status,
                 content_type,
                 strategy: strategy.to_string(),
-                escalated: cef_fallback,
+                escalated: fallback_used,
                 parsed,
+                axtree_text: None,
+                imperative_tools: Vec::new(),
             }
         };
 
@@ -1157,7 +1343,7 @@ async fn acquire_page(
                     respect_robots,
                     max_bytes,
                 )
-                .await
+                .await?
                 {
                     return Ok(record_network_page(
                         mirror_body,
@@ -1180,19 +1366,52 @@ async fn acquire_page(
             ))
         }
         ResponseClassification::JavaScriptShell { reason } => {
-            if plan.escalation == EscalationBackend::Cef {
-                match try_cef_escalation(ctx, host, start, &final_url, effective_selector).await {
-                    CefEscalation::Completed(res) => return *res,
-                    CefEscalation::Unavailable(err) => return Err(err),
-                    CefEscalation::RenderFailed(err) => {
-                        tracing::warn!(
-                            "JS shell detected ({}) on {} and CEF escalation failed: {}",
-                            reason,
-                            host,
-                            err
-                        );
+            match plan.escalation {
+                EscalationBackend::Cef => {
+                    match try_cef_escalation(ctx, host, start, &final_url, effective_selector).await
+                    {
+                        RendererEscalation::Completed(res) => return *res,
+                        RendererEscalation::Unavailable(err) => return Err(err),
+                        RendererEscalation::RenderFailed(err) => {
+                            tracing::warn!(
+                                "JS shell detected ({}) on {} and CEF escalation failed: {}",
+                                reason,
+                                host,
+                                err
+                            );
+                        }
                     }
                 }
+                EscalationBackend::Cdp => {
+                    if let Some(cdp) = cdp_renderer.as_deref() {
+                        match try_cdp_escalation(
+                            ctx,
+                            cdp,
+                            host,
+                            start,
+                            &final_url,
+                            effective_selector,
+                            capture_axtree,
+                        )
+                        .await
+                        {
+                            RendererEscalation::Completed(res) => return *res,
+                            RendererEscalation::Unavailable(err) => return Err(err),
+                            RendererEscalation::RenderFailed(err) => {
+                                if is_non_fallback_cdp_fetch_error(&err) {
+                                    return Err(err);
+                                }
+                                tracing::warn!(
+                                    "JS shell detected ({}) on {} and CDP escalation failed: {}",
+                                    reason,
+                                    host,
+                                    err
+                                );
+                            }
+                        }
+                    }
+                }
+                EscalationBackend::None => {}
             }
             Ok(record_network_page(
                 body,
@@ -1204,21 +1423,63 @@ async fn acquire_page(
             ))
         }
         ResponseClassification::Blocked { status } => {
-            if plan.escalation == EscalationBackend::Cef {
-                match try_cef_escalation(ctx, host, start, &final_url, effective_selector).await {
-                    CefEscalation::Completed(res) => return *res,
-                    CefEscalation::Unavailable(err) => return Err(err),
-                    CefEscalation::RenderFailed(err) => {
-                        return Err(FetchError::Blocked {
-                            url: final_url,
-                            status,
-                            detail: format!("network blocked and CEF escalation failed: {}", err),
-                        });
+            match plan.escalation {
+                EscalationBackend::Cef => {
+                    match try_cef_escalation(ctx, host, start, &final_url, effective_selector).await
+                    {
+                        RendererEscalation::Completed(res) => return *res,
+                        RendererEscalation::Unavailable(err) => return Err(err),
+                        RendererEscalation::RenderFailed(err) => {
+                            return Err(FetchError::Blocked {
+                                url: final_url,
+                                status,
+                                detail: format!(
+                                    "network blocked and CEF escalation failed: {}",
+                                    err
+                                ),
+                            });
+                        }
                     }
                 }
+                EscalationBackend::Cdp => {
+                    if let Some(cdp) = cdp_renderer.as_deref() {
+                        match try_cdp_escalation(
+                            ctx,
+                            cdp,
+                            host,
+                            start,
+                            &final_url,
+                            effective_selector,
+                            capture_axtree,
+                        )
+                        .await
+                        {
+                            RendererEscalation::Completed(res) => return *res,
+                            RendererEscalation::Unavailable(err) => return Err(err),
+                            RendererEscalation::RenderFailed(err) => {
+                                if matches!(
+                                    err,
+                                    FetchError::Challenge { .. } | FetchError::HttpError { .. }
+                                ) {
+                                    return Err(err);
+                                }
+                                return Err(FetchError::Blocked {
+                                    url: final_url,
+                                    status,
+                                    detail: format!(
+                                        "network blocked and CDP escalation failed: {}",
+                                        err
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+                EscalationBackend::None => {}
             }
-            let detail = if !cef_available && render_mode != RenderMode::Cronet {
-                "site blocked the request and CEF renderer is not installed".to_string()
+            let detail = if !cef_available && !cdp_available && render_mode != RenderMode::Cronet {
+                "site blocked the request and no browser renderer (CEF or CDP) is available"
+                    .to_string()
             } else {
                 "site blocked the request".to_string()
             };
@@ -1240,7 +1501,7 @@ async fn acquire_page(
     }
 }
 
-enum CefEscalation {
+enum RendererEscalation {
     Completed(Box<std::result::Result<AcquiredPage, FetchError>>),
     Unavailable(FetchError),
     RenderFailed(FetchError),
@@ -1252,13 +1513,167 @@ async fn try_cef_escalation(
     start: Instant,
     url: &str,
     wait_for_selector: Option<&str>,
-) -> CefEscalation {
+) -> RendererEscalation {
     match render_cef_checked(&ctx.cef, url, wait_for_selector, ctx.config.cef_timeout).await {
-        Ok(cef_res) => CefEscalation::Completed(Box::new(classify_cef_result(
+        Ok(cef_res) => RendererEscalation::Completed(Box::new(classify_cef_result(
             ctx, host, url, start, cef_res, true,
         ))),
-        Err(err @ FetchError::CefUnavailable(_)) => CefEscalation::Unavailable(err),
-        Err(err) => CefEscalation::RenderFailed(err),
+        Err(err @ FetchError::CefUnavailable(_)) => RendererEscalation::Unavailable(err),
+        Err(err) => RendererEscalation::RenderFailed(err),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn try_cdp_escalation(
+    ctx: &RuntimeContext,
+    cdp: &CdpRenderer,
+    host: &str,
+    start: Instant,
+    url: &str,
+    wait_for_selector: Option<&str>,
+    capture_axtree: bool,
+) -> RendererEscalation {
+    match acquire_via_cdp(
+        ctx,
+        cdp,
+        host,
+        url,
+        wait_for_selector,
+        capture_axtree,
+        start,
+        true,
+    )
+    .await
+    {
+        Ok(page) => RendererEscalation::Completed(Box::new(Ok(page))),
+        Err(err @ FetchError::CdpUnavailable(_)) => RendererEscalation::Unavailable(err),
+        Err(err) => {
+            if matches!(err, FetchError::Timeout { .. }) {
+                ctx.site_cache
+                    .record(host, "cdp_timeout", start.elapsed().as_millis() as u64);
+            }
+            RendererEscalation::RenderFailed(err)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn acquire_via_cdp(
+    ctx: &RuntimeContext,
+    cdp: &CdpRenderer,
+    host: &str,
+    url: &str,
+    wait_for_selector: Option<&str>,
+    capture_axtree: bool,
+    start: Instant,
+    escalated: bool,
+) -> std::result::Result<AcquiredPage, FetchError> {
+    let max_bytes = ctx
+        .config
+        .max_response_bytes
+        .unwrap_or(DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES);
+    let opts = CdpRenderOptions {
+        wait_for_selector: wait_for_selector.map(|s| s.to_string()),
+        capture_axtree,
+        max_response_bytes: max_bytes,
+        allow_local_targets: false,
+    };
+    let res = cdp
+        .render(url, &opts, ctx.config.cdp_timeout)
+        .await
+        .map_err(|err| map_cdp_error(url, err, max_bytes))?;
+    if let Some(reason) = detect_interstitial_challenge(&res.html) {
+        return Err(challenge_error_from_cdp(res, reason));
+    }
+    classify_cdp_result(ctx, host, url, start, res, escalated)
+}
+
+fn classify_cdp_result(
+    ctx: &RuntimeContext,
+    host: &str,
+    requested_url: &str,
+    start: Instant,
+    res: CdpRenderResult,
+    escalated: bool,
+) -> std::result::Result<AcquiredPage, FetchError> {
+    if res.status_code == 0 {
+        return Err(FetchError::Transport(anyhow::anyhow!(
+            "CDP render did not capture an HTTP status code for {}",
+            res.final_url
+        )));
+    }
+
+    let mut parsed_html = None;
+    match classify_response_with_context(
+        res.status_code,
+        true,
+        Some(requested_url),
+        Some(&res.final_url),
+        &res.html,
+        &mut parsed_html,
+    ) {
+        ResponseClassification::Ok | ResponseClassification::JavaScriptShell { .. } => {
+            let timing_ms = start.elapsed().as_millis() as u64;
+            ctx.site_cache.record(host, "cdp", timing_ms);
+            let content_type = res
+                .content_type
+                .filter(|c| extract::is_html_content_type(Some(c)))
+                .or_else(|| Some("text/html".to_string()));
+            Ok(AcquiredPage {
+                body: res.html,
+                final_url: res.final_url,
+                extract_base_url: None,
+                status_code: res.status_code,
+                content_type,
+                strategy: "cdp".to_string(),
+                escalated,
+                parsed: parsed_html,
+                axtree_text: res.axtree_text,
+                imperative_tools: res.imperative_tools,
+            })
+        }
+        ResponseClassification::Blocked { status } => Err(FetchError::Blocked {
+            url: res.final_url,
+            status,
+            detail: "site blocked the request after CDP render".to_string(),
+        }),
+        ResponseClassification::Challenge { status, reason } => Err(FetchError::Challenge {
+            url: res.final_url,
+            status,
+            reason,
+        }),
+        ResponseClassification::HttpError { status } => Err(FetchError::HttpError {
+            url: res.final_url,
+            status,
+        }),
+    }
+}
+
+fn challenge_error_from_cdp(result: CdpRenderResult, reason: String) -> FetchError {
+    let status = if result.status_code != 0 {
+        result.status_code
+    } else {
+        403
+    };
+    FetchError::Challenge {
+        url: result.final_url,
+        status,
+        reason,
+    }
+}
+
+fn is_non_fallback_cdp_fetch_error(err: &FetchError) -> bool {
+    match err {
+        FetchError::CdpUnavailable(_)
+        | FetchError::Challenge { .. }
+        | FetchError::Blocked { .. }
+        | FetchError::HttpError { .. }
+        | FetchError::ResponseTooLarge { .. } => true,
+        FetchError::Transport(inner) => matches!(
+            transport_error_kind(inner),
+            Some(TransportErrorKind::InvalidSelector | TransportErrorKind::RedirectBlocked)
+        ),
+        _ => false,
     }
 }
 
@@ -1298,6 +1713,8 @@ fn classify_cef_result(
                 strategy: "cef".to_string(),
                 escalated,
                 parsed: parsed_html,
+                axtree_text: None,
+                imperative_tools: Vec::new(),
             })
         }
         ResponseClassification::Blocked { status } => Err(FetchError::Blocked {
@@ -1419,6 +1836,27 @@ fn map_transport_error(url: &str, err: anyhow::Error, max_response_bytes: usize)
 
 fn map_cef_error(url: &str, err: anyhow::Error) -> FetchError {
     map_transport_error(url, err, DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES)
+}
+
+fn map_cdp_error(url: &str, err: anyhow::Error, max_response_bytes: usize) -> FetchError {
+    if let Some(too_large) = err.downcast_ref::<ResponseTooLargeError>() {
+        return FetchError::ResponseTooLarge {
+            url: url.to_string(),
+            limit_bytes: too_large.limit_bytes,
+        };
+    }
+    match transport_error_kind(&err) {
+        Some(TransportErrorKind::Timeout) => FetchError::Timeout {
+            url: url.to_string(),
+            detail: err.to_string(),
+        },
+        Some(TransportErrorKind::ResponseTooLarge) => FetchError::ResponseTooLarge {
+            url: url.to_string(),
+            limit_bytes: max_response_bytes,
+        },
+        Some(TransportErrorKind::ProtocolMismatch) => FetchError::CdpUnavailable(err.to_string()),
+        _ => FetchError::Transport(err),
+    }
 }
 
 fn is_acceptable_cef_render(res: &CefRenderResult) -> bool {
@@ -1664,6 +2102,18 @@ mod tests {
         );
         assert!(matches!(mismatch, FetchError::CefUnavailable(_)));
 
+        let cdp_mismatch = map_cdp_error(
+            "https://example.com",
+            anyhow::Error::new(TransportError::new(
+                TransportErrorKind::ProtocolMismatch,
+                "CDP Target.createTarget missing",
+            )),
+            1024,
+        );
+        assert!(matches!(cdp_mismatch, FetchError::CdpUnavailable(_)));
+        assert_eq!(cdp_mismatch.kind(), "cdp_unavailable");
+        assert_eq!(cdp_mismatch.exit_code(), 1);
+
         let invalid_selector_err = anyhow::Error::new(TransportError::new(
             TransportErrorKind::InvalidSelector,
             "bad css selector",
@@ -1762,6 +2212,7 @@ mod tests {
             Instant::now(),
         )
         .await
+        .unwrap()
         .unwrap();
         assert_eq!(md_out.strategy, "raw_source");
         assert!(md_out.content.contains("Hello raw."));
@@ -1783,6 +2234,7 @@ mod tests {
             Instant::now(),
         )
         .await
+        .unwrap()
         .unwrap();
         assert_eq!(rs_out.strategy, "raw_source");
         assert!(rs_out.content.contains("```rust"));
@@ -1805,6 +2257,7 @@ mod tests {
             Instant::now()
         )
         .await
+        .unwrap()
         .is_none());
 
         // 4. Binary content returns None so fetch_document falls back cleanly.
@@ -1822,6 +2275,7 @@ mod tests {
             Instant::now()
         )
         .await
+        .unwrap()
         .is_none());
 
         // 5. respect_robots=true skips disallowed raw_url.
@@ -1838,6 +2292,7 @@ mod tests {
             Instant::now()
         )
         .await
+        .unwrap()
         .is_none());
 
         let _ = std::fs::remove_dir_all(&state_dir);
@@ -2013,7 +2468,9 @@ mod tests {
             ..Default::default()
         };
 
-        enrich_document_resources(&ctx, &page_url, &mut content, &mut resources, &opts).await;
+        enrich_document_resources(&ctx, &page_url, &mut content, &mut resources, &opts)
+            .await
+            .unwrap();
 
         let staged_png = resources[0].staged_path.as_deref().unwrap();
         assert!(std::path::Path::new(staged_png).exists());

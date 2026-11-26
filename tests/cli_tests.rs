@@ -514,6 +514,9 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
     assert_eq!(val["daemon"]["running"], false);
     assert_eq!(val["daemon"]["active_requests"], 0);
     assert_eq!(val["cef_renderer"]["expected_protocol"], "v5-meta");
+    assert_eq!(val["cdp_renderer"]["configured"], false);
+    assert_eq!(val["cdp_renderer"]["prefer_cdp"], false);
+    assert_eq!(val["agent_identity"]["jwk_configured"], false);
 
     // README.md, README-FULL.md, llms.txt, and llms-full.txt must maintain canonical branding,
     // valid relative file links, valid heading anchors, and CLI/schema contract parity without retired identifiers.
@@ -775,6 +778,16 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "Crawl4AI",
         "crates.io",
         "packaging/homebrew/pleb.rb",
+        "--tools",
+        "--render cdp",
+        "--cdp-url",
+        "--cdp-timeout",
+        "--prefer-cdp",
+        "--no-web-bot-auth",
+        "--format axtree",
+        "web-bot-auth",
+        "cdp-access",
+        "workerd",
     ] {
         assert!(
             readme_full.contains(required),
@@ -875,6 +888,12 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "--mode",
         "exact",
         "semantic",
+        "--tools",
+        "--render cdp",
+        "--cdp-url",
+        "--prefer-cdp",
+        "--no-web-bot-auth",
+        "--format axtree",
     ] {
         assert!(
             skill_md.contains(required),
@@ -1325,4 +1344,271 @@ async fn cli_auth_subcommands_help_and_zero_secret_leakage() {
         assert_eq!(after_json["brave"]["configured"], false);
         assert!(after_json["brave"]["source"].is_null());
     }
+}
+
+#[tokio::test]
+async fn cli_status_auth_status_redaction_and_m6_flag_validations() {
+    let pleb_bin = env!("CARGO_BIN_EXE_pleb");
+    let state_dir = temp_dir();
+
+    // 1. status --json redacts query tokens from --cdp-url and reports prefer_cdp.
+    let status_out = Command::new(pleb_bin)
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .env("PLEB_NO_HOME_CEF", "1")
+        .env_remove("PLEB_CDP_URL")
+        .args(["--state-dir"])
+        .arg(state_dir.path())
+        .args([
+            "--cdp-url",
+            "ws://127.0.0.1:9222/devtools/browser?token=super-secret-query",
+            "--prefer-cdp",
+            "status",
+            "--json",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(status_out.status.code(), Some(0));
+    let status_json: serde_json::Value = serde_json::from_slice(&status_out.stdout).unwrap();
+    assert_eq!(status_json["cdp_renderer"]["configured"], true);
+    assert_eq!(status_json["cdp_renderer"]["prefer_cdp"], true);
+    assert_eq!(
+        status_json["cdp_renderer"]["url"],
+        "ws://127.0.0.1:9222/devtools/browser"
+    );
+    assert!(!String::from_utf8_lossy(&status_out.stdout).contains("super-secret-query"));
+    assert_eq!(status_json["agent_identity"]["jwk_configured"], false);
+
+    // 2. auth status --json preserves top-level search keys alongside agent_identity & cdp_access.
+    let auth_status = Command::new(pleb_bin)
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .env("PLEB_NO_HOME_CEF", "1")
+        .args(["--state-dir"])
+        .arg(state_dir.path())
+        .args(["auth", "status", "--json"])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(auth_status.status.code(), Some(0));
+    let auth_json: serde_json::Value = serde_json::from_slice(&auth_status.stdout).unwrap();
+    assert!(auth_json.get("brave").is_some());
+    assert!(auth_json.get("agent_identity").is_some());
+    assert!(auth_json.get("cdp_access").is_some());
+    assert_eq!(auth_json["cdp_access"]["client_id_configured"], false);
+
+    // 3. Invalid Milestone 6 CLI flag combinations fail with exit code 4 before network calls.
+    for args in [
+        vec![
+            "fetch",
+            "https://example.com",
+            "--tools",
+            "manifest",
+            "--stage",
+        ],
+        vec![
+            "fetch",
+            "https://example.com",
+            "--tools",
+            "manifest",
+            "--format",
+            "raw",
+            "--output",
+            "/tmp/pleb-unused",
+        ],
+        vec![
+            "fetch",
+            "https://example.com",
+            "--format",
+            "axtree",
+            "--stage",
+        ],
+        vec![
+            "fetch",
+            "https://example.com",
+            "--format",
+            "axtree",
+            "--render",
+            "cronet",
+        ],
+        vec![
+            "fetch",
+            "https://example.com",
+            "--format",
+            "axtree",
+            "--render",
+            "cef",
+        ],
+        vec!["fetch", "https://example.com", "--format", "axtree"],
+        vec![
+            "--cdp-url",
+            "ws://127.0.0.1:9222/devtools/browser",
+            "--proxy",
+            "http://127.0.0.1:8888",
+            "fetch",
+            "https://example.com",
+            "--render",
+            "cdp",
+        ],
+    ] {
+        let out = Command::new(pleb_bin)
+            .env("PLEB_NO_KEYCHAIN", "1")
+            .env("PLEB_NO_HOME_CEF", "1")
+            .env_remove("PLEB_CDP_URL")
+            .args(["--state-dir"])
+            .arg(state_dir.path())
+            .args(&args)
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "expected exit 1 for {args:?}, got {:?} ({})",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[tokio::test]
+async fn cli_fetch_render_cdp_emits_tools_json_metadata() {
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::{json, Value};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                while let Some(Ok(Message::Text(text))) = ws.next().await {
+                    let Ok(val) = serde_json::from_str::<Value>(text.as_str()) else {
+                        continue;
+                    };
+                    let id = val["id"].as_i64().unwrap_or(0);
+                    let method = val["method"].as_str().unwrap_or("");
+                    let sid = val["sessionId"].as_str().map(|s| s.to_string());
+                    let mk = |id_opt: Option<i64>, ev: Option<&str>, result: Value| {
+                        let mut obj = serde_json::Map::new();
+                        if let Some(i) = id_opt {
+                            obj.insert("id".into(), json!(i));
+                            obj.insert("result".into(), result);
+                        } else if let Some(m) = ev {
+                            obj.insert("method".into(), json!(m));
+                            obj.insert("params".into(), result);
+                        }
+                        if let Some(ref s) = sid {
+                            obj.insert("sessionId".into(), json!(s));
+                        }
+                        Message::Text(Value::Object(obj).to_string().into())
+                    };
+                    let replies = match method {
+                        "Target.createTarget" => {
+                            vec![mk(Some(id), None, json!({ "targetId": "tgt-cli" }))]
+                        }
+                        "Target.attachToTarget" => {
+                            vec![mk(Some(id), None, json!({ "sessionId": "sess-cli" }))]
+                        }
+                        "Target.closeTarget" | "Page.enable" | "Network.enable"
+                        | "Fetch.enable" | "WebMCP.enable" => vec![mk(Some(id), None, json!({}))],
+                        "Page.getFrameTree" => vec![mk(
+                            Some(id),
+                            None,
+                            json!({ "frameTree": { "frame": { "id": "mf-cli" } } }),
+                        )],
+                        "Page.navigate" => vec![
+                            mk(
+                                None,
+                                Some("Network.responseReceived"),
+                                json!({
+                                    "requestId": "req-cli",
+                                    "frameId": "mf-cli",
+                                    "type": "Document",
+                                    "response": {
+                                        "url": "https://example.com/cli-cdp",
+                                        "status": 200,
+                                        "headers": { "Content-Type": "text/html" }
+                                    }
+                                }),
+                            ),
+                            mk(
+                                None,
+                                Some("WebMCP.toolsAdded"),
+                                json!({
+                                    "tools": [{
+                                        "name": "search_docs",
+                                        "description": "Search docs",
+                                        "frameId": "mf-cli"
+                                    }]
+                                }),
+                            ),
+                            mk(Some(id), None, json!({})),
+                            mk(None, Some("Page.loadEventFired"), json!({})),
+                        ],
+                        "DOM.getDocument" => {
+                            vec![mk(Some(id), None, json!({ "root": { "nodeId": 11 } }))]
+                        }
+                        "DOM.getOuterHTML" => vec![mk(
+                            Some(id),
+                            None,
+                            json!({ "outerHTML": "<html><head><title>CLI CDP</title></head><body><main><p>CLI rendered body</p></main></body></html>" }),
+                        )],
+                        _ => {
+                            let mut obj = json!({
+                                "id": id,
+                                "error": { "code": -32601, "message": "not found" }
+                            });
+                            if let Some(ref s) = sid {
+                                obj["sessionId"] = json!(s);
+                            }
+                            vec![Message::Text(obj.to_string().into())]
+                        }
+                    };
+                    for m in replies {
+                        if ws.send(m).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let pleb_bin = env!("CARGO_BIN_EXE_pleb");
+    let state_dir = temp_dir();
+    let ws_url = format!("ws://127.0.0.1:{}/devtools/browser", addr.port());
+
+    let out = Command::new(pleb_bin)
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .env("PLEB_NO_HOME_CEF", "1")
+        .args(["--state-dir"])
+        .arg(state_dir.path())
+        .args([
+            "--cdp-url",
+            &ws_url,
+            "fetch",
+            "https://example.com/cli-cdp",
+            "--render",
+            "cdp",
+            "--json",
+            "--metadata-only",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let val: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(val["strategy"], "cdp");
+    assert_eq!(val["tools"][0]["name"], "search_docs");
 }
