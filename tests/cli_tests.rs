@@ -1978,3 +1978,100 @@ async fn cli_contract_hardening_exit_codes_js_shell_warning_crawl_seed_keychain_
     assert_eq!(focused_json["content_outcome"], "complete");
     assert!(focused_json["content_bytes"].as_u64().unwrap() <= 1024);
 }
+
+#[tokio::test]
+async fn cli_stage_resources_with_max_bytes_prints_staged_paths_on_stderr() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+
+    tokio::spawn(async move {
+        let padding = "System architecture walkthrough paragraph. ".repeat(30);
+        let html = format!(
+            "<!doctype html><html><head><title>Arch</title></head><body><main>\
+             <h1>Arch</h1><img width=\"800\" height=\"400\" src=\"/arch.png\" alt=\"System diagram\">\
+             <p>{padding}</p></main></body></html>"
+        );
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let html = html.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let (status, ct, body): (&str, &str, Vec<u8>) = match path {
+                    "/page" => ("200 OK", "text/html; charset=utf-8", html.into_bytes()),
+                    "/arch.png" => (
+                        "200 OK",
+                        "image/png",
+                        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR".to_vec(),
+                    ),
+                    _ => ("404 Not Found", "text/plain", b"missing".to_vec()),
+                };
+                let hdr = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(hdr.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+            });
+        }
+    });
+
+    let pleb_bin = env!("CARGO_BIN_EXE_pleb");
+    let state_dir = temp_dir();
+    let diagram_id = pleb::extract::resource_identifier(&format!("{base}/arch.png"));
+
+    let out = Command::new(pleb_bin)
+        .env("PLEB_NO_HOME_CEF", "1")
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args([
+            "--no-daemon",
+            "fetch",
+            "--render",
+            "cronet",
+            "--stage-resources",
+            &diagram_id,
+            "--max-bytes",
+            "120",
+            &format!("{base}/page"),
+        ])
+        .output()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout.len() <= 120,
+        "stdout exceeded max-bytes: {} bytes",
+        out.stdout.len()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let prefix = format!("Staged: {diagram_id}=");
+    let staged_line = stderr
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("expected stderr {prefix:?}; got:\n{stderr}"));
+    let staged_path = Path::new(staged_line.trim_start_matches(&prefix).trim());
+    assert!(
+        staged_path.exists(),
+        "staged path missing on disk: {}",
+        staged_path.display()
+    );
+}

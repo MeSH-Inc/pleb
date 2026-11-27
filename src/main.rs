@@ -1034,6 +1034,9 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                                 eprintln!("{cue}");
                             }
                         }
+                        if let Some(staged) = fetch::format_staged_resources_line(&res.resources) {
+                            eprintln!("{staged}");
+                        }
                         if let Some(warning) = &res.warning {
                             eprintln!("Warning: {}", warning);
                         }

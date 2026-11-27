@@ -2959,3 +2959,48 @@ fn resource_sections_scope_to_articles_without_leaking_across_siblings() {
     assert_eq!(s1.section_heading.as_deref(), Some("Section 1"));
     assert_eq!(s2.section_heading.as_deref(), Some("Section 2"));
 }
+
+#[test]
+fn resource_sections_scope_list_items_and_recognize_slotted_or_aria_titles() {
+    let url = Url::parse("https://feed.example.com/r/rust/").unwrap();
+    let html = r#"<!doctype html>
+<html><head><title>r/rust</title></head><body><main>
+  <h1>r/rust</h1>
+  <ul>
+    <li><a href="/h"><h2>Pinned Highlight</h2></a></li>
+  </ul>
+  <article>
+    <shreddit-post>
+      <a slot="title" href="/p1">Slotted Post Title</a>
+      <img width="800" height="450" src="/a.png" alt="Post diagram">
+    </shreddit-post>
+  </article>
+  <article>
+    <div role="heading">ARIA Post Title</div>
+    <img width="800" height="450" src="/b.png" alt="ARIA diagram">
+  </article>
+  <article>
+    <p>Headingless card falls back outside list highlight.</p>
+    <figure><img src="/fallback.png" alt="Fallback diagram"><figcaption>Fallback Fig</figcaption></figure>
+  </article>
+  <section>
+    <h2>Core Architecture</h2>
+    <ul><li><h3>Sub-item</h3></li></ul>
+    <figure><img src="/c.png" alt="Diagram"><figcaption>Fig 1</figcaption></figure>
+  </section>
+</main></body></html>"#;
+
+    let doc = extract_document(html, &url, Some("text/html"), &ExtractOptions::default()).unwrap();
+    let find_sec = |suffix: &str| {
+        doc.resources
+            .iter()
+            .find(|r| r.url.ends_with(suffix))
+            .unwrap()
+            .section_heading
+            .clone()
+    };
+    assert_eq!(find_sec("/a.png").as_deref(), Some("Slotted Post Title"));
+    assert_eq!(find_sec("/b.png").as_deref(), Some("ARIA Post Title"));
+    assert_eq!(find_sec("/fallback.png").as_deref(), Some("r/rust"));
+    assert_eq!(find_sec("/c.png").as_deref(), Some("Core Architecture"));
+}

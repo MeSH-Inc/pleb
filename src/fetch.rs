@@ -645,6 +645,18 @@ pub fn format_resource_cue(resources: &[ResourceDescriptor]) -> Option<String> {
     )
 }
 
+pub fn format_staged_resources_line(resources: &[ResourceDescriptor]) -> Option<String> {
+    let parts: Vec<String> = resources
+        .iter()
+        .filter_map(|r| {
+            r.staged_path
+                .as_deref()
+                .map(|p| format!("{}={p}", r.identifier))
+        })
+        .collect();
+    (!parts.is_empty()).then(|| format!("Staged: {}", parts.join(", ")))
+}
+
 fn infer_subresource_dest(url: &url::Url) -> SubresourceDest {
     let lower = url.path().to_ascii_lowercase();
     if [

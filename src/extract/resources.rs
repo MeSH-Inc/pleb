@@ -235,6 +235,15 @@ fn walk_for_resources(
         return;
     }
 
+    if tag == "li" {
+        let saved_heading = ctx.current_heading.clone();
+        for child in node.children() {
+            walk_for_resources(child, in_figure, figure_caption, ctx);
+        }
+        ctx.current_heading = saved_heading;
+        return;
+    }
+
     if tag == "figure" {
         let caption = find_figcaption_text(node);
         for child in node.children() {
@@ -297,11 +306,18 @@ fn first_article_heading(node: NodeRef<'_, Node>) -> Option<String> {
             let tag = el.name();
             if matches!(
                 tag,
-                "article" | "script" | "style" | "noscript" | "template"
+                "article" | "script" | "style" | "noscript" | "template" | "svg"
             ) {
                 continue;
             }
-            if matches!(tag, "h1" | "h2" | "h3") {
+            let is_heading = matches!(tag, "h1" | "h2" | "h3")
+                || el
+                    .attr("role")
+                    .is_some_and(|r| r.eq_ignore_ascii_case("heading"))
+                || el
+                    .attr("slot")
+                    .is_some_and(|s| s.eq_ignore_ascii_case("title"));
+            if is_heading {
                 if let Some(heading) = extract_node_clean_text(child) {
                     return Some(heading);
                 }

@@ -380,17 +380,8 @@ async fn call_fetch(
                     lines.push(cue);
                 }
             }
-            let staged_parts: Vec<String> = res
-                .resources
-                .iter()
-                .filter_map(|r| {
-                    r.staged_path
-                        .as_deref()
-                        .map(|p| format!("{}={p}", r.identifier))
-                })
-                .collect();
-            if !staged_parts.is_empty() {
-                lines.push(format!("Staged: {}", staged_parts.join(", ")));
+            if let Some(staged) = fetch::format_staged_resources_line(&res.resources) {
+                lines.push(staged);
             }
             if let Some(ref warning) = res.warning {
                 lines.push(format!("Warning: {warning}"));
