@@ -491,8 +491,15 @@ pub fn validate_credential(provider: CredentialProvider, raw: &str) -> Result<Se
     }
 }
 
+fn is_truthy_env_flag(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed == "1" || trimmed.eq_ignore_ascii_case("true")
+}
+
 fn keychain_disabled() -> bool {
-    std::env::var(NO_KEYCHAIN_ENV).ok().as_deref() == Some("1")
+    std::env::var(NO_KEYCHAIN_ENV)
+        .ok()
+        .is_some_and(|v| is_truthy_env_flag(&v))
 }
 
 fn keychain_enabled() -> bool {
@@ -1736,5 +1743,12 @@ mod vault_tests {
             vec![0xab; VAULT_KEY_LEN]
         );
         assert!(decode_hex_vault_key("not-hex").is_err());
+
+        for truthy in ["1", "true", "TRUE", " True "] {
+            assert!(is_truthy_env_flag(truthy), "expected truthy for {truthy:?}");
+        }
+        for falsy in ["", "0", "false", "FALSE", "yes", "on"] {
+            assert!(!is_truthy_env_flag(falsy), "expected falsy for {falsy:?}");
+        }
     }
 }

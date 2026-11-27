@@ -135,7 +135,7 @@ enum Command {
         /// Enforce robots.txt for this fetch (skipped by default)
         #[arg(long)]
         respect_robots: bool,
-        /// Disable bundled/local host rewrite rules (e.g., old.reddit.com)
+        /// Disable host rewrite rules (e.g., old.reddit.com) and forge raw-source rewrites
         #[arg(long)]
         no_rewrite: bool,
         /// Strip image references from markdown output
@@ -191,7 +191,7 @@ enum Command {
         #[command(subcommand)]
         action: AuthAction,
     },
-    /// Crawl a website starting from a URL
+    /// Crawl a website starting from a URL (per-page content capped at 10 KiB; plain output at 100 KiB)
     Crawl {
         /// Starting URL
         url: String,
@@ -211,7 +211,7 @@ enum Command {
         #[arg(long)]
         no_robots: bool,
     },
-    /// Discover URLs on a website via sitemap and links
+    /// Discover URLs on a website via sitemap.xml and up to 20 HTML pages
     Map {
         /// Starting URL
         url: String,
@@ -228,7 +228,7 @@ enum Command {
         #[arg(long)]
         no_robots: bool,
     },
-    /// Manage persistent background CEF renderer daemon
+    /// Manage persistent unified transport daemon (Cronet/reqwest + CEF)
     Daemon {
         #[command(subcommand)]
         action: DaemonAction,
@@ -240,7 +240,7 @@ enum Command {
     },
     /// Show binary, Cronet, CEF, CDP, agent identity, and search configuration status
     Status,
-    /// Emit the canonical version-locked pleb agent skill
+    /// Print or install the canonical version-locked pleb agent skill
     Skill {
         #[command(subcommand)]
         action: SkillAction,
@@ -249,28 +249,28 @@ enum Command {
 
 #[derive(Subcommand)]
 enum AuthAction {
-    /// Store a search provider credential (hidden TTY prompt, or read from --stdin)
+    /// Store a search, Web Bot Auth, or CDP Access credential (hidden TTY prompt, or read from --stdin)
     Set {
-        /// Search provider credential to store
+        /// Credential provider or slot to store
         #[arg(value_enum, ignore_case = true)]
         provider: CredentialProvider,
-        /// Read credential from stdin (single line, <= 4096 bytes)
+        /// Read credential from stdin (<= 4096 bytes; single line, or multi-line JSON for web-bot-auth-jwk)
         #[arg(long)]
         stdin: bool,
         /// Credential storage backend
         #[arg(long, value_enum, default_value_t = CredentialStorage::Auto, ignore_case = true)]
         storage: CredentialStorage,
     },
-    /// Remove a stored search provider credential
+    /// Remove a stored search, Web Bot Auth, or CDP Access credential
     Remove {
-        /// Search provider credential to remove
+        /// Credential provider or slot to remove
         #[arg(value_enum, ignore_case = true)]
         provider: CredentialProvider,
         /// Credential storage backend to remove from
         #[arg(long, value_enum, default_value_t = CredentialStorage::Auto, ignore_case = true)]
         storage: CredentialStorage,
     },
-    /// Show search provider credential and cooldown status
+    /// Show search provider, Web Bot Auth, and CDP Access credential and cooldown status
     Status,
 }
 
@@ -278,23 +278,32 @@ enum AuthAction {
 enum SkillAction {
     /// Print the bundled pleb SKILL.md to stdout
     Print,
+    /// Install the bundled pleb SKILL.md into local agent skill directories (or --dir <PATH>)
+    Install {
+        /// Target directory to write <DIR>/SKILL.md into instead of default agent locations
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Overwrite existing modified SKILL.md files or symlinks
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 const BUNDLED_SKILL_MD: &str = include_str!("../skills/pleb/SKILL.md");
 
 #[derive(Subcommand)]
 enum DaemonAction {
-    /// Run the background CEF daemon (auto-started on demand)
+    /// Run the unified transport daemon (auto-started on demand)
     Run,
-    /// Show background CEF daemon status
+    /// Show unified transport daemon status
     Status,
-    /// Stop the running background CEF daemon
+    /// Stop the running unified transport daemon
     Stop,
 }
 
 #[derive(Subcommand)]
 enum SessionAction {
-    /// Clear network storage and cached per-site strategies
+    /// Stop daemon and clear caches, artifacts, and site/search state (preserves credentials and site-rules.json)
     Clear,
 }
 
@@ -343,6 +352,8 @@ struct FetchMetadataOutput<'a> {
     truncated: bool,
     timing_ms: u64,
     content_bytes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    warning: Option<&'a str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     resources: Vec<pleb::extract::ResourceDescriptor>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -362,6 +373,7 @@ impl<'a> From<&'a FetchOutput> for FetchMetadataOutput<'a> {
             truncated: res.truncated,
             timing_ms: res.timing_ms,
             content_bytes: res.content_bytes,
+            warning: res.warning.as_deref(),
             resources: res.resources.clone(),
             tools: res.tools.clone(),
         }
@@ -422,12 +434,17 @@ fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(err) => {
-            if err.use_stderr() && std::env::args_os().any(|a| a == "--json" || a == "--jsonl") {
-                let cli_err = CliError::invalid_input(err.to_string().trim_end());
-                emit_cli_error(&cli_err, true);
-                return ExitCode::from(cli_err.exit_code);
+            if err.use_stderr() {
+                if std::env::args_os().any(|a| a == "--json" || a == "--jsonl") {
+                    let cli_err = CliError::invalid_input(err.to_string().trim_end());
+                    emit_cli_error(&cli_err, true);
+                } else {
+                    let _ = err.print();
+                }
+                return ExitCode::from(1);
             }
-            err.exit();
+            let _ = err.print();
+            return ExitCode::SUCCESS;
         }
     };
 
@@ -676,6 +693,24 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 }
                 Ok(ExitCode::SUCCESS)
             }
+            SkillAction::Install { dir, force } => {
+                let entries = install_bundled_skill(dir, force)?;
+                if json {
+                    print_json(&serde_json::json!({
+                        "name": "pleb",
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "installed": entries,
+                    }))?;
+                } else if !quiet {
+                    for entry in &entries {
+                        match entry.status {
+                            "up_to_date" => println!("Up to date: {}", entry.path),
+                            _ => println!("Installed {}", entry.path),
+                        }
+                    }
+                }
+                Ok(ExitCode::SUCCESS)
+            }
         },
         Command::Fetch {
             urls,
@@ -888,6 +923,9 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                                 eprintln!("{cue}");
                             }
                         }
+                        if let Some(warning) = &res.warning {
+                            eprintln!("Warning: {}", warning);
+                        }
                         eprintln!(
                             "Status: {} | Strategy: {} | Time: {}ms\n",
                             res.status_code, res.strategy, res.timing_ms
@@ -934,6 +972,11 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 for (i, item) in ordered.iter().enumerate() {
                     match item {
                         BatchItemResult::Success(s) => {
+                            if !quiet {
+                                if let Some(ref warning) = s.warning {
+                                    eprintln!("warning [{}]: {}", s.url, warning);
+                                }
+                            }
                             if printed_any {
                                 println!();
                             }
@@ -1107,9 +1150,12 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 respect_robots: !no_robots,
                 path_filter,
             };
-            let result = crawl::crawl(&ctx, &url, options)
-                .await
-                .map_err(|e| CliError::runtime("crawl_error", e))?;
+            let result = crawl::crawl(&ctx, &url, options).await.map_err(|e| {
+                match e.downcast::<FetchError>() {
+                    Ok(fetch_err) => CliError::from_fetch(fetch_err),
+                    Err(other) => CliError::runtime("crawl_error", other),
+                }
+            })?;
             if json {
                 print_json(&result)?;
             } else {
@@ -1574,6 +1620,156 @@ fn init_tracing(verbose: bool) {
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .try_init();
+}
+
+#[derive(Serialize)]
+struct SkillInstallEntry {
+    path: String,
+    status: &'static str,
+}
+
+fn resolve_skill_install_targets(dir: Option<PathBuf>) -> Result<Vec<PathBuf>, CliError> {
+    if let Some(explicit) = dir {
+        if explicit.as_os_str().is_empty() {
+            return Err(CliError::invalid_input("--dir must not be empty"));
+        }
+        return Ok(vec![explicit]);
+    }
+    let home = std::env::var_os("HOME").filter(|v| !v.is_empty());
+    #[cfg(windows)]
+    let home = home.or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()));
+    let home = home.map(PathBuf::from).ok_or_else(|| {
+        CliError::runtime(
+            "skill_error",
+            "cannot determine home directory (HOME is unset); pass --dir <PATH>",
+        )
+    })?;
+    Ok(vec![
+        home.join(".agents/skills/pleb"),
+        home.join(".gemini/config/skills/pleb"),
+        home.join(".claude/skills/pleb"),
+        home.join(".codex/skills/pleb"),
+        home.join(".config/opencode/skills/pleb"),
+    ])
+}
+
+fn write_skill_file_atomic(skill_path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    let parent = skill_path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "skill path missing parent directory",
+        )
+    })?;
+    let tmp_path = parent.join(format!(".SKILL.md.tmp.{}", std::process::id()));
+    std::fs::write(&tmp_path, content.as_bytes())?;
+    if let Err(err) = std::fs::rename(&tmp_path, skill_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn install_bundled_skill(
+    dir: Option<PathBuf>,
+    force: bool,
+) -> Result<Vec<SkillInstallEntry>, CliError> {
+    let targets = resolve_skill_install_targets(dir)?;
+    let mut entries = Vec::with_capacity(targets.len());
+    for dest in targets {
+        let skill_path = dest.join("SKILL.md");
+        match std::fs::symlink_metadata(&dest) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if !force {
+                    if let Ok(existing) = std::fs::read_to_string(&skill_path) {
+                        if existing == BUNDLED_SKILL_MD {
+                            entries.push(SkillInstallEntry {
+                                path: skill_path.display().to_string(),
+                                status: "up_to_date",
+                            });
+                            continue;
+                        }
+                    }
+                    return Err(CliError::runtime(
+                        "skill_error",
+                        format!(
+                            "refusing to overwrite symlink at {}; pass --force to replace",
+                            dest.display()
+                        ),
+                    ));
+                }
+                std::fs::remove_file(&dest).map_err(|e| CliError::runtime("skill_error", e))?;
+            }
+            Ok(meta) if !meta.is_dir() => {
+                return Err(CliError::runtime(
+                    "skill_error",
+                    format!(
+                        "skill target exists and is not a directory: {}",
+                        dest.display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(CliError::runtime("skill_error", err)),
+        }
+
+        std::fs::create_dir_all(&dest).map_err(|e| CliError::runtime("skill_error", e))?;
+
+        match std::fs::symlink_metadata(&skill_path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if !force {
+                    return Err(CliError::runtime(
+                        "skill_error",
+                        format!(
+                            "refusing to overwrite symlink {}; pass --force to replace",
+                            skill_path.display()
+                        ),
+                    ));
+                }
+                std::fs::remove_file(&skill_path)
+                    .map_err(|e| CliError::runtime("skill_error", e))?;
+            }
+            Ok(meta) if !meta.is_file() => {
+                return Err(CliError::runtime(
+                    "skill_error",
+                    format!(
+                        "refusing to overwrite non-file path {}",
+                        skill_path.display()
+                    ),
+                ));
+            }
+            Ok(_) => {
+                let existing = std::fs::read_to_string(&skill_path)
+                    .map_err(|e| CliError::runtime("skill_error", e))?;
+                if existing == BUNDLED_SKILL_MD {
+                    entries.push(SkillInstallEntry {
+                        path: skill_path.display().to_string(),
+                        status: "up_to_date",
+                    });
+                    continue;
+                }
+                if !force {
+                    return Err(CliError::runtime(
+                        "skill_error",
+                        format!(
+                            "refusing to overwrite modified {}; pass --force to overwrite",
+                            skill_path.display()
+                        ),
+                    ));
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(CliError::runtime("skill_error", err)),
+        }
+
+        write_skill_file_atomic(&skill_path, BUNDLED_SKILL_MD)
+            .map_err(|e| CliError::runtime("skill_error", e))?;
+        entries.push(SkillInstallEntry {
+            path: skill_path.display().to_string(),
+            status: "installed",
+        });
+    }
+    Ok(entries)
 }
 
 fn emit_cli_error(err: &CliError, json: bool) {

@@ -72,6 +72,11 @@ async fn spawn_cli_test_server() -> String {
                         "text/html; charset=utf-8",
                         b"<html><head><title>CLI Test</title></head><body><main><p>Hello CLI.</p></main></body></html>",
                     ),
+                    "/js-shell" => (
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        b"<html><head><title>App</title></head><body><div id=\"root\"></div><script src=\"/app.js\"></script><noscript>You need to enable JavaScript to run this app.</noscript></body></html>",
+                    ),
                     "/blocked" => ("403 Forbidden", "text/html", b"Forbidden"),
                     "/missing" => ("404 Not Found", "text/plain", b"Not Found"),
                     "/file.pdf" => ("200 OK", "application/pdf", b"%PDF-1.7\nbinary"),
@@ -999,7 +1004,7 @@ async fn cli_direct_stage_rejects_disguised_html_conflicts_and_clears_artifacts(
         .unwrap();
     assert_eq!(stage_fake.status.code(), Some(1));
 
-    // 4. Flag conflicts with --stage fail cleanly (exit 1 with --json/--jsonl/runtime checks, exit 2 from clap).
+    // 4. Flag conflicts and usage errors fail consistently with exit code 1 (both plain and --json/--jsonl).
     for (args, expected_code) in [
         (
             vec![
@@ -1009,7 +1014,7 @@ async fn cli_direct_stage_rejects_disguised_html_conflicts_and_clears_artifacts(
                 "/tmp/unused.png",
                 &format!("{base}/diagram.png"),
             ],
-            2,
+            1,
         ),
         (
             vec![
@@ -1279,71 +1284,55 @@ async fn cli_auth_subcommands_help_and_zero_secret_leakage() {
     assert!(!set_stdout.contains(file_secret));
     assert!(!set_stderr.contains(file_secret));
 
-    if set_out.status.code() == Some(1) && set_stderr.contains("not yet implemented") {
-        // Wave-header stub in src/auth.rs before auth-store lands: verify remove routes cleanly too.
-        let remove_out = Command::new(pleb_bin)
-            .env("PLEB_NO_KEYCHAIN", "1")
-            .env("PLEB_NO_HOME_CEF", "1")
-            .env_remove("BRAVE_API_KEY")
-            .args(["--state-dir"])
-            .arg(&state_dir)
-            .args(["auth", "remove", "brave", "--storage", "file"])
-            .output()
-            .await
-            .unwrap();
-        assert_eq!(remove_out.status.code(), Some(1));
-        assert!(String::from_utf8_lossy(&remove_out.stderr).contains("not yet implemented"));
-    } else {
-        assert_eq!(set_out.status.code(), Some(0), "stderr: {set_stderr}");
-        let file_status = Command::new(pleb_bin)
-            .env("PLEB_NO_KEYCHAIN", "1")
-            .env("PLEB_NO_HOME_CEF", "1")
-            .env_remove("BRAVE_API_KEY")
-            .args(["--state-dir"])
-            .arg(&state_dir)
-            .args(["auth", "status", "--json"])
-            .output()
-            .await
-            .unwrap();
-        assert_eq!(file_status.status.code(), Some(0));
-        let file_status_str = String::from_utf8_lossy(&file_status.stdout);
-        assert!(!file_status_str.contains(file_secret));
-        let file_status_json: serde_json::Value = serde_json::from_str(&file_status_str).unwrap();
-        assert_eq!(file_status_json["brave"]["configured"], true);
-        assert_eq!(file_status_json["brave"]["source"], "file");
+    assert_eq!(set_out.status.code(), Some(0), "stderr: {set_stderr}");
+    let file_status = Command::new(pleb_bin)
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .env("PLEB_NO_HOME_CEF", "1")
+        .env_remove("BRAVE_API_KEY")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args(["auth", "status", "--json"])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(file_status.status.code(), Some(0));
+    let file_status_str = String::from_utf8_lossy(&file_status.stdout);
+    assert!(!file_status_str.contains(file_secret));
+    let file_status_json: serde_json::Value = serde_json::from_str(&file_status_str).unwrap();
+    assert_eq!(file_status_json["brave"]["configured"], true);
+    assert_eq!(file_status_json["brave"]["source"], "file");
 
-        // Removing while BRAVE_API_KEY is set emits a warning on stderr without leaking the key.
-        let remove_with_env = Command::new(pleb_bin)
-            .env("PLEB_NO_KEYCHAIN", "1")
-            .env("PLEB_NO_HOME_CEF", "1")
-            .env("BRAVE_API_KEY", env_secret)
-            .args(["--state-dir"])
-            .arg(&state_dir)
-            .args(["auth", "remove", "brave", "--storage", "file"])
-            .output()
-            .await
-            .unwrap();
-        assert_eq!(remove_with_env.status.code(), Some(0));
-        let remove_stderr = String::from_utf8_lossy(&remove_with_env.stderr);
-        assert!(remove_stderr.contains("BRAVE_API_KEY"));
-        assert!(!remove_stderr.contains(env_secret));
+    // Removing while BRAVE_API_KEY is set emits a warning on stderr without leaking the key.
+    let remove_with_env = Command::new(pleb_bin)
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .env("PLEB_NO_HOME_CEF", "1")
+        .env("BRAVE_API_KEY", env_secret)
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args(["auth", "remove", "brave", "--storage", "file"])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(remove_with_env.status.code(), Some(0));
+    let remove_stderr = String::from_utf8_lossy(&remove_with_env.stderr);
+    assert!(remove_stderr.contains("BRAVE_API_KEY"));
+    assert!(!remove_stderr.contains(env_secret));
 
-        // After removal without env var, brave is no longer configured.
-        let after_remove = Command::new(pleb_bin)
-            .env("PLEB_NO_KEYCHAIN", "1")
-            .env("PLEB_NO_HOME_CEF", "1")
-            .env_remove("BRAVE_API_KEY")
-            .args(["--state-dir"])
-            .arg(&state_dir)
-            .args(["auth", "status", "--json"])
-            .output()
-            .await
-            .unwrap();
-        assert_eq!(after_remove.status.code(), Some(0));
-        let after_json: serde_json::Value = serde_json::from_slice(&after_remove.stdout).unwrap();
-        assert_eq!(after_json["brave"]["configured"], false);
-        assert!(after_json["brave"]["source"].is_null());
-    }
+    // After removal without env var, brave is no longer configured.
+    let after_remove = Command::new(pleb_bin)
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .env("PLEB_NO_HOME_CEF", "1")
+        .env_remove("BRAVE_API_KEY")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args(["auth", "status", "--json"])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(after_remove.status.code(), Some(0));
+    let after_json: serde_json::Value = serde_json::from_slice(&after_remove.stdout).unwrap();
+    assert_eq!(after_json["brave"]["configured"], false);
+    assert!(after_json["brave"]["source"].is_null());
 }
 
 #[tokio::test]
@@ -1396,7 +1385,7 @@ async fn cli_status_auth_status_redaction_and_m6_flag_validations() {
     assert!(auth_json.get("cdp_access").is_some());
     assert_eq!(auth_json["cdp_access"]["client_id_configured"], false);
 
-    // 3. Invalid Milestone 6 CLI flag combinations fail with exit code 4 before network calls.
+    // 3. Invalid Milestone 6 CLI flag combinations fail with exit code 1 before network calls.
     for args in [
         vec![
             "fetch",
@@ -1611,4 +1600,257 @@ async fn cli_fetch_render_cdp_emits_tools_json_metadata() {
     let val: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(val["strategy"], "cdp");
     assert_eq!(val["tools"][0]["name"], "search_docs");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_contract_hardening_exit_codes_js_shell_warning_crawl_seed_keychain_and_skill_install()
+{
+    use tokio::io::AsyncWriteExt;
+
+    let base = spawn_cli_test_server().await;
+    let state_dir = temp_dir();
+    let skill_root = temp_dir();
+    let pleb_bin = env!("CARGO_BIN_EXE_pleb");
+
+    // 1. Unknown CLI flags without --json exit 1 (never colliding with exit 2); --help/--version exit 0.
+    let bad_flag = Command::new(pleb_bin)
+        .args(["fetch", "--not-a-real-flag", "https://example.com"])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(bad_flag.status.code(), Some(1));
+    assert!(bad_flag.stdout.is_empty());
+    assert!(!bad_flag.stderr.is_empty());
+
+    for ok_args in [["--help"], ["--version"]] {
+        let ok = Command::new(pleb_bin).args(ok_args).output().await.unwrap();
+        assert_eq!(ok.status.code(), Some(0));
+    }
+
+    // 2. Unrendered JavaScript shell surfaces an explicit warning in stderr, --json, --metadata-only, and --jsonl.
+    let js_plain = Command::new(pleb_bin)
+        .env("PLEB_NO_HOME_CEF", "1")
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .env_remove("PLEB_CDP_URL")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args(["--no-daemon", "fetch", &format!("{base}/js-shell")])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(js_plain.status.code(), Some(0));
+    let js_plain_stderr = String::from_utf8_lossy(&js_plain.stderr);
+    assert!(
+        js_plain_stderr.contains("Warning:") && js_plain_stderr.contains("JavaScript shell"),
+        "expected JS shell warning on stderr, got: {js_plain_stderr}"
+    );
+
+    let js_json = Command::new(pleb_bin)
+        .env("PLEB_NO_HOME_CEF", "1")
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .env_remove("PLEB_CDP_URL")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args([
+            "--no-daemon",
+            "--json",
+            "fetch",
+            &format!("{base}/js-shell"),
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(js_json.status.code(), Some(0));
+    let js_val: serde_json::Value = serde_json::from_slice(&js_json.stdout).unwrap();
+    assert!(
+        js_val["warning"]
+            .as_str()
+            .is_some_and(|w| w.contains("JavaScript shell")),
+        "expected FetchOutput.warning, got: {js_val}"
+    );
+
+    let js_meta = Command::new(pleb_bin)
+        .env("PLEB_NO_HOME_CEF", "1")
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .env_remove("PLEB_CDP_URL")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args([
+            "--no-daemon",
+            "--json",
+            "fetch",
+            "--metadata-only",
+            &format!("{base}/js-shell"),
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(
+        js_meta.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&js_meta.stderr)
+    );
+    let js_meta_val: serde_json::Value = serde_json::from_slice(&js_meta.stdout).unwrap();
+    assert!(
+        js_meta_val["warning"]
+            .as_str()
+            .is_some_and(|w| w.contains("JavaScript shell")),
+        "expected FetchMetadataOutput.warning, got: {js_meta_val}"
+    );
+
+    let js_jsonl = Command::new(pleb_bin)
+        .env("PLEB_NO_HOME_CEF", "1")
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .env_remove("PLEB_CDP_URL")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args([
+            "--no-daemon",
+            "fetch",
+            "--jsonl",
+            &format!("{base}/js-shell"),
+            &format!("{base}/ok"),
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(js_jsonl.status.code(), Some(0));
+    let lines: Vec<serde_json::Value> = String::from_utf8_lossy(&js_jsonl.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    let shell_item = lines
+        .iter()
+        .find(|item| item["url"].as_str().unwrap().ends_with("/js-shell"))
+        .unwrap();
+    let ok_item = lines
+        .iter()
+        .find(|item| item["url"].as_str().unwrap().ends_with("/ok"))
+        .unwrap();
+    assert!(shell_item["warning"]
+        .as_str()
+        .is_some_and(|w| w.contains("JavaScript shell")));
+    assert!(ok_item.get("warning").is_none());
+
+    // 3. `pleb crawl` fails loudly when the seed URL fails rather than silently exiting 0.
+    let bad_crawl = Command::new(pleb_bin)
+        .env("PLEB_NO_HOME_CEF", "1")
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args([
+            "--no-daemon",
+            "--json",
+            "crawl",
+            "--no-robots",
+            &format!("{base}/missing"),
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(bad_crawl.status.code(), Some(3));
+    let bad_crawl_err: serde_json::Value = serde_json::from_slice(&bad_crawl.stderr).unwrap();
+    assert_eq!(bad_crawl_err["kind"], "http_error");
+    assert_eq!(bad_crawl_err["exit_code"], 3);
+
+    // 4. `PLEB_NO_KEYCHAIN=true` disables macOS Keychain consistently with `PLEB_NO_KEYCHAIN=1`.
+    let mut kc_child = Command::new(pleb_bin)
+        .env("PLEB_NO_KEYCHAIN", "true")
+        .env("PLEB_NO_HOME_CEF", "1")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args(["auth", "set", "brave", "--stdin", "--storage", "keychain"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    kc_child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"dummy-secret\n")
+        .await
+        .unwrap();
+    let kc_out = kc_child.wait_with_output().await.unwrap();
+    assert_eq!(kc_out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&kc_out.stderr).contains("PLEB_NO_KEYCHAIN=1"));
+
+    // 5. `pleb skill install --dir` writes canonical SKILL.md, stays idempotent, guards edits, and supports --force.
+    let target_dir = skill_root.path().join("pleb");
+    let canonical = Command::new(pleb_bin)
+        .args(["skill", "print"])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(canonical.status.code(), Some(0));
+    let canonical_str = String::from_utf8_lossy(&canonical.stdout).to_string();
+
+    let first = Command::new(pleb_bin)
+        .args([
+            "--json",
+            "skill",
+            "install",
+            "--dir",
+            target_dir.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_json: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first_json["installed"][0]["status"], "installed");
+    let installed_file = target_dir.join("SKILL.md");
+    assert_eq!(fs::read_to_string(&installed_file).unwrap(), canonical_str);
+
+    let second = Command::new(pleb_bin)
+        .args([
+            "--json",
+            "skill",
+            "install",
+            "--dir",
+            target_dir.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(second.status.code(), Some(0));
+    let second_json: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(second_json["installed"][0]["status"], "up_to_date");
+
+    fs::write(&installed_file, "local customization\n").unwrap();
+    let conflict = Command::new(pleb_bin)
+        .args(["skill", "install", "--dir", target_dir.to_str().unwrap()])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(conflict.status.code(), Some(1));
+    assert_eq!(
+        fs::read_to_string(&installed_file).unwrap(),
+        "local customization\n"
+    );
+
+    let forced = Command::new(pleb_bin)
+        .args([
+            "--json",
+            "skill",
+            "install",
+            "--dir",
+            target_dir.to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(forced.status.code(), Some(0));
+    let forced_json: serde_json::Value = serde_json::from_slice(&forced.stdout).unwrap();
+    assert_eq!(forced_json["installed"][0]["status"], "installed");
+    assert_eq!(fs::read_to_string(&installed_file).unwrap(), canonical_str);
 }

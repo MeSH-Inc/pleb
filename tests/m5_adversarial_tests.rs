@@ -268,7 +268,7 @@ async fn adversarial_cli_zero_secret_leakage_in_json_and_verbose_logs() {
     let tavily_secret = "tvly-adversarial-secret-5544332211";
     let searxng_url = "http://127.0.0.1:19999";
 
-    // 1. Positional secret argument must be rejected by clap (exit 2).
+    // 1. Positional secret argument must be rejected by clap (exit 1).
     let positional = Command::new(pleb_bin)
         .env("PLEB_NO_KEYCHAIN", "1")
         .env("PLEB_NO_HOME_CEF", "1")
@@ -278,7 +278,7 @@ async fn adversarial_cli_zero_secret_leakage_in_json_and_verbose_logs() {
         .output()
         .await
         .unwrap();
-    assert_eq!(positional.status.code(), Some(2));
+    assert_eq!(positional.status.code(), Some(1));
 
     // 2. `pleb status --json --verbose` and `pleb auth status --json --verbose` must never leak
     //    configured secrets, prefixes, or SEARXNG_URL on stdout or stderr.

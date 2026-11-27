@@ -57,7 +57,7 @@ pub enum FetchError {
     HttpError { url: String, status: u16 },
 
     #[error(
-        "unsupported binary content ({}) on {url} ({byte_count} bytes); use --format raw --output <path>",
+        "unsupported binary content ({}) on {url} ({byte_count} bytes); use --stage or --format raw --output <path>",
         content_type.as_deref().unwrap_or("unknown")
     )]
     UnsupportedContentType {
@@ -158,6 +158,8 @@ pub struct FetchOutput {
     pub escalated: bool,
     pub truncated: bool,
     pub timing_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub resources: Vec<crate::extract::ResourceDescriptor>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -201,6 +203,7 @@ struct AcquiredPage {
     content_type: Option<String>,
     strategy: String,
     escalated: bool,
+    warning: Option<String>,
     parsed: Option<ParsedHtml>,
     axtree_text: Option<String>,
     imperative_tools: Vec<crate::extract::WebMcpToolDescriptor>,
@@ -367,6 +370,7 @@ pub async fn fetch_document(
         escalated: page.escalated,
         truncated: extracted.truncated,
         timing_ms: start.elapsed().as_millis() as u64,
+        warning: page.warning,
         resources: extracted.resources,
         tools: extracted.tools,
     })
@@ -982,6 +986,7 @@ async fn try_fetch_raw_source(
         escalated: false,
         truncated: extracted.truncated,
         timing_ms,
+        warning: None,
         resources: extracted.resources,
         tools: extracted.tools,
     }))
@@ -1109,9 +1114,10 @@ async fn acquire_page(
         wait_for_selector.or_else(|| rule.and_then(|r| r.wait_for_selector.as_deref()));
 
     if render_mode == RenderMode::Cef && !cef_available {
-        return Err(FetchError::CefUnavailable(
-            "render=cef requested but pleb-renderer was not found".to_string(),
-        ));
+        return Err(FetchError::CefUnavailable(format!(
+            "render=cef requested but pleb-renderer was not found; install CEF ({}) or use --render cdp with --cdp-url",
+            crate::transport::cef::rebuild_command_hint()
+        )));
     }
     if render_mode == RenderMode::Cdp {
         if ctx.config.proxy.is_some() {
@@ -1311,6 +1317,7 @@ async fn acquire_page(
                 content_type,
                 strategy: strategy.to_string(),
                 escalated: fallback_used,
+                warning: None,
                 parsed,
                 axtree_text: None,
                 imperative_tools: Vec::new(),
@@ -1366,6 +1373,7 @@ async fn acquire_page(
             ))
         }
         ResponseClassification::JavaScriptShell { reason } => {
+            let mut escalation_failure: Option<(&'static str, String)> = None;
             match plan.escalation {
                 EscalationBackend::Cef => {
                     match try_cef_escalation(ctx, host, start, &final_url, effective_selector).await
@@ -1379,6 +1387,7 @@ async fn acquire_page(
                                 host,
                                 err
                             );
+                            escalation_failure = Some(("CEF", err.to_string()));
                         }
                     }
                 }
@@ -1407,20 +1416,37 @@ async fn acquire_page(
                                     host,
                                     err
                                 );
+                                escalation_failure = Some(("CDP", err.to_string()));
                             }
                         }
                     }
                 }
                 EscalationBackend::None => {}
             }
-            Ok(record_network_page(
+            let mut page = record_network_page(
                 body,
                 final_url,
                 None,
                 content_type,
                 ctx.client.transport_name(),
                 parsed_html,
-            ))
+            );
+            page.warning = Some(match escalation_failure {
+                Some((backend, err)) => format!(
+                    "JavaScript shell detected ({reason}) and {backend} escalation failed ({err}); returning unrendered HTML"
+                ),
+                None if render_mode == RenderMode::Cronet => format!(
+                    "JavaScript shell detected ({reason}) but --render cronet disabled browser escalation; returning unrendered HTML"
+                ),
+                None if !cef_available && !cdp_available => format!(
+                    "JavaScript shell detected ({reason}) but no browser renderer (CEF or CDP) is available; install CEF ({}) or pass --cdp-url",
+                    crate::transport::cef::rebuild_command_hint()
+                ),
+                None => format!(
+                    "JavaScript shell detected ({reason}) and browser escalation was skipped; returning unrendered HTML"
+                ),
+            });
+            Ok(page)
         }
         ResponseClassification::Blocked { status } => {
             match plan.escalation {
@@ -1478,8 +1504,10 @@ async fn acquire_page(
                 EscalationBackend::None => {}
             }
             let detail = if !cef_available && !cdp_available && render_mode != RenderMode::Cronet {
-                "site blocked the request and no browser renderer (CEF or CDP) is available"
-                    .to_string()
+                format!(
+                    "site blocked the request and no browser renderer (CEF or CDP) is available; install CEF ({}) or pass --cdp-url",
+                    crate::transport::cef::rebuild_command_hint()
+                )
             } else {
                 "site blocked the request".to_string()
             };
@@ -1630,6 +1658,7 @@ fn classify_rendered_result(
                 content_type,
                 strategy: strategy.to_string(),
                 escalated,
+                warning: None,
                 parsed: parsed_html,
                 axtree_text,
                 imperative_tools,
@@ -1897,6 +1926,8 @@ pub struct BatchItemSuccess {
     pub truncated: bool,
     pub timing_ms: u64,
     pub content_bytes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1940,6 +1971,7 @@ impl BatchItemResult {
                 truncated: out.truncated,
                 timing_ms: out.timing_ms,
                 content_bytes: out.content_bytes,
+                warning: out.warning,
                 content: (!metadata_only).then_some(out.content),
                 resources: out.resources,
                 tools: out.tools,

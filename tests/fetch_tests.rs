@@ -629,6 +629,79 @@ async fn crawl_enforces_max_pages_and_deterministic_order_under_concurrency() {
 }
 
 #[tokio::test]
+async fn crawl_propagates_seed_error_and_skips_broken_child_links() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let resp = match path {
+                    "/seed-ok" => http_response(
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        b"<html><head><title>Seed OK</title></head><body><main><a href=\"/broken-child\">Broken</a><a href=\"/good-child\">Good</a></main></body></html>",
+                    ),
+                    "/good-child" => http_response(
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        b"<html><head><title>Good Child</title></head><body><main><p>Recovered child.</p></main></body></html>",
+                    ),
+                    _ => http_response("404 Not Found", "text/plain", b"missing"),
+                };
+                let _ = socket.write_all(&resp).await;
+            });
+        }
+    });
+
+    let state_dir = temp_state_dir();
+    let ctx = RuntimeContext::new(RuntimeConfig {
+        state_dir: state_dir.path().to_path_buf(),
+        timeout: Duration::from_secs(5),
+        cef_timeout: Duration::from_secs(5),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let opts = CrawlOptions {
+        max_depth: 1,
+        max_pages: 5,
+        format: OutputFormat::Markdown,
+        extract_mode: ExtractMode::Clean,
+        respect_robots: false,
+        path_filter: None,
+    };
+
+    let seed_err = crawl(&ctx, &format!("{base}/missing-seed"), opts.clone())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        seed_err.downcast_ref::<FetchError>(),
+        Some(FetchError::HttpError { status: 404, .. })
+    ));
+
+    let res = crawl(&ctx, &format!("{base}/seed-ok"), opts).await.unwrap();
+    let urls: Vec<&str> = res.pages.iter().map(|p| p.url.as_str()).collect();
+    assert_eq!(
+        urls,
+        vec![format!("{base}/seed-ok"), format!("{base}/good-child")]
+    );
+}
+
+#[tokio::test]
 async fn robots_cache_coalesces_concurrent_cold_requests() {
     let robots_hits = Arc::new(AtomicUsize::new(0));
     let hits_srv = Arc::clone(&robots_hits);
@@ -2070,6 +2143,7 @@ async fn fetch_cdp_render_escalation_challenge_proxy_and_batch_tools() {
     let ctx = Arc::new(
         RuntimeContext::new(RuntimeConfig {
             state_dir: state_dir.path().to_path_buf(),
+            cef_renderer_executable: Some(state_dir.path().join("no-cef-renderer")),
             cdp_url: Some(cdp_ws.clone()),
             cdp_timeout: Duration::from_secs(5),
             no_web_bot_auth: true,
@@ -2115,6 +2189,7 @@ async fn fetch_cdp_render_escalation_challenge_proxy_and_batch_tools() {
     let make_cold_ctx = |dir: &Path| {
         RuntimeContext::new(RuntimeConfig {
             state_dir: dir.to_path_buf(),
+            cef_renderer_executable: Some(dir.join("no-cef-renderer")),
             cdp_url: Some(cdp_ws.clone()),
             cdp_timeout: Duration::from_secs(5),
             no_web_bot_auth: true,
@@ -2169,6 +2244,7 @@ async fn fetch_cdp_render_escalation_challenge_proxy_and_batch_tools() {
         let state_sub = temp_state_dir();
         let sub_ctx = RuntimeContext::new(RuntimeConfig {
             state_dir: state_sub.path().to_path_buf(),
+            cef_renderer_executable: Some(state_sub.path().join("no-cef-renderer")),
             cdp_url: bad_cdp,
             no_web_bot_auth: true,
             ..Default::default()
@@ -2195,6 +2271,7 @@ async fn fetch_cdp_render_escalation_challenge_proxy_and_batch_tools() {
     let proxy_state = temp_state_dir();
     let proxy_ctx = RuntimeContext::new(RuntimeConfig {
         state_dir: proxy_state.path().to_path_buf(),
+        cef_renderer_executable: Some(proxy_state.path().join("no-cef-renderer")),
         cdp_url: Some(cdp_ws.clone()),
         proxy: Some("http://127.0.0.1:18080".to_string()),
         no_web_bot_auth: true,
@@ -2577,6 +2654,7 @@ async fn adversarial_fetch_cdp_webmcp_merge_axtree_manifest_timeout_cache_and_un
 
     let ctx = RuntimeContext::new(RuntimeConfig {
         state_dir: state_dir.path().to_path_buf(),
+        cef_renderer_executable: Some(state_dir.path().join("no-cef-renderer")),
         cdp_url: Some(cdp_ws.clone()),
         cdp_timeout: Duration::from_secs(5),
         no_web_bot_auth: false,
@@ -2672,6 +2750,7 @@ async fn adversarial_fetch_cdp_webmcp_merge_axtree_manifest_timeout_cache_and_un
     let ax_cold_dir = temp_state_dir();
     let ax_cold_ctx = RuntimeContext::new(RuntimeConfig {
         state_dir: ax_cold_dir.path().to_path_buf(),
+        cef_renderer_executable: Some(ax_cold_dir.path().join("no-cef-renderer")),
         cdp_url: Some(cdp_ws.clone()),
         cdp_timeout: Duration::from_secs(5),
         no_web_bot_auth: true,
@@ -2759,6 +2838,7 @@ async fn adversarial_fetch_cdp_webmcp_merge_axtree_manifest_timeout_cache_and_un
     let timeout_dir = temp_state_dir();
     let timeout_ctx = RuntimeContext::new(RuntimeConfig {
         state_dir: timeout_dir.path().to_path_buf(),
+        cef_renderer_executable: Some(timeout_dir.path().join("no-cef-renderer")),
         cdp_url: Some(cdp_ws),
         cdp_timeout: Duration::from_millis(150),
         no_web_bot_auth: true,

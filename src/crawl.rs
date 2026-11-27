@@ -14,7 +14,7 @@ use crate::extract::{
     self, url::normalize_crawl_url, ExtractMode, ExtractOptions, ExtractedDocument, OutputFormat,
     ParsedHtml,
 };
-use crate::fetch;
+use crate::fetch::{self, FetchError};
 
 const DEFAULT_CRAWL_CONCURRENCY: usize = 4;
 const DEFAULT_POLITE_SPACING: Duration = Duration::from_millis(100);
@@ -83,6 +83,7 @@ pub async fn crawl(
         0 < options.max_depth,
     )
     .await
+    .map_err(anyhow::Error::new)?
     else {
         return Ok(CrawlResult {
             pages: Vec::new(),
@@ -147,11 +148,12 @@ pub async fn crawl(
 
                 let fallback_url = &seed_final_url;
                 let opts_ref = &options;
+                let url_for_log = url.clone();
                 in_flight.push(Box::pin(async move {
                     if dispatch_at > tokio::time::Instant::now() {
                         tokio::time::sleep_until(dispatch_at).await;
                     }
-                    fetch_and_extract_page(
+                    match fetch_and_extract_page(
                         ctx,
                         url,
                         depth,
@@ -161,6 +163,13 @@ pub async fn crawl(
                         collect_links,
                     )
                     .await
+                    {
+                        Ok(page) => page,
+                        Err(e) => {
+                            tracing::debug!("crawl skip {}: {}", url_for_log, e);
+                            None
+                        }
+                    }
                 }));
             }
 
@@ -214,17 +223,11 @@ async fn fetch_and_extract_page(
     fallback_url: &Url,
     options: &CrawlOptions,
     collect_links: bool,
-) -> Option<FetchedCrawlPage> {
-    let html_result = match fetch::fetch_html(ctx, &url, options.respect_robots).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::debug!("crawl skip {}: {}", url, e);
-            return None;
-        }
-    };
+) -> std::result::Result<Option<FetchedCrawlPage>, FetchError> {
+    let html_result = fetch::fetch_html(ctx, &url, options.respect_robots).await?;
 
     if html_result.status_code >= 400 || html_result.html.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let page_url = Url::parse(&html_result.url).unwrap_or_else(|_| fallback_url.clone());
@@ -269,7 +272,7 @@ async fn fetch_and_extract_page(
         tools: Vec::new(),
     });
 
-    Some(FetchedCrawlPage {
+    Ok(Some(FetchedCrawlPage {
         depth,
         discovery_sequence,
         page: CrawlPage {
@@ -279,7 +282,7 @@ async fn fetch_and_extract_page(
             depth,
         },
         links,
-    })
+    }))
 }
 
 fn enqueue_discovered_links(
