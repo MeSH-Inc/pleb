@@ -45,7 +45,7 @@ async fn spawn_mcp_test_origin() -> String {
                     .and_then(|l| l.split_whitespace().nth(1))
                     .unwrap_or("/");
 
-                let resp = match path {
+                let resp: Vec<u8> = match path {
                     "/doc" => {
                         let body = "<html><head><title>MCP Guide</title></head><body><main><h1>MCP Guide</h1><p>Clean markdown via local fetch.</p></main></body></html>";
                         format!(
@@ -53,6 +53,26 @@ async fn spawn_mcp_test_origin() -> String {
                             body.len(),
                             body
                         )
+                        .into_bytes()
+                    }
+                    "/diagram-page" => {
+                        let body = "<html><head><title>Architecture</title></head><body><main><h1>Architecture</h1><p>System pipeline overview.</p><img src=\"/diagram.png\" width=\"640\" height=\"480\" alt=\"Architecture diagram\"></main></body></html>";
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .into_bytes()
+                    }
+                    "/diagram.png" => {
+                        let png: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82";
+                        let mut out = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            png.len()
+                        )
+                        .into_bytes();
+                        out.extend_from_slice(png);
+                        out
                     }
                     "/waf" => concat!(
                         "HTTP/1.1 403 Forbidden\r\n",
@@ -63,11 +83,14 @@ async fn spawn_mcp_test_origin() -> String {
                         "Connection: close\r\n\r\n",
                         "Forbidden"
                     )
-                    .to_string(),
-                    _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        .to_string(),
+                    .as_bytes()
+                    .to_vec(),
+                    _ => {
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_vec()
+                    }
                 };
-                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.write_all(&resp).await;
             });
         }
     });
@@ -179,6 +202,23 @@ async fn mcp_initialize_list_fetch_block_diagnostics_and_status() {
             "pleb_status"
         ]
     );
+    let fetch_props = &list_resp["result"]["tools"][0]["inputSchema"]["properties"];
+    for param in [
+        "url",
+        "format",
+        "extract",
+        "render",
+        "source",
+        "resources",
+        "stage_resources",
+    ] {
+        assert!(
+            fetch_props[param]["description"]
+                .as_str()
+                .is_some_and(|d| !d.trim().is_empty()),
+            "pleb_fetch schema param '{param}' missing description"
+        );
+    }
 
     // 4. pleb_fetch returns clean Markdown.
     let fetch_ok = send_rpc(
@@ -246,6 +286,89 @@ async fn mcp_initialize_list_fetch_block_diagnostics_and_status() {
     .unwrap();
     assert_eq!(st["cronet_enabled"], cfg!(feature = "cronet"));
     assert_eq!(st["cef_renderer"]["expected_protocol"], "v5-meta");
+
+    // 6b. MCP resource cue uses MCP arg names, manifest appends table, and stage_resources stages locally.
+    let diag_default = send_rpc(
+        &mut writer,
+        &mut reader,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 61,
+            "method": "tools/call",
+            "params": {
+                "name": "pleb_fetch",
+                "arguments": { "url": format!("{base}/diagram-page"), "render": "cronet" }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(diag_default["result"]["isError"], false);
+    let diag_default_text = diag_default["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(
+        diag_default_text.contains("resources=\"manifest\"")
+            && diag_default_text.contains("stage_resources=\"r1,r2\""),
+        "expected MCP-native cue, got: {diag_default_text}"
+    );
+    assert!(
+        !diag_default_text.contains("--stage-resources"),
+        "MCP cue must not leak CLI flags: {diag_default_text}"
+    );
+
+    let diag_manifest = send_rpc(
+        &mut writer,
+        &mut reader,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 62,
+            "method": "tools/call",
+            "params": {
+                "name": "pleb_fetch",
+                "arguments": {
+                    "url": format!("{base}/diagram-page"),
+                    "render": "cronet",
+                    "resources": "manifest"
+                }
+            }
+        }),
+    )
+    .await;
+    let diag_manifest_text = diag_manifest["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(
+        diag_manifest_text.contains("## Linked Resources")
+            && diag_manifest_text.contains("/diagram.png"),
+        "manifest text={diag_manifest_text}"
+    );
+
+    let diag_staged = send_rpc(
+        &mut writer,
+        &mut reader,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 63,
+            "method": "tools/call",
+            "params": {
+                "name": "pleb_fetch",
+                "arguments": {
+                    "url": format!("{base}/diagram-page"),
+                    "render": "cronet",
+                    "stage_resources": "r1"
+                }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(diag_staged["result"]["isError"], false);
+    let diag_staged_text = diag_staged["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(
+        diag_staged_text.contains("Staged: r1="),
+        "expected Staged header line, got: {diag_staged_text}"
+    );
 
     // 7. Unknown tool -> -32602; unknown method -> -32601.
     let unknown_tool = send_rpc(

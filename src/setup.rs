@@ -252,9 +252,9 @@ pub fn run_claude_webfetch_hook(
         HookMode::Fallback => {
             let msg = match sanitized_url {
                 Some(url) => format!(
-                    "WebFetch failed for {url}. Retry with the local `pleb_fetch` MCP tool (url=\"{url}\") — `pleb` runs from the host machine over Chrome TLS (Cronet) with automatic 403/SPA escalation — or run `pleb fetch`."
+                    "WebFetch failed for {url}. Retry with `mcp__pleb__pleb_fetch` (load via ToolSearch if needed, url=\"{url}\") or `pleb fetch \"{url}\"` (local Chrome TLS + 403/SPA escalation)."
                 ),
-                None => "WebFetch failed. Retry with the local `pleb_fetch` MCP tool or `pleb fetch <url>` (`pleb` uses host Chrome TLS and local escalation instead of datacenter IPs).".to_string(),
+                None => "WebFetch failed. Retry with `mcp__pleb__pleb_fetch` (load via ToolSearch if needed) or `pleb fetch <url>` (local Chrome TLS + 403/SPA escalation).".to_string(),
             };
             let payload = json!({
                 "hookSpecificOutput": {
@@ -269,9 +269,9 @@ pub fn run_claude_webfetch_hook(
         HookMode::Redirect => {
             let msg = match sanitized_url {
                 Some(url) => format!(
-                    "Use the local `pleb_fetch` MCP tool (url=\"{url}\") or `pleb fetch \"{url}\"` instead of built-in WebFetch: `pleb` fetches from the host machine over Chrome TLS (Cronet) with automatic 403/SPA escalation."
+                    "Use `mcp__pleb__pleb_fetch` (load via ToolSearch if needed, url=\"{url}\") or `pleb fetch \"{url}\"` instead of built-in WebFetch (local Chrome TLS + 403/SPA escalation)."
                 ),
-                None => "Use the local `pleb_fetch` MCP tool or `pleb fetch <url>` instead of built-in WebFetch.".to_string(),
+                None => "Use `mcp__pleb__pleb_fetch` (load via ToolSearch if needed) or `pleb fetch <url>` instead of built-in WebFetch.".to_string(),
             };
             writeln!(stderr, "{msg}")?;
             stderr.flush()?;

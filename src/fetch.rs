@@ -604,7 +604,11 @@ pub async fn fetch_staged_asset(
     })
 }
 
-pub fn format_resource_cue(resources: &[ResourceDescriptor]) -> Option<String> {
+/// Formats a one-line resource summary with a caller-specific action hint.
+pub fn format_resource_cue_with_hint(
+    resources: &[ResourceDescriptor],
+    hint: &str,
+) -> Option<String> {
     let kind_order = [
         (ResourceKind::Diagram, "diagram", "diagrams"),
         (ResourceKind::Transcript, "transcript", "transcripts"),
@@ -630,11 +634,15 @@ pub fn format_resource_cue(resources: &[ResourceDescriptor]) -> Option<String> {
     if parts.is_empty() {
         None
     } else {
-        Some(format!(
-            "Resources: {} — pass --resources manifest or --stage-resources <ids>",
-            parts.join(", ")
-        ))
+        Some(format!("Resources: {} — {hint}", parts.join(", ")))
     }
+}
+
+pub fn format_resource_cue(resources: &[ResourceDescriptor]) -> Option<String> {
+    format_resource_cue_with_hint(
+        resources,
+        "pass --resources manifest or --stage-resources <ids>",
+    )
 }
 
 fn infer_subresource_dest(url: &url::Url) -> SubresourceDest {

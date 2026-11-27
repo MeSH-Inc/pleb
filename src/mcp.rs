@@ -9,7 +9,7 @@ use crate::crawl::{self, CrawlOptions, MapOptions};
 use crate::daemon::protocol::read_bounded_line;
 use crate::extract::{ExtractMode, ExtractOptions, OutputFormat};
 use crate::fetch::{self, FetchError, FetchOptions};
-use crate::policy::{RenderMode, SourceMode};
+use crate::policy::{RenderMode, ResourcePolicy, SourceMode};
 use crate::search::{self, Freshness, SearchMode, SearchOptions, SearchProvider};
 use crate::transport::cef;
 
@@ -211,14 +211,39 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "url": { "type": "string", "description": "http or https URL to fetch" },
-                    "format": { "type": "string", "enum": ["markdown", "html", "text", "axtree"] },
-                    "extract": { "type": "string", "enum": ["clean", "article", "full"] },
-                    "render": { "type": "string", "enum": ["auto", "cef", "cdp", "cronet"] },
-                    "source": { "type": "string", "enum": ["auto", "negotiate", "none"] },
+                    "format": {
+                        "type": "string",
+                        "enum": ["markdown", "html", "text", "axtree"],
+                        "description": "Output format (default markdown; axtree inspects the CDP accessibility tree)"
+                    },
+                    "extract": {
+                        "type": "string",
+                        "enum": ["clean", "article", "full"],
+                        "description": "Extraction scope: clean strips chrome across page (default); article focuses primary <article>/<main>; full preserves verbatim body"
+                    },
+                    "render": {
+                        "type": "string",
+                        "enum": ["auto", "cef", "cdp", "cronet"],
+                        "description": "Transport mode: auto tries Chrome-TLS network fetch and escalates 403/JS shells to CEF/CDP; cronet stays network-only; cef/cdp force browser rendering"
+                    },
+                    "source": {
+                        "type": "string",
+                        "enum": ["auto", "negotiate", "none"],
+                        "description": "Source negotiation: auto rewrites GitHub/GitLab/Gist to raw and follows Markdown mirrors; negotiate adds Accept: text/markdown; none disables rewrites"
+                    },
+                    "resources": {
+                        "type": "string",
+                        "enum": ["none", "manifest", "transcripts", "diagrams", "all"],
+                        "description": "Linked asset handling: none indexes zero-fetch cues; manifest appends resource table; transcripts inlines captions; diagrams/all stage assets"
+                    },
+                    "stage_resources": {
+                        "type": "string",
+                        "description": "Comma-separated resource IDs (e.g., \"r1,r3\") or URLs to stage locally or inline"
+                    },
                     "focus": { "type": "string", "description": "Optional query for BM25 section projection" },
-                    "max_bytes": { "type": "integer", "minimum": 1 },
+                    "max_bytes": { "type": "integer", "minimum": 1, "description": "Maximum UTF-8 bytes of returned content" },
                     "wait_for_selector": { "type": "string", "description": "CSS selector to wait for when CEF/CDP renders" },
-                    "respect_robots": { "type": "boolean" }
+                    "respect_robots": { "type": "boolean", "description": "Enforce robots.txt rules (default false for single-URL fetch)" }
                 },
                 "required": ["url"]
             }
@@ -230,10 +255,10 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Search query" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 20 },
-                    "provider": { "type": "string", "enum": ["auto", "brave", "tavily", "serper", "exa", "searxng", "duckduckgo", "federated"] },
-                    "mode": { "type": "string", "enum": ["auto", "exact", "semantic"] },
-                    "freshness": { "type": "string", "enum": ["day", "week", "month", "year"] },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 20, "description": "Maximum results (1-20, default 8)" },
+                    "provider": { "type": "string", "enum": ["auto", "brave", "tavily", "serper", "exa", "searxng", "duckduckgo", "federated"], "description": "Search backend (auto balances configured keys; federated merges via RRF)" },
+                    "mode": { "type": "string", "enum": ["auto", "exact", "semantic"], "description": "Query intent routing hint in auto mode" },
+                    "freshness": { "type": "string", "enum": ["day", "week", "month", "year"], "description": "Recency filter window" },
                     "site": { "type": "string", "description": "Restrict results to domain" }
                 },
                 "required": ["query"]
@@ -246,11 +271,11 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "url": { "type": "string", "description": "Starting http or https URL" },
-                    "depth": { "type": "integer", "minimum": 0, "maximum": 5 },
-                    "max_pages": { "type": "integer", "minimum": 1, "maximum": 50 },
-                    "extract": { "type": "string", "enum": ["clean", "article", "full"] },
-                    "path_filter": { "type": "string" },
-                    "respect_robots": { "type": "boolean" }
+                    "depth": { "type": "integer", "minimum": 0, "maximum": 5, "description": "Maximum BFS link depth (0-5, default 2)" },
+                    "max_pages": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Maximum pages to fetch (1-50, default 10)" },
+                    "extract": { "type": "string", "enum": ["clean", "article", "full"], "description": "Extraction scope (default clean)" },
+                    "path_filter": { "type": "string", "description": "Restrict crawl to URLs whose path starts with prefix" },
+                    "respect_robots": { "type": "boolean", "description": "Enforce robots.txt and Crawl-delay (default true)" }
                 },
                 "required": ["url"]
             }
@@ -262,10 +287,10 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "url": { "type": "string", "description": "Starting http or https URL" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 5000 },
-                    "use_sitemap": { "type": "boolean" },
-                    "path_filter": { "type": "string" },
-                    "respect_robots": { "type": "boolean" }
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 5000, "description": "Maximum URLs to return (1-5000, default 100)" },
+                    "use_sitemap": { "type": "boolean", "description": "Inspect robots.txt sitemaps and sitemap.xml (default true)" },
+                    "path_filter": { "type": "string", "description": "Restrict discovered URLs to path prefix" },
+                    "respect_robots": { "type": "boolean", "description": "Enforce robots.txt directives (default true)" }
                 },
                 "required": ["url"]
             }
@@ -310,10 +335,13 @@ async fn call_fetch(
     let mode = parse_opt_enum::<ExtractMode>(args, "extract")?.unwrap_or(ExtractMode::Clean);
     let render = parse_opt_enum::<RenderMode>(args, "render")?.unwrap_or(RenderMode::Auto);
     let source = parse_opt_enum::<SourceMode>(args, "source")?.unwrap_or(SourceMode::Auto);
+    let resources = parse_opt_enum::<ResourcePolicy>(args, "resources")?.unwrap_or_default();
+    let stage_resources = opt_string_list(args, "stage_resources")?;
     let focus = opt_nonempty_str(args, "focus")?;
     let max_bytes = opt_positive_usize(args, "max_bytes")?;
     let wait_for_selector = opt_nonempty_str(args, "wait_for_selector")?;
     let respect_robots = opt_bool(args, "respect_robots")?.unwrap_or(false);
+    let has_stage_request = !stage_resources.is_empty();
 
     let opts = FetchOptions {
         extract: ExtractOptions {
@@ -326,6 +354,8 @@ async fn call_fetch(
         },
         render,
         source,
+        resources,
+        stage_resources,
         wait_for_selector,
         respect_robots,
         ..Default::default()
@@ -342,8 +372,25 @@ async fn call_fetch(
                 "Status: {} | Strategy: {} | Time: {}ms",
                 res.status_code, res.strategy, res.timing_ms
             ));
-            if let Some(cue) = fetch::format_resource_cue(&res.resources) {
-                lines.push(cue);
+            if resources == ResourcePolicy::None && !has_stage_request {
+                if let Some(cue) = fetch::format_resource_cue_with_hint(
+                    &res.resources,
+                    "pass resources=\"manifest\" or stage_resources=\"r1,r2\" to pleb_fetch",
+                ) {
+                    lines.push(cue);
+                }
+            }
+            let staged_parts: Vec<String> = res
+                .resources
+                .iter()
+                .filter_map(|r| {
+                    r.staged_path
+                        .as_deref()
+                        .map(|p| format!("{}={p}", r.identifier))
+                })
+                .collect();
+            if !staged_parts.is_empty() {
+                lines.push(format!("Staged: {}", staged_parts.join(", ")));
             }
             if let Some(ref warning) = res.warning {
                 lines.push(format!("Warning: {warning}"));
@@ -592,4 +639,36 @@ fn parse_opt_enum<T: ValueEnum>(
     T::from_str(&raw, true)
         .map(Some)
         .map_err(|msg| RpcError::invalid_params(format!("invalid '{key}': {msg}")))
+}
+
+fn opt_string_list(
+    args: &serde_json::Map<String, Value>,
+    key: &str,
+) -> std::result::Result<Vec<String>, RpcError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(s)) => Ok(s
+            .split(',')
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .collect()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        RpcError::invalid_params(format!(
+                            "'{key}' array items must be non-empty strings"
+                        ))
+                    })
+            })
+            .collect(),
+        Some(_) => Err(RpcError::invalid_params(format!(
+            "'{key}' must be a comma-separated string or array of strings"
+        ))),
+    }
 }
