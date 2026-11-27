@@ -677,22 +677,78 @@ pub(crate) fn is_hidden_or_inert(node: NodeRef<'_, Node>) -> bool {
         .any(|n| matches!(n.value(), Node::Element(el) if is_element_hidden_or_inert(el)))
 }
 
+fn eq_any_ci(s: &str, opts: &[&str]) -> bool {
+    opts.iter().any(|o| s.eq_ignore_ascii_case(o))
+}
+
+fn parse_css_zero(val: &str) -> bool {
+    let n = val
+        .trim()
+        .trim_end_matches(|c: char| c.is_ascii_alphabetic() || c == '%');
+    !n.is_empty() && n.parse::<f32>().is_ok_and(|x| x == 0.0)
+}
+
+fn is_offscreen_px(val: &str) -> bool {
+    let t = val.trim();
+    t.len() > 2
+        && t[t.len() - 2..].eq_ignore_ascii_case("px")
+        && t[..t.len() - 2]
+            .trim()
+            .parse::<f32>()
+            .is_ok_and(|n| n <= -1000.0)
+}
+
 pub(crate) fn is_inline_hidden_style(style: &str) -> bool {
-    style.split(';').any(|decl| {
-        let Some((prop, raw_val)) = decl.split_once(':') else {
-            return false;
+    let (mut overflow_hidden, mut zero_box, mut positioned, mut offscreen) =
+        (false, false, false, false);
+    for decl in style.split(';') {
+        let Some((prop, raw)) = decl.split_once(':') else {
+            continue;
         };
-        let (prop, val) = (
-            prop.trim(),
-            raw_val
-                .trim()
-                .strip_suffix("!important")
-                .unwrap_or(raw_val.trim())
-                .trim(),
-        );
-        (prop.eq_ignore_ascii_case("display") && val.eq_ignore_ascii_case("none"))
-            || (prop.eq_ignore_ascii_case("visibility") && val.eq_ignore_ascii_case("hidden"))
-    })
+        let (prop, trimmed) = (prop.trim(), raw.trim());
+        let val = trimmed
+            .len()
+            .checked_sub(10)
+            .filter(|&i| {
+                trimmed.is_char_boundary(i) && trimmed[i..].eq_ignore_ascii_case("!important")
+            })
+            .map_or(trimmed, |i| trimmed[..i].trim_end());
+        let zero_clip = prop.eq_ignore_ascii_case("clip")
+            && val.len() >= 7
+            && val[..5].eq_ignore_ascii_case("rect(")
+            && val.ends_with(')')
+            && {
+                let mut n = 0usize;
+                val[5..val.len() - 1]
+                    .split(|c: char| c == ',' || c.is_ascii_whitespace())
+                    .filter(|s| !s.is_empty())
+                    .all(|p| {
+                        n += 1;
+                        parse_css_zero(p)
+                    })
+                    && n == 4
+            };
+        if (prop.eq_ignore_ascii_case("display") && val.eq_ignore_ascii_case("none"))
+            || (prop.eq_ignore_ascii_case("visibility") && eq_any_ci(val, &["hidden", "collapse"]))
+            || (eq_any_ci(prop, &["opacity", "font-size"]) && parse_css_zero(val))
+            || (prop.eq_ignore_ascii_case("text-indent") && is_offscreen_px(val))
+            || zero_clip
+            || (prop.eq_ignore_ascii_case("clip-path")
+                && ["inset(50%", "inset(100%", "circle(0"]
+                    .iter()
+                    .any(|p| val.len() >= p.len() && val[..p.len()].eq_ignore_ascii_case(p)))
+        {
+            return true;
+        }
+        overflow_hidden |= eq_any_ci(prop, &["overflow", "overflow-x", "overflow-y"])
+            && val.eq_ignore_ascii_case("hidden");
+        zero_box |=
+            eq_any_ci(prop, &["width", "height", "max-width", "max-height"]) && parse_css_zero(val);
+        positioned |=
+            prop.eq_ignore_ascii_case("position") && eq_any_ci(val, &["absolute", "fixed"]);
+        offscreen |= eq_any_ci(prop, &["left", "top"]) && is_offscreen_px(val);
+    }
+    (overflow_hidden && zero_box) || (positioned && offscreen)
 }
 
 pub(crate) fn collapsed_node_text(node: NodeRef<'_, Node>) -> Option<String> {

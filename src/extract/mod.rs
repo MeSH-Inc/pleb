@@ -161,7 +161,40 @@ pub fn extract_document(
     extract_document_parsed(body, None, page_url, content_type, options)
 }
 
+pub(crate) fn is_concealed_unicode(c: char) -> bool {
+    matches!(
+        c,
+        '\u{E0000}'..='\u{E007F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+fn strip_concealed_unicode(s: &mut String) {
+    if s.chars().any(is_concealed_unicode) {
+        s.retain(|c| !is_concealed_unicode(c));
+    }
+}
+
 pub fn extract_document_parsed(
+    body: &str,
+    parsed: Option<ParsedHtml>,
+    page_url: &::url::Url,
+    content_type: Option<&str>,
+    options: &ExtractOptions,
+) -> Result<ExtractedDocument> {
+    let mut doc = extract_document_parsed_inner(body, parsed, page_url, content_type, options)?;
+    if options.mode != ExtractMode::Full
+        && options.format != OutputFormat::Html
+        && !is_passthrough_non_html(content_type)
+    {
+        strip_concealed_unicode(&mut doc.content);
+        if let Some(title) = doc.title.as_mut() {
+            strip_concealed_unicode(title);
+        }
+    }
+    Ok(doc)
+}
+
+fn extract_document_parsed_inner(
     body: &str,
     parsed: Option<ParsedHtml>,
     page_url: &::url::Url,

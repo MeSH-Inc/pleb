@@ -63,15 +63,11 @@ pub struct WebMcpToolDescriptor {
     pub method: Option<String>,
 }
 
-pub(crate) fn is_bidi_control(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{061C}' | '\u{200E}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
-    )
-}
-
 pub(crate) fn is_stripped_control(ch: char) -> bool {
-    ch < '\x20' || ch == '\x7f' || is_bidi_control(ch)
+    ch < '\x20'
+        || ch == '\x7f'
+        || super::is_concealed_unicode(ch)
+        || matches!(ch, '\u{061C}' | '\u{200E}'..='\u{200F}')
 }
 
 pub(crate) fn strip_controls_and_bidi(raw: &str) -> String {

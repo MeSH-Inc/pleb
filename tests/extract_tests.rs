@@ -2496,3 +2496,47 @@ fn webmcp_and_axtree_boundary_and_counterexample_guards() {
         "checkbox \"Accept\" value=42 description=\"Line1\\nLine2\" checked=\"invalid_state\" extra=\"[1,\\\"a\\\"]\""
     );
 }
+
+#[test]
+fn concealed_channel_stripping_preserves_benign_styles_webmcp_and_full_mode() {
+    let url = Url::parse("https://docs.example.com/security").unwrap();
+    let html = r#"<!doctype html><html><head><title>Policy&#xE0041;</title></head><body><main>
+        <h1>Policy</h1>
+        <p style="opacity:0.05">Low-opacity caption preserved.</p>
+        <p style="font-size:0.75rem">Small rem text preserved.</p>
+        <p style="text-indent:-16px">Small negative indent preserved.</p>
+        <span style="opacity:0">HIDDEN-OPACITY</span>
+        <span style="font-size:0px !IMPORTANT">HIDDEN-FONTSIZE</span>
+        <form toolname="cloaked_tool" tooldescription="Hidden" style="opacity:0"></form>
+        <form toolname="visible_tool" tooldescription="Visible&#xE0049; action" style="opacity:0.9"></form>
+        <p>Safe text&#xE0053;&#x2066; and emoji 👩&#x200D;💻.</p>
+    </main></body></html>"#;
+
+    let clean =
+        extract_document(html, &url, Some("text/html"), &ExtractOptions::default()).unwrap();
+    assert_eq!(clean.title.as_deref(), Some("Policy"));
+    assert!(clean.content.contains("Low-opacity caption preserved."));
+    assert!(clean.content.contains("Small rem text preserved."));
+    assert!(clean.content.contains("Small negative indent preserved."));
+    assert!(clean.content.contains("Safe text and emoji 👩\u{200D}💻."));
+    assert!(!clean.content.contains("HIDDEN-OPACITY"));
+    assert!(!clean.content.contains("HIDDEN-FONTSIZE"));
+    assert!(!clean.content.contains('\u{E0053}'));
+    assert!(!clean.content.contains('\u{2066}'));
+    assert_eq!(clean.tools.len(), 1);
+    assert_eq!(clean.tools[0].name, "visible_tool");
+    assert_eq!(clean.tools[0].description, "Visible action");
+
+    // ExtractMode::Full preserves verbatim text (including native markdown unicode) without mutating source.
+    let full = extract_document(
+        "Raw \u{E0041} text",
+        &url,
+        Some("text/markdown"),
+        &ExtractOptions {
+            mode: ExtractMode::Full,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(full.content.contains('\u{E0041}'));
+}

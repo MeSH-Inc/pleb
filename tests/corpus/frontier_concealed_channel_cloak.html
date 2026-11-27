@@ -1,0 +1,26 @@
+<!-- pleb-fixture: {"tier":"ratchet","url":"https://docs.example.com/security/rotation","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"Key Rotation Policy","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["rotate-keys --grace-hours 24","Translucent note at half opacity stays visible.","Compact caption at 0.875rem stays visible.","Hanging indent stays visible.","Small offset stays visible.","Unclipped container stays visible.","Developer icon 👩\u200d💻 preserved."],"forbidden_substrings":["CLOAK-OPACITY-ZERO","CLOAK-OPACITY-IMPORTANT","CLOAK-FONT-ZERO-PX","CLOAK-FONT-ZERO-REM","CLOAK-CLIP-PATH","CLOAK-CLIP-RECT","CLOAK-TEXT-INDENT","CLOAK-OFFSCREEN-LEFT","CLOAK-ZERO-HEIGHT-CLIP","\u202e","\udb40\udc49"],"minimum_output_bytes":180,"maximum_output_bytes":900}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Key Rotation Policy</title></head>
+<body>
+  <main>
+    <h1>Key Rotation Policy</h1>
+    <p>Run <code>rotate-keys --grace-hours 24</code> during scheduled maintenance.&#xE0049;&#xE0047;&#x202E;</p>
+    <span style="opacity: 0">CLOAK-OPACITY-ZERO</span>
+    <span style="opacity: 0.0 !important">CLOAK-OPACITY-IMPORTANT</span>
+    <span style="font-size: 0px">CLOAK-FONT-ZERO-PX</span>
+    <span style="font-size: 0rem">CLOAK-FONT-ZERO-REM</span>
+    <span style="clip-path: inset(50%)">CLOAK-CLIP-PATH</span>
+    <span style="clip: rect(0, 0, 0, 0)">CLOAK-CLIP-RECT</span>
+    <p style="text-indent: -9999px">CLOAK-TEXT-INDENT</p>
+    <div style="position: absolute; left: -9999px">CLOAK-OFFSCREEN-LEFT</div>
+    <div style="height: 0; overflow: hidden">CLOAK-ZERO-HEIGHT-CLIP</div>
+    <p style="opacity: 0.5">Translucent note at half opacity stays visible.</p>
+    <p style="font-size: 0.875rem">Compact caption at 0.875rem stays visible.</p>
+    <p style="text-indent: -24px">Hanging indent stays visible.</p>
+    <div style="position: absolute; left: -4px">Small offset stays visible.</div>
+    <div style="height: 0">Unclipped container stays visible.</div>
+    <p>Developer icon 👩&#x200D;💻 preserved.</p>
+  </main>
+</body>
+</html>
