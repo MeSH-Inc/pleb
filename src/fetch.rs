@@ -1064,10 +1064,10 @@ async fn try_fetch_raw_source(
         {
             extract::wrap_raw_code_document(&candidate.filename, &body, language, &options.extract)
         }
-        _ => match extract::extract_document_parsed(
+        _ => match extract::extract_document_with_link_base(
             &body,
-            None,
             &raw_final_url,
+            effective_url,
             Some("text/markdown"),
             &options.extract,
         ) {
@@ -2411,7 +2411,7 @@ mod tests {
                         "/README.md" => (
                             "200 OK",
                             "text/plain; charset=utf-8",
-                            b"# Raw Readme\n\nHello raw.",
+                            b"# Raw Readme\n\nHello raw. [Install](README-FULL.md#installation)\n\n![Arch](docs/arch.png)",
                         ),
                         "/lib.rs" => (
                             "200 OK",
@@ -2475,6 +2475,10 @@ mod tests {
         .unwrap();
         assert_eq!(md_out.strategy, "raw_source");
         assert!(md_out.content.contains("Hello raw."));
+        assert!(md_out
+            .content
+            .contains("https://github.com/org/repo/blob/main/README-FULL.md#installation"));
+        assert!(md_out.content.contains(&format!("{base}/docs/arch.png")));
 
         // 2. Code raw source succeeds with strategy == "raw_source".
         let rs_cand = RawSourceCandidate {

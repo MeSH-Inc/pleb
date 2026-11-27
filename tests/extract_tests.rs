@@ -2878,3 +2878,84 @@ fn anchor_block_formatting_preserves_inline_hashes_code_and_balances_fences() {
     assert!(doc.content.contains("Trailing prose"));
     assert_eq!(doc.content.matches("* * *").count(), 1);
 }
+
+#[test]
+fn resource_sections_scope_to_articles_without_leaking_across_siblings() {
+    let url = Url::parse("https://feed.example.com/r/rust/").unwrap();
+    let feed_html = r#"<!doctype html>
+<html><head><title>r/rust</title></head><body><main>
+  <h1>r/rust</h1>
+  <article>
+    <h2>Hiring Thread</h2>
+    <h3>Automotive / Hardware</h3>
+    <p>Jobs list.</p>
+    <img src="https://styles.redditmedia.com/t5_abc/styles/profileIcon_123.jpg?width=64&height=64" alt="u/alice avatar">
+  </article>
+  <article>
+    <img src="https://i.redd.it/gpui-layout-diagram.png" width="800" height="450" alt="GPUI layout diagram">
+    <h2>Building a GPUI Dashboard</h2>
+    <p>UI notes.</p>
+  </article>
+  <article>
+    <figure>
+      <img src="https://i.redd.it/perf-chart.png" width="800" height="450" alt="Benchmark chart">
+      <figcaption>Throughput comparison</figcaption>
+    </figure>
+    <p>No heading in this card.</p>
+  </article>
+</main></body></html>"#;
+
+    let feed_doc = extract_document(
+        feed_html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    let gpui = feed_doc
+        .resources
+        .iter()
+        .find(|r| r.url.ends_with("/gpui-layout-diagram.png"))
+        .unwrap();
+    let perf = feed_doc
+        .resources
+        .iter()
+        .find(|r| r.url.ends_with("/perf-chart.png"))
+        .unwrap();
+    assert_eq!(
+        gpui.section_heading.as_deref(),
+        Some("Building a GPUI Dashboard")
+    );
+    assert_eq!(perf.section_heading.as_deref(), Some("r/rust"));
+
+    // Single-article documentation page must still attribute each image to its nearest preceding heading.
+    let doc_url = Url::parse("https://docs.example.com/arch").unwrap();
+    let doc_html = r#"<!doctype html>
+<html><head><title>Architecture</title></head><body><article>
+  <h1>Architecture</h1>
+  <h2>Section 1</h2>
+  <figure><img src="/img/s1.png" width="800" height="400" alt="Section one diagram"><figcaption>S1</figcaption></figure>
+  <h2>Section 2</h2>
+  <figure><img src="/img/s2.png" width="800" height="400" alt="Section two diagram"><figcaption>S2</figcaption></figure>
+</article></body></html>"#;
+
+    let single_doc = extract_document(
+        doc_html,
+        &doc_url,
+        Some("text/html"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    let s1 = single_doc
+        .resources
+        .iter()
+        .find(|r| r.url.ends_with("/s1.png"))
+        .unwrap();
+    let s2 = single_doc
+        .resources
+        .iter()
+        .find(|r| r.url.ends_with("/s2.png"))
+        .unwrap();
+    assert_eq!(s1.section_heading.as_deref(), Some("Section 1"));
+    assert_eq!(s2.section_heading.as_deref(), Some("Section 2"));
+}

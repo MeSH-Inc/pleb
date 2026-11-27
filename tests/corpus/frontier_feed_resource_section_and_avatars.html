@@ -1,0 +1,28 @@
+<!-- pleb-fixture: {"tier":"ratchet","url":"https://feed.example.com/r/rust/","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"r/rust","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["Hiring Thread","Building a GPUI Dashboard","Throughput comparison"],"expected_resource_urls":["https://i.redd.it/gpui-layout-diagram.png","https://i.redd.it/perf-chart.png"],"forbidden_resource_urls":["https://styles.redditmedia.com/t5_abc/styles/profileIcon_123.jpg?width=64&height=64"],"minimum_output_bytes":80,"maximum_output_bytes":1200,"expected_structure":{"minimum_headings":2}}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><title>r/rust</title></head>
+<body>
+  <main>
+    <h1>r/rust</h1>
+    <article>
+      <h2>Hiring Thread</h2>
+      <h3>Automotive / Hardware</h3>
+      <p>Jobs list.</p>
+      <img src="https://styles.redditmedia.com/t5_abc/styles/profileIcon_123.jpg?width=64&height=64" alt="u/alice avatar">
+    </article>
+    <article>
+      <img src="https://i.redd.it/gpui-layout-diagram.png" width="800" height="450" alt="GPUI layout diagram">
+      <h2>Building a GPUI Dashboard</h2>
+      <p>UI notes.</p>
+    </article>
+    <article>
+      <figure>
+        <img src="https://i.redd.it/perf-chart.png" width="800" height="450" alt="Benchmark chart">
+        <figcaption>Throughput comparison</figcaption>
+      </figure>
+      <p>No heading in this card.</p>
+    </article>
+  </main>
+</body>
+</html>

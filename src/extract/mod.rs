@@ -174,6 +174,27 @@ pub fn extract_document_parsed(
     content_type: Option<&str>,
     options: &ExtractOptions,
 ) -> Result<ExtractedDocument> {
+    extract_document_core(body, parsed, page_url, page_url, content_type, options)
+}
+
+pub(crate) fn extract_document_with_link_base(
+    body: &str,
+    page_url: &::url::Url,
+    link_base_url: &::url::Url,
+    content_type: Option<&str>,
+    options: &ExtractOptions,
+) -> Result<ExtractedDocument> {
+    extract_document_core(body, None, page_url, link_base_url, content_type, options)
+}
+
+fn extract_document_core(
+    body: &str,
+    parsed: Option<ParsedHtml>,
+    page_url: &::url::Url,
+    link_base_url: &::url::Url,
+    content_type: Option<&str>,
+    options: &ExtractOptions,
+) -> Result<ExtractedDocument> {
     let defer_limit = options.focus.is_some()
         && matches!(options.format, OutputFormat::Markdown | OutputFormat::Text);
     let inner_opts = if defer_limit {
@@ -185,7 +206,14 @@ pub fn extract_document_parsed(
     } else {
         options.clone()
     };
-    let mut doc = extract_document_parsed_inner(body, parsed, page_url, content_type, &inner_opts)?;
+    let mut doc = extract_document_parsed_inner(
+        body,
+        parsed,
+        page_url,
+        link_base_url,
+        content_type,
+        &inner_opts,
+    )?;
     if options.mode != ExtractMode::Full
         && options.format != OutputFormat::Html
         && !is_passthrough_non_html(content_type)
@@ -212,6 +240,7 @@ fn extract_document_parsed_inner(
     body: &str,
     parsed: Option<ParsedHtml>,
     page_url: &::url::Url,
+    link_base_url: &::url::Url,
     content_type: Option<&str>,
     options: &ExtractOptions,
 ) -> Result<ExtractedDocument> {
@@ -224,7 +253,12 @@ fn extract_document_parsed_inner(
 
     let mime = extract_mime(content_type);
     if native_markdown::is_markdown_mime(mime.as_deref()) {
-        return native_markdown::extract_native_markdown(body, page_url, options);
+        return native_markdown::extract_native_markdown_with_bases(
+            body,
+            link_base_url,
+            page_url,
+            options,
+        );
     }
 
     if feed::is_feed_document(mime.as_deref(), body) {

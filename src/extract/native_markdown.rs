@@ -22,6 +22,15 @@ pub fn extract_native_markdown(
     page_url: &Url,
     options: &ExtractOptions,
 ) -> Result<ExtractedDocument> {
+    extract_native_markdown_with_bases(body, page_url, page_url, options)
+}
+
+pub(crate) fn extract_native_markdown_with_bases(
+    body: &str,
+    link_base_url: &Url,
+    image_base_url: &Url,
+    options: &ExtractOptions,
+) -> Result<ExtractedDocument> {
     if options.format == OutputFormat::Html {
         let (content, truncated) = apply_utf8_limit(body, options.max_bytes);
         return Ok(ExtractedDocument {
@@ -48,7 +57,8 @@ pub fn extract_native_markdown(
 
     let rewritten_body = rewrite_markdown_links(
         markdown_body,
-        page_url,
+        link_base_url,
+        image_base_url,
         options.include_images,
         options.include_links,
         options.mode != ExtractMode::Full,
@@ -294,7 +304,8 @@ fn strip_trailing_atx_hashes(s: &str) -> &str {
 
 fn rewrite_markdown_links(
     md: &str,
-    base_url: &Url,
+    link_base_url: &Url,
+    image_base_url: &Url,
     include_images: bool,
     include_links: bool,
     strip_skip_lines: bool,
@@ -321,9 +332,13 @@ fn rewrite_markdown_links(
             continue;
         }
 
-        if let Some(rewritten_def) =
-            rewrite_link_ref_definition(line, base_url, include_images, include_links)
-        {
+        if let Some(rewritten_def) = rewrite_link_ref_definition(
+            line,
+            link_base_url,
+            image_base_url,
+            include_images,
+            include_links,
+        ) {
             if !rewritten_def.is_empty() {
                 out.push_str(&rewritten_def);
                 out.push_str(newline);
@@ -331,7 +346,14 @@ fn rewrite_markdown_links(
             continue;
         }
 
-        rewrite_inline_segment(line, base_url, include_images, include_links, &mut out);
+        rewrite_inline_segment(
+            line,
+            link_base_url,
+            image_base_url,
+            include_images,
+            include_links,
+            &mut out,
+        );
         out.push_str(newline);
     }
 
@@ -410,9 +432,18 @@ fn parse_link_ref_definition(line: &str) -> Option<LinkRefDef<'_>> {
     })
 }
 
+fn is_image_dest(dest: &str) -> bool {
+    let path = dest.split(['?', '#']).next().unwrap_or("");
+    let lower = path.to_ascii_lowercase();
+    [".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".avif"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
+}
+
 fn rewrite_link_ref_definition(
     line: &str,
-    base_url: &Url,
+    link_base_url: &Url,
+    image_base_url: &Url,
     include_images: bool,
     include_links: bool,
 ) -> Option<String> {
@@ -420,7 +451,12 @@ fn rewrite_link_ref_definition(
     if !include_links && !include_images {
         return Some(String::new());
     }
-    match resolve_and_clean_url(def.dest, base_url) {
+    let ref_base = if is_image_dest(def.dest) {
+        image_base_url
+    } else {
+        link_base_url
+    };
+    match resolve_and_clean_url(def.dest, ref_base) {
         ResolvedUrl::Resolved(cleaned) => Some(if def.title.is_empty() {
             format!(
                 "{}[{}]: {}",
@@ -443,7 +479,8 @@ fn rewrite_link_ref_definition(
 
 fn rewrite_inline_segment(
     s: &str,
-    base_url: &Url,
+    link_base_url: &Url,
+    image_base_url: &Url,
     include_images: bool,
     include_links: bool,
     out: &mut String,
@@ -488,7 +525,7 @@ fn rewrite_inline_segment(
                         if is_image {
                             if include_images {
                                 if let ResolvedUrl::Resolved(cleaned) =
-                                    resolve_and_clean_url(parsed.dest, base_url)
+                                    resolve_and_clean_url(parsed.dest, image_base_url)
                                 {
                                     out.push_str("![");
                                     out.push_str(raw_label);
@@ -502,7 +539,8 @@ fn rewrite_inline_segment(
                             let mut rewritten_label = String::with_capacity(raw_label.len());
                             rewrite_inline_segment(
                                 raw_label,
-                                base_url,
+                                link_base_url,
+                                image_base_url,
                                 include_images,
                                 include_links,
                                 &mut rewritten_label,
@@ -514,7 +552,7 @@ fn rewrite_inline_segment(
                             {
                                 // Label consisted solely of a dropped image; drop the empty link wrapper.
                             } else {
-                                match resolve_and_clean_url(parsed.dest, base_url) {
+                                match resolve_and_clean_url(parsed.dest, link_base_url) {
                                     ResolvedUrl::Resolved(cleaned) => {
                                         out.push('[');
                                         out.push_str(&rewritten_label);

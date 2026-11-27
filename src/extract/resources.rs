@@ -223,6 +223,18 @@ fn walk_for_resources(
         }
     }
 
+    if tag == "article" {
+        let saved_heading = ctx.current_heading.clone();
+        if let Some(heading) = first_article_heading(node) {
+            ctx.current_heading = Some(heading);
+        }
+        for child in node.children() {
+            walk_for_resources(child, in_figure, figure_caption, ctx);
+        }
+        ctx.current_heading = saved_heading;
+        return;
+    }
+
     if tag == "figure" {
         let caption = find_figcaption_text(node);
         for child in node.children() {
@@ -277,6 +289,29 @@ fn walk_for_resources(
     for child in node.children() {
         walk_for_resources(child, in_figure, figure_caption, ctx);
     }
+}
+
+fn first_article_heading(node: NodeRef<'_, Node>) -> Option<String> {
+    for child in node.children() {
+        if let Node::Element(el) = child.value() {
+            let tag = el.name();
+            if matches!(
+                tag,
+                "article" | "script" | "style" | "noscript" | "template"
+            ) {
+                continue;
+            }
+            if matches!(tag, "h1" | "h2" | "h3") {
+                if let Some(heading) = extract_node_clean_text(child) {
+                    return Some(heading);
+                }
+            }
+        }
+        if let Some(heading) = first_article_heading(child) {
+            return Some(heading);
+        }
+    }
+    None
 }
 
 fn maybe_index_image(
