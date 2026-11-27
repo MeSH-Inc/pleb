@@ -11,10 +11,9 @@ use url::Url;
 
 use crate::context::RuntimeContext;
 use crate::extract::{
-    self, url::normalize_crawl_url, ExtractMode, ExtractOptions, ExtractedDocument, OutputFormat,
-    ParsedHtml,
+    self, url::normalize_crawl_url, ExtractMode, ExtractOptions, OutputFormat, ParsedHtml,
 };
-use crate::fetch::{self, FetchError};
+use crate::fetch::{self, ContentOutcome, FetchError};
 
 const DEFAULT_CRAWL_CONCURRENCY: usize = 4;
 const DEFAULT_POLITE_SPACING: Duration = Duration::from_millis(100);
@@ -38,11 +37,28 @@ pub struct CrawlPage {
     pub title: Option<String>,
     pub content: String,
     pub depth: u32,
+    pub status_code: u16,
+    pub strategy: String,
+    pub content_outcome: ContentOutcome,
+    pub truncated: bool,
+    pub acquired_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CrawlFailure {
+    pub url: String,
+    pub depth: u32,
+    pub error: String,
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CrawlResult {
     pub pages: Vec<CrawlPage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_pages: Vec<CrawlFailure>,
     pub urls_discovered: usize,
     pub timing_ms: u64,
 }
@@ -52,6 +68,15 @@ struct FetchedCrawlPage {
     discovery_sequence: usize,
     page: CrawlPage,
     links: Vec<Url>,
+}
+
+enum CrawlAttempt {
+    Page(FetchedCrawlPage),
+    Skipped,
+    Failed {
+        discovery_sequence: usize,
+        failure: CrawlFailure,
+    },
 }
 
 pub async fn crawl(
@@ -65,6 +90,7 @@ pub async fn crawl(
     if max_pages == 0 {
         return Ok(CrawlResult {
             pages: Vec::new(),
+            failed_pages: Vec::new(),
             urls_discovered: 0,
             timing_ms: start.elapsed().as_millis() as u64,
         });
@@ -87,6 +113,7 @@ pub async fn crawl(
     else {
         return Ok(CrawlResult {
             pages: Vec::new(),
+            failed_pages: Vec::new(),
             urls_discovered: 0,
             timing_ms: start.elapsed().as_millis() as u64,
         });
@@ -108,6 +135,7 @@ pub async fn crawl(
     };
 
     let mut collected: Vec<(u32, usize, CrawlPage)> = vec![(0, 0, seed_fetched.page)];
+    let mut failed: Vec<(u32, usize, CrawlFailure)> = Vec::new();
     let mut urls_discovered: usize = 0;
     let mut next_discovery_seq: usize = 1;
 
@@ -131,9 +159,8 @@ pub async fn crawl(
         let collect_links = depth < options.max_depth;
         let mut reserved_slots = collected.len();
         let mut wave_results: Vec<FetchedCrawlPage> = Vec::new();
-        let mut in_flight: Vec<
-            Pin<Box<dyn Future<Output = Option<FetchedCrawlPage>> + Send + '_>>,
-        > = Vec::new();
+        let mut in_flight: Vec<Pin<Box<dyn Future<Output = CrawlAttempt> + Send + '_>>> =
+            Vec::new();
 
         while !current_wave.is_empty() || !in_flight.is_empty() {
             while in_flight.len() < DEFAULT_CRAWL_CONCURRENCY && reserved_slots < max_pages {
@@ -164,10 +191,19 @@ pub async fn crawl(
                     )
                     .await
                     {
-                        Ok(page) => page,
+                        Ok(Some(page)) => CrawlAttempt::Page(page),
+                        Ok(None) => CrawlAttempt::Skipped,
                         Err(e) => {
                             tracing::debug!("crawl skip {}: {}", url_for_log, e);
-                            None
+                            CrawlAttempt::Failed {
+                                discovery_sequence: seq,
+                                failure: CrawlFailure {
+                                    url: url_for_log,
+                                    depth,
+                                    error: e.to_string(),
+                                    kind: e.kind().to_string(),
+                                },
+                            }
                         }
                     }
                 }));
@@ -175,8 +211,15 @@ pub async fn crawl(
 
             if let Some(outcome) = poll_next_ready(&mut in_flight).await {
                 match outcome {
-                    Some(fetched) => wave_results.push(fetched),
-                    None => reserved_slots = reserved_slots.saturating_sub(1),
+                    CrawlAttempt::Page(fetched) => wave_results.push(fetched),
+                    CrawlAttempt::Skipped => reserved_slots = reserved_slots.saturating_sub(1),
+                    CrawlAttempt::Failed {
+                        discovery_sequence,
+                        failure,
+                    } => {
+                        reserved_slots = reserved_slots.saturating_sub(1);
+                        failed.push((failure.depth, discovery_sequence, failure));
+                    }
                 }
             } else {
                 break;
@@ -206,10 +249,13 @@ pub async fn crawl(
     }
 
     collected.sort_by_key(|(page_depth, seq, _)| (*page_depth, *seq));
+    failed.sort_by_key(|(page_depth, seq, _)| (*page_depth, *seq));
     let pages = collected.into_iter().map(|(_, _, page)| page).collect();
+    let failed_pages = failed.into_iter().map(|(_, _, f)| f).collect();
 
     Ok(CrawlResult {
         pages,
+        failed_pages,
         urls_discovered,
         timing_ms: start.elapsed().as_millis() as u64,
     })
@@ -264,13 +310,7 @@ async fn fetch_and_extract_page(
         html_result.content_type.as_deref(),
         &opts,
     )
-    .unwrap_or(ExtractedDocument {
-        content: String::new(),
-        title: None,
-        truncated: false,
-        resources: Vec::new(),
-        tools: Vec::new(),
-    });
+    .map_err(FetchError::Transport)?;
 
     Ok(Some(FetchedCrawlPage {
         depth,
@@ -280,6 +320,12 @@ async fn fetch_and_extract_page(
             title: extracted.title,
             content: extracted.content,
             depth,
+            status_code: html_result.status_code,
+            strategy: html_result.strategy,
+            content_outcome: html_result.content_outcome,
+            truncated: extracted.truncated,
+            acquired_sha256: html_result.acquired_sha256,
+            warning: html_result.warning,
         },
         links,
     }))
@@ -336,20 +382,29 @@ async fn poll_next_ready<T>(
 
 pub fn format_crawl_output(result: &CrawlResult, host: &str) -> String {
     let mut out = format!(
-        "# Crawl Results: {}\nCrawled {} pages in {:.1}s\n",
+        "# Crawl Results: {}\nCrawled {} pages in {:.1}s",
         host,
         result.pages.len(),
         result.timing_ms as f64 / 1000.0
     );
+    if !result.failed_pages.is_empty() {
+        out.push_str(&format!(" ({} failed)", result.failed_pages.len()));
+    }
+    out.push('\n');
 
     let mut total_len = out.len();
     for (i, page) in result.pages.iter().enumerate() {
+        let mut body = String::new();
+        if let Some(warning) = &page.warning {
+            body.push_str(&format!("> Warning: {warning}\n\n"));
+        }
+        body.push_str(&page.content);
         let section = extract::format_page_section(
             i + 1,
             result.pages.len(),
             page.title.as_deref(),
             &page.url,
-            &page.content,
+            &body,
         );
 
         if total_len + section.len() > 100_000 {

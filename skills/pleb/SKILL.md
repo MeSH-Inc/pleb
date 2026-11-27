@@ -120,7 +120,7 @@ Genuine `pleb` installations report `"version"`, `"cef_renderer": { "expected_pr
 | `130` | Interactive TTY credential prompt interrupted (`SIGINT`/`SIGTERM`) |
 
 Key `--json` / `--jsonl` outputs:
-- **`FetchOutput`**: `{ url, final_url, status_code, content_type, title, content, content_bytes, strategy, escalated, truncated, timing_ms, warning?, resources?, tools? }` (`--metadata-only` omits `content`).
+- **`FetchOutput`**: `{ url, final_url, representation_url?, status_code, content_type, title, content, content_bytes, strategy, content_outcome, acquired_sha256, escalated, truncated, timing_ms, warning?, resources?, tools? }` (`--metadata-only` omits `content`; `content_outcome` is `complete` or `incomplete_shell`).
 - **`BatchItemResult`**: untagged on `ok` (`true` -> `FetchOutput` fields with `content?`; `false` -> `{ url, ok, error, kind, exit_code }`).
 - **`StagedAssetOutput`**: `{ url, final_url, status_code, content_type, byte_count, staged_path, timing_ms }`.
 - **`SearchResponse`**: `{ provider, providers_used?, results: [{ title, url, snippet, extra_snippets? }] }`.

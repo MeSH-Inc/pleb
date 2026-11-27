@@ -795,6 +795,10 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "workerd",
         "pleb skill install",
         "warning",
+        "content_outcome",
+        "acquired_sha256",
+        "representation_url",
+        "failed_pages",
     ] {
         assert!(
             readme_full.contains(required),
@@ -817,6 +821,9 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "FetchOutput",
         "WebMcpToolDescriptor",
         "PLEB_NO_KEYCHAIN",
+        "content_outcome",
+        "acquired_sha256",
+        "representation_url",
     ] {
         assert!(
             llms_full_txt.contains(required),
@@ -909,6 +916,8 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "--prefer-cdp",
         "--no-web-bot-auth",
         "--format axtree",
+        "content_outcome",
+        "acquired_sha256",
     ] {
         assert!(
             skill_md.contains(required),
@@ -1672,6 +1681,8 @@ async fn cli_contract_hardening_exit_codes_js_shell_warning_crawl_seed_keychain_
         .unwrap();
     assert_eq!(js_json.status.code(), Some(0));
     let js_val: serde_json::Value = serde_json::from_slice(&js_json.stdout).unwrap();
+    assert_eq!(js_val["content_outcome"], "incomplete_shell");
+    assert_eq!(js_val["acquired_sha256"].as_str().map(str::len), Some(64));
     assert!(
         js_val["warning"]
             .as_str()
@@ -1702,6 +1713,11 @@ async fn cli_contract_hardening_exit_codes_js_shell_warning_crawl_seed_keychain_
         String::from_utf8_lossy(&js_meta.stderr)
     );
     let js_meta_val: serde_json::Value = serde_json::from_slice(&js_meta.stdout).unwrap();
+    assert_eq!(js_meta_val["content_outcome"], "incomplete_shell");
+    assert_eq!(
+        js_meta_val["acquired_sha256"].as_str().map(str::len),
+        Some(64)
+    );
     assert!(
         js_meta_val["warning"]
             .as_str()
@@ -1739,6 +1755,13 @@ async fn cli_contract_hardening_exit_codes_js_shell_warning_crawl_seed_keychain_
         .iter()
         .find(|item| item["url"].as_str().unwrap().ends_with("/ok"))
         .unwrap();
+    assert_eq!(shell_item["content_outcome"], "incomplete_shell");
+    assert_eq!(ok_item["content_outcome"], "complete");
+    assert_eq!(
+        shell_item["acquired_sha256"].as_str().map(str::len),
+        Some(64)
+    );
+    assert_eq!(ok_item["acquired_sha256"].as_str().map(str::len), Some(64));
     assert!(shell_item["warning"]
         .as_str()
         .is_some_and(|w| w.contains("JavaScript shell")));

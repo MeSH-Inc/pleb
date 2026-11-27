@@ -344,10 +344,14 @@ impl CliError {
 struct FetchMetadataOutput<'a> {
     url: &'a str,
     final_url: &'a str,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    representation_url: Option<&'a str>,
     status_code: u16,
     content_type: Option<&'a str>,
     title: Option<&'a str>,
     strategy: &'a str,
+    content_outcome: fetch::ContentOutcome,
+    acquired_sha256: &'a str,
     escalated: bool,
     truncated: bool,
     timing_ms: u64,
@@ -365,10 +369,13 @@ impl<'a> From<&'a FetchOutput> for FetchMetadataOutput<'a> {
         Self {
             url: &res.url,
             final_url: &res.final_url,
+            representation_url: res.representation_url.as_deref(),
             status_code: res.status_code,
             content_type: res.content_type.as_deref(),
             title: res.title.as_deref(),
             strategy: &res.strategy,
+            content_outcome: res.content_outcome,
+            acquired_sha256: &res.acquired_sha256,
             escalated: res.escalated,
             truncated: res.truncated,
             timing_ms: res.timing_ms,

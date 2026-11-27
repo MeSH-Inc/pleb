@@ -687,16 +687,19 @@ All `--json` and `--jsonl` payloads serialize directly from `pleb`'s Rust output
 | :--- | :--- | :--- |
 | `url` | `string` | Requested URL |
 | `final_url` | `string` | Post-rewrite / post-redirect final URL |
-| `status_code` | `number` | HTTP status code (`u16`) |
+| `representation_url` | `string` | Exact representation URL when distinct from `final_url` (e.g., an advertised Markdown mirror; **omitted** when identical) |
+| `status_code` | `number` | Observed HTTP status code (`u16`) |
 | `content_type` | `string \| null` | Response `Content-Type` header if present |
 | `title` | `string \| null` | Extracted document title if present |
 | `content` | `string` | Extracted Markdown, text, HTML, or accessibility tree (`axtree`) (**omitted** with `--metadata-only`) |
 | `content_bytes` | `number` | Byte length of `content` (still populated with `--metadata-only`) |
 | `strategy` | `string` | Acquisition strategy (`cronet`, `reqwest`, `cef`, `cdp`, `raw_source`, `markdown_mirror`, `markdown_negotiated`) |
+| `content_outcome` | `string` | Machine-readable completeness classification (`complete` or `incomplete_shell`) |
+| `acquired_sha256` | `string` | Lowercase SHA-256 hex digest of the acquired source body prior to extraction/truncation |
 | `escalated` | `boolean` | `true` when transport escalated from primary HTTP to CEF or CDP |
 | `truncated` | `boolean` | `true` when `--max-bytes` truncated output |
 | `timing_ms` | `number` | End-to-end fetch duration in milliseconds |
-| `warning` | `string` | Advisory warning when an unrendered `JavaScriptShell` returns raw HTML (**omitted** when absent) |
+| `warning` | `string` | Advisory warning when an unrendered or post-render `JavaScriptShell` returns partial HTML, or when a requested `--stage-resources` selector is absent (**omitted** when absent) |
 | `resources` | `ResourceDescriptor[]` | Indexed linked resources (**omitted** when empty) |
 | `tools` | `WebMcpToolDescriptor[]` | Indexed WebMCP page tools (**omitted** when empty; `untrusted_content: true`) |
 
@@ -704,7 +707,7 @@ All `--json` and `--jsonl` payloads serialize directly from `pleb`'s Rust output
 
 Multi-URL and `stdin` (`-`) fetches emit an array (`--json`) or newline-delimited stream (`--jsonl`) of untagged `BatchItemResult` objects discriminated by `ok`:
 
-- **Success (`ok: true`)**: `url`, `ok`, `final_url`, `status_code`, `content_type`, `title`, `strategy`, `escalated`, `truncated`, `timing_ms`, `content_bytes`, plus `warning` (omitted when absent), `content` (omitted with `--metadata-only`), `resources` (omitted when empty), and `tools` (omitted when empty).
+- **Success (`ok: true`)**: `url`, `ok`, `final_url`, `representation_url` (omitted when identical to `final_url`), `status_code`, `content_type`, `title`, `strategy`, `content_outcome`, `acquired_sha256`, `escalated`, `truncated`, `timing_ms`, `content_bytes`, plus `warning` (omitted when absent), `content` (omitted with `--metadata-only`), `resources` (omitted when empty), and `tools` (omitted when empty).
 - **Failure (`ok: false`)**: `url`, `ok`, `error`, `kind`, `exit_code`.
 
 ### `StagedAssetOutput` (`pleb fetch --stage --json`)
@@ -745,7 +748,7 @@ Multi-URL and `stdin` (`-`) fetches emit an array (`--json`) or newline-delimite
 
 | Command (`--json`) | Schema Fields |
 | :--- | :--- |
-| `pleb crawl` (`CrawlResult`) | `pages` (`[{ url, title, content, depth }]`), `urls_discovered`, `timing_ms` |
+| `pleb crawl` (`CrawlResult`) | `pages` (`[{ url, title, content, depth, status_code, strategy, content_outcome, truncated, acquired_sha256, warning? }]`), `failed_pages` (`[{ url, depth, error, kind }]`, omitted when empty), `urls_discovered`, `timing_ms` |
 | `pleb map` (`MapResult`) | `urls` (`string[]`), `timing_ms`, `from_sitemap` |
 | `pleb auth set` | `provider`, `stored`, `source` |
 | `pleb auth remove` | `provider`, `removed`, `removed_from`, `env_var_still_set` |

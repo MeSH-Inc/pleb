@@ -2860,3 +2860,336 @@ async fn adversarial_fetch_cdp_webmcp_merge_axtree_manifest_timeout_cache_and_un
         .expect("cdp_timeout should be recorded in site_cache");
     assert_eq!(cached.strategy, "cdp_timeout");
 }
+
+#[tokio::test]
+async fn typed_outcomes_representation_identity_crawl_fidelity_and_rendered_shell_guard() {
+    use futures_util::{SinkExt, StreamExt};
+    use pleb::fetch::{sha256_hex, ContentOutcome};
+    use serde_json::{json, Value};
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    const UNHYDRATED_SHELL: &str = r#"<!doctype html><html><head><title>App</title></head><body><div id="root"></div><script src="/a.js"></script><script src="/b.js"></script><script src="/c.js"></script></body></html>"#;
+    const MIRROR_MD: &str =
+        "# Guide Mirror\n\nLossless markdown representation with [spec](./spec.md).\n";
+    let long_prose = format!(
+        "<!doctype html><html><head><title>Long Doc</title></head><body><main><h1>Long Doc</h1><p>{}</p></main></body></html>",
+        "Structured verification paragraph explaining API version qualifiers and constraints. "
+            .repeat(220)
+    );
+    let long_prose_srv = long_prose.clone();
+
+    // 1. Local HTTP origin serving mirror, shell, long doc, resources, and broken child.
+    let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_port = http_listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{http_port}");
+    let base_srv = base.clone();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = http_listener.accept().await else {
+                break;
+            };
+            let origin = base_srv.clone();
+            let long_doc = long_prose_srv.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let (status, ct, body): (&str, &str, Vec<u8>) = match path {
+                    "/guide" => (
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        format!(
+                            r#"<!doctype html><html><head><title>Guide</title><link rel="alternate" type="text/markdown" href="{origin}/guide.md"></head><body><main><h1>Guide</h1><p>HTML body that is long enough to classify as complete without escalation. {}</p></main></body></html>"#,
+                            "Detailed guide text. ".repeat(40)
+                        )
+                        .into_bytes(),
+                    ),
+                    "/guide.md" => ("200 OK", "text/markdown; charset=utf-8", MIRROR_MD.as_bytes().to_vec()),
+                    "/shell" => ("200 OK", "text/html; charset=utf-8", UNHYDRATED_SHELL.as_bytes().to_vec()),
+                    "/resources" => (
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        format!(
+                            r#"<!doctype html><html><head><title>Res</title></head><body><main><h1>Architecture</h1><figure><img src="{origin}/arch.png" width="800" height="400" alt="Architecture diagram"><figcaption>Pipeline Diagram</figcaption></figure><p>{}</p></main></body></html>"#,
+                            "Substantial architecture narrative text. ".repeat(30)
+                        )
+                        .into_bytes(),
+                    ),
+                    "/arch.png" => (
+                        "200 OK",
+                        "image/png",
+                        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR".to_vec(),
+                    ),
+                    "/crawl-seed" => (
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        format!(
+                            r#"<!doctype html><html><head><title>Seed</title></head><body><main><h1>Seed</h1><p>{}</p><a href="{origin}/long-child">Long</a> <a href="{origin}/shell">Shell</a> <a href="{origin}/missing-child">Missing</a></main></body></html>"#,
+                            "Seed page content explaining crawl structure. ".repeat(25)
+                        )
+                        .into_bytes(),
+                    ),
+                    "/long-child" => ("200 OK", "text/html; charset=utf-8", long_doc.into_bytes()),
+                    _ => ("404 Not Found", "text/plain", b"not found".to_vec()),
+                };
+                let hdr = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(hdr.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+            });
+        }
+    });
+
+    // 2. Mock CDP server that returns an unhydrated JavaScript shell even after render.
+    let cdp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cdp_port = cdp_listener.local_addr().unwrap().port();
+    let shell_url_srv = format!("{base}/shell");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = cdp_listener.accept().await else {
+                break;
+            };
+            let shell_url = shell_url_srv.clone();
+            tokio::spawn(async move {
+                let Ok(mut ws) = accept_async(stream).await else {
+                    return;
+                };
+                while let Some(Ok(Message::Text(text))) = ws.next().await {
+                    let Ok(req) = serde_json::from_str::<Value>(&text) else {
+                        continue;
+                    };
+                    let id = req.get("id").and_then(Value::as_u64);
+                    let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+                    let sid = req
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    let frame = |fid: Option<u64>, m: Option<&str>, payload: Value| -> Message {
+                        let mut obj = serde_json::Map::new();
+                        if let Some(i) = fid {
+                            obj.insert("id".into(), json!(i));
+                            obj.insert("result".into(), payload);
+                        } else if let Some(meth) = m {
+                            obj.insert("method".into(), json!(meth));
+                            obj.insert("params".into(), payload);
+                        }
+                        if let Some(ref s) = sid {
+                            obj.insert("sessionId".into(), json!(s));
+                        }
+                        Message::Text(Value::Object(obj).to_string().into())
+                    };
+                    let replies = match method {
+                        "Target.createTarget" => {
+                            vec![frame(id, None, json!({ "targetId": "t-shell" }))]
+                        }
+                        "Target.attachToTarget" => {
+                            vec![frame(id, None, json!({ "sessionId": "s-shell" }))]
+                        }
+                        "Target.closeTarget" | "Page.enable" | "DOM.enable" | "Network.enable"
+                        | "Fetch.enable" | "WebMCP.enable" => {
+                            vec![frame(id, None, json!({}))]
+                        }
+                        "Page.getFrameTree" => vec![frame(
+                            id,
+                            None,
+                            json!({ "frameTree": { "frame": { "id": "mf-shell" } } }),
+                        )],
+                        "Page.navigate" => vec![
+                            frame(
+                                None,
+                                Some("Network.responseReceived"),
+                                json!({
+                                    "requestId": "req-shell",
+                                    "frameId": "mf-shell",
+                                    "type": "Document",
+                                    "response": {
+                                        "url": shell_url,
+                                        "status": 200,
+                                        "headers": { "Content-Type": "text/html; charset=utf-8" }
+                                    }
+                                }),
+                            ),
+                            frame(id, None, json!({ "frameId": "mf-shell" })),
+                            frame(None, Some("Page.loadEventFired"), json!({})),
+                        ],
+                        "DOM.getDocument" => {
+                            vec![frame(id, None, json!({ "root": { "nodeId": 1 } }))]
+                        }
+                        "DOM.getOuterHTML" => {
+                            vec![frame(id, None, json!({ "outerHTML": UNHYDRATED_SHELL }))]
+                        }
+                        _ => {
+                            let mut obj = json!({
+                                "id": id,
+                                "error": { "code": -32601, "message": "not found" }
+                            });
+                            if let Some(ref s) = sid {
+                                obj["sessionId"] = json!(s);
+                            }
+                            vec![Message::Text(obj.to_string().into())]
+                        }
+                    };
+                    for msg in replies {
+                        if ws.send(msg).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    // A. Post-render unhydrated JavaScript shell must surface IncompleteShell + warning and NOT cache "cdp".
+    let cdp_dir = temp_state_dir();
+    let cdp_ctx = RuntimeContext::new(RuntimeConfig {
+        state_dir: cdp_dir.path().to_path_buf(),
+        cef_renderer_executable: Some(cdp_dir.path().join("no-cef")),
+        cdp_url: Some(format!("ws://127.0.0.1:{cdp_port}/devtools/browser")),
+        cdp_timeout: Duration::from_secs(5),
+        no_web_bot_auth: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let rendered_shell = fetch_document(
+        &cdp_ctx,
+        &format!("{base}/shell"),
+        &FetchOptions {
+            render: RenderMode::Cdp,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(rendered_shell.strategy, "cdp");
+    assert_eq!(
+        rendered_shell.content_outcome,
+        ContentOutcome::IncompleteShell
+    );
+    assert_eq!(
+        rendered_shell.acquired_sha256,
+        sha256_hex(UNHYDRATED_SHELL.as_bytes())
+    );
+    assert!(rendered_shell
+        .warning
+        .as_deref()
+        .is_some_and(|w| w.contains("remained unhydrated after CDP render")));
+    assert!(
+        cdp_ctx.site_cache.get("127.0.0.1").is_none(),
+        "post-render unhydrated shell must not poison site_cache"
+    );
+
+    // B. Network-only unrendered shell must surface IncompleteShell and NOT poison site_cache.
+    let net_dir = temp_state_dir();
+    let net_ctx = RuntimeContext::new(RuntimeConfig {
+        state_dir: net_dir.path().to_path_buf(),
+        cef_renderer_executable: Some(net_dir.path().join("no-cef")),
+        no_web_bot_auth: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let net_shell = fetch_document(
+        &net_ctx,
+        &format!("{base}/shell"),
+        &FetchOptions {
+            render: RenderMode::Cronet,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(net_shell.content_outcome, ContentOutcome::IncompleteShell);
+    assert!(net_shell.warning.is_some());
+    assert!(
+        net_ctx.site_cache.get("127.0.0.1").is_none(),
+        "network unrendered shell must not poison site_cache"
+    );
+
+    // C. Markdown mirror records distinct representation_url and exact acquired_sha256 of mirror bytes.
+    let mirror_out = fetch_document(&net_ctx, &format!("{base}/guide"), &FetchOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(mirror_out.strategy, "markdown_mirror");
+    assert_eq!(mirror_out.final_url, format!("{base}/guide"));
+    assert_eq!(
+        mirror_out.representation_url.as_deref(),
+        Some(format!("{base}/guide.md").as_str())
+    );
+    assert_eq!(mirror_out.content_outcome, ContentOutcome::Complete);
+    assert_eq!(mirror_out.acquired_sha256, sha256_hex(MIRROR_MD.as_bytes()));
+
+    // D. --stage-resources supports exact URL selection and warns on missing/drifted selectors.
+    let by_url = fetch_document(
+        &net_ctx,
+        &format!("{base}/resources"),
+        &FetchOptions {
+            stage_resources: vec![format!("{base}/arch.png"), "r99".to_string()],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(by_url.resources[0].staged_path.is_some());
+    assert!(by_url
+        .warning
+        .as_deref()
+        .is_some_and(|w| w.contains("r99") && w.contains("not found")));
+
+    // E. Crawl preserves truncation, IncompleteShell outcome/warning, acquired_sha256, and failed_pages.
+    let crawl_res = crawl(
+        &net_ctx,
+        &format!("{base}/crawl-seed"),
+        CrawlOptions {
+            max_depth: 1,
+            max_pages: 5,
+            format: OutputFormat::Markdown,
+            extract_mode: ExtractMode::Clean,
+            respect_robots: false,
+            path_filter: None,
+        },
+    )
+    .await
+    .unwrap();
+    let seed_page = crawl_res
+        .pages
+        .iter()
+        .find(|p| p.url.ends_with("/crawl-seed"))
+        .expect("seed page collected");
+    assert!(!seed_page.truncated);
+    assert_eq!(seed_page.content_outcome, ContentOutcome::Complete);
+    assert_eq!(seed_page.acquired_sha256.len(), 64);
+
+    let long_page = crawl_res
+        .pages
+        .iter()
+        .find(|p| p.url.ends_with("/long-child"))
+        .expect("long child collected");
+    assert!(
+        long_page.truncated,
+        "10,000-byte crawl cap must preserve truncated=true"
+    );
+    assert_eq!(long_page.content_outcome, ContentOutcome::Complete);
+
+    let shell_page = crawl_res
+        .pages
+        .iter()
+        .find(|p| p.url.ends_with("/shell"))
+        .expect("shell child collected with explicit incomplete_shell outcome");
+    assert_eq!(shell_page.content_outcome, ContentOutcome::IncompleteShell);
+    assert!(shell_page.warning.is_some());
+
+    assert_eq!(crawl_res.failed_pages.len(), 1);
+    assert!(crawl_res.failed_pages[0].url.ends_with("/missing-child"));
+    assert_eq!(crawl_res.failed_pages[0].kind, "http_error");
+    assert_eq!(crawl_res.failed_pages[0].depth, 1);
+}

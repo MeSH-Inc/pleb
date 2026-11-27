@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -145,16 +145,41 @@ impl Default for FetchOptions {
     }
 }
 
+/// Machine-readable completeness classification of acquired document content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentOutcome {
+    /// Acquired document passed response classification with usable content.
+    Complete,
+    /// Response remained an unhydrated JavaScript shell (unrendered or after rendering).
+    IncompleteShell,
+}
+
+/// Compute lowercase SHA-256 hex digest over exact acquired source bytes.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    let mut out = String::with_capacity(digest.as_ref().len() * 2);
+    for byte in digest.as_ref() {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct FetchOutput {
     pub url: String,
     pub final_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub representation_url: Option<String>,
     pub status_code: u16,
     pub content_type: Option<String>,
     pub title: Option<String>,
     pub content: String,
     pub content_bytes: usize,
     pub strategy: String,
+    pub content_outcome: ContentOutcome,
+    pub acquired_sha256: String,
     pub escalated: bool,
     pub truncated: bool,
     pub timing_ms: u64,
@@ -171,6 +196,10 @@ pub struct FetchHtmlResult {
     pub url: String,
     pub status_code: u16,
     pub content_type: Option<String>,
+    pub strategy: String,
+    pub content_outcome: ContentOutcome,
+    pub acquired_sha256: String,
+    pub warning: Option<String>,
     pub parsed: Option<ParsedHtml>,
 }
 
@@ -202,6 +231,7 @@ struct AcquiredPage {
     status_code: u16,
     content_type: Option<String>,
     strategy: String,
+    content_outcome: ContentOutcome,
     escalated: bool,
     warning: Option<String>,
     parsed: Option<ParsedHtml>,
@@ -284,6 +314,12 @@ pub async fn fetch_document(
     )
     .await?;
 
+    let acquired_sha256 = sha256_hex(page.body.as_bytes());
+    let representation_url = page
+        .extract_base_url
+        .as_ref()
+        .map(|u| u.as_str().to_string())
+        .filter(|u| u != &page.final_url);
     let final_url_parsed = url::Url::parse(&page.final_url).unwrap_or_else(|_| effective.clone());
     let extract_url = page.extract_base_url.as_ref().unwrap_or(&final_url_parsed);
     let needs_enrichment = options.resources != ResourcePolicy::None
@@ -327,8 +363,9 @@ pub async fn fetch_document(
         extracted.tools = extract::webmcp::merge_webmcp_tools(extracted.tools, imperative);
     }
 
+    let mut warning = page.warning;
     if needs_enrichment {
-        enrich_document_resources(
+        let missing_resources = enrich_document_resources(
             ctx,
             &final_url_parsed,
             &mut extracted.content,
@@ -336,6 +373,16 @@ pub async fn fetch_document(
             options,
         )
         .await?;
+        if !missing_resources.is_empty() {
+            let drift_warning = format!(
+                "requested resource(s) not found in acquired representation: {}",
+                missing_resources.join(", ")
+            );
+            warning = Some(match warning {
+                Some(existing) => format!("{existing}; {drift_warning}"),
+                None => drift_warning,
+            });
+        }
         if options.tools == ToolPolicy::Manifest && !extracted.tools.is_empty() {
             let manifest = extract::webmcp::format_webmcp_manifest_markdown(&extracted.tools);
             if !manifest.trim().is_empty() {
@@ -361,16 +408,19 @@ pub async fn fetch_document(
     Ok(FetchOutput {
         url: url.to_string(),
         final_url: page.final_url,
+        representation_url,
         status_code: page.status_code,
         content_type: page.content_type,
         title: extracted.title,
         content: extracted.content,
         content_bytes,
         strategy: page.strategy,
+        content_outcome: page.content_outcome,
+        acquired_sha256,
         escalated: page.escalated,
         truncated: extracted.truncated,
         timing_ms: start.elapsed().as_millis() as u64,
-        warning: page.warning,
+        warning,
         resources: extracted.resources,
         tools: extracted.tools,
     })
@@ -392,11 +442,16 @@ pub async fn fetch_html(
         false,
     )
     .await?;
+    let acquired_sha256 = sha256_hex(page.body.as_bytes());
     Ok(FetchHtmlResult {
         html: page.body,
         url: page.final_url,
         status_code: page.status_code,
         content_type: page.content_type,
+        strategy: page.strategy,
+        content_outcome: page.content_outcome,
+        acquired_sha256,
+        warning: page.warning,
         parsed: page.parsed,
     })
 }
@@ -636,7 +691,7 @@ async fn enrich_document_resources(
     content: &mut String,
     resources: &mut [ResourceDescriptor],
     options: &FetchOptions,
-) -> std::result::Result<(), FetchError> {
+) -> std::result::Result<Vec<String>, FetchError> {
     if options.resources == ResourcePolicy::Manifest && !resources.is_empty() {
         let manifest = extract::format_resource_manifest_markdown(resources);
         if !manifest.trim().is_empty() {
@@ -645,27 +700,37 @@ async fn enrich_document_resources(
         }
     }
 
-    let explicit_ids: HashSet<&str> = options
+    let explicit_tokens: Vec<&str> = options
         .stage_resources
         .iter()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
+    let explicit_ids: HashSet<&str> = explicit_tokens.iter().copied().collect();
 
     if matches!(
         options.resources,
         ResourcePolicy::None | ResourcePolicy::Manifest
     ) && explicit_ids.is_empty()
     {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
+    let mut matched_explicit: HashSet<&str> = HashSet::new();
     let mut selected = Vec::new();
     let mut transcript_count = 0usize;
     let mut staged_count = 0usize;
 
     for (index, res) in resources.iter().enumerate() {
-        let explicit = explicit_ids.contains(res.identifier.as_str());
+        let matched_by_id = explicit_ids.contains(res.identifier.as_str());
+        let matched_by_url = explicit_ids.contains(res.url.as_str());
+        if matched_by_id {
+            matched_explicit.insert(res.identifier.as_str());
+        }
+        if matched_by_url {
+            matched_explicit.insert(res.url.as_str());
+        }
+        let explicit = matched_by_id || matched_by_url;
         let policy_match = match options.resources {
             ResourcePolicy::Transcripts => res.kind == ResourceKind::Transcript,
             ResourcePolicy::Diagrams => {
@@ -721,8 +786,15 @@ async fn enrich_document_resources(
         });
     }
 
+    let mut missing_explicit: Vec<String> = Vec::new();
+    for token in explicit_tokens {
+        if !matched_explicit.contains(token) && !missing_explicit.iter().any(|m| m == token) {
+            missing_explicit.push(token.to_string());
+        }
+    }
+
     if selected.is_empty() {
-        return Ok(());
+        return Ok(missing_explicit);
     }
 
     let mut subresource_signer: Option<Arc<crate::transport::web_bot_auth::WebBotAuthSigner>> =
@@ -879,7 +951,7 @@ async fn enrich_document_resources(
         content.push_str("\n\n## Staged Resources\n\n");
         content.push_str(&staged_lines.join("\n"));
     }
-    Ok(())
+    Ok(missing_explicit)
 }
 
 async fn resolve_and_check_robots(
@@ -973,16 +1045,20 @@ async fn try_fetch_raw_source(
         ctx.site_cache
             .record(host, ctx.client.transport_name(), timing_ms);
     }
+    let acquired_sha256 = sha256_hex(body.as_bytes());
     let content_bytes = extracted.content.len();
     Ok(Some(FetchOutput {
         url: original_url.to_string(),
         final_url: resp.final_url,
+        representation_url: None,
         status_code: resp.status,
         content_type: resp.content_type,
         title: extracted.title.or_else(|| Some(candidate.filename.clone())),
         content: extracted.content,
         content_bytes,
         strategy: "raw_source".to_string(),
+        content_outcome: ContentOutcome::Complete,
+        acquired_sha256,
         escalated: false,
         truncated: extracted.truncated,
         timing_ms,
@@ -1316,6 +1392,7 @@ async fn acquire_page(
                 status_code: status,
                 content_type,
                 strategy: strategy.to_string(),
+                content_outcome: ContentOutcome::Complete,
                 escalated: fallback_used,
                 warning: None,
                 parsed,
@@ -1423,15 +1500,7 @@ async fn acquire_page(
                 }
                 EscalationBackend::None => {}
             }
-            let mut page = record_network_page(
-                body,
-                final_url,
-                None,
-                content_type,
-                ctx.client.transport_name(),
-                parsed_html,
-            );
-            page.warning = Some(match escalation_failure {
+            let warning = Some(match escalation_failure {
                 Some((backend, err)) => format!(
                     "JavaScript shell detected ({reason}) and {backend} escalation failed ({err}); returning unrendered HTML"
                 ),
@@ -1446,7 +1515,20 @@ async fn acquire_page(
                     "JavaScript shell detected ({reason}) and browser escalation was skipped; returning unrendered HTML"
                 ),
             });
-            Ok(page)
+            Ok(AcquiredPage {
+                body,
+                final_url,
+                extract_base_url: None,
+                status_code: status,
+                content_type,
+                strategy: ctx.client.transport_name().to_string(),
+                content_outcome: ContentOutcome::IncompleteShell,
+                escalated: fallback_used,
+                warning,
+                parsed: parsed_html,
+                axtree_text: None,
+                imperative_tools: Vec::new(),
+            })
         }
         ResponseClassification::Blocked { status } => {
             match plan.escalation {
@@ -1647,7 +1729,7 @@ fn classify_rendered_result(
         &html,
         &mut parsed_html,
     ) {
-        ResponseClassification::Ok | ResponseClassification::JavaScriptShell { .. } => {
+        ResponseClassification::Ok => {
             let timing_ms = start.elapsed().as_millis() as u64;
             ctx.site_cache.record(host, strategy, timing_ms);
             Ok(AcquiredPage {
@@ -1657,6 +1739,7 @@ fn classify_rendered_result(
                 status_code,
                 content_type,
                 strategy: strategy.to_string(),
+                content_outcome: ContentOutcome::Complete,
                 escalated,
                 warning: None,
                 parsed: parsed_html,
@@ -1664,6 +1747,23 @@ fn classify_rendered_result(
                 imperative_tools,
             })
         }
+        ResponseClassification::JavaScriptShell { reason } => Ok(AcquiredPage {
+            body: html,
+            final_url,
+            extract_base_url: None,
+            status_code,
+            content_type,
+            strategy: strategy.to_string(),
+            content_outcome: ContentOutcome::IncompleteShell,
+            escalated,
+            warning: Some(format!(
+                "JavaScript shell remained unhydrated after {} render ({reason}); returning partial rendered HTML",
+                strategy.to_ascii_uppercase()
+            )),
+            parsed: parsed_html,
+            axtree_text,
+            imperative_tools,
+        }),
         ResponseClassification::Blocked { status } => Err(FetchError::Blocked {
             url: final_url,
             status,
@@ -1918,10 +2018,14 @@ pub struct BatchItemSuccess {
     pub url: String,
     pub ok: bool,
     pub final_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub representation_url: Option<String>,
     pub status_code: u16,
     pub content_type: Option<String>,
     pub title: Option<String>,
     pub strategy: String,
+    pub content_outcome: ContentOutcome,
+    pub acquired_sha256: String,
     pub escalated: bool,
     pub truncated: bool,
     pub timing_ms: u64,
@@ -1948,7 +2052,7 @@ pub struct BatchItemFailure {
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum BatchItemResult {
-    Success(BatchItemSuccess),
+    Success(Box<BatchItemSuccess>),
     Failure(BatchItemFailure),
 }
 
@@ -1959,14 +2063,17 @@ impl BatchItemResult {
         metadata_only: bool,
     ) -> Self {
         match res {
-            Ok(out) => Self::Success(BatchItemSuccess {
+            Ok(out) => Self::Success(Box::new(BatchItemSuccess {
                 url: out.url,
                 ok: true,
                 final_url: out.final_url,
+                representation_url: out.representation_url,
                 status_code: out.status_code,
                 content_type: out.content_type,
                 title: out.title,
                 strategy: out.strategy,
+                content_outcome: out.content_outcome,
+                acquired_sha256: out.acquired_sha256,
                 escalated: out.escalated,
                 truncated: out.truncated,
                 timing_ms: out.timing_ms,
@@ -1975,7 +2082,7 @@ impl BatchItemResult {
                 content: (!metadata_only).then_some(out.content),
                 resources: out.resources,
                 tools: out.tools,
-            }),
+            })),
             Err(err) => Self::Failure(BatchItemFailure {
                 url: url.to_string(),
                 ok: false,

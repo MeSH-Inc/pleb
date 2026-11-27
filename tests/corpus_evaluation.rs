@@ -816,6 +816,8 @@ fn corpus_evaluation_scorecard() {
         }
     }
 
+    let mut frontier_total = 0usize;
+    let mut frontier_pass = 0usize;
     for path in &paths {
         let (id, spec, out) = evaluate_fixture(path);
         if let Some(d) = out.md_density {
@@ -829,6 +831,10 @@ fn corpus_evaluation_scorecard() {
                 ratchet_errors.push(format!("{id}: {}", out.failures.join("; ")));
             }
         } else {
+            frontier_total += 1;
+            if out.passed {
+                frontier_pass += 1;
+            }
             f_cls_n += 1;
             if out.cls_exact {
                 f_cls_sum += 1.0;
@@ -848,28 +854,23 @@ fn corpus_evaluation_scorecard() {
     }
 
     let ratchet_rate = ratchet_pass as f64 / ratchet_total.max(1) as f64;
-    let f_cls = if f_cls_n > 0 {
-        f_cls_sum / f_cls_n as f64
-    } else {
-        1.0
+    let fmt_opt = |sum: f64, n: usize| -> String {
+        if n > 0 {
+            format!("{:.3} ({n})", sum / n as f64)
+        } else {
+            "N/A (0)".to_string()
+        }
     };
-    let f_rec = if f_rec_n > 0 {
-        f_rec_sum / f_rec_n as f64
-    } else {
-        1.0
-    };
-    let f_sup = if f_sup_n > 0 {
-        f_sup_sum / f_sup_n as f64
-    } else {
-        1.0
-    };
+    let f_cls = fmt_opt(f_cls_sum, f_cls_n);
+    let f_rec = fmt_opt(f_rec_sum, f_rec_n);
+    let f_sup = fmt_opt(f_sup_sum, f_sup_n);
     let density = if densities.is_empty() {
         0.0
     } else {
         densities.iter().sum::<f64>() / densities.len() as f64
     };
     println!(
-        "[SCORECARD] ratchet={ratchet_rate:.3} frontier_cls={f_cls:.3} frontier_recall={f_rec:.3} frontier_suppress={f_sup:.3} signal_density={density:.3}"
+        "[SCORECARD] ratchet={ratchet_pass}/{ratchet_total} ({ratchet_rate:.3}) frontier={frontier_pass}/{frontier_total} frontier_cls={f_cls} frontier_recall={f_rec} frontier_suppress={f_sup} signal_density={density:.3}"
     );
     assert!(
         ratchet_errors.is_empty() && (ratchet_rate - 1.0).abs() < f64::EPSILON,
