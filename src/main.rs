@@ -260,12 +260,12 @@ enum Command {
         /// Claude Code MCP scope (user, local, or project)
         #[arg(long, value_enum, default_value_t = setup::ClaudeScope::User, ignore_case = true)]
         scope: setup::ClaudeScope,
-        /// Claude Code WebFetch hook mode (fallback, redirect, or none)
+        /// Claude Code WebFetch hook mode (redirect, fallback, or none)
         #[arg(
             long,
             value_enum,
-            default_value_t = setup::HookMode::Fallback,
-            default_missing_value = "fallback",
+            default_value_t = setup::HookMode::Redirect,
+            default_missing_value = "redirect",
             num_args = 0..=1,
             ignore_case = true
         )]
@@ -289,10 +289,10 @@ enum Command {
 
 #[derive(Subcommand)]
 enum HookAction {
-    /// Claude Code WebFetch hook adapter (PostToolUseFailure fallback or PreToolUse redirect)
+    /// Claude Code WebFetch hook adapter (PreToolUse redirect or PostToolUseFailure fallback)
     ClaudeWebfetch {
         /// Hook mode configured in Claude Code settings
-        #[arg(long, value_enum, default_value_t = setup::HookMode::Fallback, ignore_case = true)]
+        #[arg(long, value_enum, default_value_t = setup::HookMode::Redirect, ignore_case = true)]
         mode: setup::HookMode,
     },
 }

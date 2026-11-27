@@ -616,8 +616,8 @@ pleb search --extra-snippets "cronet http2"
 ### Daemon, Session, Status, MCP, Setup, and Skill Commands
 
 ```bash
-pleb setup                  # Register `pleb mcp`, Claude Code WebFetch hook (--hooks fallback|redirect|none), and skill (--target, --scope, --skip-skill, --remove, --dry-run)
-pleb hook claude-webfetch  # Claude Code WebFetch hook adapter (--mode fallback|redirect)
+pleb setup                  # Register `pleb mcp`, Claude Code WebFetch hook (--hooks redirect|fallback|none, default redirect), and skill (--target, --scope, --skip-skill, --remove, --dry-run)
+pleb hook claude-webfetch  # Claude Code WebFetch hook adapter (--mode redirect|fallback)
 pleb mcp                    # Run stdio JSON-RPC 2.0 MCP server (pleb_fetch, pleb_search, pleb_crawl, pleb_map, pleb_status)
 pleb status                 # Binary, Cronet, CEF, daemon, state dir, search providers (--json supported)
 pleb daemon status          # Transport daemon status (--json supported)

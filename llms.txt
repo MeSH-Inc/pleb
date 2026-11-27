@@ -2,7 +2,7 @@
 
 > Local, MIT-licensed, zero-telemetry web acquisition CLI and stdio MCP server (`pleb`) by Memory Sync Hub LLC, built to unblock `403`s and empty JS shells in Claude Code and Codex.
 
-`pleb` wires into Claude Code and Codex via `pleb setup` (`pleb mcp`, bundled skill, and `WebFetch` hooks via `--hooks fallback|redirect|none`), fetches over Chromium 154 Cronet (or cookie-jar `reqwest`) with `CEF v5-meta` / WebSocket CDP escalation (`--render cdp`) and optional RFC 9421 signing (`pleb auth init-web-bot-auth`), and fails fast (exit `2`) on active bot challenges without CAPTCHA bypass.
+`pleb` wires into Claude Code and Codex via `pleb setup` (`pleb mcp`, bundled skill, and `WebFetch` hooks via `--hooks redirect|fallback|none`), fetches over Chromium 154 Cronet (or cookie-jar `reqwest`) with `CEF v5-meta` / WebSocket CDP escalation (`--render cdp`) and optional RFC 9421 signing (`pleb auth init-web-bot-auth`), and fails fast (exit `2`) on active bot challenges without CAPTCHA bypass.
 
 ## Primary Docs
 

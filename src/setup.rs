@@ -40,8 +40,8 @@ impl ClaudeScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookMode {
-    #[default]
     Fallback,
+    #[default]
     Redirect,
     None,
 }
@@ -72,7 +72,7 @@ impl Default for SetupOptions {
         Self {
             target: SetupTarget::All,
             claude_scope: ClaudeScope::User,
-            hooks: HookMode::Fallback,
+            hooks: HookMode::Redirect,
             remove: false,
             dry_run: false,
             pleb_binary: None,

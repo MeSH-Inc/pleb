@@ -15,17 +15,17 @@ cargo install pleb
 # Optional: local offscreen CEF v5-meta renderer for automatic 403/SPA escalation
 bash scripts/install-cef-mac.sh --force   # or bash scripts/install-cef-linux.sh --force
 
-# Register `pleb mcp`, bundled SKILL.md, and Claude Code WebFetch hook (fallback on failure by default)
+# Register `pleb mcp`, bundled SKILL.md, and Claude Code WebFetch hook (PreToolUse redirect by default)
 pleb setup
 ```
 
-See [Installation and Runtime Setup](README-FULL.md#installation-and-runtime-setup) for prerequisites, `--hooks` options (`fallback`, `redirect`, `none`), and verification.
+See [Installation and Runtime Setup](README-FULL.md#installation-and-runtime-setup) for prerequisites, `--hooks` options (`redirect`, `fallback`, `none`), and verification.
 
 ## Quick Start
 
 ```bash
-# Intercept built-in Claude WebFetch before it runs (--hooks redirect), or inspect readiness
-pleb setup --hooks redirect
+# Fall back only when built-in WebFetch errors (--hooks fallback), or inspect readiness
+pleb setup --hooks fallback
 pleb status
 
 # Fetch as clean Markdown (auto-escalates 403/JS shells to CEF/CDP when available)

@@ -565,8 +565,8 @@ async fn setup_claude_webfetch_hooks_preserve_settings_switch_modes_and_run_prot
     )
     .unwrap();
 
-    // 1. Install default fallback hook (PostToolUseFailure) via --hooks fallback.
-    let fb = Command::new(pleb_bin)
+    // 1. Install default redirect hook (PreToolUse) when --hooks is omitted.
+    let redir = Command::new(pleb_bin)
         .env("HOME", &fake_home)
         .env("PLEB_NO_HOME_CEF", "1")
         .env("PLEB_NO_KEYCHAIN", "1")
@@ -580,53 +580,33 @@ async fn setup_claude_webfetch_hooks_preserve_settings_switch_modes_and_run_prot
         .await
         .unwrap();
     assert!(
-        fb.status.success(),
+        redir.status.success(),
         "{}",
-        String::from_utf8_lossy(&fb.stderr)
+        String::from_utf8_lossy(&redir.stderr)
     );
-    let fb_json: Value = serde_json::from_slice(&fb.stdout).unwrap();
-    assert_eq!(fb_json["hook"]["status"], "configured");
-    assert_eq!(fb_json["hook"]["mode"], "fallback");
+    let redir_json: Value = serde_json::from_slice(&redir.stdout).unwrap();
+    assert_eq!(redir_json["hook"]["status"], "configured");
+    assert_eq!(redir_json["hook"]["mode"], "redirect");
 
-    let after_fb: Value =
+    let after_redir: Value =
         serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
-    assert_eq!(after_fb["theme"], "dark");
-    assert_eq!(after_fb["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
-    let post_entries = after_fb["hooks"]["PostToolUseFailure"].as_array().unwrap();
-    assert_eq!(post_entries.len(), 2);
+    assert_eq!(after_redir["theme"], "dark");
     assert_eq!(
-        post_entries[1]["hooks"][0]["command"],
-        "/fake/bin/pleb hook claude-webfetch --mode fallback"
+        after_redir["hooks"]["PostToolUseFailure"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let pre_entries = after_redir["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(pre_entries.len(), 2);
+    assert_eq!(
+        pre_entries[1]["hooks"][0]["command"],
+        "/fake/bin/pleb hook claude-webfetch --mode redirect"
     );
 
     // 2. Repeating the same hook install is idempotent (`up_to_date`).
-    let fb_again = Command::new(pleb_bin)
-        .env("HOME", &fake_home)
-        .env("PLEB_NO_HOME_CEF", "1")
-        .env("PLEB_NO_KEYCHAIN", "1")
-        .env("PLEB_CLAUDE_BIN", &mock_claude)
-        .env("PLEB_CLAUDE_SETTINGS", &settings_path)
-        .env("PLEB_SETUP_BINARY", "/fake/bin/pleb")
-        .args(["--state-dir"])
-        .arg(&state_dir)
-        .args([
-            "--json",
-            "setup",
-            "--target",
-            "claude",
-            "--hooks",
-            "fallback",
-            "--skip-skill",
-        ])
-        .output()
-        .await
-        .unwrap();
-    assert!(fb_again.status.success());
-    let fb_again_json: Value = serde_json::from_slice(&fb_again.stdout).unwrap();
-    assert_eq!(fb_again_json["hook"]["status"], "up_to_date");
-
-    // 3. Switching to `--hooks redirect` removes PostToolUseFailure pleb entry and installs PreToolUse.
-    let redir = Command::new(pleb_bin)
+    let redir_again = Command::new(pleb_bin)
         .env("HOME", &fake_home)
         .env("PLEB_NO_HOME_CEF", "1")
         .env("PLEB_NO_KEYCHAIN", "1")
@@ -647,25 +627,45 @@ async fn setup_claude_webfetch_hooks_preserve_settings_switch_modes_and_run_prot
         .output()
         .await
         .unwrap();
-    assert!(redir.status.success());
-    let redir_json: Value = serde_json::from_slice(&redir.stdout).unwrap();
-    assert_eq!(redir_json["hook"]["status"], "configured");
-    assert_eq!(redir_json["hook"]["mode"], "redirect");
+    assert!(redir_again.status.success());
+    let redir_again_json: Value = serde_json::from_slice(&redir_again.stdout).unwrap();
+    assert_eq!(redir_again_json["hook"]["status"], "up_to_date");
 
-    let after_redir: Value =
+    // 3. Switching to `--hooks fallback` removes PreToolUse pleb entry and installs PostToolUseFailure.
+    let fb = Command::new(pleb_bin)
+        .env("HOME", &fake_home)
+        .env("PLEB_NO_HOME_CEF", "1")
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .env("PLEB_CLAUDE_BIN", &mock_claude)
+        .env("PLEB_CLAUDE_SETTINGS", &settings_path)
+        .env("PLEB_SETUP_BINARY", "/fake/bin/pleb")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args([
+            "--json",
+            "setup",
+            "--target",
+            "claude",
+            "--hooks",
+            "fallback",
+            "--skip-skill",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(fb.status.success());
+    let fb_json: Value = serde_json::from_slice(&fb.stdout).unwrap();
+    assert_eq!(fb_json["hook"]["status"], "configured");
+    assert_eq!(fb_json["hook"]["mode"], "fallback");
+
+    let after_fb: Value =
         serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(after_fb["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+    let post_entries = after_fb["hooks"]["PostToolUseFailure"].as_array().unwrap();
+    assert_eq!(post_entries.len(), 2);
     assert_eq!(
-        after_redir["hooks"]["PostToolUseFailure"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    let pre_entries = after_redir["hooks"]["PreToolUse"].as_array().unwrap();
-    assert_eq!(pre_entries.len(), 2);
-    assert_eq!(
-        pre_entries[1]["hooks"][0]["command"],
-        "/fake/bin/pleb hook claude-webfetch --mode redirect"
+        post_entries[1]["hooks"][0]["command"],
+        "/fake/bin/pleb hook claude-webfetch --mode fallback"
     );
 
     // 4. `--remove` strips only pleb's hook and leaves unrelated settings/hooks intact.
@@ -772,7 +772,7 @@ async fn setup_claude_webfetch_hooks_preserve_settings_switch_modes_and_run_prot
     assert!(wba_json["public_jwk"]["d"].is_null());
     assert!(!String::from_utf8_lossy(&wba_out.stdout).contains("\"d\""));
 
-    // 7. Bare `--hooks --dry-run` plans fallback hook without creating settings.json.
+    // 7. Bare `--hooks --dry-run` plans redirect hook without creating settings.json.
     let dry_settings_path = work.join("nonexistent-claude/settings.json");
     let dry_hooks = Command::new(pleb_bin)
         .env("HOME", &fake_home)
@@ -805,7 +805,7 @@ async fn setup_claude_webfetch_hooks_preserve_settings_switch_modes_and_run_prot
     );
     let dry_hooks_json: Value = serde_json::from_slice(&dry_hooks.stdout).unwrap();
     assert_eq!(dry_hooks_json["hook"]["status"], "planned");
-    assert_eq!(dry_hooks_json["hook"]["mode"], "fallback");
+    assert_eq!(dry_hooks_json["hook"]["mode"], "redirect");
 
     let _ = std::fs::remove_dir_all(&work);
 }

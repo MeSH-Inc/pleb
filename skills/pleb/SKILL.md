@@ -16,8 +16,8 @@ Local, MIT-licensed, zero-telemetry web acquisition CLI and stdio MCP server by 
 Register `pleb mcp` (`pleb_fetch`, `pleb_search`, `pleb_crawl`, `pleb_map`, `pleb_status`) and the bundled `SKILL.md` into Claude Code and Codex, or run the stdio MCP server directly:
 
 ```bash
-pleb setup [--target all|claude|codex] [--scope user|local|project] [--hooks fallback|redirect|none] [--skip-skill] [--remove] [--dry-run]
-pleb hook claude-webfetch --mode <fallback|redirect>
+pleb setup [--target all|claude|codex] [--scope user|local|project] [--hooks redirect|fallback|none] [--skip-skill] [--remove] [--dry-run]
+pleb hook claude-webfetch --mode <redirect|fallback>
 pleb mcp
 pleb status --json
 ```

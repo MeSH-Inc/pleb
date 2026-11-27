@@ -5,8 +5,8 @@
 Verify any host installation and wire Claude Code / Codex MCP integration:
 
 ```bash
-pleb setup [--target all|claude|codex] [--scope user|local|project] [--hooks fallback|redirect|none] [--skip-skill] [--remove] [--dry-run]
-pleb hook claude-webfetch --mode <fallback|redirect>
+pleb setup [--target all|claude|codex] [--scope user|local|project] [--hooks redirect|fallback|none] [--skip-skill] [--remove] [--dry-run]
+pleb hook claude-webfetch --mode <redirect|fallback>
 pleb mcp
 pleb status --json
 pleb skill print
@@ -118,8 +118,8 @@ Notes:
 - `pleb crawl <URL> [-d 2] [-n 10] [--extract clean|article|full] [--path-filter PREFIX] [--no-robots]` (respects `robots.txt` + `Crawl-delay` by default; max `--depth 5`, `--max-pages 50`, `10,000`-byte per-page cap, `100,000`-byte plain output cap; exits non-zero if the seed URL fails)
 - `pleb map <URL> [-n 100] [--path-filter PREFIX] [--no-sitemap] [--no-robots]` (max `--limit 5000`; sitemaps plus up to `20` HTML page crawls)
 - `pleb mcp` *(newline-delimited JSON-RPC 2.0 stdio MCP server exposing `pleb_fetch`, `pleb_search`, `pleb_crawl`, `pleb_map`, and `pleb_status`)*
-- `pleb setup [--target all|claude|codex] [--scope user|local|project] [--hooks fallback|redirect|none] [--skip-skill] [--remove] [--dry-run]` *(registers `pleb mcp`, optional Claude Code `WebFetch` hook, and bundled skill into Claude Code and Codex)*
-- `pleb hook claude-webfetch --mode <fallback|redirect>` *(Claude Code `PostToolUseFailure` fallback hint on exit `0`, or `PreToolUse` `WebFetch` block on exit `2`)*
+- `pleb setup [--target all|claude|codex] [--scope user|local|project] [--hooks redirect|fallback|none] [--skip-skill] [--remove] [--dry-run]` *(registers `pleb mcp`, Claude Code `WebFetch` hook — `redirect` by default, or `fallback`/`none` — and bundled skill into Claude Code and Codex)*
+- `pleb hook claude-webfetch --mode <redirect|fallback>` *(Claude Code `PreToolUse` `WebFetch` block on exit `2`, or `PostToolUseFailure` fallback hint on exit `0`)*
 - `pleb status [--json]`, `pleb daemon <status|stop|run>`, `pleb session clear`, `pleb skill print [--json]`, `pleb skill install [--dir <PATH>] [--force]`
 
 ## Environment Variables
