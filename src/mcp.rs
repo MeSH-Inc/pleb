@@ -11,7 +11,7 @@ use crate::extract::{ExtractMode, ExtractOptions, OutputFormat};
 use crate::fetch::{self, FetchError, FetchOptions};
 use crate::policy::{RenderMode, SourceMode};
 use crate::search::{self, Freshness, SearchMode, SearchOptions, SearchProvider};
-use crate::transport::cef::{self, RendererProbe};
+use crate::transport::cef;
 
 const MAX_MCP_LINE_BYTES: usize = 4 * 1024 * 1024;
 const SUPPORTED_PROTOCOLS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -408,10 +408,7 @@ async fn call_crawl(
 
     match crawl::crawl(ctx, &url, opts).await {
         Ok(result) => {
-            let host = url::Url::parse(&url)
-                .ok()
-                .and_then(|u| u.host_str().map(str::to_string))
-                .unwrap_or_else(|| url.clone());
+            let host = crawl::url_host_or_raw(&url);
             Ok(tool_ok(crawl::format_crawl_output(&result, &host)))
         }
         Err(err) => match err.downcast::<FetchError>() {
@@ -444,10 +441,7 @@ async fn call_map(
 
     match crawl::map(ctx, &url, opts).await {
         Ok(result) => {
-            let host = url::Url::parse(&url)
-                .ok()
-                .and_then(|u| u.host_str().map(str::to_string))
-                .unwrap_or_else(|| url.clone());
+            let host = crawl::url_host_or_raw(&url);
             Ok(tool_ok(crawl::format_map_output(&result, &host)))
         }
         Err(err) => Ok(tool_error(json!({
@@ -459,32 +453,11 @@ async fn call_map(
 }
 
 fn build_mcp_status_text(ctx: &RuntimeContext) -> String {
-    let cef_probe = cef::probe_renderer_with_override(
+    let cef_renderer = cef::probe_renderer_with_override(
         &ctx.config.state_dir,
         ctx.config.cef_renderer_executable.as_deref(),
-    );
-    let cef_renderer = match cef_probe {
-        RendererProbe::Ready(path) => json!({
-            "status": "ready",
-            "path": path.display().to_string(),
-            "expected_protocol": cef::EXPECTED_PROTOCOL,
-        }),
-        RendererProbe::ProtocolMismatch {
-            path,
-            found,
-            expected,
-        } => json!({
-            "status": "protocol_mismatch",
-            "path": path.display().to_string(),
-            "found_protocol": found,
-            "expected_protocol": expected,
-        }),
-        RendererProbe::NotInstalled => json!({
-            "status": "not_installed",
-            "path": null,
-            "expected_protocol": cef::EXPECTED_PROTOCOL,
-        }),
-    };
+    )
+    .to_status();
 
     let cdp_url = ctx
         .configured_cdp_url()

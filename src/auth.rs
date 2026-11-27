@@ -30,7 +30,8 @@ const VAULT_NONCE_LEN: usize = 12;
 const VAULT_KEY_LEN: usize = 32;
 const VAULT_AAD: &[u8] = b"pleb-vault-v1";
 
-fn zeroize_bytes(bytes: &mut [u8]) {
+/// Overwrites sensitive bytes in place with a compiler fence.
+pub fn zeroize_bytes(bytes: &mut [u8]) {
     for byte in bytes {
         unsafe { std::ptr::write_volatile(byte, 0) };
     }
@@ -847,6 +848,26 @@ fn open_vault_map(vault_path: &Path, raw: &[u8], key: &[u8]) -> Result<Zeroizing
     Ok(ZeroizingCredentialMap(parsed))
 }
 
+fn ensure_existing_private_dir(state_dir: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(state_dir) {
+        Ok(_) => {
+            ensure_private_dir(state_dir)?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn require_vault_key(vault_path: &Path, store: &dyn VaultKeyStore) -> Result<ZeroizingBytes> {
+    store.get_key()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "credentials vault {} exists but macOS Keychain master key \"{KEYCHAIN_VAULT_ACCOUNT}\" (service \"{KEYCHAIN_SERVICE}\") is missing",
+            vault_path.display()
+        )
+    })
+}
+
 fn read_vault_map_locked(
     vault_path: &Path,
     store: &dyn VaultKeyStore,
@@ -854,12 +875,7 @@ fn read_vault_map_locked(
     let Some(raw_bytes) = read_private_file_bytes_locked(vault_path)? else {
         return Ok(None);
     };
-    let key = store.get_key()?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "credentials vault {} exists but macOS Keychain master key \"{KEYCHAIN_VAULT_ACCOUNT}\" (service \"{KEYCHAIN_SERVICE}\") is missing",
-            vault_path.display()
-        )
-    })?;
+    let key = require_vault_key(vault_path, store)?;
     open_vault_map(vault_path, &raw_bytes.0, &key.0).map(Some)
 }
 
@@ -874,12 +890,7 @@ fn vault_set_with_store(
     let vault_path = state_dir.join(VAULT_FILE_NAME);
     let (key, mut map) = match read_private_file_bytes_locked(&vault_path)? {
         Some(raw_bytes) => {
-            let key = store.get_key()?.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "credentials vault {} exists but macOS Keychain master key \"{KEYCHAIN_VAULT_ACCOUNT}\" (service \"{KEYCHAIN_SERVICE}\") is missing",
-                    vault_path.display()
-                )
-            })?;
+            let key = require_vault_key(&vault_path, store)?;
             let map = open_vault_map(&vault_path, &raw_bytes.0, &key.0)?;
             (key, map)
         }
@@ -900,22 +911,15 @@ fn vault_delete_with_store(
     provider: CredentialProvider,
     store: &dyn VaultKeyStore,
 ) -> Result<bool> {
-    match std::fs::symlink_metadata(state_dir) {
-        Ok(_) => ensure_private_dir(state_dir)?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(err.into()),
+    if !ensure_existing_private_dir(state_dir)? {
+        return Ok(false);
     }
     let _lock = acquire_private_lock(&state_dir.join(CREDENTIALS_LOCK_NAME))?;
     let vault_path = state_dir.join(VAULT_FILE_NAME);
     let Some(raw_bytes) = read_private_file_bytes_locked(&vault_path)? else {
         return Ok(false);
     };
-    let key = store.get_key()?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "credentials vault {} exists but macOS Keychain master key \"{KEYCHAIN_VAULT_ACCOUNT}\" (service \"{KEYCHAIN_SERVICE}\") is missing",
-            vault_path.display()
-        )
-    })?;
+    let key = require_vault_key(&vault_path, store)?;
     let mut map = open_vault_map(&vault_path, &raw_bytes.0, &key.0)?;
     let Some(removed_val) = map.0.remove(provider.as_str()) else {
         return Ok(false);
@@ -945,10 +949,8 @@ fn file_set(state_dir: &Path, provider: CredentialProvider, secret: &SecretStrin
 }
 
 fn file_delete(state_dir: &Path, provider: CredentialProvider) -> Result<bool> {
-    match std::fs::symlink_metadata(state_dir) {
-        Ok(_) => ensure_private_dir(state_dir)?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(err.into()),
+    if !ensure_existing_private_dir(state_dir)? {
+        return Ok(false);
     }
     let _lock = acquire_private_lock(&state_dir.join(CREDENTIALS_LOCK_NAME))?;
     let creds_path = state_dir.join(CREDENTIALS_FILE_NAME);
@@ -1036,41 +1038,30 @@ fn resolve_provider_results_with_store(
         }
     }
 
-    if !unresolved_indices.is_empty() {
-        let state_exists = match std::fs::symlink_metadata(state_dir) {
-            Ok(_) => {
-                ensure_private_dir(state_dir)?;
-                true
+    if !unresolved_indices.is_empty() && ensure_existing_private_dir(state_dir)? {
+        let _lock = acquire_private_lock(&state_dir.join(CREDENTIALS_LOCK_NAME))?;
+        if let Some(store) = vault_store {
+            if let Some(mut vault_map) =
+                read_vault_map_locked(&state_dir.join(VAULT_FILE_NAME), store)?
+            {
+                populate_from_map(
+                    &mut slots,
+                    &mut unresolved_indices,
+                    &mut vault_map.0,
+                    CredentialSource::Keychain,
+                );
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
-            Err(err) => return Err(err.into()),
-        };
-
-        if state_exists {
-            let _lock = acquire_private_lock(&state_dir.join(CREDENTIALS_LOCK_NAME))?;
-            if let Some(store) = vault_store {
-                if let Some(mut vault_map) =
-                    read_vault_map_locked(&state_dir.join(VAULT_FILE_NAME), store)?
-                {
-                    populate_from_map(
-                        &mut slots,
-                        &mut unresolved_indices,
-                        &mut vault_map.0,
-                        CredentialSource::Keychain,
-                    );
-                }
-            }
-            if !unresolved_indices.is_empty() {
-                let (mut file_map, existed) =
-                    read_credentials_map_locked(&state_dir.join(CREDENTIALS_FILE_NAME))?;
-                if existed {
-                    populate_from_map(
-                        &mut slots,
-                        &mut unresolved_indices,
-                        &mut file_map.0,
-                        CredentialSource::File,
-                    );
-                }
+        }
+        if !unresolved_indices.is_empty() {
+            let (mut file_map, existed) =
+                read_credentials_map_locked(&state_dir.join(CREDENTIALS_FILE_NAME))?;
+            if existed {
+                populate_from_map(
+                    &mut slots,
+                    &mut unresolved_indices,
+                    &mut file_map.0,
+                    CredentialSource::File,
+                );
             }
         }
     }
@@ -1078,13 +1069,20 @@ fn resolve_provider_results_with_store(
     Ok(slots)
 }
 
+fn resolve_with_system_store(
+    state_dir: &Path,
+    providers: &[CredentialProvider],
+) -> Result<Vec<ProviderResolution>> {
+    let sys_store = SystemKeychainStore;
+    let vault_store: Option<&dyn VaultKeyStore> = keychain_enabled().then_some(&sys_store);
+    resolve_provider_results_with_store(state_dir, providers, vault_store)
+}
+
 pub fn resolve_credential(
     state_dir: &Path,
     provider: CredentialProvider,
 ) -> Result<Option<ResolvedCredential>> {
-    let sys_store = SystemKeychainStore;
-    let vault_store: Option<&dyn VaultKeyStore> = keychain_enabled().then_some(&sys_store);
-    let mut results = resolve_provider_results_with_store(state_dir, &[provider], vault_store)?;
+    let mut results = resolve_with_system_store(state_dir, &[provider])?;
     match results.pop() {
         Some((_, res)) => res,
         None => Ok(None),
@@ -1159,18 +1157,14 @@ pub fn remove_credential(
 pub fn resolve_all_provider_results(
     state_dir: &Path,
 ) -> Result<Vec<(CredentialProvider, Result<Option<ResolvedCredential>>)>> {
-    let sys_store = SystemKeychainStore;
-    let vault_store: Option<&dyn VaultKeyStore> = keychain_enabled().then_some(&sys_store);
-    resolve_provider_results_with_store(state_dir, CredentialProvider::ALL, vault_store)
+    resolve_with_system_store(state_dir, CredentialProvider::ALL)
 }
 
 pub fn resolve_credentials(
     state_dir: &Path,
     providers: &[CredentialProvider],
 ) -> Result<BTreeMap<CredentialProvider, ResolvedCredential>> {
-    let sys_store = SystemKeychainStore;
-    let vault_store: Option<&dyn VaultKeyStore> = keychain_enabled().then_some(&sys_store);
-    let entries = resolve_provider_results_with_store(state_dir, providers, vault_store)?;
+    let entries = resolve_with_system_store(state_dir, providers)?;
     let mut map = BTreeMap::new();
     for (provider, res) in entries {
         if let Some(cred) = res? {
@@ -1255,15 +1249,12 @@ pub fn resolve_agent_identity_status(
     state_dir: &Path,
     no_web_bot_auth: bool,
 ) -> AgentIdentityStatus {
-    let sys_store = SystemKeychainStore;
-    let vault_store: Option<&dyn VaultKeyStore> = keychain_enabled().then_some(&sys_store);
-    let results = match resolve_provider_results_with_store(
+    let results = match resolve_with_system_store(
         state_dir,
         &[
             CredentialProvider::WebBotAuthJwk,
             CredentialProvider::WebBotAuthAgent,
         ],
-        vault_store,
     ) {
         Ok(res) => res,
         Err(err) => {
@@ -1345,16 +1336,13 @@ pub fn cdp_access_status_from_results(
 }
 
 pub fn resolve_cdp_access_status(state_dir: &Path) -> CdpAccessStatus {
-    let sys_store = SystemKeychainStore;
-    let vault_store: Option<&dyn VaultKeyStore> = keychain_enabled().then_some(&sys_store);
-    let results = match resolve_provider_results_with_store(
+    let results = match resolve_with_system_store(
         state_dir,
         &[
             CredentialProvider::CdpAccessClientId,
             CredentialProvider::CdpAccessClientSecret,
             CredentialProvider::CdpAccessHost,
         ],
-        vault_store,
     ) {
         Ok(res) => res,
         Err(err) => {

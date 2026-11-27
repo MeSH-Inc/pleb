@@ -152,22 +152,10 @@ impl DaemonResponseHeader {
     ) -> Self {
         Self {
             ok: false,
-            protocol_version: PROTOCOL_VERSION,
-            build_id: BUILD_ID.to_string(),
-            pid: None,
-            active_requests: None,
-            cronet_slots: None,
-            cef_renderers_alive: None,
-            status_code: None,
-            final_url: None,
-            content_type: None,
-            link_header: None,
-            location_header: None,
-            diagnostics: DiagnosticHeaders::default(),
-            body_bytes: 0,
             error: Some(message.into()),
             error_kind: kind,
             limit_bytes,
+            ..Self::ok_empty()
         }
     }
 }

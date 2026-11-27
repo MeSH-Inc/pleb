@@ -766,6 +766,14 @@ fn normalize_url(url: &str) -> String {
     }
 }
 
+/// Returns the URL host string for display output, falling back to `raw`.
+pub fn url_host_or_raw(raw: &str) -> String {
+    Url::parse(raw)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_else(|| raw.to_string())
+}
+
 fn get_origin(url: &Url) -> String {
     url.origin().ascii_serialization()
 }

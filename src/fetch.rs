@@ -2059,7 +2059,12 @@ fn is_non_retryable_cef_error(err: &anyhow::Error) -> bool {
     )
 }
 
-fn map_transport_error(url: &str, err: anyhow::Error, max_response_bytes: usize) -> FetchError {
+fn map_backend_error(
+    url: &str,
+    err: anyhow::Error,
+    max_response_bytes: usize,
+    on_protocol_mismatch: fn(String) -> FetchError,
+) -> FetchError {
     if let Some(too_large) = err.downcast_ref::<ResponseTooLargeError>() {
         return FetchError::ResponseTooLarge {
             url: url.to_string(),
@@ -2075,9 +2080,13 @@ fn map_transport_error(url: &str, err: anyhow::Error, max_response_bytes: usize)
             url: url.to_string(),
             limit_bytes: max_response_bytes,
         },
-        Some(TransportErrorKind::ProtocolMismatch) => FetchError::CefUnavailable(err.to_string()),
+        Some(TransportErrorKind::ProtocolMismatch) => on_protocol_mismatch(err.to_string()),
         _ => FetchError::Transport(err),
     }
+}
+
+fn map_transport_error(url: &str, err: anyhow::Error, max_response_bytes: usize) -> FetchError {
+    map_backend_error(url, err, max_response_bytes, FetchError::CefUnavailable)
 }
 
 fn map_cef_error(url: &str, err: anyhow::Error) -> FetchError {
@@ -2085,24 +2094,7 @@ fn map_cef_error(url: &str, err: anyhow::Error) -> FetchError {
 }
 
 fn map_cdp_error(url: &str, err: anyhow::Error, max_response_bytes: usize) -> FetchError {
-    if let Some(too_large) = err.downcast_ref::<ResponseTooLargeError>() {
-        return FetchError::ResponseTooLarge {
-            url: url.to_string(),
-            limit_bytes: too_large.limit_bytes,
-        };
-    }
-    match transport_error_kind(&err) {
-        Some(TransportErrorKind::Timeout) => FetchError::Timeout {
-            url: url.to_string(),
-            detail: err.to_string(),
-        },
-        Some(TransportErrorKind::ResponseTooLarge) => FetchError::ResponseTooLarge {
-            url: url.to_string(),
-            limit_bytes: max_response_bytes,
-        },
-        Some(TransportErrorKind::ProtocolMismatch) => FetchError::CdpUnavailable(err.to_string()),
-        _ => FetchError::Transport(err),
-    }
+    map_backend_error(url, err, max_response_bytes, FetchError::CdpUnavailable)
 }
 
 fn is_acceptable_cef_render(res: &CefRenderResult) -> bool {

@@ -20,7 +20,8 @@ use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{compiler_fence, Ordering};
+#[cfg(unix)]
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -415,14 +416,6 @@ impl<'a> From<&'a FetchOutput> for FetchMetadataOutput<'a> {
     }
 }
 
-#[derive(Serialize)]
-struct RendererStatusJson {
-    status: &'static str,
-    path: Option<String>,
-    found_protocol: Option<String>,
-    expected_protocol: &'static str,
-}
-
 #[derive(Default, Serialize)]
 struct DaemonStatusJson {
     supported: bool,
@@ -449,7 +442,7 @@ struct CdpStatusJson {
 struct StatusJson {
     version: &'static str,
     cronet_enabled: bool,
-    cef_renderer: RendererStatusJson,
+    cef_renderer: cef::RendererStatus,
     cdp_renderer: CdpStatusJson,
     daemon: DaemonStatusJson,
     state_dir: String,
@@ -616,30 +609,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
         },
         Command::Status => {
             let probe = cef::probe_renderer_in(&config.state_dir);
-            let renderer_json = match &probe {
-                RendererProbe::Ready(path) => RendererStatusJson {
-                    status: "ready",
-                    path: Some(path.display().to_string()),
-                    found_protocol: Some(cef::EXPECTED_PROTOCOL.to_string()),
-                    expected_protocol: cef::EXPECTED_PROTOCOL,
-                },
-                RendererProbe::ProtocolMismatch {
-                    path,
-                    found,
-                    expected,
-                } => RendererStatusJson {
-                    status: "protocol_mismatch",
-                    path: Some(path.display().to_string()),
-                    found_protocol: found.clone(),
-                    expected_protocol: expected,
-                },
-                RendererProbe::NotInstalled => RendererStatusJson {
-                    status: "not_installed",
-                    path: None,
-                    found_protocol: None,
-                    expected_protocol: cef::EXPECTED_PROTOCOL,
-                },
-            };
+            let renderer_json = probe.to_status();
             let daemon_json = daemon_status_json(&config.state_dir).await;
             let all_creds = auth::resolve_all_provider_results(&config.state_dir)
                 .map_err(|e| CliError::runtime("status_error", e))?;
@@ -1250,7 +1220,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             if json {
                 print_json(&result)?;
             } else {
-                let host = url_host(&url);
+                let host = crawl::url_host_or_raw(&url);
                 if !quiet {
                     eprintln!(
                         "Crawled {} pages in {:.1}s\n",
@@ -1283,7 +1253,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             if json {
                 print_json(&result)?;
             } else {
-                let host = url_host(&url);
+                let host = crawl::url_host_or_raw(&url);
                 if !quiet {
                     eprintln!(
                         "Found {} URLs in {:.1}s\n",
@@ -1303,13 +1273,6 @@ fn print_json<T: Serialize>(value: &T) -> Result<(), CliError> {
         serde_json::to_string(value).map_err(|e| CliError::runtime("serialization_error", e))?;
     println!("{encoded}");
     Ok(())
-}
-
-fn url_host(raw: &str) -> String {
-    url::Url::parse(raw)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_string))
-        .unwrap_or_else(|| raw.to_string())
 }
 
 fn print_daemon_status(status: &DaemonStatusJson) {
@@ -1357,19 +1320,12 @@ async fn daemon_status_json(state_dir: &std::path::Path) -> DaemonStatusJson {
 
 const MAX_SECRET_INPUT_BYTES: usize = 4096;
 
-fn zeroize_bytes(bytes: &mut [u8]) {
-    for byte in bytes {
-        unsafe { std::ptr::write_volatile(byte, 0) };
-    }
-    compiler_fence(Ordering::SeqCst);
-}
-
 fn validate_secret_input(
     provider: CredentialProvider,
     raw: &mut [u8],
 ) -> Result<SecretString, CliError> {
     if raw.len() > MAX_SECRET_INPUT_BYTES {
-        zeroize_bytes(raw);
+        auth::zeroize_bytes(raw);
         return Err(CliError::invalid_input(
             "credential input exceeds 4096-byte limit",
         ));
@@ -1399,7 +1355,7 @@ fn validate_secret_input(
             "credential must be printable ASCII",
         )),
     };
-    zeroize_bytes(raw);
+    auth::zeroize_bytes(raw);
     result
 }
 
@@ -1407,7 +1363,7 @@ fn read_secret_from_stdin(provider: CredentialProvider) -> Result<SecretString, 
     let mut buf = Vec::new();
     let mut limited = std::io::stdin().take((MAX_SECRET_INPUT_BYTES + 1) as u64);
     if let Err(err) = limited.read_to_end(&mut buf) {
-        zeroize_bytes(&mut buf);
+        auth::zeroize_bytes(&mut buf);
         return Err(CliError::runtime("io_error", err));
     }
     validate_secret_input(provider, &mut buf)
@@ -1520,7 +1476,7 @@ fn read_secret_from_tty(provider: CredentialProvider) -> Result<SecretString, Cl
         if n < 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) || TTY_INTERRUPTED.load(Ordering::SeqCst) {
-                zeroize_bytes(&mut buf);
+                auth::zeroize_bytes(&mut buf);
                 drop(guard);
                 return Err(CliError {
                     message: "interrupted".to_string(),
@@ -1529,7 +1485,7 @@ fn read_secret_from_tty(provider: CredentialProvider) -> Result<SecretString, Cl
                     exit_code: 130,
                 });
             }
-            zeroize_bytes(&mut buf);
+            auth::zeroize_bytes(&mut buf);
             drop(guard);
             return Err(CliError::runtime("io_error", err));
         }
@@ -1544,7 +1500,7 @@ fn read_secret_from_tty(provider: CredentialProvider) -> Result<SecretString, Cl
 
     drop(guard);
     if TTY_INTERRUPTED.load(Ordering::SeqCst) {
-        zeroize_bytes(&mut buf);
+        auth::zeroize_bytes(&mut buf);
         return Err(CliError {
             message: "interrupted".to_string(),
             kind: "interrupted",

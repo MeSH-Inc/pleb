@@ -32,6 +32,45 @@ pub enum RendererProbe {
     NotInstalled,
 }
 
+/// Serializable status snapshot of the CEF renderer probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RendererStatus {
+    pub status: &'static str,
+    pub path: Option<String>,
+    pub found_protocol: Option<String>,
+    pub expected_protocol: &'static str,
+}
+
+impl RendererProbe {
+    /// Converts this probe result into a structured JSON status payload.
+    pub fn to_status(&self) -> RendererStatus {
+        match self {
+            Self::Ready(path) => RendererStatus {
+                status: "ready",
+                path: Some(path.display().to_string()),
+                found_protocol: Some(EXPECTED_PROTOCOL.to_string()),
+                expected_protocol: EXPECTED_PROTOCOL,
+            },
+            Self::ProtocolMismatch {
+                path,
+                found,
+                expected,
+            } => RendererStatus {
+                status: "protocol_mismatch",
+                path: Some(path.display().to_string()),
+                found_protocol: found.clone(),
+                expected_protocol: expected,
+            },
+            Self::NotInstalled => RendererStatus {
+                status: "not_installed",
+                path: None,
+                found_protocol: None,
+                expected_protocol: EXPECTED_PROTOCOL,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CefRenderOptions {
     pub wait_for_selector: Option<String>,
