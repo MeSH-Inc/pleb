@@ -1,5 +1,8 @@
 # Milestone 5 Specification: Tool-Owned Credential Storage (`wick auth`) and Multi-Provider Search Balancing
 
+> [!NOTE]
+> Historical milestone design specification (recorded under the pre-rename `wick` name and initial 3-tier Keychain design, later upgraded to the AES-256-GCM `credentials.enc` vault). Authoritative current `pleb` contracts live in [README-FULL.md](../README-FULL.md), [llms-full.txt](../llms-full.txt), [skills/pleb/SKILL.md](../skills/pleb/SKILL.md), and `src/`.
+
 ## 1. Purpose and Scope
 
 `wick search` currently supports only `BRAVE_API_KEY` (Brave Search API) with DuckDuckGo HTML fallback. Relying on a single API key loaded via `~/.zshrc` `security find-generic-password` forks introduces four structural limitations:

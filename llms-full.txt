@@ -9,7 +9,7 @@ pleb status --json
 pleb skill print
 ```
 
-Healthy Cronet + CEF installations report `"cronet_enabled": true`, `"cef_renderer": { "status": "ready", "expected_protocol": "v5-meta" }`, `"cdp_renderer"`, `"agent_identity"`, and `"state_dir": "<home>/.pleb"`. Standard builds without `--features cronet` report `"cronet_enabled": false` and use `reqwest` (`rustls`).
+Healthy Cronet + CEF installations report `"cronet_enabled": true`, `"cef_renderer": { "status": "ready", "expected_protocol": "v5-meta" }`, `"cdp_renderer"`, `"agent_identity"`, and `"state_dir": "<home>/.pleb"`. Standard builds without `--features cronet` report `"cronet_enabled": false` and use `reqwest` (`rustls`). The transport daemon (`daemon.sock`) starts lazily on demand and reports `"protocol_version": 4` while running (`null` when stopped).
 
 ## Behavioral Boundaries
 
@@ -20,24 +20,25 @@ Healthy Cronet + CEF installations report `"cronet_enabled": true`, `"cef_render
 
 ## Installation Modes
 
-1. **macOS Apple Silicon or Linux with Chromium 154 Cronet (recommended from source checkout):**
+1. **Quick binary install (pure-Rust `reqwest`/`rustls` default, works anywhere without a repo checkout):**
+   ```bash
+   cargo install pleb
+   pleb skill install
+   ```
+2. **macOS Apple Silicon or Linux with Chromium 154 Cronet (requires a source checkout for `scripts/*.sh`):**
    ```bash
    ./scripts/download-cronet-macos.sh   # or ./scripts/download-cronet-linux.sh
    cargo install --path . --features cronet --locked
    ```
-2. **Optional local offscreen CEF renderer (`v5-meta`):**
+   - **Linux note**: Cronet binaries link dynamically against `libcronet.so` with an `$ORIGIN` and repo `lib/linux_<arch>` rpath. If you move or install the binary elsewhere (such as `~/.cargo/bin/pleb`) and remove the checkout, copy `lib/linux_<arch>/libcronet.so` beside the binary or set `LD_LIBRARY_PATH`.
+3. **Optional local offscreen CEF renderer (`v5-meta`, requires a source checkout):**
    ```bash
    bash scripts/install-cef-mac.sh --force     # macOS arm64 (~/.pleb/cef/pleb-renderer.app)
    bash scripts/install-cef-linux.sh --force   # Linux x86_64/aarch64 (Ozone headless when DISPLAY is unset)
    ```
-3. **Pure-Rust `reqwest` (`rustls`) build (offline-friendly default for package managers):**
-   ```bash
-   cargo build --release
-   ```
-4. **Agent skill symlink installer (`~/.agents`, `~/.gemini`, `~/.claude`, `~/.codex`, `~/.config/opencode`):**
-   ```bash
-   bash scripts/install-skill.sh
-   ```
+4. **Agent skill installer (`~/.agents`, `~/.gemini`, `~/.claude`, `~/.codex`, `~/.config/opencode`):**
+   - From any installed binary: `pleb skill install [--dir <PATH>] [--force]`
+   - From a source checkout (symlinks `skills/pleb`): `bash scripts/install-skill.sh`
 
 ## Corpus Extraction Benchmarks
 
@@ -50,7 +51,7 @@ Measured with `cargo run --release --example corpus_benchmark` across all `45` s
 | Transcripts (WebVTT/SRT) | 2 | 520 | 205 | 60.6% | 130 | 52 | 1.5 us |
 | Native Markdown | 5 | 2,108 | 2,142 | -1.6% | 527 | 536 | 3.0 us |
 | Plain/JSON passthrough | 2 | 152 | 152 | 0.0% | 38 | 38 | 0.1 us |
-| **All extractable fixtures** | **41** | **46,032** | **13,575** | **70.5%** | **11,508** | **3,394** | **45.1 us** |
+| **All extractable** | **41** | **46,032** | **13,575** | **70.5%** | **11,508** | **3,394** | **45.1 us** (`23.72 MiB/s`) |
 
 Notes:
 - Combined warm extraction throughput measured `23.72 MiB/s` (`1.851 ms` per full pass across `46,032` bytes).
@@ -96,10 +97,10 @@ Notes:
 
 - `pleb fetch [OPTIONS] <URLS>...` (or `-` to read URLs from `stdin`):
   - `--format <markdown|html|text|axtree|raw>` (aliases: `md`, `txt`, `ax`; `axtree` requires CDP)
-  - `--extract <clean|article|full>` (default `clean`)
-  - `--render <auto|cef|cdp|cronet>` (aliases: `browser`/`render`/`js` -> `cef`; `kitesurf`/`remote` -> `cdp`; `network`/`fast`/`no-js`/`nojs` -> `cronet`)
+  - `--extract <clean|article|full>` (default `clean`: prune chrome; `article`: main content; `full`: verbatim body/frontmatter/feeds/transcripts)
+  - `--render <auto|cef|cdp|cronet>` (aliases: `browser`/`render`/`js` -> `cef`; `kitesurf`/`remote` -> `cdp`; `network`/`fast`/`no-js`/`nojs` -> `cronet`; unrendered `JavaScriptShell` emits a `Warning:` on `stderr` and `FetchOutput.warning`)
   - `--source <auto|negotiate|none>` (default `auto`: raw forge URLs + RFC 8288/HTML Markdown mirrors; `negotiate` sends `Accept: text/markdown` and probes `<path>.md`)
-  - `--resources <none|manifest|transcripts|diagrams|all>` (default `none`: zero subresource requests, indexes into JSON/`stderr` cue)
+  - `--resources <none|manifest|transcripts|diagrams|all>` (default `none`: zero subresource requests, indexes into JSON/`stderr` cue; `transcripts` fetches WebVTT/SRT and YouTube captions)
   - `--tools <none|manifest>` (default `none`: indexes declarative/imperative WebMCP tools into `tools` and `stderr` cue; `manifest` appends `## Page Tools (WebMCP)`)
   - `--stage-resources <r1,r2>` / `--stage` / `--referer <URL>` (content-addressed `0o600` files in `<state_dir>/artifacts/`, magic-byte validated, `256 MiB` LRU eviction)
   - `--wait-for-selector <CSS>`, `--respect-robots`, `--no-rewrite`, `--no-images`, `--no-links`, `--max-bytes <N>`
@@ -109,16 +110,37 @@ Notes:
   - `--provider <auto|brave|tavily|serper|exa|searxng|duckduckgo|federated>` (`ddg` alias; `federated` merges with deterministic RRF `k = 60`)
   - `--mode <auto|exact|semantic>`
   - `--freshness <day|week|month|year>`, `--site <DOMAIN>`, `--extra-snippets`, `--urls-only`
-- `pleb auth set <brave|tavily|serper|exa|searxng|web-bot-auth-jwk|web-bot-auth-agent|cdp-access-client-id|cdp-access-client-secret|cdp-access-host> [--stdin] [--storage <auto|keychain|file>]`, `pleb auth remove <provider>`, `pleb auth status [--json]` (interactive `set` reads `/dev/tty` with echo off; multi-line JSON allowed for `web-bot-auth-jwk`)
-- `pleb crawl <URL> [-d 2] [-n 10] [--extract clean|article|full] [--path-filter PREFIX] [--no-robots]` (respects `robots.txt` + `Crawl-delay` by default; max `--depth 5`, `--max-pages 50`)
-- `pleb map <URL> [-n 100] [--path-filter PREFIX] [--no-sitemap] [--no-robots]` (max `--limit 5000`)
-- `pleb status [--json]`, `pleb daemon <status|stop|run>`, `pleb session clear`, `pleb skill print [--json]`
+- `pleb auth set <brave|tavily|serper|exa|searxng|web-bot-auth-jwk|web-bot-auth-agent|cdp-access-client-id|cdp-access-client-secret|cdp-access-host> [--stdin] [--storage <auto|keychain|file>]`, `pleb auth remove <provider>`, `pleb auth status [--json]`:
+  - Interactive `set` reads `/dev/tty` with echo off. Expected formats: `web-bot-auth-jwk` expects an Ed25519 private OKP JWK JSON object (`kty`, `crv`, `d`, `x`; multi-line JSON allowed via `--stdin`); `web-bot-auth-agent` expects an `https://` URL (no whitespace/query/fragment); `cdp-access-host` expects bare `host[:port]` (no scheme/path); `searxng` expects an `http://` or `https://` base URL.
+- `pleb crawl <URL> [-d 2] [-n 10] [--extract clean|article|full] [--path-filter PREFIX] [--no-robots]` (respects `robots.txt` + `Crawl-delay` by default; max `--depth 5`, `--max-pages 50`, `10,000`-byte per-page cap, `100,000`-byte plain output cap; exits non-zero if the seed URL fails)
+- `pleb map <URL> [-n 100] [--path-filter PREFIX] [--no-sitemap] [--no-robots]` (max `--limit 5000`; sitemaps plus up to `20` HTML page crawls)
+- `pleb status [--json]`, `pleb daemon <status|stop|run>`, `pleb session clear`, `pleb skill print [--json]`, `pleb skill install [--dir <PATH>] [--force]`
+
+## Environment Variables
+
+| Variable | Effect |
+| :--- | :--- |
+| `PLEB_HOME` | Default path for `--state-dir` (fallback `~/.pleb`). |
+| `PLEB_PROXY` | Default `--proxy` (SOCKS5/HTTP proxy URL). |
+| `PLEB_NO_DAEMON` | Default `--no-daemon` (`daemon.sock` bypass). |
+| `PLEB_DAEMON_IDLE_SECONDS` | Default `--daemon-idle-timeout` (seconds, default `300`). |
+| `PLEB_TIMEZONE` | Optional IANA timezone override injected into CEF `Intl.DateTimeFormat`. |
+| `BRAVE_API_KEY`, `TAVILY_API_KEY`, `SERPER_API_KEY`, `EXA_API_KEY`, `SEARXNG_URL` | Search credentials overriding Keychain vault and `credentials.json`. |
+| `PLEB_WEB_BOT_AUTH_JWK`, `PLEB_WEB_BOT_AUTH_AGENT` | Ed25519 JWK and `https://` signature-agent URL for RFC 9421 signing. |
+| `PLEB_CDP_ACCESS_CLIENT_ID`, `PLEB_CDP_ACCESS_CLIENT_SECRET`, `PLEB_CDP_ACCESS_HOST` | Host-scoped Cloudflare Access credentials for `wss://` CDP endpoints. |
+| `PLEB_NO_WEB_BOT_AUTH` | Disables Web Bot Auth request signing (`--no-web-bot-auth`). |
+| `PLEB_CDP_URL`, `PLEB_CDP_TIMEOUT`, `PLEB_PREFER_CDP` | Default WebSocket CDP endpoint, timeout seconds, and `--render auto` preference. |
+| `PLEB_NO_KEYCHAIN=1` *(or `true`)* | Disables macOS Keychain reads/writes (uses `<state_dir>/credentials.json` under `--storage auto`). |
+| `PLEB_CEF_RENDERER` | Explicit path to a `v5-meta` `pleb-renderer` binary. |
+| `PLEB_NO_HOME_CEF=1` | Disables fallback discovery of `~/.pleb/cef`. |
+| `PLEB_DAEMON_EXECUTABLE` | Explicit `pleb` executable path spawned for `daemon.sock`. |
+| `RUST_LOG` | Overrides `tracing` filter on `stderr`. |
 
 ## Exit Codes and JSON Schemas
 
 | Exit Code | Meaning |
 | :--- | :--- |
-| `0` | Success |
+| `0` | Success (check `warning` / `Warning:` if a JS shell could not be rendered) |
 | `1` | Invalid flags/input, missing/mismatched CEF or CDP renderer, size overflow, transport failure, or heterogeneous all-failed batch |
 | `2` | Origin block (`403`/`503`, login/cookie wall), active bot challenge, or `robots.txt` disallow |
 | `3` | Origin HTTP `4xx`/`5xx` error (including low-prose soft-`404`) |
@@ -126,14 +148,28 @@ Notes:
 | `5` | Unsupported binary payload in non-raw mode (use `--stage` or `--format raw -o <path>`) |
 | `130` | Interrupted interactive TTY secret prompt (`SIGINT`/`SIGTERM`) |
 
+**JSON error envelope on `stderr` (`--json` or `--jsonl`):**
+
+```json
+{"error":"HTTP 404 error fetching https://example.com/missing","kind":"http_error","exit_code":3}
+```
+
+Known `kind` values: `invalid_input`, `invalid_url`, `robots_disallowed`, `blocked`, `challenge`, `http_error`, `unsupported_content_type`, `cef_unavailable`, `cdp_unavailable`, `timeout`, `response_too_large`, `transport`, `redirect_blocked`, `search_error`, `auth_error`, `crawl_error`, `map_error`, `daemon_error`, `session_error`, `status_error`, `skill_error`, `runtime_error`, `serialization_error`, `context_error`, `io_error`.
+
 Key JSON schemas (`--json` / `--jsonl`):
-- **`FetchOutput`**: `url`, `final_url`, `status_code`, `content_type`, `title`, `content` (omitted with `--metadata-only`), `content_bytes`, `strategy` (`cronet`, `reqwest`, `cef`, `cdp`, `raw_source`, `markdown_mirror`, `markdown_negotiated`), `escalated`, `truncated`, `timing_ms`, optional `resources` (`ResourceDescriptor[]`), optional `tools` (`WebMcpToolDescriptor[]`).
-- **`BatchItemResult`**: untagged union on `ok` (`true` matches `FetchOutput`; `false` has `url`, `ok`, `error`, `kind`, `exit_code`).
+- **`FetchOutput`** (`FetchMetadataOutput` omits `content`): `url`, `final_url`, `status_code`, `content_type`, `title`, `content` *(omitted with `--metadata-only`)*, `content_bytes`, `strategy` (`cronet`, `reqwest`, `cef`, `cdp`, `raw_source`, `markdown_mirror`, `markdown_negotiated`), `escalated`, `truncated`, `timing_ms`, optional `warning` *(present when unrendered JS shell returns raw HTML)*, optional `resources` (`ResourceDescriptor[]`), optional `tools` (`WebMcpToolDescriptor[]`).
+- **`BatchItemResult`**: untagged union on `ok` (`true` matches `FetchOutput` with optional `content`, `warning`, `resources`, `tools`; `false` has `url`, `ok`, `error`, `kind`, `exit_code`).
 - **`StagedAssetOutput`**: `url`, `final_url`, `status_code`, `content_type`, `byte_count`, `staged_path`, `timing_ms`.
 - **`ResourceDescriptor`**: `identifier` (`r1`, ...), `kind` (`diagram`, `image`, `transcript`, `document`, `dataset`, `schema`), `url`, `salience` (`high`, `medium`), plus optional `mime_hint`, `section_heading`, `label`, `dimensions`, `staged_path`, `byte_count`, `content_type`.
+- **`WebMcpToolDescriptor`**: `name`, `description`, optional `title`, `source` (`declarative` | `imperative`), optional `input_schema`, optional `annotations` (`read_only`, `autosubmit`, `untrusted_content`), optional `action_url`, optional `method`.
 - **`SearchResponse`**: `provider`, optional `providers_used`, `results` (`[{ title, url, snippet, extra_snippets? }]`).
-- **`StatusJson`**: `version`, `cronet_enabled`, `cef_renderer` (`status`, `path`, `found_protocol`, `expected_protocol`), `cdp_renderer` (`configured`, `url`, `prefer_cdp`, `proxy_blocked`, `access`, `status_error`), `daemon` (`supported`, `running`, `pid`, `protocol_version`, `build_id`, `active_requests`, `cronet_slots`, `cef_renderers_alive`), `state_dir`, `search_providers`, `agent_identity`.
+- **`SearchProviderStatus`**: `configured`, `source` (`env` | `keychain` | `file` | `null`), `month_requests`, `cooldown_remaining_secs`, optional `last_error_status`.
+- **`AgentIdentityStatus`**: `web_bot_auth_enabled`, `jwk_configured`, `jwk_source`, `agent_configured`, `agent_source`, `keyid`, optional `status_error`.
+- **`CdpAccessStatus`**: `configured`, `client_id_configured`, `client_id_source`, `client_secret_configured`, `client_secret_source`, `host_configured`, `host_source`, optional `access_host`, optional `status_error`.
+- **`StatusJson`**: `version`, `cronet_enabled`, `cef_renderer` (`status`, `path`, `found_protocol`, `expected_protocol`), `cdp_renderer` (`configured`, `url`, `prefer_cdp`, `proxy_blocked`, `access`, `status_error`), `daemon` (`supported`, `running`, `pid`, `protocol_version`, `build_id`, `active_requests`, `cronet_slots`, `cef_renderers_alive`), `state_dir`, `search_providers` (map -> `SearchProviderStatus`), `agent_identity` (`AgentIdentityStatus`).
+- **`AuthStatusJson`**: flattened search provider keys (`brave`, `tavily`, `serper`, `exa`, `searxng` -> `SearchProviderStatus`), `agent_identity` (`AgentIdentityStatus`), `cdp_access` (`CdpAccessStatus`).
 - **`CrawlResult`** / **`MapResult`**: `pages` (`[{ url, title, content, depth }]`), `urls_discovered`, `timing_ms` / `urls`, `timing_ms`, `from_sitemap`.
+- **Skill commands (`pleb skill ... --json`)**: `print` emits `name`, `version`, `content`; `install` emits `name`, `version`, `installed` (`[{ path, status }]`).
 
 ## Agent Composition Patterns
 
@@ -145,13 +181,29 @@ pleb search --urls-only -n 5 "rustls ech support" | pleb fetch - --jsonl --concu
 pleb fetch --json --resources none https://example.com/architecture
 pleb fetch --json --stage-resources r1 https://example.com/architecture
 
-# Render a client-side SPA deterministically
-pleb fetch --render cef --wait-for-selector "article[data-ready]" https://app.example.com/post
+# Inline YouTube video caption transcripts directly into Markdown
+pleb fetch --resources transcripts "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
-# Verify full non-regression test suite and corpus scorecard
+# Render a client-side SPA deterministically, or extract CDP accessibility tree & WebMCP tools
+pleb fetch --render cef --wait-for-selector "article[data-ready]" https://app.example.com/post
+pleb fetch --render cdp --tools manifest --cdp-url ws://127.0.0.1:8787/devtools/browser https://app.example.com
+pleb fetch --format axtree --cdp-url ws://127.0.0.1:8787/devtools/browser https://app.example.com
+
+# Non-interactively store Web Bot Auth signing credentials and verify without echoing secrets
+cat agent.jwk | pleb auth set web-bot-auth-jwk --stdin
+pleb auth set web-bot-auth-agent --stdin <<< "https://agent.example.com"
+pleb auth status --json
+```
+
+## Contributor Verification
+
+From a source checkout after code or corpus edits:
+
+```bash
 cargo fmt --check
 cargo clippy --all-targets --features cronet -- -D warnings
 cargo test --features cronet --locked
+cargo test --test corpus_evaluation
 ```
 
-For full details on all flags, extraction rules, and packaging files, see [README.md](README.md) and [README-FULL.md](README-FULL.md).
+For complete design history and contributor rules, see [README.md](README.md), [README-FULL.md](README-FULL.md), and [AGENTS.md](AGENTS.md).

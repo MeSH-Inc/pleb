@@ -119,6 +119,8 @@ With Cronet on Linux (`x86_64` or `aarch64`):
 cargo install --path . --features cronet --locked
 ```
 
+Linux `--features cronet` binaries link dynamically against `libcronet.so` with `-Wl,-rpath,$ORIGIN` and the checkout `lib/linux_<arch>` directory. If you relocate an installed binary and delete the source checkout, copy `lib/linux_<arch>/libcronet.so` next to the binary or set `LD_LIBRARY_PATH`.
+
 Without Cronet (`reqwest` with `rustls` TLS fallback):
 
 ```bash
@@ -143,10 +145,11 @@ Both installers accept `--prefix <dir>` to install into an isolated directory ra
 
 ### Agent Skill Installation
 
-The repository ships a version-locked agent reference at [skills/pleb/SKILL.md](skills/pleb/SKILL.md), embedded directly into the `pleb` binary (`pleb skill print`). To symlink it into local agent harness directories (`~/.agents`, `~/.gemini`, `~/.claude`, `~/.codex`, `~/.config/opencode`):
+The repository ships a version-locked agent reference at [skills/pleb/SKILL.md](skills/pleb/SKILL.md), embedded directly into the `pleb` binary (`pleb skill print`). Install it into local agent harness directories (`~/.agents`, `~/.gemini`, `~/.claude`, `~/.codex`, `~/.config/opencode`) from any installed binary, or symlink it from a source checkout:
 
 ```bash
-bash scripts/install-skill.sh
+pleb skill install [--dir <PATH>] [--force]   # works anywhere (binary-only or source)
+bash scripts/install-skill.sh                 # source-checkout symlink helper
 ```
 
 ### Verifying the Installation
@@ -156,7 +159,7 @@ pleb status
 pleb status --json
 ```
 
-Healthy local installations report `"cronet_enabled": true`, `"cef_renderer": { "status": "ready", "expected_protocol": "v5-meta" }` (when CEF is installed), daemon status, active state directory, and configured search providers.
+Healthy local installations report `"version"`, `"cef_renderer": { "status": "ready", "expected_protocol": "v5-meta" }` (when CEF is installed), daemon status (`protocol_version: 4` while running, `null` when stopped), active state directory, and configured search providers. `"cronet_enabled"` is `true` for `--features cronet` builds and `false` for pure-Rust `reqwest` (`rustls`) builds.
 
 ---
 
@@ -165,7 +168,7 @@ Healthy local installations report `"cronet_enabled": true`, `"cef_renderer": { 
 `Cargo.toml` sets pure-Rust `reqwest` (`rustls`) as the default feature set so `cargo install pleb` and offline package-manager sandboxes (such as Homebrew) build cleanly without external prebuilt binary downloads:
 
 - **Cargo / `crates.io` (`pleb`)**: `Cargo.toml` excludes `research/` and `.gitignore` / `Cargo.toml` keep prebuilt `lib/*/libcronet.*` static/shared libraries out of published `.crate` tarballs while packaging all sources (`src/`, `cef/`, `data/`, `scripts/`, `skills/pleb/SKILL.md`, `packaging/`, and `README*`). Build with Cronet TLS from a repository checkout using `./scripts/download-cronet-macos.sh` or `./scripts/download-cronet-linux.sh` followed by `cargo install --path . --features cronet --locked`.
-- **Homebrew tap template**: [packaging/homebrew/pleb.rb](packaging/homebrew/pleb.rb) installs the pure-Rust `pleb` binary alongside helper setup scripts (`pkgshare/scripts/`) and [skills/pleb/SKILL.md](skills/pleb/SKILL.md) (`pkgshare/skills/pleb`), printing Cronet and CEF source-build instructions in `caveats`.
+- **Homebrew tap template**: [packaging/homebrew/pleb.rb](packaging/homebrew/pleb.rb) installs the pure-Rust `pleb` binary alongside helper setup scripts (`pkgshare/scripts/`), CEF renderer sources (`pkgshare/cef/`), and [skills/pleb/SKILL.md](skills/pleb/SKILL.md) (`pkgshare/skills/pleb`), printing `pleb skill install`, CEF, and Cronet source-build instructions in `caveats`.
 - **Verification**: Check crate packaging contents before publishing with `cargo package --list`.
 
 ---
@@ -216,7 +219,7 @@ CLI / Library Call
 | `src/extract/` | Single-parse HTML pruning (`dom.rs`), Markdown conversion and compaction (`markdown.rs`), WebMCP tool indexing (`webmcp.rs`), CDP accessibility tree formatter (`axtree.rs`), native Markdown (`native_markdown.rs`), URL hygiene (`url.rs`), charset decoding (`charset.rs`), feeds (`feed.rs`), transcripts (`transcript.rs`), YouTube watch extraction (`youtube.rs`), and resource salience indexing (`resources.rs`) |
 | `src/artifacts.rs` | Content-addressed `<state_dir>/artifacts/` store, magic-byte validation, disguised-HTML rejection, and `256 MiB` LRU eviction |
 | `src/search/` | Multi-provider search dispatch, intent routing, Reciprocal Rank Fusion (`mod.rs`), provider HTTP adapters (`providers.rs`), and locked health/cooldown/pacing state (`state.rs`) |
-| `src/auth.rs` | 3-tier credential resolution (`env` -> macOS Keychain -> `credentials.json`), secret zeroization, and status reporting |
+| `src/auth.rs` | 3-tier credential resolution (`env` -> AES-256-GCM `credentials.enc` vault wrapped by macOS Keychain `vault-key` -> `credentials.json`), secret zeroization, and status reporting |
 | `cef/` | C/Objective-C sources for the `v5-meta` offscreen CEF renderer and helper (`protocol.h`, `browser_environment.h`, `renderer_core.h`, `helper_core.h`, macOS `.m` and Linux `.c` entrypoints) |
 | `data/site-rules.json` | Bundled structural host rewrite and mandatory CEF overrides |
 | `examples/corpus_benchmark.rs` | Offline corpus byte/token reduction and warm release extraction benchmark |
@@ -478,7 +481,7 @@ pleb auth remove tavily
 ```
 
 - **Supported providers**: `brave`, `tavily`, `serper`, `exa`, `searxng`, `web-bot-auth-jwk`, `web-bot-auth-agent`, `cdp-access-client-id`, `cdp-access-client-secret`, `cdp-access-host`.
-- **Resolution precedence**: Environment variable (`BRAVE_API_KEY`, `TAVILY_API_KEY`, `SERPER_API_KEY`, `EXA_API_KEY`, `SEARXNG_URL`, `PLEB_WEB_BOT_AUTH_JWK`, `PLEB_WEB_BOT_AUTH_AGENT`, `PLEB_CDP_ACCESS_CLIENT_ID`, `PLEB_CDP_ACCESS_CLIENT_SECRET`, `PLEB_CDP_ACCESS_HOST`) -> `<state_dir>/credentials.enc` (`0o600` AES-256-GCM vault wrapped by one `vault-key` item in macOS Keychain under service `pleb`; skipped with zero Keychain calls when absent or when `PLEB_NO_KEYCHAIN=1`) -> `<state_dir>/credentials.json` (`0o600`).
+- **Resolution precedence**: Environment variable (`BRAVE_API_KEY`, `TAVILY_API_KEY`, `SERPER_API_KEY`, `EXA_API_KEY`, `SEARXNG_URL`, `PLEB_WEB_BOT_AUTH_JWK`, `PLEB_WEB_BOT_AUTH_AGENT`, `PLEB_CDP_ACCESS_CLIENT_ID`, `PLEB_CDP_ACCESS_CLIENT_SECRET`, `PLEB_CDP_ACCESS_HOST`) -> `<state_dir>/credentials.enc` (`0o600` AES-256-GCM vault wrapped by one `vault-key` item in macOS Keychain under service `pleb`; skipped with zero Keychain calls when absent or when `PLEB_NO_KEYCHAIN=1` / `true`) -> `<state_dir>/credentials.json` (`0o600`).
 - **Input hygiene**: `pleb auth set` never accepts secrets as positional arguments. Interactive mode reads from `/dev/tty` with echo disabled; `--stdin` accepts printable ASCII up to `4096` bytes (multi-line JSON whitespace is allowed solely for `web-bot-auth-jwk` and canonicalized on store). Child `daemon.sock` and CEF processes explicitly scrub all credential env vars and `PLEB_CDP_URL`. In-memory secret buffers are zeroized on drop, and `pleb auth status` never prints secret values, private keys, or Access tokens.
 - **Cooldown reset**: `pleb auth set` and `pleb auth remove` clear any stale cooldown entry for that provider. `pleb auth remove` warns on `stderr` if the provider's environment variable is still set.
 
@@ -488,8 +491,8 @@ pleb auth remove tavily
 
 Both `pleb crawl` and `pleb map` respect `robots.txt` by default (pass `--no-robots` to override):
 
-- **`pleb crawl`**: Performs breadth-first crawling over same-origin HTML links using bounded concurrency (`4` workers), polite per-origin spacing (`100ms` default, or `robots.txt` `Crawl-delay` when present), post-redirect origin tracking, and deterministic output ordering. Caps `--depth` at `5` (default `2`) and `--max-pages` at `50` (default `10`).
-- **`pleb map`**: Discovers site URLs from `robots.txt` `Sitemap:` directives, recursive `<sitemapindex>` trees (up to depth `3`, `64` sitemaps, `32 MiB` decompressed `.xml.gz` cap), and page links unless `--no-sitemap` is set. Caps `--limit` at `5000` (default `100`).
+- **`pleb crawl`**: Performs breadth-first crawling over same-origin HTML links using bounded concurrency (`4` workers), polite per-origin spacing (`100ms` default, or `robots.txt` `Crawl-delay` when present), post-redirect origin tracking, and deterministic output ordering. Caps `--depth` at `5` (default `2`), `--max-pages` at `50` (default `10`), per-page extracted content at `10,000` bytes, and plain output at `100,000` bytes. Seed URL errors propagate loudly (non-zero exit), while broken child links are skipped.
+- **`pleb map`**: Discovers site URLs from `robots.txt` `Sitemap:` directives, recursive `<sitemapindex>` trees (up to depth `3`, `64` sitemaps, `32 MiB` decompressed `.xml.gz` cap), and up to `20` HTML page crawls unless `--no-sitemap` is set. Caps `--limit` at `5000` (default `100`).
 
 ```bash
 pleb crawl https://docs.example.com --depth 2 --max-pages 10 --path-filter /guide
@@ -553,7 +556,7 @@ pleb search --urls-only "rust async runtime" | pleb fetch -
 | `--max-bytes <N>` | integer | UTF-8 byte cap with fence-safe Markdown truncation. |
 | `--concurrency <N>` | `1..=16` *(default `4`)* | Batch mode concurrency (hard cap of `2` concurrent fetches per host). |
 | `--jsonl` | flag | Stream one JSON result object per completed URL (conflicts with `--json`). |
-| `--metadata-only` | flag | Omit `content` while retaining metadata and `resources` (requires `--json` or `--jsonl`; conflicts with `-o`). |
+| `--metadata-only` | flag | Omit `content` while retaining metadata, `warning`, `resources`, and `tools` (requires `--json` or `--jsonl`; conflicts with `-o`). |
 | `-o`, `--output <PATH>` | file path | Write output to a file on single-URL fetch (created only after success). |
 
 In batch mode (`2+` URLs or `-` on `stdin`), default Markdown output emits numbered `## [i/N]` sections, `--json` emits an input-ordered JSON array, and `--jsonl` streams completion-ordered JSON lines.
@@ -611,6 +614,7 @@ pleb daemon stop            # Stop the running transport daemon (--json supporte
 pleb daemon run             # Run daemon in foreground (auto-started on demand; honors --daemon-idle-timeout)
 pleb session clear          # Stop daemon and clear caches/artifacts while preserving credentials and rules
 pleb skill print            # Emit bundled skills/pleb/SKILL.md (--json supported)
+pleb skill install          # Write bundled SKILL.md into local agent skill directories (or --dir <PATH>)
 ```
 
 ---
@@ -631,7 +635,7 @@ pleb skill print            # Emit bundled skills/pleb/SKILL.md (--json supporte
 | `PLEB_CDP_ACCESS_CLIENT_ID`, `PLEB_CDP_ACCESS_CLIENT_SECRET`, `PLEB_CDP_ACCESS_HOST` | Host-scoped Cloudflare Access service-token credentials attached only when `wss://` CDP host matches `PLEB_CDP_ACCESS_HOST`. |
 | `PLEB_NO_WEB_BOT_AUTH` | Disables RFC 9421 Web Bot Auth signing (`--no-web-bot-auth`). |
 | `PLEB_CDP_URL`, `PLEB_CDP_TIMEOUT`, `PLEB_PREFER_CDP` | Default WebSocket CDP endpoint, render timeout (seconds), and `--render auto` CDP priority. |
-| `PLEB_NO_KEYCHAIN=1` | Disables macOS Keychain reads/writes (forces `credentials.json` under `--storage auto`; required for hermetic tests). |
+| `PLEB_NO_KEYCHAIN=1` | Disables macOS Keychain reads/writes (`1` or case-insensitive `true`; forces `credentials.json` under `--storage auto`; required for hermetic tests). |
 | `PLEB_CEF_RENDERER` | Explicit path to a `v5-meta` `pleb-renderer` binary (overrides `<state_dir>/cef` discovery). |
 | `PLEB_NO_HOME_CEF=1` | Disables fallback discovery of `~/.pleb/cef` (used in hermetic tests). |
 | `PLEB_DAEMON_EXECUTABLE` | Explicit path to the `pleb` executable spawned when auto-starting the background daemon. |
@@ -658,7 +662,7 @@ pleb skill print            # Emit bundled skills/pleb/SKILL.md (--json supporte
 | Exit Code | Meaning |
 | :--- | :--- |
 | `0` | Success |
-| `1` | Invalid input or conflicting flags, unavailable/mismatched CEF renderer, response-size overflow, network/transport failure, or heterogeneous all-failed batch |
+| `1` | Invalid or conflicting CLI flags/input, unavailable/mismatched CEF or CDP renderer, response-size overflow, network/transport failure, or heterogeneous all-failed batch |
 | `2` | Blocked by origin (`403`/`503`, login/cookie wall), active anti-bot challenge, or `robots.txt` disallow |
 | `3` | Origin HTTP `4xx`/`5xx` error (including low-prose soft-`404` HTML pages) |
 | `4` | Partial batch failure (some URLs succeeded and some failed) |
@@ -686,12 +690,13 @@ All `--json` and `--jsonl` payloads serialize directly from `pleb`'s Rust output
 | `status_code` | `number` | HTTP status code (`u16`) |
 | `content_type` | `string \| null` | Response `Content-Type` header if present |
 | `title` | `string \| null` | Extracted document title if present |
-| `content` | `string` | Extracted Markdown, text, or HTML (**omitted** with `--metadata-only`) |
+| `content` | `string` | Extracted Markdown, text, HTML, or accessibility tree (`axtree`) (**omitted** with `--metadata-only`) |
 | `content_bytes` | `number` | Byte length of `content` (still populated with `--metadata-only`) |
 | `strategy` | `string` | Acquisition strategy (`cronet`, `reqwest`, `cef`, `cdp`, `raw_source`, `markdown_mirror`, `markdown_negotiated`) |
 | `escalated` | `boolean` | `true` when transport escalated from primary HTTP to CEF or CDP |
 | `truncated` | `boolean` | `true` when `--max-bytes` truncated output |
 | `timing_ms` | `number` | End-to-end fetch duration in milliseconds |
+| `warning` | `string` | Advisory warning when an unrendered `JavaScriptShell` returns raw HTML (**omitted** when absent) |
 | `resources` | `ResourceDescriptor[]` | Indexed linked resources (**omitted** when empty) |
 | `tools` | `WebMcpToolDescriptor[]` | Indexed WebMCP page tools (**omitted** when empty; `untrusted_content: true`) |
 
@@ -699,7 +704,7 @@ All `--json` and `--jsonl` payloads serialize directly from `pleb`'s Rust output
 
 Multi-URL and `stdin` (`-`) fetches emit an array (`--json`) or newline-delimited stream (`--jsonl`) of untagged `BatchItemResult` objects discriminated by `ok`:
 
-- **Success (`ok: true`)**: `url`, `ok`, `final_url`, `status_code`, `content_type`, `title`, `strategy`, `escalated`, `truncated`, `timing_ms`, `content_bytes`, plus `content` (omitted with `--metadata-only`), `resources` (omitted when empty), and `tools` (omitted when empty).
+- **Success (`ok: true`)**: `url`, `ok`, `final_url`, `status_code`, `content_type`, `title`, `strategy`, `escalated`, `truncated`, `timing_ms`, `content_bytes`, plus `warning` (omitted when absent), `content` (omitted with `--metadata-only`), `resources` (omitted when empty), and `tools` (omitted when empty).
 - **Failure (`ok: false`)**: `url`, `ok`, `error`, `kind`, `exit_code`.
 
 ### `StagedAssetOutput` (`pleb fetch --stage --json`)
@@ -747,6 +752,7 @@ Multi-URL and `stdin` (`-`) fetches emit an array (`--json`) or newline-delimite
 | `pleb daemon stop` | `stopped` |
 | `pleb session clear` | `cleared`, `state_dir` |
 | `pleb skill print` | `name`, `version`, `content` |
+| `pleb skill install` | `name`, `version`, `installed` (`[{ path, status }]`) |
 
 ---
 
@@ -767,15 +773,17 @@ cargo test --test cef_protocol_tests -- --ignored  # opt-in live v5-meta CEF smo
 - **Extraction corpus**: `tests/corpus/` holds sanitized HTML, Markdown, feed, and transcript fixtures tagged as `"ratchet"` (must pass at `1.000`) or `"frontier"` (tracked open targets), verified together with binary magic-byte guards by `tests/corpus_evaluation.rs`.
 - **Hermetic test boundaries**: Tests never touch `~/.pleb` or macOS Keychain. Each test allocates a short temporary state directory under `/tmp/pleb-t-<pid>-<seq>` (`0o700`, staying under the Unix `sun_path` socket length ceiling) and sets `PLEB_NO_HOME_CEF=1` and `PLEB_NO_KEYCHAIN=1`.
 
-### Design Specifications and Contribution Rules
+### Historical Design Specifications and Contribution Rules
+
+The milestone specifications in `docs/` record point-in-time design history (earlier milestones include pre-rename names and older Keychain/protocol layouts). Always rely on this document, [llms-full.txt](llms-full.txt), [skills/pleb/SKILL.md](skills/pleb/SKILL.md), and `src/` for current runtime and CLI behavior:
 
 - [AGENTS.md](AGENTS.md) — Repository engineering rules, host binary sync, iteration protocol, and non-regression gates.
-- [docs/01-transport-daemon-and-batch-fetch.md](docs/01-transport-daemon-and-batch-fetch.md) — Core extraction pipeline, unified transport daemon, and batch fetch design.
-- [docs/02-swarm-hillclimb-protocol.md](docs/02-swarm-hillclimb-protocol.md) — Corpus evaluation and iterative quality-gate protocol.
-- [docs/03-structured-source-negotiation.md](docs/03-structured-source-negotiation.md) — Forge raw-source resolution, Markdown mirror negotiation, native Markdown, and feed extraction.
-- [docs/04-resource-indexing-and-staging.md](docs/04-resource-indexing-and-staging.md) — Resource salience indexing, SVG/transcript rescue, and content-addressed artifact staging.
-- [docs/05-multi-provider-search-and-auth.md](docs/05-multi-provider-search-and-auth.md) — `pleb auth` credential storage and multi-provider search routing/federation.
-- [docs/06-agent-identity-webmcp-and-cdp-renderer.md](docs/06-agent-identity-webmcp-and-cdp-renderer.md) — RFC 9421 Web Bot Auth signing, WebMCP tool discovery, and pluggable CDP / Kitesurf renderer transport.
+- [docs/01-transport-daemon-and-batch-fetch.md](docs/01-transport-daemon-and-batch-fetch.md) — Historical Milestone 1–2 design specification.
+- [docs/02-swarm-hillclimb-protocol.md](docs/02-swarm-hillclimb-protocol.md) — Corpus evaluation and swarm convergence protocol.
+- [docs/03-structured-source-negotiation.md](docs/03-structured-source-negotiation.md) — Historical Milestone 3 design specification.
+- [docs/04-resource-indexing-and-staging.md](docs/04-resource-indexing-and-staging.md) — Historical Milestone 4 design specification.
+- [docs/05-multi-provider-search-and-auth.md](docs/05-multi-provider-search-and-auth.md) — Historical Milestone 5 design specification.
+- [docs/06-agent-identity-webmcp-and-cdp-renderer.md](docs/06-agent-identity-webmcp-and-cdp-renderer.md) — Historical Milestone 6 design specification.
 
 ---
 

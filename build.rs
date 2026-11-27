@@ -134,19 +134,22 @@ fn main() {
                 "lib/linux_amd64/libcronet.so",
                 "./scripts/download-cronet-linux.sh",
             );
-            // Linux amd64: dynamic link libcronet.so
-            // The .so must be next to the binary at runtime, or in LD_LIBRARY_PATH
+            // Linux amd64: dynamic link libcronet.so; search alongside the binary ($ORIGIN) or repo checkout
             println!("cargo:rustc-link-search=native={}/lib/linux_amd64", dir);
             println!("cargo:rustc-link-lib=dylib=cronet");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}/lib/linux_amd64", dir);
         } else if cfg!(target_os = "linux") && cfg!(target_arch = "aarch64") {
             ensure_cronet_lib(
                 &dir,
                 "lib/linux_arm64/libcronet.so",
                 "./scripts/download-cronet-linux.sh",
             );
-            // Linux arm64: dynamic link libcronet.so
+            // Linux arm64: dynamic link libcronet.so; search alongside the binary ($ORIGIN) or repo checkout
             println!("cargo:rustc-link-search=native={}/lib/linux_arm64", dir);
             println!("cargo:rustc-link-lib=dylib=cronet");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}/lib/linux_arm64", dir);
         } else {
             panic!(
                 "Cronet linking not configured for this platform. \

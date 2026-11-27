@@ -16,7 +16,9 @@ case "$ARCH" in
             exit 1 ;;
 esac
 
-DEST="lib/${DIR}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+DEST="${REPO_ROOT}/lib/${DIR}"
 mkdir -p "$DEST"
 
 if [ -f "$DEST/libcronet.a" ]; then
@@ -47,4 +49,4 @@ fi
 echo "Checksum OK."
 echo "Saved to $DEST/libcronet.a"
 echo ""
-echo "Build with: cargo build --release --features cronet"
+echo "Install with: cargo install --path . --features cronet --locked"

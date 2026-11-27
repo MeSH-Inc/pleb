@@ -1,5 +1,8 @@
 # Milestone 1 and 2 Specification: Extraction Pipeline, CEF `v4-meta`, Unified Transport Daemon, and Batch Fetch
 
+> [!NOTE]
+> Historical milestone design specification recorded during initial architecture work (using pre-rename `mesh-wick` / `v4-meta` terminology). Authoritative current CLI flags, `v5-meta` protocol, and `pleb` contracts live in [README-FULL.md](../README-FULL.md), [llms-full.txt](../llms-full.txt), [skills/pleb/SKILL.md](../skills/pleb/SKILL.md), and `src/`.
+
 ## Goals and Scope
 
 This specification defines the next two dependency-ordered milestones for `mesh-wick` (`wick`):

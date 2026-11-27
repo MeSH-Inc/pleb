@@ -1,5 +1,8 @@
 # Milestone 6 Specification: Cryptographic Agent Identity (Web Bot Auth), WebMCP Discovery, and Pluggable CDP / Kitesurf Renderer Transport
 
+> [!NOTE]
+> Point-in-time Milestone 6 design specification. Check [README-FULL.md](../README-FULL.md), [llms-full.txt](../llms-full.txt), [skills/pleb/SKILL.md](../skills/pleb/SKILL.md), and `src/` for current `pleb` runtime and CLI behavior.
+
 ## 1. Purpose and Scope
 
 `pleb` acquires public web documents through a low-cost escalation funnel (source bypass -> Cronet HTTP + single-parse `O(N)` DOM extraction -> optional local CEF `v5-meta`). Studying Cloudflare's experimental Rust+Wasm browser engine (`cloudflare/kitesurf`, cloned locally under `research/kitesurf/`) exposes three orthogonal, high-leverage capabilities that close `pleb`'s structural gaps without compromising its single-binary ergonomics, zero-telemetry guarantee, or strict anti-evasion boundary:

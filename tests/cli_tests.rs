@@ -793,6 +793,8 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "web-bot-auth",
         "cdp-access",
         "workerd",
+        "pleb skill install",
+        "warning",
     ] {
         assert!(
             readme_full.contains(required),
@@ -808,9 +810,13 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "Firecrawl",
         "Jina Reader",
         "Crawl4AI",
+        "cargo install pleb",
+        "pleb skill install",
         "pleb auth set",
         "--stage-resources",
         "FetchOutput",
+        "WebMcpToolDescriptor",
+        "PLEB_NO_KEYCHAIN",
     ] {
         assert!(
             llms_full_txt.contains(required),
@@ -880,6 +886,10 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "PLEB_DAEMON_EXECUTABLE",
         "PLEB_NO_HOME_CEF",
         "pleb skill print",
+        "pleb skill install",
+        "credentials.enc",
+        "youtube",
+        "130",
         "artifacts/",
         "pleb auth set",
         "pleb auth remove",

@@ -1,5 +1,8 @@
 # Swarm Convergence Protocol: Efficacy and Elegance Specification
 
+> [!NOTE]
+> Historical milestone specification written under the pre-rename `mesh-wick` (`wick`) name. Core swarm convergence and Subtraction Pass principles remain active (with `pleb` / `pleb-fixture` conventions defined in [AGENTS.md](../AGENTS.md)); authoritative current contracts live in [README-FULL.md](../README-FULL.md) and `src/`.
+
 ## 1. Purpose and Baseline
 
 `mesh-wick` (`wick`) is a local, zero-telemetry web acquisition and search CLI for AI agents. Its purpose is to acquire public web documents over browser-grade network (`Cronet` / `reqwest`) and offscreen-rendering (`CEF`) transports and emit compact, structurally faithful Markdown, plain text, HTML, or exact raw bytes with deterministic metadata and exit codes (`0..=5`).

@@ -4,33 +4,44 @@
 
 `pleb` converts public web pages, Markdown mirrors, syndication feeds, YouTube captions, and transcripts into compact Markdown, plain text, or CDP accessibility trees in a single `O(N)` DOM pass. Primary HTTP runs over Chromium 154 Cronet (or `reqwest` with `rustls` by default when compiled without `--features cronet`) with redirect-time SSRF protection, optional RFC 9421 Ed25519 Web Bot Auth signing, offscreen CEF (`pleb-renderer`, protocol `v5-meta`) via a shared Unix-socket daemon (`daemon.sock`), pluggable WebSocket CDP / Kitesurf rendering (`--render cdp`, `--format axtree`), zero-fetch resource and WebMCP tool indexing (`--tools`), and local multi-provider search (`pleb search`, `pleb auth`). Active anti-bot challenges fail fast (exit code `2`) without CAPTCHA solving or evasion scripts.
 
+## Quick Start for Agents
+
+- **Using the `pleb` CLI (`cargo install pleb && pleb skill install`)**: read [skills/pleb/SKILL.md](skills/pleb/SKILL.md) (or run `pleb skill print`) for decision trees, flags, exit codes, and `pleb status --json` checks.
+- **Full single-file reference**: read [llms-full.txt](llms-full.txt) or [README-FULL.md](README-FULL.md) for JSON output schemas, environment variables, and agent composition patterns.
+- **Contributing to this repository**: read [AGENTS.md](AGENTS.md) first for build rules, hermetic test boundaries, and non-regression gates.
+
 ## Core Documentation
 
+- [skills/pleb/SKILL.md](skills/pleb/SKILL.md): Canonical version-locked agent skill embedded verbatim in `pleb skill print` / `pleb skill install`
+- [llms-full.txt](llms-full.txt): Single-file technical reference, schemas, environment variables, and benchmark report formatted for full-context LLM ingestion
 - [README.md](README.md): Overview, verified corpus benchmark summary, tool comparison, installation, and quick start
 - [README-FULL.md](README-FULL.md): Complete CLI reference, five-stage extraction pipeline, environment variables, JSON output schemas, comparison matrix, and packaging notes
-- [llms-full.txt](llms-full.txt): Single-file technical reference and benchmark report formatted for full-context LLM ingestion
-- [skills/pleb/SKILL.md](skills/pleb/SKILL.md): Canonical version-locked agent skill embedded verbatim in `pleb skill print`
 - [examples/corpus_benchmark.rs](examples/corpus_benchmark.rs): Reproducible corpus byte/token reduction and extraction throughput harness
-
-## Architecture Specifications
-
-- [AGENTS.md](AGENTS.md): Build rules, host installation sync, hermetic test boundaries, and non-regression gates
-- [docs/01-transport-daemon-and-batch-fetch.md](docs/01-transport-daemon-and-batch-fetch.md): Unified transport daemon (`daemon.sock`), Cronet/`reqwest`, CEF escalation, and batch fetching
-- [docs/02-swarm-hillclimb-protocol.md](docs/02-swarm-hillclimb-protocol.md): Corpus scorecard evaluation (`ratchet == 1.000`) and quality gates
-- [docs/03-structured-source-negotiation.md](docs/03-structured-source-negotiation.md): GitHub/GitLab/Gist raw source resolution, Markdown mirrors, feeds, and native Markdown
-- [docs/04-resource-indexing-and-staging.md](docs/04-resource-indexing-and-staging.md): Resource salience indexing, SVG/transcript rescue, and artifact staging
-- [docs/05-multi-provider-search-and-auth.md](docs/05-multi-provider-search-and-auth.md): `pleb auth` credential resolution and multi-provider search routing
-- [docs/06-agent-identity-webmcp-and-cdp-renderer.md](docs/06-agent-identity-webmcp-and-cdp-renderer.md): RFC 9421 Web Bot Auth, WebMCP tool indexing, and pluggable CDP / Kitesurf renderer transport
 
 ## Packaging and Distribution
 
 - [Cargo.toml](Cargo.toml): Cargo crate manifest (`pleb`, default `reqwest` TLS or optional `cronet` feature)
 - [packaging/homebrew/pleb.rb](packaging/homebrew/pleb.rb): Homebrew formula template for tap distribution
+- [scripts/download-cronet-macos.sh](scripts/download-cronet-macos.sh): macOS arm64 prebuilt Chromium 154 `libcronet.a` downloader
+- [scripts/download-cronet-linux.sh](scripts/download-cronet-linux.sh): Linux `x86_64` / `aarch64` prebuilt Chromium 154 `libcronet.so` downloader
 - [scripts/install-cef-mac.sh](scripts/install-cef-mac.sh): macOS arm64 offscreen CEF `v5-meta` installer
 - [scripts/install-cef-linux.sh](scripts/install-cef-linux.sh): Linux `x86_64` / `aarch64` native Ozone headless CEF `v5-meta` installer
+- [scripts/install-skill.sh](scripts/install-skill.sh): Symlinks `skills/pleb` from a source checkout into local agent skill directories
 
-## Optional
+## Engineering Rules
 
-- [LICENSE](LICENSE): MIT license and upstream attribution (`wickproject/wick`)
+- [AGENTS.md](AGENTS.md): Build rules, host installation sync, hermetic test boundaries, and non-regression gates
 - [data/site-rules.json](data/site-rules.json): Bundled host rewrite and mandatory CEF overrides
 - [tests/corpus_evaluation.rs](tests/corpus_evaluation.rs): Corpus non-regression test harness across all `45` fixtures
+- [LICENSE](LICENSE): MIT license and upstream attribution (`wickproject/wick`)
+
+## Historical Milestone Specifications
+
+The documents in `docs/` capture point-in-time design decisions from Milestones 1–6 (including pre-rename development notes and earlier Keychain/protocol layouts). Treat [README-FULL.md](README-FULL.md), [llms-full.txt](llms-full.txt), [skills/pleb/SKILL.md](skills/pleb/SKILL.md), and `src/` as authoritative for the current CLI and library contract.
+
+- [docs/01-transport-daemon-and-batch-fetch.md](docs/01-transport-daemon-and-batch-fetch.md): Historical design record for Milestones 1–2 (extraction pipeline, transport daemon, batch fetch)
+- [docs/02-swarm-hillclimb-protocol.md](docs/02-swarm-hillclimb-protocol.md): Swarm convergence protocol, Generator–Verifier separation, and subtraction gates
+- [docs/03-structured-source-negotiation.md](docs/03-structured-source-negotiation.md): Milestone 3 design record (raw-source resolution, Markdown mirrors, feeds, native Markdown)
+- [docs/04-resource-indexing-and-staging.md](docs/04-resource-indexing-and-staging.md): Milestone 4 design record (resource salience indexing, SVG/transcript rescue, artifact staging)
+- [docs/05-multi-provider-search-and-auth.md](docs/05-multi-provider-search-and-auth.md): Milestone 5 design record (`auth` credential storage and multi-provider search routing)
+- [docs/06-agent-identity-webmcp-and-cdp-renderer.md](docs/06-agent-identity-webmcp-and-cdp-renderer.md): Milestone 6 design record (RFC 9421 Web Bot Auth, WebMCP indexing, CDP / Kitesurf transport)

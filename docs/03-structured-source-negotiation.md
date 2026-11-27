@@ -1,5 +1,8 @@
 # Milestone 3 Specification: Structured Source Negotiation, Native Markdown, and Feed Extraction
 
+> [!NOTE]
+> Historical milestone design specification (recorded under the pre-rename `mesh-wick` name). Authoritative current `pleb` contracts live in [README-FULL.md](../README-FULL.md), [llms-full.txt](../llms-full.txt), [skills/pleb/SKILL.md](../skills/pleb/SKILL.md), and `src/`.
+
 ## 1. Purpose and Scope
 
 Many high-value agent targets—developer documentation platforms (`llms.txt`, Cloudflare Markdown-for-Agents, Mintlify, Nextra, Stripe, Antigravity docs), source forges (GitHub blobs, GitLab blobs, GitHub Gists), and release/blog syndication endpoints (RSS 2.0, Atom 1.0, JSON Feed 1.1)—expose lossless machine-structured or raw Markdown representations alongside heavy HTML chrome.

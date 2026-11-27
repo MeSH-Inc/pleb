@@ -31,7 +31,9 @@ verify_sha256() {
     fi
 }
 
-DEST="lib/${DIR}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+DEST="${REPO_ROOT}/lib/${DIR}"
 mkdir -p "$DEST"
 
 if [ -f "$DEST/libcronet.so" ]; then
@@ -58,3 +60,6 @@ fi
 
 echo "Checksum OK."
 echo "Saved to $DEST/libcronet.so"
+echo ""
+echo "Install with: cargo install --path . --features cronet --locked"
+echo "Note: Linux binaries embed rpath \$ORIGIN and $DEST; if moving pleb without keeping the checkout, copy libcronet.so beside the binary or set LD_LIBRARY_PATH=$DEST."

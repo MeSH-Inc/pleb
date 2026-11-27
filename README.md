@@ -44,14 +44,15 @@ See [Comparison with Alternatives](README-FULL.md#comparison-with-alternatives) 
 Install `pleb` onto `PATH`:
 
 ```bash
-# From crates.io (pure-Rust reqwest/rustls transport)
+# From crates.io (pure-Rust reqwest/rustls transport, works anywhere without a repo checkout)
 cargo install pleb
+pleb skill install
 
-# macOS Apple Silicon from source with Cronet (recommended for Chrome TLS/HTTP2/QUIC)
+# From a source checkout on macOS Apple Silicon with Cronet (recommended for Chrome TLS/HTTP2/QUIC)
 ./scripts/download-cronet-macos.sh
 cargo install --path . --features cronet --locked
 
-# Linux from source with Cronet
+# From a source checkout on Linux with Cronet (binary links libcronet.so with $ORIGIN rpath)
 ./scripts/download-cronet-linux.sh
 cargo install --path . --features cronet --locked
 
@@ -62,11 +63,11 @@ cargo build --release
 Optional components:
 
 ```bash
-# Install the local offscreen CEF renderer (macOS arm64; use install-cef-linux.sh on Linux x86_64/aarch64)
+# Install the local offscreen CEF renderer (from source checkout; use install-cef-linux.sh on Linux x86_64/aarch64)
 bash scripts/install-cef-mac.sh --force
 
-# Symlink the bundled agent skill into local agent directories
-bash scripts/install-skill.sh
+# Install the bundled agent skill from any binary install (or symlink from a source checkout via bash scripts/install-skill.sh)
+pleb skill install
 ```
 
 See [Installation and Runtime Setup](README-FULL.md#installation-and-runtime-setup) for prerequisites, custom install prefixes, and verification.

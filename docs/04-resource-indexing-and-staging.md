@@ -1,5 +1,8 @@
 # Milestone 4 Specification: Resource Salience Indexing, SVG/Transcript Rescue, and Session-Aware Staging
 
+> [!NOTE]
+> Historical milestone design specification (recorded under the pre-rename `mesh-wick` / `wick` name). Authoritative current `pleb` contracts live in [README-FULL.md](../README-FULL.md), [llms-full.txt](../llms-full.txt), [skills/pleb/SKILL.md](../skills/pleb/SKILL.md), and `src/`.
+
 ## 1. Purpose and Scope
 
 AI agents reading technical web pages routinely encounter high-value non-prose artifacts: architecture diagrams inside `<figure>`, inline `<svg>` flowcharts whose `<text>` labels are discarded during DOM pruning, `<video>`/`<audio>` `<track>` caption transcripts (`.vtt`/`.srt`), and linked `.pdf` specifications, `.csv` datasets, or OpenAPI `.yaml`/`.json` schemas.

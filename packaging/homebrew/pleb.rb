@@ -20,16 +20,19 @@ class Pleb < Formula
                                  "scripts/download-cronet-macos.sh",
                                  "scripts/download-cronet-linux.sh",
                                  "scripts/install-skill.sh"
+    (pkgshare/"cef").install Dir["cef/*"]
     (pkgshare/"skills").install "skills/pleb"
   end
 
   def caveats
     <<~EOS
       This formula builds pleb with the pure-Rust reqwest (rustls) transport.
-      For Chromium 154 Cronet TLS/HTTP2/QUIC fingerprinting or the optional
-      local CEF v5-meta renderer, clone the repository and build with:
+      To install the bundled agent skill into local agent directories, run:
+        #{bin}/pleb skill install
+      To install the optional CEF v5-meta renderer, run:
+        bash #{pkgshare}/scripts/install-cef-mac.sh --force
+      For Chromium 154 Cronet TLS/HTTP2/QUIC fingerprinting, clone the repository and build with:
         ./scripts/download-cronet-macos.sh && cargo install --path . --features cronet --locked
-        bash scripts/install-cef-mac.sh --force
     EOS
   end
 
