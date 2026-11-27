@@ -799,6 +799,7 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "acquired_sha256",
         "representation_url",
         "failed_pages",
+        "--focus",
     ] {
         assert!(
             readme_full.contains(required),
@@ -824,6 +825,7 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "content_outcome",
         "acquired_sha256",
         "representation_url",
+        "--focus",
     ] {
         assert!(
             llms_full_txt.contains(required),
@@ -918,6 +920,7 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "--format axtree",
         "content_outcome",
         "acquired_sha256",
+        "--focus",
     ] {
         assert!(
             skill_md.contains(required),
@@ -1886,4 +1889,71 @@ async fn cli_contract_hardening_exit_codes_js_shell_warning_crawl_seed_keychain_
     let forced_json: serde_json::Value = serde_json::from_slice(&forced.stdout).unwrap();
     assert_eq!(forced_json["installed"][0]["status"], "installed");
     assert_eq!(fs::read_to_string(&installed_file).unwrap(), canonical_str);
+
+    // 6. `--focus` rejects incompatible formats/flags loudly and works cleanly on markdown fetches.
+    for bad_args in [
+        vec![
+            "--json",
+            "fetch",
+            "--focus",
+            "q",
+            "--stage",
+            &format!("{base}/ok"),
+        ],
+        vec![
+            "--json",
+            "fetch",
+            "--focus",
+            "q",
+            "--format",
+            "html",
+            &format!("{base}/ok"),
+        ],
+        vec![
+            "fetch",
+            "--focus",
+            "q",
+            "--format",
+            "raw",
+            "-o",
+            "/tmp/unused.bin",
+            &format!("{base}/ok"),
+        ],
+    ] {
+        let out = Command::new(pleb_bin)
+            .env("PLEB_NO_HOME_CEF", "1")
+            .env("PLEB_NO_KEYCHAIN", "1")
+            .args(&bad_args)
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "expected conflict exit 1 for {bad_args:?}"
+        );
+    }
+
+    let focused_ok = Command::new(pleb_bin)
+        .env("PLEB_NO_HOME_CEF", "1")
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args([
+            "--no-daemon",
+            "--json",
+            "fetch",
+            "--focus",
+            "guide",
+            "--max-bytes",
+            "1024",
+            &format!("{base}/ok"),
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(focused_ok.status.code(), Some(0));
+    let focused_json: serde_json::Value = serde_json::from_slice(&focused_ok.stdout).unwrap();
+    assert_eq!(focused_json["content_outcome"], "complete");
+    assert!(focused_json["content_bytes"].as_u64().unwrap() <= 1024);
 }

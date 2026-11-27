@@ -554,6 +554,7 @@ pleb search --urls-only "rust async runtime" | pleb fetch -
 | `--no-rewrite` | flag | Disable host rewrites (`reddit.com` -> `old.reddit.com`) and forge raw-source rewrites. |
 | `--no-images` / `--no-links` | flags | Omit images or unwrap links in Markdown output. |
 | `--max-bytes <N>` | integer | UTF-8 byte cap with fence-safe Markdown truncation. |
+| `--focus <QUERY>` | string | Query-focused BM25 section projection over Markdown/text with a bounded collapsed-section map (uses `--max-bytes` or default `16,000` bytes; rejects `--stage`, `--format html`, `--format raw`, and `--format axtree`). |
 | `--concurrency <N>` | `1..=16` *(default `4`)* | Batch mode concurrency (hard cap of `2` concurrent fetches per host). |
 | `--jsonl` | flag | Stream one JSON result object per completed URL (conflicts with `--json`). |
 | `--metadata-only` | flag | Omit `content` while retaining metadata, `warning`, `resources`, and `tools` (requires `--json` or `--jsonl`; conflicts with `-o`). |

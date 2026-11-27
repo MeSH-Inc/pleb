@@ -329,11 +329,15 @@ pub async fn fetch_document(
         ExtractOptions {
             format: OutputFormat::Html,
             max_bytes: None,
+            focus: None,
             ..options.extract.clone()
         }
-    } else if needs_enrichment && options.extract.max_bytes.is_some() {
+    } else if needs_enrichment
+        && (options.extract.max_bytes.is_some() || options.extract.focus.is_some())
+    {
         ExtractOptions {
             max_bytes: None,
+            focus: None,
             ..options.extract.clone()
         }
     } else {
@@ -394,7 +398,22 @@ pub async fn fetch_document(
         }
     }
 
-    if (needs_enrichment || is_axtree) && options.extract.max_bytes.is_some() {
+    if needs_enrichment && options.extract.focus.is_some() {
+        if let Some(ref query) = options.extract.focus {
+            let budget = options
+                .extract
+                .max_bytes
+                .unwrap_or(extract::focus::DEFAULT_FOCUS_MAX_BYTES);
+            let (projected, did_truncate) = extract::focus::focus_document(
+                &extracted.content,
+                query,
+                budget,
+                options.extract.format == OutputFormat::Markdown,
+            );
+            extracted.content = projected;
+            extracted.truncated |= did_truncate;
+        }
+    } else if (needs_enrichment || is_axtree) && options.extract.max_bytes.is_some() {
         let (truncated_content, did_truncate) = extract::apply_format_limit(
             &extracted.content,
             options.extract.format,
@@ -881,6 +900,7 @@ async fn enrich_document_resources(
         include_images: false,
         include_links: false,
         max_bytes: None,
+        focus: None,
     };
 
     for entry in fetched.into_iter().flatten() {

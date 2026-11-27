@@ -103,7 +103,7 @@ Notes:
   - `--resources <none|manifest|transcripts|diagrams|all>` (default `none`: zero subresource requests, indexes into JSON/`stderr` cue; `transcripts` fetches WebVTT/SRT and YouTube captions)
   - `--tools <none|manifest>` (default `none`: indexes declarative/imperative WebMCP tools into `tools` and `stderr` cue; `manifest` appends `## Page Tools (WebMCP)`)
   - `--stage-resources <r1,r2>` / `--stage` / `--referer <URL>` (content-addressed `0o600` files in `<state_dir>/artifacts/`, magic-byte validated, `256 MiB` LRU eviction)
-  - `--wait-for-selector <CSS>`, `--respect-robots`, `--no-rewrite`, `--no-images`, `--no-links`, `--max-bytes <N>`
+  - `--wait-for-selector <CSS>`, `--respect-robots`, `--no-rewrite`, `--no-images`, `--no-links`, `--max-bytes <N>`, `--focus <QUERY>` *(BM25 section projection over Markdown/text with bounded collapsed-section map; default `16,000` bytes or `--max-bytes`)*
   - Batch options: `--concurrency <1..=16>` (default `4`, host cap `2`), `--jsonl`, `--metadata-only`, `-o <PATH>` (single URL only)
 - `pleb search [OPTIONS] <QUERY>`:
   - `-n, --limit <1..=20>` (default `8`)

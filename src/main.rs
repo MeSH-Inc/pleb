@@ -147,6 +147,9 @@ enum Command {
         /// Truncate extracted content to at most N bytes
         #[arg(long)]
         max_bytes: Option<usize>,
+        /// Project long markdown/text output onto query-relevant sections (BM25 + bounded collapsed-section map; default 16000-byte budget or --max-bytes)
+        #[arg(long)]
+        focus: Option<String>,
         /// Maximum concurrent requests in batch mode (1-16)
         #[arg(long, default_value = "4")]
         concurrency: usize,
@@ -736,6 +739,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             no_images,
             no_links,
             max_bytes,
+            focus,
             concurrency,
             jsonl,
             metadata_only,
@@ -789,6 +793,16 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             if format == OutputFormat::Raw && (json || jsonl || metadata_only || batch_mode) {
                 return Err(CliError::invalid_input(
                     "--format raw cannot be combined with batch mode, --json, --jsonl, or --metadata-only",
+                ));
+            }
+            let focus = focus
+                .map(|q| q.trim().to_string())
+                .filter(|q| !q.is_empty());
+            if focus.is_some()
+                && (stage || !matches!(format, OutputFormat::Markdown | OutputFormat::Text))
+            {
+                return Err(CliError::invalid_input(
+                    "--focus is only supported with --format markdown or --format text (cannot be combined with --stage, --format html, --format raw, or --format axtree)",
                 ));
             }
             if batch_mode && output.is_some() {
@@ -876,6 +890,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     include_images: !no_images,
                     include_links: !no_links,
                     max_bytes,
+                    focus,
                 },
                 render,
                 source,

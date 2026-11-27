@@ -444,6 +444,7 @@ fn evaluate_fixture(path: &Path) -> (String, FixtureSpec, FixtureOutcome) {
             include_images: v.include_images,
             include_links: v.include_links,
             max_bytes: v.max_bytes,
+            focus: None,
         };
         let doc = extract_document_parsed(
             &body_str,

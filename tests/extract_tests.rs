@@ -187,6 +187,7 @@ fn no_images_no_links_data_uri_and_utf8_max_bytes() {
             include_images: false,
             include_links: false,
             max_bytes: None,
+            focus: None,
         },
     )
     .unwrap();
@@ -2539,4 +2540,50 @@ fn concealed_channel_stripping_preserves_benign_styles_webmcp_and_full_mode() {
     )
     .unwrap();
     assert!(full.content.contains('\u{E0041}'));
+}
+
+#[test]
+fn focus_projection_recovers_late_sections_splits_identifiers_and_enforces_byte_and_fence_bounds() {
+    use pleb::extract::focus::focus_document;
+    use pleb::extract::markdown::open_fence_at;
+
+    let mut md = String::from("# SDK Guide\n\n## Quick Start\n\nBasic setup notes.\n");
+    for i in 1..=25 {
+        md.push_str(&format!(
+            "\n## Operational Section {i}\n\n{}\n",
+            "Routine operational telemetry note explaining buffer tuning and keepalive heartbeats. "
+                .repeat(12)
+        ));
+    }
+    md.push_str(
+        "\n## Migration Caveats\n\nCall `clear_poison` after recovery and pass `--tls-verify=strict`.\n\n```rust\nmutex.clear_poison();\n```\n",
+    );
+
+    // 1. Short budget recovers late section via identifier sub-token matching ("clear poison" -> clear_poison),
+    // keeps code fence balanced, stays within max_bytes, and emits a bounded collapsed-sections map.
+    let (focused, truncated) =
+        focus_document(&md, "clear poison tls verify migration", 1_400, true);
+    assert!(truncated);
+    assert!(focused.len() <= 1_400);
+    assert!(open_fence_at(&focused, focused.len()).is_none());
+    assert!(focused.contains("clear_poison"));
+    assert!(focused.contains("--tls-verify=strict"));
+    assert!(focused.contains("<!-- Collapsed sections:"));
+
+    // 2. Short document under budget is returned untouched with truncated=false.
+    let short = "# Short\n\nFits easily.\n";
+    let (same, trunc) = focus_document(short, "fits", 1_400, true);
+    assert!(!trunc);
+    assert_eq!(same, short);
+
+    // 3. Tiny budgets never exceed max_bytes or leave unclosed fences.
+    for cap in [32usize, 64, 128, 300, 700] {
+        let (out, did_trunc) = focus_document(&md, "clear poison migration", cap, true);
+        assert!(did_trunc);
+        assert!(out.len() <= cap, "cap={cap}, got {}", out.len());
+        assert!(
+            open_fence_at(&out, out.len()).is_none(),
+            "unclosed fence at cap={cap}"
+        );
+    }
 }

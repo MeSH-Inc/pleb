@@ -2,6 +2,7 @@ pub mod axtree;
 pub mod charset;
 pub mod dom;
 pub mod feed;
+pub mod focus;
 pub mod markdown;
 pub mod native_markdown;
 pub mod resources;
@@ -54,6 +55,7 @@ pub struct ExtractOptions {
     pub include_images: bool,
     pub include_links: bool,
     pub max_bytes: Option<usize>,
+    pub focus: Option<String>,
 }
 
 impl Default for ExtractOptions {
@@ -64,6 +66,7 @@ impl Default for ExtractOptions {
             include_images: true,
             include_links: true,
             max_bytes: None,
+            focus: None,
         }
     }
 }
@@ -181,7 +184,18 @@ pub fn extract_document_parsed(
     content_type: Option<&str>,
     options: &ExtractOptions,
 ) -> Result<ExtractedDocument> {
-    let mut doc = extract_document_parsed_inner(body, parsed, page_url, content_type, options)?;
+    let defer_limit = options.focus.is_some()
+        && matches!(options.format, OutputFormat::Markdown | OutputFormat::Text);
+    let inner_opts = if defer_limit {
+        ExtractOptions {
+            max_bytes: None,
+            focus: None,
+            ..options.clone()
+        }
+    } else {
+        options.clone()
+    };
+    let mut doc = extract_document_parsed_inner(body, parsed, page_url, content_type, &inner_opts)?;
     if options.mode != ExtractMode::Full
         && options.format != OutputFormat::Html
         && !is_passthrough_non_html(content_type)
@@ -189,6 +203,19 @@ pub fn extract_document_parsed(
         strip_concealed_unicode(&mut doc.content);
         if let Some(title) = doc.title.as_mut() {
             strip_concealed_unicode(title);
+        }
+    }
+    if defer_limit {
+        if let Some(ref query) = options.focus {
+            let budget = options.max_bytes.unwrap_or(focus::DEFAULT_FOCUS_MAX_BYTES);
+            let (projected, did_truncate) = focus::focus_document(
+                &doc.content,
+                query,
+                budget,
+                options.format == OutputFormat::Markdown,
+            );
+            doc.content = projected;
+            doc.truncated |= did_truncate;
         }
     }
     Ok(doc)
