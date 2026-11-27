@@ -4,7 +4,7 @@
 class Pleb < Formula
   desc "Local, zero-telemetry web acquisition and search CLI for AI agents"
   homepage "https://github.com/MeSH-Inc/pleb"
-  url "https://github.com/MeSH-Inc/pleb/archive/refs/tags/v0.2.0.tar.gz"
+  url "https://github.com/MeSH-Inc/pleb/archive/refs/tags/v0.2.1.tar.gz"
   sha256 "cf02f4d5989895dc98118aefff292c339ec1a97ed8854b3390ae5ec75e59d6d0"
   license "MIT"
   head "https://github.com/MeSH-Inc/pleb.git", branch: "main"
