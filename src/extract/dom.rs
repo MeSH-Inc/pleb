@@ -112,7 +112,7 @@ static A_HREF_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("a[href
 static BUTTON_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("button").unwrap());
 static STYLE_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("[style]").unwrap());
 static IMG_DIM_SEL: LazyLock<Selector> =
-    LazyLock::new(|| Selector::parse("img[width], img[height]").unwrap());
+    LazyLock::new(|| Selector::parse("img[width], img[height], img[role]").unwrap());
 static CHECKBOX_POPUP_SEL: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("input[type=\"checkbox\"][aria-haspopup=\"true\"]").unwrap());
 pub(crate) static WEBMCP_FORM_SEL: LazyLock<Selector> =
@@ -536,9 +536,8 @@ fn prune_dom(doc: &mut Html, mode: ExtractMode) -> HashMap<NodeId, NodeMetrics> 
                 continue;
             }
             if is_boilerplate_attr(val.attr("id"), val.attr("class"))
-                && !el.descendants().any(|d| {
-                    matches!(d.value(), Node::Element(e) if e.name() == "h1" || is_landmark_element(e))
-                })
+                && find_tex_annotation(*el).is_none()
+                && !contains_heading_or_landmark(*el)
             {
                 to_detach.push(el.id());
             }
@@ -553,13 +552,29 @@ fn prune_dom(doc: &mut Html, mode: ExtractMode) -> HashMap<NodeId, NodeMetrics> 
             }
         }
         for el in doc.select(&IMG_DIM_SEL) {
-            if ["width", "height"].iter().any(|a| {
-                el.value()
-                    .attr(a)
+            let val = el.value();
+            let tiny = ["width", "height"].iter().any(|a| {
+                val.attr(a)
                     .and_then(parse_html_dimension)
                     .is_some_and(|n| n <= 1)
-            }) {
+            });
+            let decorative_empty = val
+                .attr("role")
+                .is_some_and(|r| eq_any_ci(r.trim(), &["presentation", "none"]))
+                && val.attr("alt").is_none_or(|a| a.trim().is_empty());
+            if tiny || decorative_empty {
                 to_detach.push(el.id());
+            }
+        }
+        for desc in doc.root_element().descendants() {
+            if let Node::Element(e) = desc.value() {
+                let tag = e.name();
+                if tag.contains('-')
+                    && tag.to_ascii_lowercase().contains("screen-reader")
+                    && !contains_heading_or_landmark(desc)
+                {
+                    to_detach.push(desc.id());
+                }
             }
         }
         for el in doc.select(&CHECKBOX_POPUP_SEL) {
@@ -569,11 +584,7 @@ fn prune_dom(doc: &mut Html, mode: ExtractMode) -> HashMap<NodeId, NodeMetrics> 
                         parent.value(),
                         Node::Element(p) if !matches!(p.name(), "html" | "body" | "main" | "article" | "header" | "form" | "section")
                     );
-                    if is_safe_box
-                        && !parent.descendants().any(|d| {
-                            matches!(d.value(), Node::Element(e) if e.name() == "h1" || is_landmark_element(e))
-                        })
-                    {
+                    if is_safe_box && !contains_heading_or_landmark(parent) {
                         to_detach.push(parent.id());
                     }
                 }
@@ -897,6 +908,12 @@ fn collect_selector_ids(doc: &Html, selector: &Selector, out: &mut Vec<NodeId>) 
     }
 }
 
+fn contains_heading_or_landmark(node: NodeRef<'_, Node>) -> bool {
+    node.descendants().any(
+        |d| matches!(d.value(), Node::Element(e) if e.name() == "h1" || is_landmark_element(e)),
+    )
+}
+
 fn is_boilerplate_attr(id: Option<&str>, class: Option<&str>) -> bool {
     let mut combined = String::new();
     if let Some(id) = id {
@@ -917,10 +934,31 @@ fn is_boilerplate_attr(id: Option<&str>, class: Option<&str>) -> bool {
         return true;
     }
 
-    class
-        .unwrap_or("")
-        .split_whitespace()
-        .any(|tok| tok.eq_ignore_ascii_case("sr-only"))
+    class.is_some_and(has_hidden_or_sr_class)
+}
+
+fn has_hidden_or_sr_class(class: &str) -> bool {
+    let lower = class.to_ascii_lowercase();
+    let has_tok = |target: &str| lower.split_whitespace().any(|t| t == target);
+    let has_prefix = |prefixes: &[&str]| {
+        lower
+            .split_whitespace()
+            .any(|t| prefixes.iter().any(|p| t.starts_with(p)))
+    };
+    has_tok("sr-only")
+        || has_tok("visually-hidden")
+        || has_tok("screen-reader-text")
+        || (has_tok("hidden") && !has_prefix(&["xs:", "sm:", "md:", "lg:", "xl:", "2xl:"]))
+        || (has_tok("d-none") && !has_prefix(&["d-sm-", "d-md-", "d-lg-", "d-xl-", "d-xxl-"]))
+        || (has_tok("is-hidden")
+            && !lower.split_whitespace().any(|t| {
+                ["is-block-", "is-flex-", "is-inline-"]
+                    .iter()
+                    .any(|p| t.starts_with(p))
+                    && ["-tablet", "-desktop", "-widescreen", "-fullhd"]
+                        .iter()
+                        .any(|s| t.ends_with(s))
+            }))
 }
 
 fn contains_word_prefix(haystack: &str, needle: &str) -> bool {

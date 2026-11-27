@@ -1,0 +1,20 @@
+<!-- pleb-fixture: {"tier":"ratchet","url":"https://feed.example.com/r/rust/","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"r/rust","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["Qt Bindings compared","Desktop visible summary stays intact.","Large viewport details stay intact."],"forbidden_substrings":["![](https://preview.example.com/qt.webp)","https://raw.example.com/qt-full.jpeg","Unconditionally hidden modal noise"],"expected_resource_urls":["https://preview.example.com/qt.webp"],"forbidden_resource_urls":["https://raw.example.com/qt-full.jpeg"],"minimum_output_bytes":80,"maximum_output_bytes":1000}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><title>r/rust</title></head>
+<body>
+  <main>
+    <h1>r/rust</h1>
+    <article>
+      <a slot="full-post-link" href="/r/rust/posts/1"><faceplate-screen-reader-content>Qt Bindings compared</faceplate-screen-reader-content></a>
+      <a slot="title" href="/r/rust/posts/1">Qt Bindings compared</a>
+      <img alt="" role="presentation" src="https://preview.example.com/qt.webp">
+      <img width="640" height="334" alt="r/rust - Qt Bindings compared" src="https://preview.example.com/qt.webp">
+      <div class="lightboxed-content hidden"><img alt="r/rust - Qt Bindings compared" src="https://raw.example.com/qt-full.jpeg"></div>
+    </article>
+    <div class="hidden md:block"><p>Desktop visible summary stays intact.</p></div>
+    <div class="d-none d-lg-flex"><p>Large viewport details stay intact.</p></div>
+    <div class="d-none"><p>Unconditionally hidden modal noise</p></div>
+  </main>
+</body>
+</html>

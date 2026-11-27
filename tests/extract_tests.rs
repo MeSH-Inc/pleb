@@ -3004,3 +3004,67 @@ fn resource_sections_scope_list_items_and_recognize_slotted_or_aria_titles() {
     assert_eq!(find_sec("/fallback.png").as_deref(), Some("r/rust"));
     assert_eq!(find_sec("/c.png").as_deref(), Some("Core Architecture"));
 }
+
+#[test]
+fn clean_extract_prunes_hidden_lightbox_decorative_imgs_and_sr_custom_elements_with_responsive_guards(
+) {
+    let url = Url::parse("https://feed.example.com/r/rust/").unwrap();
+    let html = r#"<!doctype html>
+<html><head><title>r/rust</title></head><body>
+  <div class="hidden"><main><h1>r/rust</h1>
+    <article>
+      <a slot="full-post-link" href="/p"><faceplate-screen-reader-content>Title</faceplate-screen-reader-content></a>
+      <a slot="title" href="/p">Title</a>
+      <img alt="" role="presentation" src="/bg.png">
+      <img alt="Meaningful alt" role="presentation" src="/meaningful.png">
+      <div class="lightboxed-content hidden"><img width="800" height="600" alt="Full post image" src="/full.jpeg"></div>
+    </article>
+    <div class="hidden md:block"><p>Responsive Tailwind kept.</p></div>
+    <div class="d-none d-lg-flex"><p>Responsive Bootstrap kept.</p></div>
+    <div class="overflow-hidden"><p>Overflow utility kept.</p></div>
+    <div class="d-none"><p>Unconditional Bootstrap hidden pruned.</p></div>
+  </main></div>
+</body></html>"#;
+
+    let clean =
+        extract_document(html, &url, Some("text/html"), &ExtractOptions::default()).unwrap();
+    assert_eq!(
+        clean
+            .content
+            .matches("[Title](https://feed.example.com/p)")
+            .count(),
+        1,
+        "screen-reader overlay duplicate link must be removed cleanly; got:\n{}",
+        clean.content
+    );
+    assert!(!clean.content.contains("/bg.png"));
+    assert!(clean
+        .content
+        .contains("![Meaningful alt](https://feed.example.com/meaningful.png)"));
+    assert!(!clean.content.contains("/full.jpeg"));
+    assert!(!clean
+        .resources
+        .iter()
+        .any(|r| r.url.ends_with("/full.jpeg")));
+    assert!(clean.content.contains("Responsive Tailwind kept."));
+    assert!(clean.content.contains("Responsive Bootstrap kept."));
+    assert!(clean.content.contains("Overflow utility kept."));
+    assert!(!clean
+        .content
+        .contains("Unconditional Bootstrap hidden pruned."));
+
+    let full = extract_document(
+        html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions {
+            mode: ExtractMode::Full,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(full
+        .content
+        .contains("Unconditional Bootstrap hidden pruned."));
+    assert!(full.content.contains("/bg.png"));
+}
