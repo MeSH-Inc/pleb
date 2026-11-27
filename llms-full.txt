@@ -45,21 +45,21 @@ Healthy Cronet + CEF installations report `"cronet_enabled": true`, `"cef_render
 
 ## Corpus Extraction Benchmarks
 
-Measured with `cargo run --release --example corpus_benchmark` across all `45` sanitized fixtures in [tests/corpus_evaluation.rs](tests/corpus_evaluation.rs) (`ExtractMode::Clean`, `OutputFormat::Markdown`, `50` warm passes per fixture on Apple Silicon). Token counts use the deterministic `ceil(bytes / 4)` heuristic (exact BPE counts vary by tokenizer), and latencies reflect single-host release execution of [examples/corpus_benchmark.rs](examples/corpus_benchmark.rs).
+Measured with `cargo run --release --example corpus_benchmark` across all `49` benchmarked fixtures from [tests/corpus_evaluation.rs](tests/corpus_evaluation.rs) (`ExtractMode::Clean`, `OutputFormat::Markdown`, `50` warm passes per fixture on Apple Silicon). Token counts use the deterministic `ceil(bytes / 4)` heuristic (exact BPE counts vary by tokenizer), and latencies reflect single-host release execution of [examples/corpus_benchmark.rs](examples/corpus_benchmark.rs).
 
 | Category | Fixtures | Raw Bytes | Output Bytes | Reduction | Raw Est. Tokens | Output Est. Tokens | Mean Latency/Doc |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| HTML pages | 28 | 40,221 | 9,652 | 76.0% | 10,056 | 2,413 | 62.3 us |
-| Syndication feeds (RSS/Atom/JSON) | 4 | 3,031 | 1,424 | 53.0% | 758 | 356 | 22.3 us |
+| HTML pages | 30 | 42,767 | 10,557 | 75.3% | 10,692 | 2,640 | 72.8 us |
+| Syndication feeds (RSS/Atom/JSON) | 4 | 3,031 | 1,424 | 53.0% | 758 | 356 | 25.0 us |
 | Transcripts (WebVTT/SRT) | 2 | 520 | 205 | 60.6% | 130 | 52 | 1.5 us |
 | Native Markdown | 5 | 2,108 | 2,142 | -1.6% | 527 | 536 | 3.0 us |
 | Plain/JSON passthrough | 2 | 152 | 152 | 0.0% | 38 | 38 | 0.1 us |
-| **All extractable** | **41** | **46,032** | **13,575** | **70.5%** | **11,508** | **3,394** | **45.1 us** (`23.72 MiB/s`) |
+| **All extractable** | **43** | **48,578** | **14,480** | **70.2%** | **12,145** | **3,620** | **53.6 us** (`20.11 MiB/s`) |
 
 Notes:
-- Combined warm extraction throughput measured `23.72 MiB/s` (`1.851 ms` per full pass across `46,032` bytes).
+- Combined warm extraction throughput measured `20.11 MiB/s` (`2.304 ms` per full pass across `48,578` bytes).
 - Native Markdown fixtures grew `+1.6%` overall because relative links (for example `./CONTRIBUTING.md`) are resolved against the base URL into full clickable URLs.
-- All `4/4` non-extractable classification gates matched (`ratchet_challenge_403.html` -> `challenge`, `frontier_soft_404_login_wall.html` -> `blocked`, `ratchet_js_shell.html` -> `javascript_shell`, `frontier_canary_sveltekit_spa.html` -> `javascript_shell`).
+- All `6/6` non-extractable classification gates matched (`ratchet_challenge_403.html` -> `challenge`, `frontier_http200_human_challenge.html` -> `challenge`, `frontier_soft_404_login_wall.html` -> `blocked`, `frontier_login_redirect_boilerplate.html` -> `blocked`, `ratchet_js_shell.html` -> `javascript_shell`, `frontier_canary_sveltekit_spa.html` -> `javascript_shell`).
 - Run `cargo run --release --example corpus_benchmark -- --json` for machine-readable JSON output.
 
 ## Comparison with Alternatives

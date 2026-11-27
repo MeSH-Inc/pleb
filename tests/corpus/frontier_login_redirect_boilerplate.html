@@ -1,0 +1,20 @@
+<!-- pleb-fixture: {"tier":"ratchet","url":"https://community.example.com/r/rust/","final_url":"https://community.example.com/login/?reason=lor2&dest=%2Fr%2Frust%2F","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":2,"expected_error_kind":"blocked","expected_response_classification":"blocked","expected_title":"Welcome to Community","variants":[]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><title>Welcome to Community</title></head>
+<body>
+  <main>
+    <h1>Sign in to Community</h1>
+    <p>By continuing, you agree to our User Agreement and acknowledge that you understand our Privacy Policy. Create an account or log in to subscribe to discussions, bookmark threads, customize feed preferences, and participate in verified community discussions across topic channels.</p>
+    <p>Use an existing username and password or link a federated account below to return to the discussion thread you requested. Password recovery and two-factor verification options are available if you have trouble accessing your profile from this browser session.</p>
+    <form action="/login" method="post">
+      <label for="u">Username</label>
+      <input id="u" type="text" name="user">
+      <label for="p">Password</label>
+      <input id="p" type="password" name="passwd">
+      <button type="submit">Log in</button>
+    </form>
+    <p>Troubleshooting sign-in? Check that cookies are enabled, clear stale session tokens, and contact your workspace administrator if single sign-on redirects back to this login screen repeatedly.</p>
+  </main>
+</body>
+</html>

@@ -2,8 +2,6 @@
   "version": 1,
   "note": "Bundled structural per-site routing and host-rewrite rules. Local overrides may be placed in <state-dir>/site-rules.json.",
   "rules": {
-    "reddit.com": { "render": "cronet", "rewrite_host": "old.reddit.com" },
-    "www.reddit.com": { "render": "cronet", "rewrite_host": "old.reddit.com" },
     "x.com": { "render": "cef", "wait_for_selector": "article" },
     "twitter.com": { "render": "cef", "wait_for_selector": "article" }
   }

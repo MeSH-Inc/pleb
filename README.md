@@ -46,7 +46,7 @@ See [Command Reference](README-FULL.md#command-reference) for global flags, `ple
 
 ## Benchmarks and Boundaries
 
-Across all `41` extractable fixtures in [tests/corpus_evaluation.rs](tests/corpus_evaluation.rs) (`cargo run --release --example corpus_benchmark`), `pleb` reduces payload size by `70.5%` (`46,032` -> `13,575` bytes) at `45.1 us` mean release latency (`23.72 MiB/s`), and classifies `4/4` challenge/login/JS-shell gates. Active CAPTCHA/bot challenges fail fast (`exit 2`, typed `block_reason`) with zero evasion scripts; see [Benchmarks](README-FULL.md#benchmarks) and [Comparison with Alternatives](README-FULL.md#comparison-with-alternatives) for methodology and trade-offs.
+Across all `43` extractable fixtures in [examples/corpus_benchmark.rs](examples/corpus_benchmark.rs) (`cargo run --release --example corpus_benchmark`, `49` benchmarked / `52` total contracts in [tests/corpus_evaluation.rs](tests/corpus_evaluation.rs)), `pleb` reduces payload size by `70.2%` (`48,578` -> `14,480` bytes) at `53.6 us` mean release latency (`20.11 MiB/s`), and classifies `6/6` challenge/login/JS-shell gates. Active CAPTCHA/bot challenges fail fast (`exit 2`, typed `block_reason`) with zero evasion scripts; see [Benchmarks](README-FULL.md#benchmarks) and [Comparison with Alternatives](README-FULL.md#comparison-with-alternatives) for methodology and trade-offs.
 
 ## Documentation
 

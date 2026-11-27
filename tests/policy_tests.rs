@@ -1,8 +1,8 @@
 use pleb::extract::ParsedHtml;
 use pleb::policy::{
-    classify_response, classify_response_with_headers, classify_response_with_parsed,
-    plan_strategy, BlockReason, EscalationBackend, PrimaryTransport, RenderMode,
-    ResponseClassification, SiteCache, SiteCacheEntry, SiteRule, SiteRules,
+    classify_response, classify_response_with_context, classify_response_with_headers,
+    classify_response_with_parsed, plan_strategy, BlockReason, EscalationBackend, PrimaryTransport,
+    RenderMode, ResponseClassification, SiteCache, SiteCacheEntry, SiteRule, SiteRules,
 };
 use pleb::transport::DiagnosticHeaders;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -221,7 +221,7 @@ fn site_cache_atomic_save_and_ttl_expiry() {
 #[test]
 fn site_rules_bundled_parent_rewrite_and_local_overlay() {
     let dir = temp_dir("site-rules");
-    let overlay = r#"{"rules":{"x.com":{"render":"cronet"},"sub.example.com":{"render":"cef"},"custom.dev":{"render":"cef"}}}"#;
+    let overlay = r#"{"rules":{"x.com":{"render":"cronet"},"sub.example.com":{"render":"cef"},"custom.dev":{"render":"cef"},"example.org":{"rewrite_host":"old.example.org"}}}"#;
     std::fs::write(dir.join("site-rules.json"), overlay).unwrap();
 
     let rules = SiteRules::load(&dir);
@@ -240,11 +240,15 @@ fn site_rules_bundled_parent_rewrite_and_local_overlay() {
     assert!(rules.get("sub.example.com").is_some());
     assert!(rules.get("other.example.com").is_none());
 
-    // Bundled Reddit rewrite works once and does not rewrite old.reddit.com again.
-    let reddit = Url::parse("https://www.reddit.com/r/rust/").unwrap();
-    let rewritten = rules.rewrite_url(&reddit).expect("reddit should rewrite");
-    assert_eq!(rewritten.as_str(), "https://old.reddit.com/r/rust/");
+    // Host rewrite works once and does not rewrite the target host again; stale reddit rewrite removed.
+    let target = Url::parse("https://example.org/r/rust/").unwrap();
+    let rewritten = rules
+        .rewrite_url(&target)
+        .expect("example.org should rewrite");
+    assert_eq!(rewritten.as_str(), "https://old.example.org/r/rust/");
     assert!(rules.rewrite_url(&rewritten).is_none());
+    let reddit = Url::parse("https://www.reddit.com/r/rust/").unwrap();
+    assert!(rules.rewrite_url(&reddit).is_none());
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -286,6 +290,61 @@ fn response_classifier_covers_challenges_js_shells_and_normal_pages() {
     let normal_page = "<html><body><h1>Welcome</h1><p>Normal prose content here.</p></body></html>";
     assert_eq!(
         classify_response(200, true, normal_page),
+        ResponseClassification::Ok
+    );
+
+    // Low-prose HTTP 200 human-verification challenge interstitial classifies as Challenge.
+    let human_gate = r#"<html><head><title>Forum - Prove your humanity</title></head>
+        <body><main><h1>Prove your humanity</h1>
+        <p>We are committed to safety and security. But not for bots. Complete the challenge below and let us know you are a real person.</p>
+        </main></body></html>"#;
+    assert!(matches!(
+        classify_response(200, true, human_gate),
+        ResponseClassification::Challenge { status: 200, .. }
+    ));
+
+    // Inverse false-positive check: long prose article discussing challenge phrases classifies as Ok.
+    let long_article = format!(
+        "<html><body><article><h1>Understanding Anti-Bot Verification</h1><p>Modern sites sometimes ask visitors to prove your humanity or verify you are human using CAPTCHA bots before access is granted. {}</p></article></body></html>",
+        "Detailed technical explanation of web authentication flows, session cookies, and browser rendering pipelines. ".repeat(10)
+    );
+    assert_eq!(
+        classify_response(200, true, &long_article),
+        ResponseClassification::Ok
+    );
+
+    // Boilerplate-heavy redirect from non-auth URL to /login with password input classifies as LoginWall.
+    let login_redirect_html = format!(
+        r#"<html><head><title>Welcome</title></head><body><main><h1>Sign in</h1><p>{}</p><form action="/login" method="post"><input type="text" name="u"><input type="password" name="p"></form></main></body></html>"#,
+        "Please sign in to access discussions, configure preferences, and review community policies. ".repeat(10)
+    );
+    let mut parsed_login = None;
+    assert_eq!(
+        classify_response_with_context(
+            200,
+            true,
+            Some("https://community.example.com/r/rust/"),
+            Some("https://community.example.com/login/?reason=lor2"),
+            &login_redirect_html,
+            &mut parsed_login,
+        ),
+        ResponseClassification::Blocked {
+            status: 200,
+            reason: BlockReason::LoginWall,
+        }
+    );
+
+    // Inverse false-positive check: direct navigation to /login (no non-auth -> login redirect) with >= 600 prose bytes classifies as Ok.
+    let mut parsed_direct_login = None;
+    assert_eq!(
+        classify_response_with_context(
+            200,
+            true,
+            Some("https://community.example.com/login"),
+            Some("https://community.example.com/login"),
+            &login_redirect_html,
+            &mut parsed_direct_login,
+        ),
         ResponseClassification::Ok
     );
 

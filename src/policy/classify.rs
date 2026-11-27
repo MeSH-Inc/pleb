@@ -161,6 +161,15 @@ pub fn classify_response_with_headers(
             let doc = parsed.get_or_insert_with(|| dom::ParsedHtml::parse(body));
             let m = doc.text_metrics();
             if m.prose_bytes >= 600 {
+                if m.prose_bytes < 2000
+                    && m.has_password_input
+                    && is_login_redirect(requested_url, final_url)
+                {
+                    return ResponseClassification::Blocked {
+                        status,
+                        reason: BlockReason::LoginWall,
+                    };
+                }
                 return ResponseClassification::Ok;
             }
             Some(m)
@@ -265,6 +274,8 @@ fn detect_challenge_lower(lower: &str) -> Option<String> {
         ("captcha-delivery.com", "DataDome challenge"),
         ("px-captcha", "PerimeterX challenge"),
         ("awswaf", "AWS WAF challenge"),
+        ("prove your humanity", "Bot verification challenge"),
+        ("verify you are human", "Bot verification challenge"),
     ];
     for (sig, label) in signals {
         if lower.contains(sig) {
@@ -288,6 +299,19 @@ fn detect_interstitial_challenge_lower(lower: &str, body_len: usize) -> Option<S
     }
     if lower.contains("captcha-delivery.com") && body_len < 50_000 {
         return Some("DataDome interstitial".to_string());
+    }
+    let has_human_gate = lower.contains("prove your humanity")
+        || lower.contains("verify you are human")
+        || lower.contains("confirm you are human")
+        || lower.contains("are you a robot")
+        || lower.contains("complete the challenge below");
+    let has_challenge_ctx = lower.contains("challenge")
+        || lower.contains("captcha")
+        || lower.contains("bot")
+        || lower.contains("real person")
+        || lower.contains("security check");
+    if has_human_gate && has_challenge_ctx && body_len < 100_000 {
+        return Some("Bot verification challenge interstitial".to_string());
     }
     None
 }

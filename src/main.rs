@@ -137,7 +137,7 @@ enum Command {
         /// Enforce robots.txt for this fetch (skipped by default)
         #[arg(long)]
         respect_robots: bool,
-        /// Disable host rewrite rules (e.g., old.reddit.com) and forge raw-source rewrites
+        /// Disable host rewrite rules (from site-rules.json) and forge raw-source rewrites
         #[arg(long)]
         no_rewrite: bool,
         /// Strip image references from markdown output

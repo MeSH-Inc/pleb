@@ -46,7 +46,7 @@ Key capabilities beyond upstream `wickproject/wick`:
 
 ## Benchmarks
 
-Reproducible offline benchmark across all `45` sanitized fixtures in [tests/corpus_evaluation.rs](tests/corpus_evaluation.rs) (`41` extractable documents in `ExtractMode::Clean` -> `OutputFormat::Markdown`, `50` warm release passes per fixture on Apple Silicon, plus `4` non-extractable gate fixtures):
+Reproducible offline benchmark across all `49` benchmarked fixtures from [tests/corpus_evaluation.rs](tests/corpus_evaluation.rs) (`43` extractable documents in `ExtractMode::Clean` -> `OutputFormat::Markdown`, `50` warm release passes per fixture on Apple Silicon, plus `6` non-extractable gate fixtures):
 
 ```bash
 cargo run --release --example corpus_benchmark
@@ -55,18 +55,18 @@ cargo run --release --example corpus_benchmark -- --json
 
 | Category | Fixtures | Raw Bytes | Output Bytes | Byte Reduction | Est. Tokens (`Raw -> Clean`) | Mean Release Latency |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| HTML pages | 28 | 40,221 | 9,652 | 76.0% | 10,056 -> 2,413 | 62.3 us |
-| Syndication feeds (RSS/Atom/JSON) | 4 | 3,031 | 1,424 | 53.0% | 758 -> 356 | 22.3 us |
+| HTML pages | 30 | 42,767 | 10,557 | 75.3% | 10,692 -> 2,640 | 72.8 us |
+| Syndication feeds (RSS/Atom/JSON) | 4 | 3,031 | 1,424 | 53.0% | 758 -> 356 | 25.0 us |
 | Transcripts (WebVTT/SRT) | 2 | 520 | 205 | 60.6% | 130 -> 52 | 1.5 us |
 | Native Markdown | 5 | 2,108 | 2,142 | -1.6% | 527 -> 536 | 3.0 us |
 | Plain/JSON passthrough | 2 | 152 | 152 | 0.0% | 38 -> 38 | 0.1 us |
-| **All extractable** | **41** | **46,032** | **13,575** | **70.5%** | **11,508 -> 3,394** | **45.1 us** (`23.72 MiB/s`) |
+| **All extractable** | **43** | **48,578** | **14,480** | **70.2%** | **12,145 -> 3,620** | **53.6 us** (`20.11 MiB/s`) |
 
 Methodology notes:
 - **Token estimation**: Uses the deterministic `ceil(bytes / 4)` heuristic (exact BPE counts vary by tokenizer; raw UTF-8 bytes are exact).
 - **Native Markdown expansion (`-1.6%`)**: Relative paths inside Markdown fixtures (such as `./CONTRIBUTING.md`) are resolved against the base URL into full URLs so agents receive valid links.
-- **Classification gates (`4/4` matched)**: `ratchet_challenge_403.html` (`challenge`), `frontier_soft_404_login_wall.html` (`blocked`), `ratchet_js_shell.html` (`javascript_shell`), and `frontier_canary_sveltekit_spa.html` (`javascript_shell`) all classify accurately before extraction.
-- **Hardware caveat**: Latency (`us`) and combined throughput (`23.72 MiB/s`, `1.851 ms` per full pass) depend on host CPU and reflect release builds (`target/release/examples/corpus_benchmark`).
+- **Classification gates (`6/6` matched)**: `ratchet_challenge_403.html` (`challenge`), `frontier_http200_human_challenge.html` (`challenge`), `frontier_soft_404_login_wall.html` (`blocked`), `frontier_login_redirect_boilerplate.html` (`blocked`), `ratchet_js_shell.html` (`javascript_shell`), and `frontier_canary_sveltekit_spa.html` (`javascript_shell`) all classify accurately before extraction.
+- **Hardware caveat**: Latency (`us`) and combined throughput (`20.11 MiB/s`, `2.304 ms` per full pass) depend on host CPU and reflect release builds (`target/release/examples/corpus_benchmark`).
 
 ---
 
@@ -258,7 +258,7 @@ When installed at `<state_dir>/cef/pleb-renderer.app` (macOS arm64) or `<state_d
 
 In `--render auto` mode (default):
 
-1. `pleb` checks bundled and local `site-rules.json` (by default `reddit.com`/`www.reddit.com` rewrite to `old.reddit.com` over Cronet, and `x.com`/`twitter.com` route to CEF waiting for `article`), then consults `<state_dir>/site-cache.json`.
+1. `pleb` checks bundled and local `site-rules.json` (by default `x.com`/`twitter.com` route to CEF waiting for `article`, and custom overlays can configure `rewrite_host` rules), then consults `<state_dir>/site-cache.json`.
 2. Unless a rule or cached strategy selects CEF first, `pleb` fetches via Cronet/`reqwest` and classifies the response:
    - `406 Not Acceptable` when sending `Accept: text/markdown` -> automatically retries once with standard HTML `Accept` headers.
    - `429 Too Many Requests` with integer `Retry-After <= 5s` -> performs one bounded retry within remaining timeout; persistent `429`s classify as `Blocked` (`block_reason: "rate_limited"`, exit code `2`).
@@ -557,7 +557,7 @@ pleb search --urls-only "rust async runtime" | pleb fetch -
 | `--stage` | flag | Stage a single binary/document URL into `<state_dir>/artifacts/` and print its path (or JSON). |
 | `--wait-for-selector <CSS>` | CSS selector | Selector to wait for during CEF or CDP rendering. |
 | `--respect-robots` | flag | Enforce `robots.txt` on `fetch` (skipped by default). |
-| `--no-rewrite` | flag | Disable host rewrites (`reddit.com` -> `old.reddit.com`) and forge raw-source rewrites. |
+| `--no-rewrite` | flag | Disable host rewrites from `site-rules.json` and forge raw-source rewrites. |
 | `--no-images` / `--no-links` | flags | Omit images or unwrap links in Markdown output. |
 | `--max-bytes <N>` | integer | UTF-8 byte cap with fence-safe Markdown truncation. |
 | `--focus <QUERY>` | string | Query-focused BM25 section projection over Markdown/text with a bounded collapsed-section map (uses `--max-bytes` or default `16,000` bytes; rejects `--stage`, `--format html`, `--format raw`, and `--format axtree`). |
