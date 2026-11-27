@@ -4,7 +4,7 @@
 class Pleb < Formula
   desc "Local, zero-telemetry web acquisition and search CLI for AI agents"
   homepage "https://github.com/MeSH-Inc/pleb"
-  url "https://github.com/MeSH-Inc/pleb/archive/refs/tags/v0.1.0.tar.gz"
+  url "https://github.com/MeSH-Inc/pleb/archive/refs/tags/v0.2.0.tar.gz"
   sha256 "f99e271ed7a49ee2fe66f891abd7d55dc50dd4d7005d05145a03d02ffaa79e79"
   license "MIT"
   head "https://github.com/MeSH-Inc/pleb.git", branch: "main"
@@ -27,7 +27,9 @@ class Pleb < Formula
   def caveats
     <<~EOS
       This formula builds pleb with the pure-Rust reqwest (rustls) transport.
-      To install the bundled agent skill into local agent directories, run:
+      To register `pleb mcp`, bundled SKILL.md, and Claude Code WebFetch hook, run:
+        #{bin}/pleb setup
+      Or install only the bundled agent skill:
         #{bin}/pleb skill install
       To install the optional CEF v5-meta renderer, run:
         bash #{pkgshare}/scripts/install-cef-mac.sh --force
