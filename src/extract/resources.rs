@@ -223,20 +223,13 @@ fn walk_for_resources(
         }
     }
 
-    if tag == "article" {
+    if matches!(tag, "article" | "li") {
         let saved_heading = ctx.current_heading.clone();
-        if let Some(heading) = first_article_heading(node) {
-            ctx.current_heading = Some(heading);
+        if tag == "article" {
+            if let Some(heading) = first_article_heading(node) {
+                ctx.current_heading = Some(heading);
+            }
         }
-        for child in node.children() {
-            walk_for_resources(child, in_figure, figure_caption, ctx);
-        }
-        ctx.current_heading = saved_heading;
-        return;
-    }
-
-    if tag == "li" {
-        let saved_heading = ctx.current_heading.clone();
         for child in node.children() {
             walk_for_resources(child, in_figure, figure_caption, ctx);
         }
@@ -572,7 +565,7 @@ fn has_technical_visual_cue(label: Option<&str>, path: &str) -> bool {
     label.is_some_and(check) || check(path)
 }
 
-fn infer_image_mime(path: &str) -> Option<String> {
+pub(crate) fn infer_image_mime(path: &str) -> Option<String> {
     let lower = path.to_ascii_lowercase();
     let ext = lower.rsplit('/').next()?.rsplit_once('.')?.1;
     let mime = match ext {

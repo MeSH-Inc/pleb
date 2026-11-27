@@ -915,30 +915,26 @@ fn contains_heading_or_landmark(node: NodeRef<'_, Node>) -> bool {
 }
 
 fn is_boilerplate_attr(id: Option<&str>, class: Option<&str>) -> bool {
+    let class_lower = class.map(str::to_ascii_lowercase);
     let mut combined = String::new();
     if let Some(id) = id {
         combined.push_str(&id.to_ascii_lowercase());
         combined.push(' ');
     }
-    if let Some(class) = class {
-        combined.push_str(&class.to_ascii_lowercase());
+    if let Some(class) = &class_lower {
+        combined.push_str(class);
     }
     if combined.is_empty() {
         return false;
     }
 
-    if BOILERPLATE_ATTR_PATTERNS
+    BOILERPLATE_ATTR_PATTERNS
         .iter()
         .any(|pat| contains_word_prefix(&combined, pat))
-    {
-        return true;
-    }
-
-    class.is_some_and(has_hidden_or_sr_class)
+        || class_lower.as_deref().is_some_and(has_hidden_or_sr_class)
 }
 
-fn has_hidden_or_sr_class(class: &str) -> bool {
-    let lower = class.to_ascii_lowercase();
+fn has_hidden_or_sr_class(lower: &str) -> bool {
     let has_tok = |target: &str| lower.split_whitespace().any(|t| t == target);
     let has_prefix = |prefixes: &[&str]| {
         lower
@@ -1575,11 +1571,7 @@ fn collect_svg_text_segments(svg_node: NodeRef<'_, Node>) -> Vec<String> {
 }
 
 fn is_svg_non_content_tag(tag: &str) -> bool {
-    tag.eq_ignore_ascii_case("style")
-        || tag.eq_ignore_ascii_case("script")
-        || tag.eq_ignore_ascii_case("defs")
-        || tag.eq_ignore_ascii_case("title")
-        || tag.eq_ignore_ascii_case("desc")
+    eq_any_ci(tag, &["style", "script", "defs", "title", "desc"])
 }
 
 fn walk_svg_text_segments(

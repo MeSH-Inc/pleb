@@ -432,14 +432,6 @@ fn parse_link_ref_definition(line: &str) -> Option<LinkRefDef<'_>> {
     })
 }
 
-fn is_image_dest(dest: &str) -> bool {
-    let path = dest.split(['?', '#']).next().unwrap_or("");
-    let lower = path.to_ascii_lowercase();
-    [".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".avif"]
-        .iter()
-        .any(|ext| lower.ends_with(ext))
-}
-
 fn rewrite_link_ref_definition(
     line: &str,
     link_base_url: &Url,
@@ -451,7 +443,8 @@ fn rewrite_link_ref_definition(
     if !include_links && !include_images {
         return Some(String::new());
     }
-    let ref_base = if is_image_dest(def.dest) {
+    let path = def.dest.split(['?', '#']).next().unwrap_or("");
+    let ref_base = if super::resources::infer_image_mime(path).is_some() {
         image_base_url
     } else {
         link_base_url
