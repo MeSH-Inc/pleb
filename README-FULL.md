@@ -478,7 +478,7 @@ pleb auth remove tavily
 ```
 
 - **Supported providers**: `brave`, `tavily`, `serper`, `exa`, `searxng`, `web-bot-auth-jwk`, `web-bot-auth-agent`, `cdp-access-client-id`, `cdp-access-client-secret`, `cdp-access-host`.
-- **Resolution precedence**: Environment variable (`BRAVE_API_KEY`, `TAVILY_API_KEY`, `SERPER_API_KEY`, `EXA_API_KEY`, `SEARXNG_URL`, `PLEB_WEB_BOT_AUTH_JWK`, `PLEB_WEB_BOT_AUTH_AGENT`, `PLEB_CDP_ACCESS_CLIENT_ID`, `PLEB_CDP_ACCESS_CLIENT_SECRET`, `PLEB_CDP_ACCESS_HOST`) -> macOS Keychain (service `pleb`, skipped when `PLEB_NO_KEYCHAIN=1`) -> `<state_dir>/credentials.json` (`0o600`).
+- **Resolution precedence**: Environment variable (`BRAVE_API_KEY`, `TAVILY_API_KEY`, `SERPER_API_KEY`, `EXA_API_KEY`, `SEARXNG_URL`, `PLEB_WEB_BOT_AUTH_JWK`, `PLEB_WEB_BOT_AUTH_AGENT`, `PLEB_CDP_ACCESS_CLIENT_ID`, `PLEB_CDP_ACCESS_CLIENT_SECRET`, `PLEB_CDP_ACCESS_HOST`) -> `<state_dir>/credentials.enc` (`0o600` AES-256-GCM vault wrapped by one `vault-key` item in macOS Keychain under service `pleb`; skipped with zero Keychain calls when absent or when `PLEB_NO_KEYCHAIN=1`) -> `<state_dir>/credentials.json` (`0o600`).
 - **Input hygiene**: `pleb auth set` never accepts secrets as positional arguments. Interactive mode reads from `/dev/tty` with echo disabled; `--stdin` accepts printable ASCII up to `4096` bytes (multi-line JSON whitespace is allowed solely for `web-bot-auth-jwk` and canonicalized on store). Child `daemon.sock` and CEF processes explicitly scrub all credential env vars and `PLEB_CDP_URL`. In-memory secret buffers are zeroized on drop, and `pleb auth status` never prints secret values, private keys, or Access tokens.
 - **Cooldown reset**: `pleb auth set` and `pleb auth remove` clear any stale cooldown entry for that provider. `pleb auth remove` warns on `stderr` if the provider's environment variable is still set.
 
@@ -647,7 +647,7 @@ pleb skill print            # Emit bundled skills/pleb/SKILL.md (--json supporte
 | `daemon.sock`, `daemon.lock`, `daemon.log` | private | Daemon stopped | Unified Unix-socket transport daemon IPC, lock, and logs |
 | `site-cache.json` | `0o600` | Yes | Learned per-host transport strategy cache |
 | `search-state.json` | `0o600` | Yes | Search provider cooldowns, burst timestamps, and monthly request counts |
-| `credentials.json` | `0o600` | **Preserved** | File-backed search provider credentials (Keychain items are also preserved) |
+| `credentials.enc`, `credentials.json` | `0o600` | **Preserved** | Encrypted Keychain-backed vault (`credentials.enc`) and file-backed credentials (`credentials.json`); `vault-key` Keychain item is also preserved |
 | `site-rules.json` | user-managed | **Preserved** | Optional local host-routing overlay merged over bundled `data/site-rules.json` |
 | `cef/` | `0o700` | **Preserved** | Default install location for `pleb-renderer.app` / `pleb-renderer` |
 

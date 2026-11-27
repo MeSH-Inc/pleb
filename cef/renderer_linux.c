@@ -60,9 +60,10 @@ int main(int argc, char* argv[]) {
     new_argv[a] = NULL;
 
     cef_api_hash(CEF_API_VERSION, 0);
+    pleb_init_cef_app();
 
     cef_main_args_t main_args = { .argc = a, .argv = new_argv };
-    int exit_code = cef_execute_process(&main_args, NULL, NULL);
+    int exit_code = cef_execute_process(&main_args, &g_app, NULL);
     if (exit_code >= 0) {
         free(new_argv);
         return exit_code;
@@ -113,7 +114,7 @@ int main(int argc, char* argv[]) {
     snprintf(profile_path, sizeof(profile_path), "%s/Default", cache_path);
     cef_string_utf8_to_utf16(profile_path, strlen(profile_path), &settings.cache_path);
 
-    if (!cef_initialize(&main_args, &settings, NULL, NULL)) {
+    if (!cef_initialize(&main_args, &settings, &g_app, NULL)) {
         pleb_write_ready(stdout, 0, "cef_initialize failed");
         free(new_argv);
         return 1;

@@ -11,7 +11,9 @@
 #include "protocol.h"
 #include "include/capi/cef_app_capi.h"
 #include "include/capi/cef_browser_capi.h"
+#include "include/capi/cef_browser_process_handler_capi.h"
 #include "include/capi/cef_client_capi.h"
+#include "include/capi/cef_command_line_capi.h"
 #include "include/capi/cef_display_handler_capi.h"
 #include "include/capi/cef_frame_capi.h"
 #include "include/capi/cef_life_span_handler_capi.h"
@@ -356,6 +358,76 @@ static void pleb_init_cef_handlers(void) {
     g_client.get_render_handler = get_render_handler;
     g_client.get_display_handler = get_display_handler;
     g_client.get_request_handler = get_request_handler;
+}
+
+// ── App & browser process handler — subprocess keyring isolation
+
+static void pleb_append_switch_if_missing(cef_command_line_t* cmd, const char* name) {
+    if (!cmd || !name || !name[0]) return;
+    cef_string_t sw = {};
+    cef_string_utf8_to_utf16(name, strlen(name), &sw);
+    if (cmd->has_switch && cmd->append_switch && !cmd->has_switch(cmd, &sw)) {
+        cmd->append_switch(cmd, &sw);
+    }
+    cef_string_clear(&sw);
+}
+
+static void pleb_append_switch_value_if_missing(
+    cef_command_line_t* cmd, const char* name, const char* value) {
+    if (!cmd || !name || !name[0] || !value) return;
+    cef_string_t sw = {};
+    cef_string_utf8_to_utf16(name, strlen(name), &sw);
+    if (cmd->has_switch && cmd->append_switch_with_value && !cmd->has_switch(cmd, &sw)) {
+        cef_string_t val = {};
+        cef_string_utf8_to_utf16(value, strlen(value), &val);
+        cmd->append_switch_with_value(cmd, &sw, &val);
+        cef_string_clear(&val);
+    }
+    cef_string_clear(&sw);
+}
+
+static void pleb_append_keyring_isolation_switches(cef_command_line_t* cmd) {
+    if (!cmd || !cmd->is_valid || !cmd->is_valid(cmd)) return;
+#ifdef __APPLE__
+    pleb_append_switch_if_missing(cmd, "use-mock-keychain");
+#endif
+    pleb_append_switch_value_if_missing(cmd, "password-store", "basic");
+}
+
+static void CEF_CALLBACK on_before_child_process_launch(
+    cef_browser_process_handler_t* self,
+    cef_command_line_t* command_line) {
+    (void)self;
+    pleb_append_keyring_isolation_switches(command_line);
+}
+
+static cef_browser_process_handler_t g_browser_process_handler;
+
+static void CEF_CALLBACK on_before_command_line_processing(
+    cef_app_t* self,
+    const cef_string_t* process_type,
+    cef_command_line_t* command_line) {
+    (void)self;
+    if (!process_type || process_type->length == 0) {
+        pleb_append_keyring_isolation_switches(command_line);
+    }
+}
+
+static cef_browser_process_handler_t* CEF_CALLBACK get_browser_process_handler(
+    cef_app_t* self) {
+    (void)self;
+    return &g_browser_process_handler;
+}
+
+static cef_app_t g_app;
+
+static void pleb_init_cef_app(void) {
+    init_base(&g_browser_process_handler.base, sizeof(cef_browser_process_handler_t));
+    g_browser_process_handler.on_before_child_process_launch = on_before_child_process_launch;
+
+    init_base(&g_app.base, sizeof(cef_app_t));
+    g_app.on_before_command_line_processing = on_before_command_line_processing;
+    g_app.get_browser_process_handler = get_browser_process_handler;
 }
 
 // ── Render a URL with v5-meta response ────────────────────────

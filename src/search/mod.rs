@@ -249,6 +249,45 @@ pub fn search_provider_statuses(
     state_dir: &Path,
 ) -> Result<BTreeMap<String, SearchProviderStatus>> {
     let resolved = auth::resolve_credentials(state_dir, CredentialProvider::SEARCH_PROVIDERS)?;
+    search_provider_statuses_from_resolved(state_dir, &resolved)
+}
+
+pub fn search_provider_statuses_from_resolved(
+    state_dir: &Path,
+    resolved: &BTreeMap<CredentialProvider, ResolvedCredential>,
+) -> Result<BTreeMap<String, SearchProviderStatus>> {
+    let by_provider: HashMap<CredentialProvider, Option<&ResolvedCredential>> =
+        CredentialProvider::SEARCH_PROVIDERS
+            .iter()
+            .copied()
+            .map(|p| (p, resolved.get(&p)))
+            .collect();
+    build_search_provider_status_map(state_dir, &by_provider)
+}
+
+pub fn search_provider_statuses_from_results(
+    state_dir: &Path,
+    results: &[(CredentialProvider, Result<Option<ResolvedCredential>>)],
+) -> Result<BTreeMap<String, SearchProviderStatus>> {
+    let mut by_provider: HashMap<CredentialProvider, Option<&ResolvedCredential>> = HashMap::new();
+    for (provider, res) in results {
+        if !provider.is_search_provider() {
+            continue;
+        }
+        match res {
+            Ok(opt) => {
+                by_provider.insert(*provider, opt.as_ref());
+            }
+            Err(err) => bail!("{err}"),
+        }
+    }
+    build_search_provider_status_map(state_dir, &by_provider)
+}
+
+fn build_search_provider_status_map(
+    state_dir: &Path,
+    by_provider: &HashMap<CredentialProvider, Option<&ResolvedCredential>>,
+) -> Result<BTreeMap<String, SearchProviderStatus>> {
     let health = provider_health_summary(state_dir)?;
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -257,7 +296,7 @@ pub fn search_provider_statuses(
 
     let mut statuses = BTreeMap::new();
     for &provider in CredentialProvider::SEARCH_PROVIDERS {
-        let cred = resolved.get(&provider);
+        let cred = by_provider.get(&provider).copied().flatten();
         let name = provider.as_str();
         let entry = health.get(name);
         let cooldown_remaining_secs = match entry {

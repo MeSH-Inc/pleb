@@ -381,6 +381,7 @@ fn clear_state_dir_preserves_credentials_and_clears_search_state() {
     .unwrap();
 
     let creds_path = dir.path.join("credentials.json");
+    let vault_path = dir.path.join("credentials.enc");
     let creds_lock_path = dir.path.join("credentials.lock");
     let site_rules_path = dir.path.join("site-rules.json");
     let search_state_path = dir.path.join("search-state.json");
@@ -389,6 +390,12 @@ fn clear_state_dir_preserves_credentials_and_clears_search_state() {
     let creds_before = std::fs::read_to_string(&creds_path).unwrap();
     assert!(creds_lock_path.exists());
 
+    std::fs::write(&vault_path, b"PLEBVLT1synthetic-vault-payload").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&vault_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     std::fs::write(&site_rules_path, r#"{"rules":[]}"#).unwrap();
     std::fs::write(&search_state_path, r#"{"brave":{"month_requests":5}}"#).unwrap();
     std::fs::write(&site_cache_path, r#"{}"#).unwrap();
@@ -404,6 +411,11 @@ fn clear_state_dir_preserves_credentials_and_clears_search_state() {
     // Preserved files
     assert!(creds_path.exists(), "credentials.json must be preserved");
     assert_eq!(std::fs::read_to_string(&creds_path).unwrap(), creds_before);
+    assert!(vault_path.exists(), "credentials.enc must be preserved");
+    assert_eq!(
+        std::fs::read(&vault_path).unwrap(),
+        b"PLEBVLT1synthetic-vault-payload"
+    );
     assert!(
         creds_lock_path.exists(),
         "credentials.lock must be preserved"
@@ -417,6 +429,8 @@ fn clear_state_dir_preserves_credentials_and_clears_search_state() {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&creds_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "credentials.json must remain 0o600");
+        let vault_mode = std::fs::metadata(&vault_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(vault_mode, 0o600, "credentials.enc must remain 0o600");
     }
 
     // Cleared files/dirs

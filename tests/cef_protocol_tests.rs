@@ -693,13 +693,31 @@ fn chromium_cronet_cef_version_and_keyring_parity() {
 
     let renderer_mac = fs::read_to_string(root.join("cef/renderer.m")).unwrap();
     let renderer_linux = fs::read_to_string(root.join("cef/renderer_linux.c")).unwrap();
+    let renderer_core = fs::read_to_string(root.join("cef/renderer_core.h")).unwrap();
+    let helper_core = fs::read_to_string(root.join("cef/helper_core.h")).unwrap();
     assert!(
-        renderer_mac.contains("--use-mock-keychain"),
-        "cef/renderer.m must pass --use-mock-keychain to prevent headless macOS Keychain hangs"
+        renderer_mac.contains("--use-mock-keychain")
+            && renderer_mac.contains("--password-store=basic")
+            && renderer_mac.contains("cef_initialize(&main_args, &settings, &g_app, NULL)"),
+        "cef/renderer.m must pass --use-mock-keychain, --password-store=basic, and &g_app to prevent headless macOS Keychain hangs"
     );
     assert!(
-        renderer_linux.contains("--password-store=basic"),
-        "cef/renderer_linux.c must pass --password-store=basic to prevent headless keyring hangs"
+        renderer_linux.contains("--password-store=basic")
+            && renderer_linux.contains("cef_initialize(&main_args, &settings, &g_app, NULL)"),
+        "cef/renderer_linux.c must pass --password-store=basic and &g_app to prevent headless keyring hangs"
+    );
+    assert!(
+        renderer_core.contains("on_before_command_line_processing")
+            && renderer_core.contains("on_before_child_process_launch")
+            && renderer_core.contains("use-mock-keychain")
+            && renderer_core.contains("password-store"),
+        "cef/renderer_core.h must enforce keyring isolation across browser and child processes"
+    );
+    assert!(
+        helper_core.contains("on_before_command_line_processing")
+            && helper_core.contains("use-mock-keychain")
+            && helper_core.contains("password-store"),
+        "cef/helper_core.h must enforce keyring isolation in CEF helper subprocesses"
     );
     assert!(
         renderer_linux.contains("display_env[0] != '\\0'"),

@@ -1,8 +1,10 @@
 use anyhow::{bail, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::Ed25519KeyPair;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::io::Read;
 use std::net::{IpAddr, Ipv6Addr};
@@ -14,14 +16,19 @@ use crate::context::{acquire_private_lock, ensure_private_dir, write_private_fil
 pub const MAX_SECRET_BYTES: usize = 4096;
 const MAX_WEB_BOT_AUTH_AGENT_BYTES: usize = 512;
 
-#[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "pleb";
+const KEYCHAIN_VAULT_ACCOUNT: &str = "vault-key";
 #[cfg(target_os = "macos")]
 const ERR_SEC_ITEM_NOT_FOUND: i32 = 44;
 
 const CREDENTIALS_FILE_NAME: &str = "credentials.json";
+const VAULT_FILE_NAME: &str = "credentials.enc";
 const CREDENTIALS_LOCK_NAME: &str = "credentials.lock";
 const NO_KEYCHAIN_ENV: &str = "PLEB_NO_KEYCHAIN";
+const VAULT_MAGIC: &[u8; 8] = b"PLEBVLT1";
+const VAULT_NONCE_LEN: usize = 12;
+const VAULT_KEY_LEN: usize = 32;
+const VAULT_AAD: &[u8] = b"pleb-vault-v1";
 
 fn zeroize_bytes(bytes: &mut [u8]) {
     for byte in bytes {
@@ -502,7 +509,6 @@ fn require_keychain_available() -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 fn encode_lowercase_hex(bytes: &[u8]) -> ZeroizingBytes {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = Vec::with_capacity(bytes.len() * 2);
@@ -513,45 +519,73 @@ fn encode_lowercase_hex(bytes: &[u8]) -> ZeroizingBytes {
     ZeroizingBytes(out)
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn decode_hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn decode_hex_vault_key(raw: &str) -> Result<ZeroizingBytes> {
+    let trimmed = trim_secret_edges(raw);
+    if trimmed.len() != VAULT_KEY_LEN * 2 {
+        bail!("invalid credentials vault key in macOS Keychain: unexpected length");
+    }
+    let mut out = ZeroizingBytes(Vec::with_capacity(VAULT_KEY_LEN));
+    for &[hi_b, lo_b] in trimmed.as_bytes().as_chunks::<2>().0 {
+        let (Some(hi), Some(lo)) = (decode_hex_nibble(hi_b), decode_hex_nibble(lo_b)) else {
+            bail!("invalid credentials vault key in macOS Keychain: malformed key encoding");
+        };
+        out.0.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
 #[cfg(target_os = "macos")]
-fn keychain_error(
-    action: &str,
-    provider: CredentialProvider,
-    output: &std::process::Output,
-) -> anyhow::Error {
+fn keychain_error(action: &str, account: &str, output: &std::process::Output) -> anyhow::Error {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let detail = stderr.trim();
     if detail.is_empty() {
         anyhow::anyhow!(
-            "failed to {action} {} credential in macOS Keychain (exit {:?})",
-            provider.as_str(),
+            "failed to {action} {account} in macOS Keychain (exit {:?})",
             output.status.code()
         )
     } else {
         anyhow::anyhow!(
-            "failed to {action} {} credential in macOS Keychain (exit {:?}): {detail}",
-            provider.as_str(),
+            "failed to {action} {account} in macOS Keychain (exit {:?}): {detail}",
             output.status.code()
         )
     }
 }
 
 #[cfg(target_os = "macos")]
-fn keychain_set(provider: CredentialProvider, secret: &SecretString) -> Result<()> {
+fn keychain_set_vault_key(key: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    let hex = encode_lowercase_hex(secret.as_str().as_bytes());
-    let mut cmd_buf = Vec::with_capacity(64 + hex.0.len());
+    if key.len() != VAULT_KEY_LEN {
+        bail!("invalid credentials vault key length");
+    }
+    // Store the 32-byte key as 64 printable ASCII hex characters encoded into
+    // `security -X` so `find-generic-password -w` always emits valid UTF-8.
+    let key_ascii_hex = encode_lowercase_hex(key);
+    let cmd_hex = encode_lowercase_hex(&key_ascii_hex.0);
+    drop(key_ascii_hex);
+
+    let mut cmd_buf = Vec::with_capacity(64 + cmd_hex.0.len());
     cmd_buf.extend_from_slice(b"add-generic-password -U -a ");
-    cmd_buf.extend_from_slice(provider.as_str().as_bytes());
+    cmd_buf.extend_from_slice(KEYCHAIN_VAULT_ACCOUNT.as_bytes());
     cmd_buf.extend_from_slice(b" -s ");
     cmd_buf.extend_from_slice(KEYCHAIN_SERVICE.as_bytes());
     cmd_buf.extend_from_slice(b" -X ");
-    cmd_buf.extend_from_slice(&hex.0);
+    cmd_buf.extend_from_slice(&cmd_hex.0);
     cmd_buf.push(b'\n');
     let cmd_buf = ZeroizingBytes(cmd_buf);
-    drop(hex);
+    drop(cmd_hex);
 
     let mut child = Command::new("/usr/bin/security")
         .args(["-q", "-i"])
@@ -569,20 +603,20 @@ fn keychain_set(provider: CredentialProvider, secret: &SecretString) -> Result<(
 
     let output = child.wait_with_output()?;
     if !output.status.success() {
-        return Err(keychain_error("store", provider, &output));
+        return Err(keychain_error("store", KEYCHAIN_VAULT_ACCOUNT, &output));
     }
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn keychain_get(provider: CredentialProvider) -> Result<Option<SecretString>> {
+fn keychain_get_vault_key() -> Result<Option<ZeroizingBytes>> {
     use std::process::{Command, Stdio};
 
     let output = Command::new("/usr/bin/security")
         .args([
             "find-generic-password",
             "-a",
-            provider.as_str(),
+            KEYCHAIN_VAULT_ACCOUNT,
             "-s",
             KEYCHAIN_SERVICE,
             "-w",
@@ -596,63 +630,57 @@ fn keychain_get(provider: CredentialProvider) -> Result<Option<SecretString>> {
     if output.status.success() {
         let stdout_buf = ZeroizingBytes(output.stdout);
         let raw = std::str::from_utf8(&stdout_buf.0).map_err(|_| {
-            anyhow::anyhow!(
-                "macOS Keychain entry for {} is not valid UTF-8",
-                provider.as_str()
-            )
+            anyhow::anyhow!("macOS Keychain entry for {KEYCHAIN_VAULT_ACCOUNT} is not valid UTF-8")
         })?;
-        return Ok(Some(validate_credential(provider, raw)?));
+        return decode_hex_vault_key(raw).map(Some);
     }
 
     if output.status.code() == Some(ERR_SEC_ITEM_NOT_FOUND) {
         return Ok(None);
     }
 
-    Err(keychain_error("read", provider, &output))
+    Err(keychain_error("read", KEYCHAIN_VAULT_ACCOUNT, &output))
 }
 
 #[cfg(target_os = "macos")]
-fn keychain_delete(provider: CredentialProvider) -> Result<bool> {
-    use std::process::{Command, Stdio};
-
-    let output = Command::new("/usr/bin/security")
-        .args([
-            "delete-generic-password",
-            "-a",
-            provider.as_str(),
-            "-s",
-            KEYCHAIN_SERVICE,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|err| anyhow::anyhow!("failed to run /usr/bin/security: {err}"))?;
-
-    if output.status.success() {
-        return Ok(true);
+fn keychain_get_or_create_vault_key() -> Result<ZeroizingBytes> {
+    if let Some(existing) = keychain_get_vault_key()? {
+        return Ok(existing);
     }
-    if output.status.code() == Some(ERR_SEC_ITEM_NOT_FOUND) {
-        return Ok(false);
-    }
-
-    Err(keychain_error("delete", provider, &output))
+    let mut key = ZeroizingBytes(vec![0u8; VAULT_KEY_LEN]);
+    SystemRandom::new()
+        .fill(&mut key.0)
+        .map_err(|_| anyhow::anyhow!("failed to generate credentials vault master key"))?;
+    keychain_set_vault_key(&key.0)?;
+    Ok(key)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn keychain_set(_provider: CredentialProvider, _secret: &SecretString) -> Result<()> {
-    require_keychain_available()
-}
-
-#[cfg(not(target_os = "macos"))]
-fn keychain_get(_provider: CredentialProvider) -> Result<Option<SecretString>> {
+fn keychain_get_vault_key() -> Result<Option<ZeroizingBytes>> {
     Ok(None)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn keychain_delete(_provider: CredentialProvider) -> Result<bool> {
+fn keychain_get_or_create_vault_key() -> Result<ZeroizingBytes> {
     require_keychain_available()?;
-    Ok(false)
+    unreachable!("require_keychain_available always errors off macOS")
+}
+
+trait VaultKeyStore {
+    fn get_key(&self) -> Result<Option<ZeroizingBytes>>;
+    fn get_or_create_key(&self) -> Result<ZeroizingBytes>;
+}
+
+struct SystemKeychainStore;
+
+impl VaultKeyStore for SystemKeychainStore {
+    fn get_key(&self) -> Result<Option<ZeroizingBytes>> {
+        keychain_get_vault_key()
+    }
+
+    fn get_or_create_key(&self) -> Result<ZeroizingBytes> {
+        keychain_get_or_create_vault_key()
+    }
 }
 
 struct ZeroizingCredentialMap(BTreeMap<String, String>);
@@ -665,7 +693,7 @@ impl Drop for ZeroizingCredentialMap {
     }
 }
 
-fn read_credentials_map_locked(creds_path: &Path) -> Result<(ZeroizingCredentialMap, bool)> {
+fn read_private_file_bytes_locked(path: &Path) -> Result<Option<ZeroizingBytes>> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
@@ -673,17 +701,11 @@ fn read_credentials_map_locked(creds_path: &Path) -> Result<(ZeroizingCredential
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = match opts.open(creds_path) {
+    let mut file = match opts.open(path) {
         Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((ZeroizingCredentialMap(BTreeMap::new()), false));
-        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
-            bail!(
-                "failed to open credentials file {}: {}",
-                creds_path.display(),
-                err
-            );
+            bail!("failed to open credentials file {}: {err}", path.display());
         }
     };
 
@@ -691,7 +713,7 @@ fn read_credentials_map_locked(creds_path: &Path) -> Result<(ZeroizingCredential
     if !meta.is_file() {
         bail!(
             "refusing to read credentials from non-regular file {}",
-            creds_path.display()
+            path.display()
         );
     }
     #[cfg(unix)]
@@ -701,7 +723,7 @@ fn read_credentials_map_locked(creds_path: &Path) -> Result<(ZeroizingCredential
         if meta.uid() != current_uid {
             bail!(
                 "refusing to read {} owned by uid {} (expected uid {})",
-                creds_path.display(),
+                path.display(),
                 meta.uid(),
                 current_uid
             );
@@ -709,7 +731,7 @@ fn read_credentials_map_locked(creds_path: &Path) -> Result<(ZeroizingCredential
         if meta.mode() & 0o077 != 0 {
             bail!(
                 "refusing to read {} with insecure permissions {:04o} (expected 0600)",
-                creds_path.display(),
+                path.display(),
                 meta.mode() & 0o7777
             );
         }
@@ -717,7 +739,13 @@ fn read_credentials_map_locked(creds_path: &Path) -> Result<(ZeroizingCredential
 
     let mut raw_bytes = Vec::new();
     file.read_to_end(&mut raw_bytes)?;
-    let raw_bytes = ZeroizingBytes(raw_bytes);
+    Ok(Some(ZeroizingBytes(raw_bytes)))
+}
+
+fn read_credentials_map_locked(creds_path: &Path) -> Result<(ZeroizingCredentialMap, bool)> {
+    let Some(raw_bytes) = read_private_file_bytes_locked(creds_path)? else {
+        return Ok((ZeroizingCredentialMap(BTreeMap::new()), false));
+    };
     let parsed: BTreeMap<String, String> = serde_json::from_slice(&raw_bytes.0).map_err(|err| {
         anyhow::anyhow!(
             "corrupt credentials file {}: invalid JSON ({err})",
@@ -735,20 +763,168 @@ fn write_credentials_map_locked(creds_path: &Path, map: &BTreeMap<String, String
     Ok(())
 }
 
-fn file_get(state_dir: &Path, provider: CredentialProvider) -> Result<Option<SecretString>> {
+fn seal_vault_map(map: &BTreeMap<String, String>, key: &[u8]) -> Result<ZeroizingBytes> {
+    if key.len() != VAULT_KEY_LEN {
+        bail!("invalid credentials vault key length");
+    }
+    let unbound = UnboundKey::new(&AES_256_GCM, key)
+        .map_err(|_| anyhow::anyhow!("failed to initialize credentials vault cipher"))?;
+    let aead_key = LessSafeKey::new(unbound);
+
+    let mut nonce_bytes = [0u8; VAULT_NONCE_LEN];
+    SystemRandom::new()
+        .fill(&mut nonce_bytes)
+        .map_err(|_| anyhow::anyhow!("failed to generate credentials vault nonce"))?;
+
+    let serialized = ZeroizingBytes(
+        serde_json::to_vec(map)
+            .map_err(|_| anyhow::anyhow!("failed to serialize credentials vault"))?,
+    );
+    let body_start = VAULT_MAGIC.len() + VAULT_NONCE_LEN;
+    let mut out = ZeroizingBytes(Vec::with_capacity(
+        body_start + serialized.0.len() + AES_256_GCM.tag_len(),
+    ));
+    out.0.extend_from_slice(VAULT_MAGIC);
+    out.0.extend_from_slice(&nonce_bytes);
+    let mut ciphertext = ZeroizingBytes(serialized.0.clone());
+    drop(serialized);
+
+    aead_key
+        .seal_in_place_append_tag(
+            Nonce::assume_unique_for_key(nonce_bytes),
+            Aad::from(VAULT_AAD),
+            &mut ciphertext.0,
+        )
+        .map_err(|_| anyhow::anyhow!("failed to encrypt credentials vault"))?;
+    out.0.extend_from_slice(&ciphertext.0);
+    Ok(out)
+}
+
+fn open_vault_map(vault_path: &Path, raw: &[u8], key: &[u8]) -> Result<ZeroizingCredentialMap> {
+    if key.len() != VAULT_KEY_LEN {
+        bail!("invalid credentials vault key length");
+    }
+    let min_len = VAULT_MAGIC.len() + VAULT_NONCE_LEN + AES_256_GCM.tag_len();
+    if raw.len() < min_len || &raw[..VAULT_MAGIC.len()] != VAULT_MAGIC {
+        bail!(
+            "corrupt credentials vault {}: unrecognized format",
+            vault_path.display()
+        );
+    }
+    let mut nonce_bytes = [0u8; VAULT_NONCE_LEN];
+    nonce_bytes.copy_from_slice(&raw[VAULT_MAGIC.len()..VAULT_MAGIC.len() + VAULT_NONCE_LEN]);
+    let mut buf = ZeroizingBytes(raw[VAULT_MAGIC.len() + VAULT_NONCE_LEN..].to_vec());
+
+    let unbound = UnboundKey::new(&AES_256_GCM, key)
+        .map_err(|_| anyhow::anyhow!("failed to initialize credentials vault cipher"))?;
+    let aead_key = LessSafeKey::new(unbound);
+    let plaintext = aead_key
+        .open_in_place(
+            Nonce::assume_unique_for_key(nonce_bytes),
+            Aad::from(VAULT_AAD),
+            &mut buf.0,
+        )
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "failed to decrypt credentials vault {}: authentication error or mismatched vault key",
+                vault_path.display()
+            )
+        })?;
+
+    let parsed: BTreeMap<String, String> = serde_json::from_slice(plaintext).map_err(|_| {
+        anyhow::anyhow!(
+            "corrupt credentials vault {}: invalid JSON payload",
+            vault_path.display()
+        )
+    })?;
+    Ok(ZeroizingCredentialMap(parsed))
+}
+
+fn read_vault_map_locked(
+    vault_path: &Path,
+    store: &dyn VaultKeyStore,
+) -> Result<Option<ZeroizingCredentialMap>> {
+    let Some(raw_bytes) = read_private_file_bytes_locked(vault_path)? else {
+        return Ok(None);
+    };
+    let key = store.get_key()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "credentials vault {} exists but macOS Keychain master key \"{KEYCHAIN_VAULT_ACCOUNT}\" (service \"{KEYCHAIN_SERVICE}\") is missing",
+            vault_path.display()
+        )
+    })?;
+    open_vault_map(vault_path, &raw_bytes.0, &key.0).map(Some)
+}
+
+fn vault_set_with_store(
+    state_dir: &Path,
+    provider: CredentialProvider,
+    secret: &SecretString,
+    store: &dyn VaultKeyStore,
+) -> Result<()> {
+    ensure_private_dir(state_dir)?;
+    let _lock = acquire_private_lock(&state_dir.join(CREDENTIALS_LOCK_NAME))?;
+    let vault_path = state_dir.join(VAULT_FILE_NAME);
+    let (key, mut map) = match read_private_file_bytes_locked(&vault_path)? {
+        Some(raw_bytes) => {
+            let key = store.get_key()?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "credentials vault {} exists but macOS Keychain master key \"{KEYCHAIN_VAULT_ACCOUNT}\" (service \"{KEYCHAIN_SERVICE}\") is missing",
+                    vault_path.display()
+                )
+            })?;
+            let map = open_vault_map(&vault_path, &raw_bytes.0, &key.0)?;
+            (key, map)
+        }
+        None => (
+            store.get_or_create_key()?,
+            ZeroizingCredentialMap(BTreeMap::new()),
+        ),
+    };
+    map.0
+        .insert(provider.as_str().to_string(), secret.as_str().to_string());
+    let sealed = seal_vault_map(&map.0, &key.0)?;
+    write_private_file_atomic(&vault_path, &sealed.0)?;
+    Ok(())
+}
+
+fn vault_delete_with_store(
+    state_dir: &Path,
+    provider: CredentialProvider,
+    store: &dyn VaultKeyStore,
+) -> Result<bool> {
     match std::fs::symlink_metadata(state_dir) {
         Ok(_) => ensure_private_dir(state_dir)?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(err) => return Err(err.into()),
     }
     let _lock = acquire_private_lock(&state_dir.join(CREDENTIALS_LOCK_NAME))?;
-    let (mut map, _) = read_credentials_map_locked(&state_dir.join(CREDENTIALS_FILE_NAME))?;
-    let Some(raw) = map.0.remove(provider.as_str()) else {
-        return Ok(None);
+    let vault_path = state_dir.join(VAULT_FILE_NAME);
+    let Some(raw_bytes) = read_private_file_bytes_locked(&vault_path)? else {
+        return Ok(false);
     };
-    let raw = SecretString::new(raw);
-    let validated = validate_credential(provider, raw.as_str())?;
-    Ok(Some(validated))
+    let key = store.get_key()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "credentials vault {} exists but macOS Keychain master key \"{KEYCHAIN_VAULT_ACCOUNT}\" (service \"{KEYCHAIN_SERVICE}\") is missing",
+            vault_path.display()
+        )
+    })?;
+    let mut map = open_vault_map(&vault_path, &raw_bytes.0, &key.0)?;
+    let Some(removed_val) = map.0.remove(provider.as_str()) else {
+        return Ok(false);
+    };
+    drop(SecretString::new(removed_val));
+    if map.0.is_empty() {
+        match std::fs::remove_file(&vault_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    } else {
+        let sealed = seal_vault_map(&map.0, &key.0)?;
+        write_private_file_atomic(&vault_path, &sealed.0)?;
+    }
+    Ok(true)
 }
 
 fn file_set(state_dir: &Path, provider: CredentialProvider, secret: &SecretString) -> Result<()> {
@@ -781,48 +957,131 @@ fn file_delete(state_dir: &Path, provider: CredentialProvider) -> Result<bool> {
     Ok(true)
 }
 
+fn resolve_env_provider(provider: CredentialProvider) -> Option<Result<ResolvedCredential>> {
+    let raw = std::env::var(provider.env_var()).ok()?;
+    let raw = SecretString::new(raw);
+    let is_blank = if provider == CredentialProvider::WebBotAuthJwk {
+        raw.as_str()
+            .trim_matches([' ', '\t', '\r', '\n'])
+            .is_empty()
+    } else {
+        trim_secret_edges(raw.as_str()).is_empty()
+    };
+    if is_blank {
+        return None;
+    }
+    Some(
+        validate_credential(provider, raw.as_str()).map(|value| ResolvedCredential {
+            provider,
+            value,
+            source: CredentialSource::Environment,
+        }),
+    )
+}
+
+pub type ProviderResolution = (CredentialProvider, Result<Option<ResolvedCredential>>);
+
+fn populate_from_map(
+    slots: &mut [ProviderResolution],
+    unresolved_indices: &mut Vec<usize>,
+    map: &mut BTreeMap<String, String>,
+    source: CredentialSource,
+) {
+    let mut still_unresolved = Vec::with_capacity(unresolved_indices.len());
+    for &idx in unresolved_indices.iter() {
+        let provider = slots[idx].0;
+        if let Some(raw) = map.remove(provider.as_str()) {
+            let raw = SecretString::new(raw);
+            let res = validate_credential(provider, raw.as_str()).map(|value| {
+                Some(ResolvedCredential {
+                    provider,
+                    value,
+                    source,
+                })
+            });
+            slots[idx] = (provider, res);
+        } else {
+            still_unresolved.push(idx);
+        }
+    }
+    *unresolved_indices = still_unresolved;
+}
+
+fn resolve_provider_results_with_store(
+    state_dir: &Path,
+    providers: &[CredentialProvider],
+    vault_store: Option<&dyn VaultKeyStore>,
+) -> Result<Vec<ProviderResolution>> {
+    let mut slots: Vec<ProviderResolution> = Vec::with_capacity(providers.len());
+    let mut unresolved_indices = Vec::new();
+    let mut seen = HashSet::with_capacity(providers.len());
+
+    for &provider in providers {
+        if !seen.insert(provider) {
+            continue;
+        }
+        let idx = slots.len();
+        if let Some(env_res) = resolve_env_provider(provider) {
+            slots.push((provider, env_res.map(Some)));
+        } else {
+            slots.push((provider, Ok(None)));
+            unresolved_indices.push(idx);
+        }
+    }
+
+    if !unresolved_indices.is_empty() {
+        let state_exists = match std::fs::symlink_metadata(state_dir) {
+            Ok(_) => {
+                ensure_private_dir(state_dir)?;
+                true
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(err) => return Err(err.into()),
+        };
+
+        if state_exists {
+            let _lock = acquire_private_lock(&state_dir.join(CREDENTIALS_LOCK_NAME))?;
+            if let Some(store) = vault_store {
+                if let Some(mut vault_map) =
+                    read_vault_map_locked(&state_dir.join(VAULT_FILE_NAME), store)?
+                {
+                    populate_from_map(
+                        &mut slots,
+                        &mut unresolved_indices,
+                        &mut vault_map.0,
+                        CredentialSource::Keychain,
+                    );
+                }
+            }
+            if !unresolved_indices.is_empty() {
+                let (mut file_map, existed) =
+                    read_credentials_map_locked(&state_dir.join(CREDENTIALS_FILE_NAME))?;
+                if existed {
+                    populate_from_map(
+                        &mut slots,
+                        &mut unresolved_indices,
+                        &mut file_map.0,
+                        CredentialSource::File,
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(slots)
+}
+
 pub fn resolve_credential(
     state_dir: &Path,
     provider: CredentialProvider,
 ) -> Result<Option<ResolvedCredential>> {
-    if let Ok(raw) = std::env::var(provider.env_var()) {
-        let raw = SecretString::new(raw);
-        let is_blank = if provider == CredentialProvider::WebBotAuthJwk {
-            raw.as_str()
-                .trim_matches([' ', '\t', '\r', '\n'])
-                .is_empty()
-        } else {
-            trim_secret_edges(raw.as_str()).is_empty()
-        };
-        if !is_blank {
-            let value = validate_credential(provider, raw.as_str())?;
-            return Ok(Some(ResolvedCredential {
-                provider,
-                value,
-                source: CredentialSource::Environment,
-            }));
-        }
+    let sys_store = SystemKeychainStore;
+    let vault_store: Option<&dyn VaultKeyStore> = keychain_enabled().then_some(&sys_store);
+    let mut results = resolve_provider_results_with_store(state_dir, &[provider], vault_store)?;
+    match results.pop() {
+        Some((_, res)) => res,
+        None => Ok(None),
     }
-
-    if keychain_enabled() {
-        if let Some(value) = keychain_get(provider)? {
-            return Ok(Some(ResolvedCredential {
-                provider,
-                value,
-                source: CredentialSource::Keychain,
-            }));
-        }
-    }
-
-    if let Some(value) = file_get(state_dir, provider)? {
-        return Ok(Some(ResolvedCredential {
-            provider,
-            value,
-            source: CredentialSource::File,
-        }));
-    }
-
-    Ok(None)
 }
 
 pub fn set_credential(
@@ -835,7 +1094,7 @@ pub fn set_credential(
     match storage {
         CredentialStorage::Keychain => {
             require_keychain_available()?;
-            keychain_set(provider, &validated)?;
+            vault_set_with_store(state_dir, provider, &validated, &SystemKeychainStore)?;
             Ok(CredentialSource::Keychain)
         }
         CredentialStorage::File => {
@@ -844,7 +1103,7 @@ pub fn set_credential(
         }
         CredentialStorage::Auto => {
             if keychain_enabled() {
-                keychain_set(provider, &validated)?;
+                vault_set_with_store(state_dir, provider, &validated, &SystemKeychainStore)?;
                 Ok(CredentialSource::Keychain)
             } else {
                 file_set(state_dir, provider, &validated)?;
@@ -862,7 +1121,7 @@ pub fn remove_credential(
     match storage {
         CredentialStorage::Keychain => {
             require_keychain_available()?;
-            if keychain_delete(provider)? {
+            if vault_delete_with_store(state_dir, provider, &SystemKeychainStore)? {
                 Ok(vec![CredentialSource::Keychain])
             } else {
                 Ok(vec![])
@@ -877,7 +1136,9 @@ pub fn remove_credential(
         }
         CredentialStorage::Auto => {
             let mut removed = Vec::new();
-            if keychain_enabled() && keychain_delete(provider)? {
+            if keychain_enabled()
+                && vault_delete_with_store(state_dir, provider, &SystemKeychainStore)?
+            {
                 removed.push(CredentialSource::Keychain);
             }
             if file_delete(state_dir, provider)? {
@@ -888,43 +1149,21 @@ pub fn remove_credential(
     }
 }
 
-fn resolve_provider_results(
+pub fn resolve_all_provider_results(
     state_dir: &Path,
-    providers: &[CredentialProvider],
 ) -> Result<Vec<(CredentialProvider, Result<Option<ResolvedCredential>>)>> {
-    if !keychain_enabled() {
-        let mut out = Vec::with_capacity(providers.len());
-        for &provider in providers {
-            out.push((provider, resolve_credential(state_dir, provider)));
-        }
-        return Ok(out);
-    }
-
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = providers
-            .iter()
-            .copied()
-            .map(|provider| {
-                scope.spawn(move || (provider, resolve_credential(state_dir, provider)))
-            })
-            .collect();
-
-        let mut out = Vec::with_capacity(handles.len());
-        for handle in handles {
-            let pair = handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("credential resolution worker panicked"))?;
-            out.push(pair);
-        }
-        Ok(out)
-    })
+    let sys_store = SystemKeychainStore;
+    let vault_store: Option<&dyn VaultKeyStore> = keychain_enabled().then_some(&sys_store);
+    resolve_provider_results_with_store(state_dir, CredentialProvider::ALL, vault_store)
 }
 
 pub fn resolve_credentials(
     state_dir: &Path,
     providers: &[CredentialProvider],
 ) -> Result<BTreeMap<CredentialProvider, ResolvedCredential>> {
-    let entries = resolve_provider_results(state_dir, providers)?;
+    let sys_store = SystemKeychainStore;
+    let vault_store: Option<&dyn VaultKeyStore> = keychain_enabled().then_some(&sys_store);
+    let entries = resolve_provider_results_with_store(state_dir, providers, vault_store)?;
     let mut map = BTreeMap::new();
     for (provider, res) in entries {
         if let Some(cred) = res? {
@@ -937,8 +1176,7 @@ pub fn resolve_credentials(
 pub fn resolve_all_credentials(
     state_dir: &Path,
 ) -> Result<Vec<(CredentialProvider, Option<ResolvedCredential>)>> {
-    let resolved = resolve_credentials(state_dir, CredentialProvider::ALL)?;
-    let mut map = resolved;
+    let mut map = resolve_credentials(state_dir, CredentialProvider::ALL)?;
     Ok(CredentialProvider::ALL
         .iter()
         .copied()
@@ -958,8 +1196,8 @@ pub fn all_credential_statuses(state_dir: &Path) -> Result<Vec<CredentialStatus>
         .collect())
 }
 
-pub fn resolve_agent_identity_status(
-    state_dir: &Path,
+pub fn agent_identity_status_from_results(
+    results: &[(CredentialProvider, Result<Option<ResolvedCredential>>)],
     no_web_bot_auth: bool,
 ) -> AgentIdentityStatus {
     let mut status = AgentIdentityStatus {
@@ -967,19 +1205,6 @@ pub fn resolve_agent_identity_status(
         ..Default::default()
     };
     let mut errors = Vec::new();
-    let results = match resolve_provider_results(
-        state_dir,
-        &[
-            CredentialProvider::WebBotAuthJwk,
-            CredentialProvider::WebBotAuthAgent,
-        ],
-    ) {
-        Ok(res) => res,
-        Err(err) => {
-            status.status_error = Some(err.to_string());
-            return status;
-        }
-    };
 
     for (provider, res) in results {
         match (provider, res) {
@@ -994,8 +1219,11 @@ pub fn resolve_agent_identity_status(
                 status.agent_configured = true;
                 status.agent_source = Some(cred.source);
             }
-            (_, Ok(_)) => {}
-            (_, Err(err)) => errors.push(err.to_string()),
+            (CredentialProvider::WebBotAuthJwk | CredentialProvider::WebBotAuthAgent, Ok(_)) => {}
+            (CredentialProvider::WebBotAuthJwk | CredentialProvider::WebBotAuthAgent, Err(err)) => {
+                errors.push(err.to_string())
+            }
+            _ => {}
         }
     }
 
@@ -1016,23 +1244,37 @@ pub fn resolve_agent_identity_status(
     status
 }
 
-pub fn resolve_cdp_access_status(state_dir: &Path) -> CdpAccessStatus {
-    let mut status = CdpAccessStatus::default();
-    let mut errors = Vec::new();
-    let results = match resolve_provider_results(
+pub fn resolve_agent_identity_status(
+    state_dir: &Path,
+    no_web_bot_auth: bool,
+) -> AgentIdentityStatus {
+    let sys_store = SystemKeychainStore;
+    let vault_store: Option<&dyn VaultKeyStore> = keychain_enabled().then_some(&sys_store);
+    let results = match resolve_provider_results_with_store(
         state_dir,
         &[
-            CredentialProvider::CdpAccessClientId,
-            CredentialProvider::CdpAccessClientSecret,
-            CredentialProvider::CdpAccessHost,
+            CredentialProvider::WebBotAuthJwk,
+            CredentialProvider::WebBotAuthAgent,
         ],
+        vault_store,
     ) {
         Ok(res) => res,
         Err(err) => {
-            status.status_error = Some(err.to_string());
-            return status;
+            return AgentIdentityStatus {
+                web_bot_auth_enabled: !no_web_bot_auth,
+                status_error: Some(err.to_string()),
+                ..Default::default()
+            };
         }
     };
+    agent_identity_status_from_results(&results, no_web_bot_auth)
+}
+
+pub fn cdp_access_status_from_results(
+    results: &[(CredentialProvider, Result<Option<ResolvedCredential>>)],
+) -> CdpAccessStatus {
+    let mut status = CdpAccessStatus::default();
+    let mut errors = Vec::new();
 
     for (provider, res) in results {
         match (provider, res) {
@@ -1049,8 +1291,19 @@ pub fn resolve_cdp_access_status(state_dir: &Path) -> CdpAccessStatus {
                 status.host_source = Some(cred.source);
                 status.access_host = Some(cred.value.as_str().to_string());
             }
-            (_, Ok(_)) => {}
-            (_, Err(err)) => errors.push(err.to_string()),
+            (
+                CredentialProvider::CdpAccessClientId
+                | CredentialProvider::CdpAccessClientSecret
+                | CredentialProvider::CdpAccessHost,
+                Ok(_),
+            ) => {}
+            (
+                CredentialProvider::CdpAccessClientId
+                | CredentialProvider::CdpAccessClientSecret
+                | CredentialProvider::CdpAccessHost,
+                Err(err),
+            ) => errors.push(err.to_string()),
+            _ => {}
         }
     }
 
@@ -1082,4 +1335,406 @@ pub fn resolve_cdp_access_status(state_dir: &Path) -> CdpAccessStatus {
     }
 
     status
+}
+
+pub fn resolve_cdp_access_status(state_dir: &Path) -> CdpAccessStatus {
+    let sys_store = SystemKeychainStore;
+    let vault_store: Option<&dyn VaultKeyStore> = keychain_enabled().then_some(&sys_store);
+    let results = match resolve_provider_results_with_store(
+        state_dir,
+        &[
+            CredentialProvider::CdpAccessClientId,
+            CredentialProvider::CdpAccessClientSecret,
+            CredentialProvider::CdpAccessHost,
+        ],
+        vault_store,
+    ) {
+        Ok(res) => res,
+        Err(err) => {
+            return CdpAccessStatus {
+                status_error: Some(err.to_string()),
+                ..Default::default()
+            };
+        }
+    };
+    cdp_access_status_from_results(&results)
+}
+
+#[cfg(test)]
+mod vault_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, MutexGuard};
+
+    static VAULT_ENV_LOCK: Mutex<()> = Mutex::new(());
+    static VAULT_DIR_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    struct ClearEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl ClearEnvGuard {
+        fn clear_all_providers(overrides: &[(&'static str, &str)]) -> Self {
+            let lock = VAULT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut saved = Vec::new();
+            for provider in CredentialProvider::ALL {
+                let key = provider.env_var();
+                saved.push((key, std::env::var(key).ok()));
+                std::env::remove_var(key);
+            }
+            for &(key, val) in overrides {
+                saved.push((key, std::env::var(key).ok()));
+                std::env::set_var(key, val);
+            }
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for ClearEnvGuard {
+        fn drop(&mut self) {
+            for (key, prev) in self.saved.iter().rev() {
+                match prev {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    struct TempVaultDir(std::path::PathBuf);
+
+    impl TempVaultDir {
+        fn new() -> Self {
+            let seq = VAULT_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir =
+                std::path::PathBuf::from(format!("/tmp/pleb-v-{}-{}", std::process::id(), seq));
+            let _ = std::fs::remove_dir_all(&dir);
+            ensure_private_dir(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempVaultDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct MockVaultKeyStore {
+        key: Mutex<Option<[u8; VAULT_KEY_LEN]>>,
+        calls: AtomicUsize,
+    }
+
+    impl MockVaultKeyStore {
+        fn new() -> Self {
+            Self {
+                key: Mutex::new(None),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn reset_calls(&self) {
+            self.calls.store(0, Ordering::SeqCst);
+        }
+
+        fn clear_key(&self) {
+            *self.key.lock().unwrap() = None;
+        }
+    }
+
+    impl VaultKeyStore for MockVaultKeyStore {
+        fn get_key(&self) -> Result<Option<ZeroizingBytes>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self
+                .key
+                .lock()
+                .unwrap()
+                .map(|bytes| ZeroizingBytes(bytes.to_vec())))
+        }
+
+        fn get_or_create_key(&self) -> Result<ZeroizingBytes> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut guard = self.key.lock().unwrap();
+            if let Some(existing) = *guard {
+                return Ok(ZeroizingBytes(existing.to_vec()));
+            }
+            let mut created = [0u8; VAULT_KEY_LEN];
+            SystemRandom::new().fill(&mut created).unwrap();
+            *guard = Some(created);
+            Ok(ZeroizingBytes(created.to_vec()))
+        }
+    }
+
+    #[test]
+    fn missing_or_env_satisfied_vault_makes_zero_keychain_calls_and_multi_provider_makes_one() {
+        let _env = ClearEnvGuard::clear_all_providers(&[]);
+        let dir = TempVaultDir::new();
+        let store = MockVaultKeyStore::new();
+
+        // Missing credentials.enc: 0 Keychain lookups across all 10 providers.
+        let initial =
+            resolve_provider_results_with_store(&dir.0, CredentialProvider::ALL, Some(&store))
+                .unwrap();
+        assert_eq!(initial.len(), CredentialProvider::ALL.len());
+        assert_eq!(store.call_count(), 0);
+        assert!(!vault_delete_with_store(&dir.0, CredentialProvider::Brave, &store).unwrap());
+        assert_eq!(store.call_count(), 0);
+
+        // Non-existent state_dir also performs 0 Keychain lookups.
+        let missing_dir = dir.0.join("nonexistent-state-dir");
+        let missing_res = resolve_provider_results_with_store(
+            &missing_dir,
+            CredentialProvider::ALL,
+            Some(&store),
+        )
+        .unwrap();
+        assert_eq!(missing_res.len(), CredentialProvider::ALL.len());
+        assert_eq!(store.call_count(), 0);
+
+        // Store Brave and Tavily in the vault, verify ciphertext is non-plaintext & nonce-random.
+        let brave_secret = SecretString::new("bsa-vault-secret-12345");
+        let tavily_secret = SecretString::new("tvly-vault-secret-67890");
+        vault_set_with_store(&dir.0, CredentialProvider::Brave, &brave_secret, &store).unwrap();
+        let vault_path = dir.0.join(VAULT_FILE_NAME);
+        let first_bytes = std::fs::read(&vault_path).unwrap();
+        assert!(first_bytes.starts_with(VAULT_MAGIC));
+        assert!(!first_bytes
+            .windows(brave_secret.as_str().len())
+            .any(|w| w == brave_secret.as_str().as_bytes()));
+
+        vault_set_with_store(&dir.0, CredentialProvider::Tavily, &tavily_secret, &store).unwrap();
+        let second_bytes = std::fs::read(&vault_path).unwrap();
+        assert_ne!(
+            &first_bytes[VAULT_MAGIC.len()..VAULT_MAGIC.len() + VAULT_NONCE_LEN],
+            &second_bytes[VAULT_MAGIC.len()..VAULT_MAGIC.len() + VAULT_NONCE_LEN],
+            "each vault write must allocate a fresh random nonce"
+        );
+        assert!(!second_bytes
+            .windows(tavily_secret.as_str().len())
+            .any(|w| w == tavily_secret.as_str().as_bytes()));
+
+        // Resolving all 10 providers performs at most ONE vault key lookup.
+        store.reset_calls();
+        let all_res =
+            resolve_provider_results_with_store(&dir.0, CredentialProvider::ALL, Some(&store))
+                .unwrap();
+        assert_eq!(store.call_count(), 1);
+        let mut by_provider: BTreeMap<CredentialProvider, (CredentialSource, String)> =
+            BTreeMap::new();
+        for (provider, res) in all_res {
+            if let Some(cred) = res.unwrap() {
+                by_provider.insert(provider, (cred.source, cred.value.as_str().to_string()));
+            }
+        }
+        assert_eq!(
+            by_provider.get(&CredentialProvider::Brave),
+            Some(&(CredentialSource::Keychain, "bsa-vault-secret-12345".into()))
+        );
+        assert_eq!(
+            by_provider.get(&CredentialProvider::Tavily),
+            Some(&(CredentialSource::Keychain, "tvly-vault-secret-67890".into()))
+        );
+
+        // When requested providers are satisfied by env, credentials.enc is untouched (0 Keychain calls).
+        drop(_env);
+        let _env_override = ClearEnvGuard::clear_all_providers(&[
+            (
+                "PLEB_WEB_BOT_AUTH_JWK",
+                r#"{"crv":"Ed25519","d":"nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A","kty":"OKP","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}"#,
+            ),
+            ("PLEB_WEB_BOT_AUTH_AGENT", "https://agent.example.com"),
+        ]);
+        store.reset_calls();
+        let env_only = resolve_provider_results_with_store(
+            &dir.0,
+            &[
+                CredentialProvider::WebBotAuthJwk,
+                CredentialProvider::WebBotAuthAgent,
+            ],
+            Some(&store),
+        )
+        .unwrap();
+        assert_eq!(store.call_count(), 0);
+        assert!(env_only
+            .iter()
+            .all(|(_, r)| r.as_ref().unwrap().as_ref().unwrap().source
+                == CredentialSource::Environment));
+    }
+
+    #[test]
+    fn vault_rejects_tamper_missing_key_bad_perms_symlink_and_prunes_empty_vault() {
+        let _env = ClearEnvGuard::clear_all_providers(&[]);
+        let dir = TempVaultDir::new();
+        let store = MockVaultKeyStore::new();
+        let vault_path = dir.0.join(VAULT_FILE_NAME);
+
+        // Vault takes precedence over file storage when both exist.
+        file_set(
+            &dir.0,
+            CredentialProvider::Brave,
+            &SecretString::new("file-secret"),
+        )
+        .unwrap();
+        vault_set_with_store(
+            &dir.0,
+            CredentialProvider::Brave,
+            &SecretString::new("vault-secret"),
+            &store,
+        )
+        .unwrap();
+
+        let res =
+            resolve_provider_results_with_store(&dir.0, &[CredentialProvider::Brave], Some(&store))
+                .unwrap();
+        let cred = res[0].1.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(cred.source, CredentialSource::Keychain);
+        assert_eq!(cred.value.as_str(), "vault-secret");
+
+        // Concurrent vault writes preserve all providers cleanly.
+        std::thread::scope(|scope| {
+            for (provider, val) in [
+                (CredentialProvider::Tavily, "tavily-conc"),
+                (CredentialProvider::Serper, "serper-conc"),
+                (CredentialProvider::Exa, "exa-conc"),
+            ] {
+                let d = &dir.0;
+                let s = &store;
+                scope.spawn(move || {
+                    vault_set_with_store(d, provider, &SecretString::new(val), s).unwrap();
+                });
+            }
+        });
+        for (provider, expected) in [
+            (CredentialProvider::Brave, "vault-secret"),
+            (CredentialProvider::Tavily, "tavily-conc"),
+            (CredentialProvider::Serper, "serper-conc"),
+            (CredentialProvider::Exa, "exa-conc"),
+        ] {
+            let single =
+                resolve_provider_results_with_store(&dir.0, &[provider], Some(&store)).unwrap();
+            assert_eq!(
+                single[0]
+                    .1
+                    .as_ref()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .value
+                    .as_str(),
+                expected
+            );
+        }
+
+        // Tamper detection without overwriting.
+        let valid_bytes = std::fs::read(&vault_path).unwrap();
+        let mut tampered = valid_bytes.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xff;
+        std::fs::write(&vault_path, &tampered).unwrap();
+        assert!(resolve_provider_results_with_store(
+            &dir.0,
+            &[CredentialProvider::Brave],
+            Some(&store)
+        )
+        .is_err());
+        assert!(vault_set_with_store(
+            &dir.0,
+            CredentialProvider::Brave,
+            &SecretString::new("new"),
+            &store
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&vault_path).unwrap(), tampered);
+
+        // Bad magic rejected.
+        let mut bad_magic = valid_bytes.clone();
+        bad_magic[0] = b'X';
+        std::fs::write(&vault_path, &bad_magic).unwrap();
+        assert!(resolve_provider_results_with_store(
+            &dir.0,
+            &[CredentialProvider::Brave],
+            Some(&store)
+        )
+        .is_err());
+
+        // Restore valid ciphertext and remove master key -> loud failure without overwriting.
+        std::fs::write(&vault_path, &valid_bytes).unwrap();
+        let saved_key = *store.key.lock().unwrap();
+        store.clear_key();
+        let err =
+            resolve_provider_results_with_store(&dir.0, &[CredentialProvider::Brave], Some(&store))
+                .unwrap_err();
+        assert!(err.to_string().contains("vault-key"), "err={err}");
+        assert!(vault_set_with_store(
+            &dir.0,
+            CredentialProvider::Brave,
+            &SecretString::new("overwrite-attempt"),
+            &store
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&vault_path).unwrap(), valid_bytes);
+        *store.key.lock().unwrap() = saved_key;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+            std::fs::set_permissions(&vault_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let err = resolve_provider_results_with_store(
+                &dir.0,
+                &[CredentialProvider::Brave],
+                Some(&store),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("insecure permissions"));
+
+            let target = dir.0.join("real-vault.enc");
+            std::fs::write(&target, &valid_bytes).unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::remove_file(&vault_path).unwrap();
+            symlink(&target, &vault_path).unwrap();
+            assert!(resolve_provider_results_with_store(
+                &dir.0,
+                &[CredentialProvider::Brave],
+                Some(&store)
+            )
+            .is_err());
+            std::fs::remove_file(&vault_path).unwrap();
+            std::fs::write(&vault_path, &valid_bytes).unwrap();
+            std::fs::set_permissions(&vault_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        // Removing all stored vault providers removes credentials.enc -> subsequent resolves make 0 Keychain calls.
+        for p in [
+            CredentialProvider::Brave,
+            CredentialProvider::Tavily,
+            CredentialProvider::Serper,
+            CredentialProvider::Exa,
+        ] {
+            assert!(vault_delete_with_store(&dir.0, p, &store).unwrap());
+        }
+        assert!(!vault_path.exists());
+        store.reset_calls();
+        let after_prune =
+            resolve_provider_results_with_store(&dir.0, CredentialProvider::ALL, Some(&store))
+                .unwrap();
+        assert_eq!(store.call_count(), 0);
+        // Brave still resolves cleanly from the remaining File tier.
+        let brave_file = after_prune[0].1.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(brave_file.source, CredentialSource::File);
+        assert_eq!(brave_file.value.as_str(), "file-secret");
+
+        // Vault key hex encoding roundtrip & validation.
+        let hex_buf = encode_lowercase_hex(&[0xab; VAULT_KEY_LEN]);
+        let hex_good = std::str::from_utf8(&hex_buf.0).unwrap();
+        assert_eq!(
+            decode_hex_vault_key(&format!("{hex_good}\n")).unwrap().0,
+            vec![0xab; VAULT_KEY_LEN]
+        );
+        assert!(decode_hex_vault_key("not-hex").is_err());
+    }
 }

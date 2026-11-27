@@ -15,7 +15,7 @@ int main(int argc, char* argv[]) {
     }
 
     const char* cache_dir_arg = NULL;
-    char** new_argv = (char**)malloc(sizeof(char*) * ((size_t)argc + 5));
+    char** new_argv = (char**)malloc(sizeof(char*) * ((size_t)argc + 6));
     if (!new_argv) {
         pleb_write_ready(stdout, 0, "out of memory");
         return 1;
@@ -36,12 +36,14 @@ int main(int argc, char* argv[]) {
     new_argv[new_argc++] = (char*)"--disable-gpu-compositing";
     new_argv[new_argc++] = (char*)"--mute-audio";
     new_argv[new_argc++] = (char*)"--use-mock-keychain";
+    new_argv[new_argc++] = (char*)"--password-store=basic";
     new_argv[new_argc] = NULL;
 
     cef_api_hash(CEF_API_VERSION, 0);
+    pleb_init_cef_app();
 
     cef_main_args_t main_args = { .argc = new_argc, .argv = new_argv };
-    int exit_code = cef_execute_process(&main_args, NULL, NULL);
+    int exit_code = cef_execute_process(&main_args, &g_app, NULL);
     if (exit_code >= 0) {
         free(new_argv);
         return exit_code;
@@ -89,7 +91,7 @@ int main(int argc, char* argv[]) {
     snprintf(profile_path, sizeof(profile_path), "%s/Default", cache_path);
     cef_string_utf8_to_utf16(profile_path, strlen(profile_path), &settings.cache_path);
 
-    if (!cef_initialize(&main_args, &settings, NULL, NULL)) {
+    if (!cef_initialize(&main_args, &settings, &g_app, NULL)) {
         pleb_write_ready(stdout, 0, "cef_initialize failed");
         free(new_argv);
         return 1;

@@ -7,6 +7,7 @@
 
 #include "browser_environment.h"
 #include "include/capi/cef_app_capi.h"
+#include "include/capi/cef_command_line_capi.h"
 #include "include/capi/cef_render_process_handler_capi.h"
 #include "include/cef_api_hash.h"
 
@@ -62,6 +63,43 @@ static cef_render_process_handler_t* CEF_CALLBACK helper_get_render_process_hand
 
 static cef_app_t g_helper_app;
 
+static void helper_append_switch_if_missing(cef_command_line_t* cmd, const char* name) {
+    if (!cmd || !name || !name[0]) return;
+    cef_string_t sw = {};
+    cef_string_utf8_to_utf16(name, strlen(name), &sw);
+    if (cmd->has_switch && cmd->append_switch && !cmd->has_switch(cmd, &sw)) {
+        cmd->append_switch(cmd, &sw);
+    }
+    cef_string_clear(&sw);
+}
+
+static void helper_append_switch_value_if_missing(
+    cef_command_line_t* cmd, const char* name, const char* value) {
+    if (!cmd || !name || !name[0] || !value) return;
+    cef_string_t sw = {};
+    cef_string_utf8_to_utf16(name, strlen(name), &sw);
+    if (cmd->has_switch && cmd->append_switch_with_value && !cmd->has_switch(cmd, &sw)) {
+        cef_string_t val = {};
+        cef_string_utf8_to_utf16(value, strlen(value), &val);
+        cmd->append_switch_with_value(cmd, &sw, &val);
+        cef_string_clear(&val);
+    }
+    cef_string_clear(&sw);
+}
+
+static void CEF_CALLBACK helper_on_before_command_line_processing(
+    cef_app_t* self,
+    const cef_string_t* process_type,
+    cef_command_line_t* command_line) {
+    (void)self;
+    (void)process_type;
+    if (!command_line || !command_line->is_valid || !command_line->is_valid(command_line)) return;
+#ifdef __APPLE__
+    helper_append_switch_if_missing(command_line, "use-mock-keychain");
+#endif
+    helper_append_switch_value_if_missing(command_line, "password-store", "basic");
+}
+
 static int pleb_run_helper_process(int argc, char* argv[]) {
     cef_api_hash(CEF_API_VERSION, 0);
 
@@ -70,6 +108,7 @@ static int pleb_run_helper_process(int argc, char* argv[]) {
     g_helper_render_process_handler.on_context_created = helper_on_context_created;
 
     helper_init_base(&g_helper_app.base, sizeof(cef_app_t));
+    g_helper_app.on_before_command_line_processing = helper_on_before_command_line_processing;
     g_helper_app.get_render_process_handler = helper_get_render_process_handler;
 
     cef_main_args_t main_args = { .argc = argc, .argv = argv };

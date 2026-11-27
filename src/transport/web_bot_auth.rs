@@ -64,9 +64,15 @@ impl fmt::Debug for WebBotAuthSigner {
 
 impl WebBotAuthSigner {
     pub fn from_state_dir(state_dir: &Path) -> Result<Option<Self>> {
-        let jwk = crate::auth::resolve_credential(state_dir, CredentialProvider::WebBotAuthJwk)?;
-        let agent =
-            crate::auth::resolve_credential(state_dir, CredentialProvider::WebBotAuthAgent)?;
+        let mut resolved = crate::auth::resolve_credentials(
+            state_dir,
+            &[
+                CredentialProvider::WebBotAuthJwk,
+                CredentialProvider::WebBotAuthAgent,
+            ],
+        )?;
+        let jwk = resolved.remove(&CredentialProvider::WebBotAuthJwk);
+        let agent = resolved.remove(&CredentialProvider::WebBotAuthAgent);
         match (jwk, agent) {
             (None, None) => Ok(None),
             (Some(j), Some(a)) => Self::from_credentials(&j.value, &a.value).map(Some),

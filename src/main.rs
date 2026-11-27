@@ -589,11 +589,14 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 },
             };
             let daemon_json = daemon_status_json(&config.state_dir).await;
-            let search_providers = search::search_provider_statuses(&config.state_dir)
+            let all_creds = auth::resolve_all_provider_results(&config.state_dir)
                 .map_err(|e| CliError::runtime("status_error", e))?;
+            let search_providers =
+                search::search_provider_statuses_from_results(&config.state_dir, &all_creds)
+                    .map_err(|e| CliError::runtime("status_error", e))?;
             let agent_identity =
-                auth::resolve_agent_identity_status(&config.state_dir, config.no_web_bot_auth);
-            let cdp_access = auth::resolve_cdp_access_status(&config.state_dir);
+                auth::agent_identity_status_from_results(&all_creds, config.no_web_bot_auth);
+            let cdp_access = auth::cdp_access_status_from_results(&all_creds);
             let cdp_renderer = build_cdp_status(&config, cdp_access);
 
             if json {
@@ -1065,11 +1068,14 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 Ok(ExitCode::SUCCESS)
             }
             AuthAction::Status => {
-                let search_providers = search::search_provider_statuses(&config.state_dir)
+                let all_creds = auth::resolve_all_provider_results(&config.state_dir)
                     .map_err(|e| CliError::runtime("auth_error", e))?;
+                let search_providers =
+                    search::search_provider_statuses_from_results(&config.state_dir, &all_creds)
+                        .map_err(|e| CliError::runtime("auth_error", e))?;
                 let agent_identity =
-                    auth::resolve_agent_identity_status(&config.state_dir, config.no_web_bot_auth);
-                let cdp_access = auth::resolve_cdp_access_status(&config.state_dir);
+                    auth::agent_identity_status_from_results(&all_creds, config.no_web_bot_auth);
+                let cdp_access = auth::cdp_access_status_from_results(&all_creds);
                 let payload = AuthStatusJson {
                     search_providers,
                     agent_identity,
