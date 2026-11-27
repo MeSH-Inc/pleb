@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Bounded-Latency WAL Group Commit</title>
+  <meta name="citation_title" content="Bounded-Latency WAL Group Commit"><meta name="citation_pdf_url" content="/papers/wal-commit-2026.pdf">
+  <script>window.__APP_STATE__ = {"theme":"dark","analytics":"disabled","flags":[1,2,3]};</script>
+  <style>.nav { display: flex; } .sr-only { position: absolute; width: 1px; }</style>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to main content</a>
+  <div class="cookie-banner" id="onetrust-banner">
+    <p>Accept all tracking cookies and Manage Cookie Preferences to personalize analytics. Accept Necessary Cookies.</p>
+    <button type="button">Accept All</button>
+    <button type="button">Manage Cookie Preferences</button>
+  </div>
+  <header>
+    <nav aria-label="Primary navigation">
+      <ul>
+      <li><a href="/nav/section-1?utm_source=topbar&fbclid=abc1">Section 1</a></li>
+      <li><a href="/nav/section-2?utm_source=topbar&fbclid=abc2">Section 2</a></li>
+      <li><a href="/nav/section-3?utm_source=topbar&fbclid=abc3">Section 3</a></li>
+      <li><a href="/nav/section-4?utm_source=topbar&fbclid=abc4">Section 4</a></li>
+      <li><a href="/nav/section-5?utm_source=topbar&fbclid=abc5">Section 5</a></li>
+      <li><a href="/nav/section-6?utm_source=topbar&fbclid=abc6">Section 6</a></li>
+      <li><a href="/nav/section-7?utm_source=topbar&fbclid=abc7">Section 7</a></li>
+      <li><a href="/nav/section-8?utm_source=topbar&fbclid=abc8">Section 8</a></li>
+      <li><a href="/nav/section-9?utm_source=topbar&fbclid=abc9">Section 9</a></li>
+      <li><a href="/nav/section-10?utm_source=topbar&fbclid=abc10">Section 10</a></li>
+      <li><a href="/nav/section-11?utm_source=topbar&fbclid=abc11">Section 11</a></li>
+      <li><a href="/nav/section-12?utm_source=topbar&fbclid=abc12">Section 12</a></li>
+      <li><a href="/nav/section-13?utm_source=topbar&fbclid=abc13">Section 13</a></li>
+      <li><a href="/nav/section-14?utm_source=topbar&fbclid=abc14">Section 14</a></li>
+      <li><a href="/nav/section-15?utm_source=topbar&fbclid=abc15">Section 15</a></li>
+      <li><a href="/nav/section-16?utm_source=topbar&fbclid=abc16">Section 16</a></li>
+      <li><a href="/nav/section-17?utm_source=topbar&fbclid=abc17">Section 17</a></li>
+      </ul>
+    </nav>
+    <div role="search"><input type="search" placeholder="Search documentation..."></div>
+  </header>
+  <div class="layout">
+    <aside aria-label="Documentation sidebar">
+      <nav>
+        <ul>
+      <li><a href="/docs/item-1?utm_medium=sidebar">Reference Entry 1</a></li>
+      <li><a href="/docs/item-2?utm_medium=sidebar">Reference Entry 2</a></li>
+      <li><a href="/docs/item-3?utm_medium=sidebar">Reference Entry 3</a></li>
+      <li><a href="/docs/item-4?utm_medium=sidebar">Reference Entry 4</a></li>
+      <li><a href="/docs/item-5?utm_medium=sidebar">Reference Entry 5</a></li>
+      <li><a href="/docs/item-6?utm_medium=sidebar">Reference Entry 6</a></li>
+      <li><a href="/docs/item-7?utm_medium=sidebar">Reference Entry 7</a></li>
+      <li><a href="/docs/item-8?utm_medium=sidebar">Reference Entry 8</a></li>
+      <li><a href="/docs/item-9?utm_medium=sidebar">Reference Entry 9</a></li>
+      <li><a href="/docs/item-10?utm_medium=sidebar">Reference Entry 10</a></li>
+      <li><a href="/docs/item-11?utm_medium=sidebar">Reference Entry 11</a></li>
+      <li><a href="/docs/item-12?utm_medium=sidebar">Reference Entry 12</a></li>
+      <li><a href="/docs/item-13?utm_medium=sidebar">Reference Entry 13</a></li>
+      <li><a href="/docs/item-14?utm_medium=sidebar">Reference Entry 14</a></li>
+      <li><a href="/docs/item-15?utm_medium=sidebar">Reference Entry 15</a></li>
+      <li><a href="/docs/item-16?utm_medium=sidebar">Reference Entry 16</a></li>
+      <li><a href="/docs/item-17?utm_medium=sidebar">Reference Entry 17</a></li>
+      <li><a href="/docs/item-18?utm_medium=sidebar">Reference Entry 18</a></li>
+      <li><a href="/docs/item-19?utm_medium=sidebar">Reference Entry 19</a></li>
+      <li><a href="/docs/item-20?utm_medium=sidebar">Reference Entry 20</a></li>
+      <li><a href="/docs/item-21?utm_medium=sidebar">Reference Entry 21</a></li>
+      <li><a href="/docs/item-22?utm_medium=sidebar">Reference Entry 22</a></li>
+      <li><a href="/docs/item-23?utm_medium=sidebar">Reference Entry 23</a></li>
+      <li><a href="/docs/item-24?utm_medium=sidebar">Reference Entry 24</a></li>
+      <li><a href="/docs/item-25?utm_medium=sidebar">Reference Entry 25</a></li>
+        </ul>
+      </nav>
+      <div class="promo">SUBSCRIBE TO OUR NEWSLETTER — Download Enterprise Whitepaper</div>
+    </aside>
+    <main id="main-content">
+      <article>
+        <h1>Bounded-Latency WAL Group Commit</h1>
+        <section id="abstract">
+          <h2>1. Abstract <a class="headerlink" href="#abstract">#</a></h2>
+          <p>We evaluate deterministic write-ahead log batching across NVMe storage pools using a zero-copy
+          sequencer pipeline. Full artifacts are linked in the archival PDF.</p>
+          <figure>
+            <svg width="640" height="240" aria-label="WAL Group Commit Pipeline">
+              <text x="20" y="40">Client</text>
+              <text x="160" y="40">Sequencer</text>
+              <text x="320" y="40">RingBuffer</text>
+              <text x="480" y="40">NVMe WAL</text>
+            </svg>
+            <figcaption>Figure 1: Four-stage write-ahead commit pipeline.</figcaption>
+          </figure>
+        </section>
+<section id="sec-2"><h2>2. Experimental Hardware and Storage Topology <a class="headerlink" href="#sec-2">¶</a></h2>
+<p>Paragraph 2.1: Operational notes for NVMe queue depth configuration. Connection pools allocate bounded descriptor tables across worker threads, reusing established TLS sessions while tracking queue depth, keepalive intervals, and health-check heartbeats under steady-state production traffic. Operators inspecting telemetry counters should compare active sockets against configured backpressure limits before tuning buffer sizes or concurrency caps.</p>
+<p>Paragraph 2.2: Operational notes for NVMe queue depth configuration. Connection pools allocate bounded descriptor tables across worker threads, reusing established TLS sessions while tracking queue depth, keepalive intervals, and health-check heartbeats under steady-state production traffic. Operators inspecting telemetry counters should compare active sockets against configured backpressure limits before tuning buffer sizes or concurrency caps.</p>
+<p>Paragraph 2.3: Operational notes for NVMe queue depth configuration. Connection pools allocate bounded descriptor tables across worker threads, reusing established TLS sessions while tracking queue depth, keepalive intervals, and health-check heartbeats under steady-state production traffic. Operators inspecting telemetry counters should compare active sockets against configured backpressure limits before tuning buffer sizes or concurrency caps.</p>
+<p>Paragraph 2.4: Operational notes for NVMe queue depth configuration. Connection pools allocate bounded descriptor tables across worker threads, reusing established TLS sessions while tracking queue depth, keepalive intervals, and health-check heartbeats under steady-state production traffic. Operators inspecting telemetry counters should compare active sockets against configured backpressure limits before tuning buffer sizes or concurrency caps.</p>
+<p>Paragraph 2.5: Operational notes for NVMe queue depth configuration. Connection pools allocate bounded descriptor tables across worker threads, reusing established TLS sessions while tracking queue depth, keepalive intervals, and health-check heartbeats under steady-state production traffic. Operators inspecting telemetry counters should compare active sockets against configured backpressure limits before tuning buffer sizes or concurrency caps.</p>
+<p>Paragraph 2.6: Operational notes for NVMe queue depth configuration. Connection pools allocate bounded descriptor tables across worker threads, reusing established TLS sessions while tracking queue depth, keepalive intervals, and health-check heartbeats under steady-state production traffic. Operators inspecting telemetry counters should compare active sockets against configured backpressure limits before tuning buffer sizes or concurrency caps.</p>
+<p>Paragraph 2.7: Operational notes for NVMe queue depth configuration. Connection pools allocate bounded descriptor tables across worker threads, reusing established TLS sessions while tracking queue depth, keepalive intervals, and health-check heartbeats under steady-state production traffic. Operators inspecting telemetry counters should compare active sockets against configured backpressure limits before tuning buffer sizes or concurrency caps.</p>
+<p>Paragraph 2.8: Operational notes for NVMe queue depth configuration. Connection pools allocate bounded descriptor tables across worker threads, reusing established TLS sessions while tracking queue depth, keepalive intervals, and health-check heartbeats under steady-state production traffic. Operators inspecting telemetry counters should compare active sockets against configured backpressure limits before tuning buffer sizes or concurrency caps.</p>
+<p>Paragraph 2.9: Operational notes for NVMe queue depth configuration. Connection pools allocate bounded descriptor tables across worker threads, reusing established TLS sessions while tracking queue depth, keepalive intervals, and health-check heartbeats under steady-state production traffic. Operators inspecting telemetry counters should compare active sockets against configured backpressure limits before tuning buffer sizes or concurrency caps.</p>
+</section>
+<section id="sec-3"><h2>3. Failure Recovery and Checkpointing <a class="headerlink" href="#sec-3">¶</a></h2>
+<p>Paragraph 3.1: Operational notes for crash replay verification. Connection pools allocate bounded descriptor tables across worker threads, reusing established TLS sessions while tracking queue depth, keepalive intervals, and health-check heartbeats under steady-state production traffic. Operators inspecting telemetry counters should compare active sockets against configured backpressure limits before tuning buffer sizes or concurrency caps.</p>
+<p>Paragraph 3.2: Operational notes for crash replay verification. Connection pools allocate bounded descriptor tables across worker threads, reusing established TLS sessions while tracking queue depth, keepalive intervals, and health-check heartbeats under steady-state production traffic. Operators inspecting telemetry counters should compare active sockets against configured backpressure limits before tuning buffer sizes or concurrency caps.</p>
+<p>Paragraph 3.3: Operational notes for crash replay verification. Connection pools allocate bounded descriptor tables across worker threads, reusing established TLS sessions while tracking queue depth, keepalive intervals, and health-check heartbeats under steady-state production traffic. Operators inspecting telemetry counters should compare active sockets against configured backpressure limits before tuning buffer sizes or concurrency caps.</p>
+<p>Paragraph 3.4: Operational notes for crash replay verification. Connection pools allocate bounded descriptor tables across worker threads, reusing established TLS sessions while tracking queue depth, keepalive intervals, and health-check heartbeats under steady-state production traffic. Operators inspecting telemetry counters should compare active sockets against configured backpressure limits before tuning buffer sizes or concurrency caps.</p>
+<p>Paragraph 3.5: Operational notes for crash replay verification. Connection pools allocate bounded descriptor tables across worker threads, reusing established TLS sessions while tracking queue depth, keepalive intervals, and health-check heartbeats under steady-state production traffic. Operators inspecting telemetry counters should compare active sockets against configured backpressure limits before tuning buffer sizes or concurrency caps.</p>
+<p>Paragraph 3.6: Operational notes for crash replay verification. Connection pools allocate bounded descriptor tables across worker threads, reusing established TLS sessions while tracking queue depth, keepalive intervals, and health-check heartbeats under steady-state production traffic. Operators inspecting telemetry counters should compare active sockets against configured backpressure limits before tuning buffer sizes or concurrency caps.</p>
+<p>Paragraph 3.7: Operational notes for crash replay verification. Connection pools allocate bounded descriptor tables across worker threads, reusing established TLS sessions while tracking queue depth, keepalive intervals, and health-check heartbeats under steady-state production traffic. Operators inspecting telemetry counters should compare active sockets against configured backpressure limits before tuning buffer sizes or concurrency caps.</p>
+<p>Paragraph 3.8: Operational notes for crash replay verification. Connection pools allocate bounded descriptor tables across worker threads, reusing established TLS sessions while tracking queue depth, keepalive intervals, and health-check heartbeats under steady-state production traffic. Operators inspecting telemetry counters should compare active sockets against configured backpressure limits before tuning buffer sizes or concurrency caps.</p>
+<p>Paragraph 3.9: Operational notes for crash replay verification. Connection pools allocate bounded descriptor tables across worker threads, reusing established TLS sessions while tracking queue depth, keepalive intervals, and health-check heartbeats under steady-state production traffic. Operators inspecting telemetry counters should compare active sockets against configured backpressure limits before tuning buffer sizes or concurrency caps.</p>
+</section>
+<section id="sec-4"><h2>4. Related Work <a class="headerlink" href="#sec-4">¶</a></h2>
+<p>Paragraph 4.1: Operational notes for epoch-based group commit protocols. Connection pools allocate bounded descriptor tables across worker threads, reusing established TLS sessions while tracking queue depth, keepalive intervals, and health-check heartbeats under steady-state production traffic. Operators inspecting telemetry counters should compare active sockets against configured backpressure limits before tuning buffer sizes or concurrency caps.</p>
+<p>Paragraph 4.2: Operational notes for epoch-based group commit protocols. Connection pools allocate bounded descriptor tables across worker threads, reusing established TLS sessions while tracking queue depth, keepalive intervals, and health-check heartbeats under steady-state production traffic. Operators inspecting telemetry counters should compare active sockets against configured backpressure limits before tuning buffer sizes or concurrency caps.</p>
+<p>Paragraph 4.3: Operational notes for epoch-based group commit protocols. Connection pools allocate bounded descriptor tables across worker threads, reusing established TLS sessions while tracking queue depth, keepalive intervals, and health-check heartbeats under steady-state production traffic. Operators inspecting telemetry counters should compare active sockets against configured backpressure limits before tuning buffer sizes or concurrency caps.</p>
+<p>Paragraph 4.4: Operational notes for epoch-based group commit protocols. Connection pools allocate bounded descriptor tables across worker threads, reusing established TLS sessions while tracking queue depth, keepalive intervals, and health-check heartbeats under steady-state production traffic. Operators inspecting telemetry counters should compare active sockets against configured backpressure limits before tuning buffer sizes or concurrency caps.</p>
+<p>Paragraph 4.5: Operational notes for epoch-based group commit protocols. Connection pools allocate bounded descriptor tables across worker threads, reusing established TLS sessions while tracking queue depth, keepalive intervals, and health-check heartbeats under steady-state production traffic. Operators inspecting telemetry counters should compare active sockets against configured backpressure limits before tuning buffer sizes or concurrency caps.</p>
+<p>Paragraph 4.6: Operational notes for epoch-based group commit protocols. Connection pools allocate bounded descriptor tables across worker threads, reusing established TLS sessions while tracking queue depth, keepalive intervals, and health-check heartbeats under steady-state production traffic. Operators inspecting telemetry counters should compare active sockets against configured backpressure limits before tuning buffer sizes or concurrency caps.</p>
+<p>Paragraph 4.7: Operational notes for epoch-based group commit protocols. Connection pools allocate bounded descriptor tables across worker threads, reusing established TLS sessions while tracking queue depth, keepalive intervals, and health-check heartbeats under steady-state production traffic. Operators inspecting telemetry counters should compare active sockets against configured backpressure limits before tuning buffer sizes or concurrency caps.</p>
+<p>Paragraph 4.8: Operational notes for epoch-based group commit protocols. Connection pools allocate bounded descriptor tables across worker threads, reusing established TLS sessions while tracking queue depth, keepalive intervals, and health-check heartbeats under steady-state production traffic. Operators inspecting telemetry counters should compare active sockets against configured backpressure limits before tuning buffer sizes or concurrency caps.</p>
+</section>
+<section id="results">
+          <h2>5. Latency and Throughput Model <a class="headerlink" href="#results">#</a></h2>
+          <p>Analytical steady-state throughput obeys
+            <span class="katex">
+              <span class="katex-mathml"><math><semantics><annotation encoding="application/x-tex">\text{throughput} = \frac{N \cdot B}{T_{\text{commit}} + T_{\text{sync}}}</annotation></semantics></math></span>
+              <span class="katex-html" aria-hidden="true">throughput = (N*B)/(T_commit + T_sync)</span>
+            </span>
+            and is <strong>valid only for batch size N &gt;= 64</strong> where ring amortization dominates syscall overhead.
+          </p>
+          <table>
+            <thead>
+              <tr><th>Engine</th><th>p50 Latency</th><th>p99 Latency</th><th>Throughput</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Baseline-WAL</td><td>680 us</td><td>1,490 us</td><td>520 MiB/s</td></tr>
+              <tr><td>GroupCommit-v2</td><td>290 us</td><td>710 us</td><td>1,210 MiB/s</td></tr>
+              <tr><td>GroupCommit-v3</td><td>185 us</td><td>412 us</td><td>1,840 MiB/s</td></tr>
+            </tbody>
+          </table>
+          <p><em>*All rows measured with fsync=on, 4 KiB blocks on single-namespace PCIe Gen5 NVMe.</em></p>
+        </section>
+        </article>
+    </main>
+  </div>
+  <footer>
+    <a href="#footer-top">Skip to footer navigation</a>
+    <p>All rights reserved 2026. Share on X. Cookie Notice.</p>
+  </footer>
+</body>
+</html>

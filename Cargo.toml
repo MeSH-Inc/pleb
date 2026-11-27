@@ -11,7 +11,7 @@ repository = "https://github.com/MeSH-Inc/pleb"
 homepage = "https://github.com/MeSH-Inc/pleb"
 keywords = ["cli", "web-fetch", "markdown", "search", "ai-agents"]
 categories = ["command-line-utilities", "web-programming::http-client"]
-exclude = ["research/"]
+exclude = ["research/", "bench/"]
 
 [lib]
 name = "pleb"
