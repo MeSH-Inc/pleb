@@ -314,6 +314,7 @@ enum SessionAction {
 struct CliError {
     message: String,
     kind: &'static str,
+    block_reason: Option<pleb::policy::BlockReason>,
     exit_code: u8,
 }
 
@@ -322,6 +323,7 @@ impl CliError {
         Self {
             message: message.into(),
             kind: "invalid_input",
+            block_reason: None,
             exit_code: 1,
         }
     }
@@ -329,6 +331,7 @@ impl CliError {
     fn from_fetch(err: FetchError) -> Self {
         Self {
             kind: err.kind(),
+            block_reason: err.block_reason(),
             exit_code: err.exit_code().clamp(1, 255) as u8,
             message: err.to_string(),
         }
@@ -338,6 +341,7 @@ impl CliError {
         Self {
             message: err.to_string(),
             kind,
+            block_reason: None,
             exit_code: 1,
         }
     }
@@ -645,7 +649,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     if cfg!(feature = "cronet") {
                         "enabled"
                     } else {
-                        "disabled (reqwest fallback)"
+                        "disabled (reqwest fallback — build with --features cronet for Chrome TLS/HTTP2/QUIC)"
                     }
                 );
                 match probe {
@@ -1456,6 +1460,7 @@ fn read_secret_from_tty(provider: CredentialProvider) -> Result<SecretString, Cl
                 return Err(CliError {
                     message: "interrupted".to_string(),
                     kind: "interrupted",
+                    block_reason: None,
                     exit_code: 130,
                 });
             }
@@ -1478,6 +1483,7 @@ fn read_secret_from_tty(provider: CredentialProvider) -> Result<SecretString, Cl
         return Err(CliError {
             message: "interrupted".to_string(),
             kind: "interrupted",
+            block_reason: None,
             exit_code: 130,
         });
     }
@@ -1796,11 +1802,14 @@ fn install_bundled_skill(
 
 fn emit_cli_error(err: &CliError, json: bool) {
     if json {
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "error": err.message,
             "kind": err.kind,
             "exit_code": err.exit_code,
         });
+        if let Some(reason) = err.block_reason {
+            payload["block_reason"] = serde_json::json!(reason);
+        }
         eprintln!("{}", payload);
     } else {
         eprintln!("error: {}", err.message);

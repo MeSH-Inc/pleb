@@ -148,7 +148,9 @@ fn print_usage() {
 fn classification_name(cls: &ResponseClassification) -> &'static str {
     match cls {
         ResponseClassification::Ok => "ok",
-        ResponseClassification::Blocked { .. } => "blocked",
+        ResponseClassification::Blocked { .. } | ResponseClassification::RateLimited { .. } => {
+            "blocked"
+        }
         ResponseClassification::Challenge { .. } => "challenge",
         ResponseClassification::JavaScriptShell { .. } => "javascript_shell",
         ResponseClassification::HttpError { .. } => "http_error",

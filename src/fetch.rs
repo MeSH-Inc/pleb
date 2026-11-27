@@ -13,18 +13,20 @@ use crate::extract::{
     ResourceSalience,
 };
 use crate::policy::{
-    classify_response_with_context, compute_safe_referer, detect_interstitial_challenge,
+    classify_response_with_headers, compute_safe_referer, detect_interstitial_challenge,
     is_markdown_content_type, is_mirror_acceptable_content_type, is_safe_subresource_url,
-    parse_markdown_link_header, plan_strategy, resolve_raw_source_candidate, EscalationBackend,
-    PrimaryTransport, RawSourceCandidate, RawSourceKind, RenderMode, ResourcePolicy,
-    ResponseClassification, SourceMode, ToolPolicy,
+    parse_markdown_link_header, parse_retry_after_secs, plan_strategy,
+    resolve_raw_source_candidate, BlockReason, EscalationBackend, PrimaryTransport,
+    RawSourceCandidate, RawSourceKind, RenderMode, ResourcePolicy, ResponseClassification,
+    SourceMode, ToolPolicy,
 };
 use crate::transport::cdp::{CdpRenderOptions, CdpRenderResult, CdpRenderer};
 use crate::transport::cef::{CefRenderOptions, CefRenderResult, CefRenderer};
 use crate::transport::web_bot_auth::execute_signed_get;
 use crate::transport::{
-    transport_error_kind, RequestHeaderOptions, ResponseTooLargeError, SubresourceDest,
-    TransportErrorKind, DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES, DEFAULT_RAW_MAX_RESPONSE_BYTES,
+    transport_error_kind, DiagnosticHeaders, RequestHeaderOptions, ResponseTooLargeError,
+    SubresourceDest, TransportErrorKind, DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES,
+    DEFAULT_RAW_MAX_RESPONSE_BYTES,
 };
 
 const MAX_TRANSCRIPT_FETCHES: usize = 4;
@@ -39,10 +41,11 @@ pub enum FetchError {
     #[error("blocked by robots.txt on {host}: {url}")]
     RobotsDisallowed { host: String, url: String },
 
-    #[error("HTTP {status} blocked fetching {url}: {detail}")]
+    #[error("HTTP {status} blocked ({reason}) fetching {url}: {detail}")]
     Blocked {
         url: String,
         status: u16,
+        reason: BlockReason,
         detail: String,
     },
 
@@ -110,6 +113,20 @@ impl FetchError {
             Self::Timeout { .. } => "timeout",
             Self::ResponseTooLarge { .. } => "response_too_large",
             Self::Transport(_) => "transport",
+        }
+    }
+
+    pub fn block_reason(&self) -> Option<BlockReason> {
+        match self {
+            Self::Blocked { reason, .. } => Some(*reason),
+            Self::Challenge { reason, .. } => {
+                if reason.to_ascii_lowercase().contains("cloudflare") {
+                    Some(BlockReason::CloudflareChallenge)
+                } else {
+                    Some(BlockReason::BotChallenge)
+                }
+            }
+            _ => None,
         }
     }
 }
@@ -1297,12 +1314,15 @@ async fn acquire_page(
         .config
         .max_response_bytes
         .unwrap_or(DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES);
-    let accept_markdown = source_mode == SourceMode::Negotiate
+    let mut effective_accept_markdown = source_mode == SourceMode::Negotiate
         || (source_mode == SourceMode::Auto && rule.is_some_and(|r| r.accept_markdown));
+    let mut retried_406 = false;
+    let mut retried_429 = false;
     let mut current_url = url_str.to_string();
     let mut current_parsed = parsed.clone();
     let mut visited_refresh = std::collections::HashSet::from([current_url.clone()]);
-    let (status, final_url, content_type, link_header, is_html, body, mut parsed_html) = {
+    let http_deadline = Instant::now() + ctx.config.timeout;
+    let (status, final_url, content_type, link_header, diagnostics, is_html, body, mut parsed_html) = {
         const MAX_META_REFRESH_HOPS: usize = 3;
         let mut hop = 0usize;
         loop {
@@ -1310,7 +1330,7 @@ async fn acquire_page(
                 .web_bot_auth_signer_for_url(&current_parsed)
                 .map_err(FetchError::Transport)?;
             let req_opts = RequestHeaderOptions {
-                accept_markdown,
+                accept_markdown: effective_accept_markdown,
                 ..Default::default()
             };
             let resp = execute_signed_get(
@@ -1327,7 +1347,30 @@ async fn acquire_page(
             let final_url = resp.final_url.clone();
             let content_type = resp.content_type.clone();
             let link_header = resp.link_header.clone();
+            let diagnostics = resp.diagnostics.clone();
             let is_html = resp.is_html();
+
+            if status == 406 && effective_accept_markdown && !retried_406 {
+                effective_accept_markdown = false;
+                retried_406 = true;
+                continue;
+            }
+            if status == 429 && !retried_429 {
+                if let Some(secs) = parse_retry_after_secs(diagnostics.retry_after.as_deref()) {
+                    if secs <= 5 {
+                        let wait = if secs == 0 {
+                            Duration::from_millis(50)
+                        } else {
+                            Duration::from_secs(secs)
+                        };
+                        if http_deadline.saturating_duration_since(Instant::now()) > wait {
+                            tokio::time::sleep(wait).await;
+                            retried_429 = true;
+                            continue;
+                        }
+                    }
+                }
+            }
 
             if status < 400 {
                 if let Some(detected_mime) =
@@ -1374,18 +1417,20 @@ async fn acquire_page(
                 final_url,
                 content_type,
                 link_header,
+                diagnostics,
                 is_html,
                 body,
                 parsed_html,
             );
         }
     };
-    let classification = classify_response_with_context(
+    let classification = classify_response_with_headers(
         status,
         is_html,
         Some(url_str),
         Some(&final_url),
         &body,
+        &diagnostics,
         &mut parsed_html,
     );
 
@@ -1414,7 +1459,9 @@ async fn acquire_page(
 
     match classification {
         ResponseClassification::Ok => {
-            if accept_markdown && status < 400 && is_markdown_content_type(content_type.as_deref())
+            if effective_accept_markdown
+                && status < 400
+                && is_markdown_content_type(content_type.as_deref())
             {
                 return Ok(record_network_page(
                     body,
@@ -1541,7 +1588,7 @@ async fn acquire_page(
                 imperative_tools: Vec::new(),
             })
         }
-        ResponseClassification::Blocked { status } => {
+        ResponseClassification::Blocked { status, reason } => {
             match plan.escalation {
                 EscalationBackend::Cef => {
                     match try_cef_escalation(ctx, host, start, &final_url, effective_selector).await
@@ -1552,9 +1599,10 @@ async fn acquire_page(
                             return Err(FetchError::Blocked {
                                 url: final_url,
                                 status,
-                                detail: format!(
-                                    "network blocked and CEF escalation failed: {}",
-                                    err
+                                reason,
+                                detail: format_block_detail(
+                                    &format!("network blocked and CEF escalation failed: {}", err),
+                                    &diagnostics,
                                 ),
                             });
                         }
@@ -1585,9 +1633,13 @@ async fn acquire_page(
                                 return Err(FetchError::Blocked {
                                     url: final_url,
                                     status,
-                                    detail: format!(
-                                        "network blocked and CDP escalation failed: {}",
-                                        err
+                                    reason,
+                                    detail: format_block_detail(
+                                        &format!(
+                                            "network blocked and CDP escalation failed: {}",
+                                            err
+                                        ),
+                                        &diagnostics,
                                     ),
                                 });
                             }
@@ -1596,7 +1648,7 @@ async fn acquire_page(
                 }
                 EscalationBackend::None => {}
             }
-            let detail = if !cef_available && !cdp_available && render_mode != RenderMode::Cronet {
+            let base = if !cef_available && !cdp_available && render_mode != RenderMode::Cronet {
                 format!(
                     "site blocked the request and no browser renderer (CEF or CDP) is available; install CEF ({}) or pass --cdp-url",
                     crate::transport::cef::rebuild_command_hint()
@@ -1607,7 +1659,23 @@ async fn acquire_page(
             Err(FetchError::Blocked {
                 url: final_url,
                 status,
-                detail,
+                reason,
+                detail: format_block_detail(&base, &diagnostics),
+            })
+        }
+        ResponseClassification::RateLimited {
+            status,
+            retry_after_secs,
+        } => {
+            let base = match retry_after_secs {
+                Some(secs) => format!("rate limited by origin (Retry-After: {secs}s)"),
+                None => "rate limited by origin".to_string(),
+            };
+            Err(FetchError::Blocked {
+                url: final_url,
+                status,
+                reason: BlockReason::RateLimited,
+                detail: format_block_detail(&base, &diagnostics),
             })
         }
         ResponseClassification::Challenge { status, reason } => Err(FetchError::Challenge {
@@ -1732,12 +1800,14 @@ fn classify_rendered_result(
     }
 
     let mut parsed_html = None;
-    match classify_response_with_context(
+    let empty_headers = DiagnosticHeaders::default();
+    match classify_response_with_headers(
         status_code,
         true,
         Some(requested_url),
         Some(&final_url),
         &html,
+        &empty_headers,
         &mut parsed_html,
     ) {
         ResponseClassification::Ok => {
@@ -1775,12 +1845,34 @@ fn classify_rendered_result(
             axtree_text,
             imperative_tools,
         }),
-        ResponseClassification::Blocked { status } => Err(FetchError::Blocked {
+        ResponseClassification::Blocked { status, reason } => Err(FetchError::Blocked {
             url: final_url,
             status,
-            detail: format!(
-                "site blocked the request after {} render",
-                strategy.to_ascii_uppercase()
+            reason,
+            detail: format_block_detail(
+                &format!(
+                    "site blocked the request after {} render",
+                    strategy.to_ascii_uppercase()
+                ),
+                &empty_headers,
+            ),
+        }),
+        ResponseClassification::RateLimited {
+            status,
+            retry_after_secs,
+        } => Err(FetchError::Blocked {
+            url: final_url,
+            status,
+            reason: BlockReason::RateLimited,
+            detail: format_block_detail(
+                &match retry_after_secs {
+                    Some(secs) => format!(
+                        "rate limited after {} render (Retry-After: {secs}s)",
+                        strategy.to_ascii_uppercase()
+                    ),
+                    None => format!("rate limited after {} render", strategy.to_ascii_uppercase()),
+                },
+                &empty_headers,
             ),
         }),
         ResponseClassification::Challenge { status, reason } => Err(FetchError::Challenge {
@@ -1793,6 +1885,19 @@ fn classify_rendered_result(
             status,
         }),
     }
+}
+
+fn format_block_detail(base: &str, diagnostics: &DiagnosticHeaders) -> String {
+    let mut detail = base.to_string();
+    if let Some(summary) = diagnostics.summary() {
+        detail.push_str(&format!(" [{summary}]"));
+    }
+    if !cfg!(feature = "cronet") {
+        detail.push_str(
+            "; built without Cronet Chrome TLS (rebuild with --features cronet for Chrome TLS/HTTP2/QUIC)",
+        );
+    }
+    detail
 }
 
 fn classify_cdp_result(
@@ -2057,6 +2162,8 @@ pub struct BatchItemFailure {
     pub ok: bool,
     pub error: String,
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_reason: Option<BlockReason>,
     pub exit_code: u8,
 }
 
@@ -2099,6 +2206,7 @@ impl BatchItemResult {
                 ok: false,
                 error: err.to_string(),
                 kind: err.kind().to_string(),
+                block_reason: err.block_reason(),
                 exit_code: err.exit_code().clamp(1, 255) as u8,
             }),
         }

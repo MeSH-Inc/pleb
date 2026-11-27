@@ -377,7 +377,9 @@ fn evaluate_fixture(path: &Path) -> (String, FixtureSpec, FixtureOutcome) {
     );
     let (cls_name, mut actual_exit, mut actual_kind) = match &cls {
         ResponseClassification::Ok => ("ok", 0, None),
-        ResponseClassification::Blocked { .. } => ("blocked", 2, Some("blocked")),
+        ResponseClassification::Blocked { .. } | ResponseClassification::RateLimited { .. } => {
+            ("blocked", 2, Some("blocked"))
+        }
         ResponseClassification::Challenge { .. } => ("challenge", 2, Some("challenge")),
         ResponseClassification::JavaScriptShell { .. } => ("javascript_shell", 0, None),
         ResponseClassification::HttpError { .. } => ("http_error", 3, Some("http_error")),

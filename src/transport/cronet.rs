@@ -120,6 +120,7 @@ pub struct CronetResponse {
     pub content_type: Option<String>,
     pub link_header: Option<String>,
     pub location_header: Option<String>,
+    pub diagnostics: super::DiagnosticHeaders,
     pub body: Vec<u8>,
 }
 
@@ -262,6 +263,7 @@ impl Engine {
             content_type: Mutex::new(None),
             link_header: Mutex::new(None),
             location_header: Mutex::new(None),
+            diagnostics: Mutex::new(super::DiagnosticHeaders::default()),
             sender: Mutex::new(Some(tx)),
             request: Mutex::new(std::ptr::null_mut()),
             callback: Mutex::new(std::ptr::null_mut()),
@@ -371,6 +373,7 @@ struct InterceptedRedirect {
     content_type: Option<String>,
     link_header: Option<String>,
     location_header: Option<String>,
+    diagnostics: super::DiagnosticHeaders,
 }
 
 struct RequestState {
@@ -386,6 +389,7 @@ struct RequestState {
     content_type: Mutex<Option<String>>,
     link_header: Mutex<Option<String>>,
     location_header: Mutex<Option<String>>,
+    diagnostics: Mutex<super::DiagnosticHeaders>,
     sender: Mutex<Option<oneshot::Sender<Result<CronetResponse>>>>,
     request: Mutex<ffi::Cronet_UrlRequestPtr>,
     callback: Mutex<ffi::Cronet_UrlRequestCallbackPtr>,
@@ -397,6 +401,7 @@ struct ParsedCronetHeaders {
     content_type: Option<String>,
     link_header: Option<String>,
     location_header: Option<String>,
+    diagnostics: super::DiagnosticHeaders,
 }
 
 unsafe fn parse_cronet_response_headers(
@@ -406,11 +411,13 @@ unsafe fn parse_cronet_response_headers(
     let mut content_type: Option<String> = None;
     let mut link_values: Vec<String> = Vec::new();
     let mut location_header: Option<String> = None;
+    let mut diagnostics = super::DiagnosticHeaders::default();
     if info.is_null() {
         return ParsedCronetHeaders {
             content_type,
             link_header: None,
             location_header,
+            diagnostics,
         };
     }
 
@@ -424,21 +431,20 @@ unsafe fn parse_cronet_response_headers(
         let value_ptr = ffi::Cronet_HttpHeader_value_get(header);
         if !name_ptr.is_null() && !value_ptr.is_null() {
             let name = CStr::from_ptr(name_ptr).to_string_lossy();
+            let value = CStr::from_ptr(value_ptr).to_string_lossy();
+            diagnostics.capture_header(&name, &value);
             if name.eq_ignore_ascii_case("content-type") && content_type.is_none() {
-                content_type = Some(CStr::from_ptr(value_ptr).to_string_lossy().into_owned());
+                content_type = Some(value.into_owned());
             } else if name.eq_ignore_ascii_case("link") {
-                let value = CStr::from_ptr(value_ptr).to_string_lossy().into_owned();
                 if !value.is_empty() {
-                    link_values.push(value);
+                    link_values.push(value.into_owned());
                 }
             } else if capture_location
                 && name.eq_ignore_ascii_case("location")
                 && location_header.is_none()
+                && !value.is_empty()
             {
-                let value = CStr::from_ptr(value_ptr).to_string_lossy().into_owned();
-                if !value.is_empty() {
-                    location_header = Some(value);
-                }
+                location_header = Some(value.into_owned());
             }
         }
     }
@@ -447,6 +453,7 @@ unsafe fn parse_cronet_response_headers(
         content_type,
         link_header: (!link_values.is_empty()).then(|| link_values.join(", ")),
         location_header,
+        diagnostics,
     }
 }
 
@@ -520,6 +527,7 @@ unsafe extern "C" fn on_redirect_received(
             content_type: headers.content_type,
             link_header: headers.link_header,
             location_header,
+            diagnostics: headers.diagnostics,
         });
         let active = Arc::clone(&state.active_request);
         cancel_active_request(&active);
@@ -578,6 +586,9 @@ unsafe extern "C" fn on_response_started(
     }
     if headers.location_header.is_some() {
         *lock_unpoisoned(&state.location_header) = headers.location_header;
+    }
+    if !headers.diagnostics.is_empty() {
+        *lock_unpoisoned(&state.diagnostics) = headers.diagnostics;
     }
 
     let buffer = ffi::Cronet_Buffer_Create();
@@ -672,6 +683,7 @@ unsafe extern "C" fn on_succeeded(
     let content_type = lock_unpoisoned(&boxed.content_type).take();
     let link_header = lock_unpoisoned(&boxed.link_header).take();
     let location_header = lock_unpoisoned(&boxed.location_header).take();
+    let diagnostics = std::mem::take(&mut *lock_unpoisoned(&boxed.diagnostics));
 
     complete(
         &boxed,
@@ -681,6 +693,7 @@ unsafe extern "C" fn on_succeeded(
             content_type,
             link_header,
             location_header,
+            diagnostics,
             body,
         }),
     );
@@ -742,6 +755,7 @@ unsafe extern "C" fn on_canceled(
             content_type: redir.content_type,
             link_header: redir.link_header,
             location_header: redir.location_header,
+            diagnostics: redir.diagnostics,
             body: Vec::new(),
         })
     } else if let Some(target) = lock_unpoisoned(&boxed.blocked_redirect).take() {

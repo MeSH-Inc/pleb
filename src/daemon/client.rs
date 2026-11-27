@@ -172,6 +172,7 @@ pub async fn daemon_http_get_with_request_options(
             content_type: hdr.content_type,
             link_header: hdr.link_header,
             location_header: hdr.location_header,
+            diagnostics: hdr.diagnostics,
             body,
         })
     } else {

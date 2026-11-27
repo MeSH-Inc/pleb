@@ -487,6 +487,7 @@ async fn handle_connection(
                             hdr.content_type = resp.content_type;
                             hdr.link_header = resp.link_header;
                             hdr.location_header = resp.location_header;
+                            hdr.diagnostics = resp.diagnostics;
                             hdr.body_bytes = resp.body.len();
                             let _ = write_frame(&mut write_half, &hdr, &resp.body).await;
                         }

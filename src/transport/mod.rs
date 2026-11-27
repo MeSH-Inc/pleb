@@ -20,6 +20,140 @@ pub const ASSET_ACCEPT_HEADER: &str = "*/*";
 pub const DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_RAW_MAX_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiagnosticHeaders {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cf_mitigated: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cf_ray: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub www_authenticate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waf_action: Option<String>,
+}
+
+fn sanitize_header_value(raw: &str) -> Option<String> {
+    let cleaned: String = raw.trim().chars().filter(|c| !c.is_control()).collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() <= 128 {
+        return Some(trimmed.to_string());
+    }
+    let mut end = 128;
+    while !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(trimmed[..end].to_string())
+}
+
+impl DiagnosticHeaders {
+    pub fn is_empty(&self) -> bool {
+        self.server.is_none()
+            && self.cf_mitigated.is_none()
+            && self.cf_ray.is_none()
+            && self.retry_after.is_none()
+            && self.www_authenticate.is_none()
+            && self.waf_action.is_none()
+    }
+
+    pub fn capture_header(&mut self, name: &str, value: &str) {
+        let Some(sanitized) = sanitize_header_value(value) else {
+            return;
+        };
+        if name.eq_ignore_ascii_case("server") {
+            if self.server.is_none() {
+                self.server = Some(sanitized);
+            }
+        } else if name.eq_ignore_ascii_case("cf-mitigated") {
+            if self.cf_mitigated.is_none() {
+                self.cf_mitigated = Some(sanitized);
+            }
+        } else if name.eq_ignore_ascii_case("cf-ray") {
+            if self.cf_ray.is_none() {
+                self.cf_ray = Some(sanitized);
+            }
+        } else if name.eq_ignore_ascii_case("retry-after") {
+            if self.retry_after.is_none() {
+                self.retry_after = Some(sanitized);
+            }
+        } else if name.eq_ignore_ascii_case("www-authenticate") {
+            if self.www_authenticate.is_none() {
+                self.www_authenticate = Some(sanitized);
+            }
+        } else if name.eq_ignore_ascii_case("x-amzn-waf-action") {
+            if self
+                .waf_action
+                .as_deref()
+                .is_none_or(|v| !v.starts_with("aws-waf:"))
+            {
+                self.waf_action = sanitize_header_value(&format!("aws-waf:{sanitized}"));
+            }
+        } else if name.eq_ignore_ascii_case("x-datadome") {
+            if self.waf_action.is_none() {
+                self.waf_action = Some("datadome".to_string());
+            }
+        } else if name.eq_ignore_ascii_case("x-sucuri-id") {
+            if self.waf_action.is_none() {
+                self.waf_action = Some("sucuri".to_string());
+            }
+        } else if name.eq_ignore_ascii_case("x-iinfo") && self.waf_action.is_none() {
+            self.waf_action = Some("imperva".to_string());
+        }
+    }
+
+    pub fn is_edge_waf(&self) -> bool {
+        if self.cf_ray.is_some() || self.cf_mitigated.is_some() || self.waf_action.is_some() {
+            return true;
+        }
+        self.server.as_deref().is_some_and(|s| {
+            let lower = s.to_ascii_lowercase();
+            [
+                "cloudflare",
+                "akamai",
+                "cloudfront",
+                "fastly",
+                "sucuri",
+                "imperva",
+                "incapsula",
+                "ddos-guard",
+                "datadome",
+                "varnish",
+            ]
+            .iter()
+            .any(|marker| lower.contains(marker))
+        })
+    }
+
+    pub fn summary(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(ref v) = self.server {
+            parts.push(format!("server={v}"));
+        }
+        if let Some(ref v) = self.cf_mitigated {
+            parts.push(format!("cf-mitigated={v}"));
+        }
+        if let Some(ref v) = self.cf_ray {
+            parts.push(format!("cf-ray={v}"));
+        }
+        if let Some(ref v) = self.waf_action {
+            parts.push(format!("waf={v}"));
+        }
+        if let Some(ref v) = self.retry_after {
+            parts.push(format!("retry-after={v}"));
+        }
+        if let Some(ref v) = self.www_authenticate {
+            parts.push(format!("www-authenticate={v}"));
+        }
+        (!parts.is_empty()).then(|| parts.join(", "))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubresourceDest {
@@ -106,6 +240,7 @@ pub struct HttpResponse {
     pub content_type: Option<String>,
     pub link_header: Option<String>,
     pub location_header: Option<String>,
+    pub diagnostics: DiagnosticHeaders,
     pub body: Vec<u8>,
 }
 
@@ -152,6 +287,7 @@ fn build_reqwest_client(
     let mut builder = reqwest::Client::builder()
         .user_agent(chrome_user_agent())
         .redirect(redirect_policy)
+        .cookie_store(true)
         .gzip(true)
         .brotli(true)
         .deflate(true);
@@ -313,6 +449,7 @@ impl TransportClient {
                         content_type: resp.content_type,
                         link_header: resp.link_header,
                         location_header: resp.location_header,
+                        diagnostics: resp.diagnostics,
                         body: resp.body,
                     })
                 }
@@ -360,6 +497,12 @@ impl TransportClient {
                         } else {
                             None
                         };
+                        let mut diagnostics = DiagnosticHeaders::default();
+                        for (name, value) in resp.headers() {
+                            if let Ok(val_str) = value.to_str() {
+                                diagnostics.capture_header(name.as_str(), val_str);
+                            }
+                        }
                         let mut body = Vec::new();
                         while let Some(chunk) = resp.chunk().await? {
                             if body.len().saturating_add(chunk.len()) > max_body_bytes {
@@ -375,6 +518,7 @@ impl TransportClient {
                             content_type,
                             link_header,
                             location_header,
+                            diagnostics,
                             body,
                         })
                     };
@@ -744,5 +888,99 @@ mod tests {
             ),
             "cross-site"
         );
+    }
+
+    #[test]
+    fn diagnostic_headers_captures_sanitizes_and_detects_waf() {
+        let mut diag = DiagnosticHeaders::default();
+        assert!(diag.is_empty());
+
+        diag.capture_header("Server", "  cloudflare\r\n  ");
+        diag.capture_header("CF-Ray", "90123abc-SJC");
+        diag.capture_header("CF-Mitigated", "challenge");
+        diag.capture_header("Retry-After", " 15 ");
+        diag.capture_header("WWW-Authenticate", "Bearer");
+        diag.capture_header("X-Amzn-Waf-Action", "captcha");
+        // First-seen wins for duplicate server header and oversized value truncates at char boundary <= 128 bytes.
+        diag.capture_header("Server", "nginx");
+        let mut long_diag = DiagnosticHeaders::default();
+        let long_val = "é".repeat(80);
+        long_diag.capture_header("Server", &long_val);
+        assert!(long_diag.server.as_ref().unwrap().len() <= 128);
+
+        assert!(!diag.is_empty());
+        assert!(diag.is_edge_waf());
+        assert_eq!(diag.server.as_deref(), Some("cloudflare"));
+        assert_eq!(diag.cf_ray.as_deref(), Some("90123abc-SJC"));
+        assert_eq!(diag.cf_mitigated.as_deref(), Some("challenge"));
+        assert_eq!(diag.retry_after.as_deref(), Some("15"));
+        assert_eq!(diag.www_authenticate.as_deref(), Some("Bearer"));
+        assert_eq!(diag.waf_action.as_deref(), Some("aws-waf:captcha"));
+        let summary = diag.summary().unwrap();
+        assert!(summary.contains("server=cloudflare"));
+        assert!(summary.contains("cf-mitigated=challenge"));
+        assert!(summary.contains("cf-ray=90123abc-SJC"));
+        assert!(summary.contains("waf=aws-waf:captcha"));
+        assert!(summary.contains("retry-after=15"));
+
+        let mut origin_only = DiagnosticHeaders::default();
+        origin_only.capture_header("Server", "nginx/1.26");
+        assert!(!origin_only.is_edge_waf());
+
+        let mut datadome = DiagnosticHeaders::default();
+        datadome.capture_header("X-DataDome", "protected");
+        assert!(datadome.is_edge_waf());
+        assert_eq!(datadome.waf_action.as_deref(), Some("datadome"));
+    }
+
+    #[cfg(not(feature = "cronet"))]
+    #[tokio::test]
+    async fn reqwest_persists_session_cookie_across_redirect_to_avoid_403() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let has_cookie = req.lines().any(|l| {
+                        l.to_ascii_lowercase().starts_with("cookie:") && l.contains("pleb_sess=ok")
+                    });
+                    let resp = match path {
+                        "/start" => "HTTP/1.1 302 Found\r\nLocation: /protected\r\nSet-Cookie: pleb_sess=ok; Path=/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        "/protected" if has_cookie => "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nServer: cloudflare\r\nContent-Length: 10\r\nConnection: close\r\n\r\ncookie_ok\n",
+                        "/protected" => "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\nServer: cloudflare\r\nContent-Length: 9\r\nConnection: close\r\n\r\nForbidden",
+                        _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    };
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let client = TransportClient::new_direct(Path::new("/tmp"), None, Duration::from_secs(5))
+            .expect("reqwest client should build");
+        let resp = client
+            .get(&format!("http://{addr}/start"))
+            .await
+            .expect("cookie redirect should succeed");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"cookie_ok\n");
+        assert_eq!(resp.diagnostics.server.as_deref(), Some("cloudflare"));
+        server.abort();
     }
 }

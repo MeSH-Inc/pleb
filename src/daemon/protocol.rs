@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::transport::{SubresourceDest, TransportErrorKind, WebBotAuthHeaders};
+use crate::transport::{DiagnosticHeaders, SubresourceDest, TransportErrorKind, WebBotAuthHeaders};
 
 pub const PROTOCOL_VERSION: u32 = 4;
 pub const BUILD_ID: &str = env!("PLEB_BUILD_ID");
@@ -110,6 +110,8 @@ pub struct DaemonResponseHeader {
     pub link_header: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location_header: Option<String>,
+    #[serde(default, skip_serializing_if = "DiagnosticHeaders::is_empty")]
+    pub diagnostics: DiagnosticHeaders,
     #[serde(default)]
     pub body_bytes: usize,
     #[serde(default)]
@@ -135,6 +137,7 @@ impl DaemonResponseHeader {
             content_type: None,
             link_header: None,
             location_header: None,
+            diagnostics: DiagnosticHeaders::default(),
             body_bytes: 0,
             error: None,
             error_kind: None,
@@ -160,6 +163,7 @@ impl DaemonResponseHeader {
             content_type: None,
             link_header: None,
             location_header: None,
+            diagnostics: DiagnosticHeaders::default(),
             body_bytes: 0,
             error: Some(message.into()),
             error_kind: kind,

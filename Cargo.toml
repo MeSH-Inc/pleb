@@ -35,7 +35,7 @@ ego-tree = "0.11"
 flate2 = "1.0"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 htmd = "0.5"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "gzip", "brotli", "deflate", "socks", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "gzip", "brotli", "deflate", "socks", "json", "cookies"] }
 ring = "0.17"
 robotstxt = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

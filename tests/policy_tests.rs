@@ -1,9 +1,10 @@
 use pleb::extract::ParsedHtml;
 use pleb::policy::{
-    classify_response, classify_response_with_parsed, plan_strategy, EscalationBackend,
-    PrimaryTransport, RenderMode, ResponseClassification, SiteCache, SiteCacheEntry, SiteRule,
-    SiteRules,
+    classify_response, classify_response_with_headers, classify_response_with_parsed,
+    plan_strategy, BlockReason, EscalationBackend, PrimaryTransport, RenderMode,
+    ResponseClassification, SiteCache, SiteCacheEntry, SiteRule, SiteRules,
 };
+use pleb::transport::DiagnosticHeaders;
 use std::sync::atomic::{AtomicU64, Ordering};
 use url::Url;
 
@@ -259,7 +260,10 @@ fn response_classifier_covers_challenges_js_shells_and_normal_pages() {
 
     assert_eq!(
         classify_response(403, true, "Forbidden"),
-        ResponseClassification::Blocked { status: 403 }
+        ResponseClassification::Blocked {
+            status: 403,
+            reason: BlockReason::OriginForbidden,
+        }
     );
     assert_eq!(
         classify_response(404, true, "Not Found"),
@@ -297,10 +301,13 @@ fn response_classifier_covers_challenges_js_shells_and_normal_pages() {
 
     // Lazy parsing only populates ParsedHtml when DOM metrics are actually evaluated.
     let mut parsed: Option<ParsedHtml> = None;
-    assert!(matches!(
+    assert_eq!(
         classify_response_with_parsed(403, true, "Forbidden", &mut parsed),
-        ResponseClassification::Blocked { status: 403 }
-    ));
+        ResponseClassification::Blocked {
+            status: 403,
+            reason: BlockReason::OriginForbidden,
+        }
+    );
     assert!(parsed.is_none());
 
     assert!(matches!(
@@ -499,7 +506,10 @@ fn classify_response_with_context_gates_http200_on_prose_and_detects_soft_blocks
             login_page,
             &mut parsed_login
         ),
-        ResponseClassification::Blocked { status: 200 }
+        ResponseClassification::Blocked {
+            status: 200,
+            reason: BlockReason::LoginWall,
+        }
     );
 
     // Password-form wall without redirect and prose < 400 classifies as Blocked.
@@ -507,7 +517,10 @@ fn classify_response_with_context_gates_http200_on_prose_and_detects_soft_blocks
     let mut parsed_form = None;
     assert_eq!(
         classify_response_with_context(200, true, None, None, form_wall, &mut parsed_form),
-        ResponseClassification::Blocked { status: 200 }
+        ResponseClassification::Blocked {
+            status: 200,
+            reason: BlockReason::LoginWall,
+        }
     );
 
     // Low-prose soft-404 title classifies as HttpError { status: 404 }.
@@ -616,4 +629,70 @@ fn is_local_or_private_host_blocks_hardened_ipv4_and_ipv6_ranges() {
             "expected public host allowance for {public}"
         );
     }
+}
+
+#[test]
+fn classify_response_with_headers_distinguishes_waf_challenges_cookie_walls_and_429() {
+    let mut cf_challenge = DiagnosticHeaders::default();
+    cf_challenge.capture_header("Server", "cloudflare");
+    cf_challenge.capture_header("CF-Mitigated", "challenge");
+    let mut parsed = None;
+    assert!(matches!(
+        classify_response_with_headers(403, true, None, None, "Access denied", &cf_challenge, &mut parsed),
+        ResponseClassification::Challenge { status: 403, ref reason } if reason.contains("cf-mitigated")
+    ));
+
+    let mut aws_challenge = DiagnosticHeaders::default();
+    aws_challenge.capture_header("x-amzn-waf-action", "captcha");
+    assert!(matches!(
+        classify_response_with_headers(403, true, None, None, "Blocked", &aws_challenge, &mut parsed),
+        ResponseClassification::Challenge { status: 403, ref reason } if reason.contains("x-amzn-waf-action")
+    ));
+
+    let mut cf_edge = DiagnosticHeaders::default();
+    cf_edge.capture_header("Server", "cloudflare");
+    cf_edge.capture_header("CF-Ray", "123abc-SJC");
+    assert_eq!(
+        classify_response_with_headers(403, true, None, None, "Forbidden", &cf_edge, &mut parsed),
+        ResponseClassification::Blocked {
+            status: 403,
+            reason: BlockReason::EdgeWafBlock,
+        }
+    );
+
+    let mut rl_headers = DiagnosticHeaders::default();
+    rl_headers.capture_header("Retry-After", "45");
+    assert_eq!(
+        classify_response_with_headers(
+            429,
+            true,
+            None,
+            None,
+            "Slow down",
+            &rl_headers,
+            &mut parsed
+        ),
+        ResponseClassification::RateLimited {
+            status: 429,
+            retry_after_secs: Some(45),
+        }
+    );
+
+    let cookie_wall =
+        "<html><body><p>Before you continue to Example, please accept cookies.</p></body></html>";
+    assert_eq!(
+        classify_response_with_headers(
+            200,
+            true,
+            None,
+            None,
+            cookie_wall,
+            &DiagnosticHeaders::default(),
+            &mut parsed
+        ),
+        ResponseClassification::Blocked {
+            status: 200,
+            reason: BlockReason::CookieWall,
+        }
+    );
 }

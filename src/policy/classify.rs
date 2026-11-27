@@ -1,12 +1,67 @@
 use crate::extract::dom;
+use crate::transport::DiagnosticHeaders;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockReason {
+    CloudflareChallenge,
+    BotChallenge,
+    EdgeWafBlock,
+    OriginForbidden,
+    LoginWall,
+    CookieWall,
+    RateLimited,
+}
+
+impl BlockReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CloudflareChallenge => "cloudflare_challenge",
+            Self::BotChallenge => "bot_challenge",
+            Self::EdgeWafBlock => "edge_waf_block",
+            Self::OriginForbidden => "origin_forbidden",
+            Self::LoginWall => "login_wall",
+            Self::CookieWall => "cookie_wall",
+            Self::RateLimited => "rate_limited",
+        }
+    }
+}
+
+impl std::fmt::Display for BlockReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponseClassification {
     Ok,
-    Blocked { status: u16 },
-    Challenge { status: u16, reason: String },
-    JavaScriptShell { reason: String },
-    HttpError { status: u16 },
+    Blocked {
+        status: u16,
+        reason: BlockReason,
+    },
+    RateLimited {
+        status: u16,
+        retry_after_secs: Option<u64>,
+    },
+    Challenge {
+        status: u16,
+        reason: String,
+    },
+    JavaScriptShell {
+        reason: String,
+    },
+    HttpError {
+        status: u16,
+    },
+}
+
+pub fn parse_retry_after_secs(raw: Option<&str>) -> Option<u64> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    trimmed.parse::<u64>().ok()
 }
 
 pub fn classify_response(status: u16, is_html: bool, body: &str) -> ResponseClassification {
@@ -31,12 +86,64 @@ pub fn classify_response_with_context(
     body: &str,
     parsed: &mut Option<dom::ParsedHtml>,
 ) -> ResponseClassification {
+    classify_response_with_headers(
+        status,
+        is_html,
+        requested_url,
+        final_url,
+        body,
+        &DiagnosticHeaders::default(),
+        parsed,
+    )
+}
+
+pub fn classify_response_with_headers(
+    status: u16,
+    is_html: bool,
+    requested_url: Option<&str>,
+    final_url: Option<&str>,
+    body: &str,
+    headers: &DiagnosticHeaders,
+    parsed: &mut Option<dom::ParsedHtml>,
+) -> ResponseClassification {
     if status == 403 || status == 503 {
+        if headers
+            .cf_mitigated
+            .as_deref()
+            .is_some_and(|v| v.to_ascii_lowercase().contains("challenge"))
+        {
+            return ResponseClassification::Challenge {
+                status,
+                reason: "Cloudflare managed challenge (cf-mitigated)".to_string(),
+            };
+        }
+        if headers.waf_action.as_deref().is_some_and(|v| {
+            let lower = v.to_ascii_lowercase();
+            lower.starts_with("aws-waf:")
+                && (lower.contains("challenge") || lower.contains("captcha"))
+        }) {
+            return ResponseClassification::Challenge {
+                status,
+                reason: "AWS WAF challenge (x-amzn-waf-action)".to_string(),
+            };
+        }
         let lower = body.to_ascii_lowercase();
         if let Some(reason) = detect_challenge_lower(&lower) {
             return ResponseClassification::Challenge { status, reason };
         }
-        return ResponseClassification::Blocked { status };
+        let reason = if headers.is_edge_waf() {
+            BlockReason::EdgeWafBlock
+        } else {
+            BlockReason::OriginForbidden
+        };
+        return ResponseClassification::Blocked { status, reason };
+    }
+
+    if status == 429 {
+        return ResponseClassification::RateLimited {
+            status,
+            retry_after_secs: parse_retry_after_secs(headers.retry_after.as_deref()),
+        };
     }
 
     if status >= 400 {
@@ -74,12 +181,19 @@ pub fn classify_response_with_context(
             doc.text_metrics()
         });
 
-        if metrics.prose_bytes < 600 && is_login_redirect(requested_url, final_url) {
-            return ResponseClassification::Blocked { status };
-        }
-        if metrics.prose_bytes < 400 && (metrics.has_password_input || is_cookie_wall_lower(&lower))
+        if (metrics.prose_bytes < 600 && is_login_redirect(requested_url, final_url))
+            || (metrics.prose_bytes < 400 && metrics.has_password_input)
         {
-            return ResponseClassification::Blocked { status };
+            return ResponseClassification::Blocked {
+                status,
+                reason: BlockReason::LoginWall,
+            };
+        }
+        if metrics.prose_bytes < 400 && is_cookie_wall_lower(&lower) {
+            return ResponseClassification::Blocked {
+                status,
+                reason: BlockReason::CookieWall,
+            };
         }
         if metrics.prose_bytes < 300 {
             let title = parsed.as_ref().and_then(dom::ParsedHtml::title);
