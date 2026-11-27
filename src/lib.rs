@@ -17,6 +17,8 @@ pub mod crawl;
 pub mod daemon;
 pub mod extract;
 pub mod fetch;
+pub mod mcp;
 pub mod policy;
 pub mod search;
+pub mod setup;
 pub mod transport;

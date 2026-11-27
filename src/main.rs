@@ -12,6 +12,7 @@ use pleb::policy::{RenderMode, ResourcePolicy, SourceMode, ToolPolicy};
 use pleb::search::{
     self, Freshness, SearchMode, SearchOptions, SearchProvider, SearchProviderStatus,
 };
+use pleb::setup;
 use pleb::transport::cdp;
 use pleb::transport::cef::{self, RendererProbe};
 use serde::Serialize;
@@ -27,7 +28,7 @@ use std::time::Duration;
 #[command(
     name = "pleb",
     version,
-    about = "Local browser-grade web fetch and search CLI for AI agents"
+    about = "Local browser-grade web fetch (CLI + MCP) that resolves agent 403 blocks and empty shells"
 )]
 struct Cli {
     /// SOCKS5/HTTP proxy URL (e.g., socks5://localhost:1080)
@@ -247,6 +248,26 @@ enum Command {
     Skill {
         #[command(subcommand)]
         action: SkillAction,
+    },
+    /// Run a local stdio MCP server exposing pleb_fetch, pleb_search, pleb_crawl, pleb_map, and pleb_status
+    Mcp,
+    /// Register `pleb mcp` and bundled skill with Claude Code and Codex
+    Setup {
+        /// Target agent harness to configure
+        #[arg(long, value_enum, default_value_t = setup::SetupTarget::All, ignore_case = true)]
+        target: setup::SetupTarget,
+        /// Claude Code MCP scope (user, local, or project)
+        #[arg(long, value_enum, default_value_t = setup::ClaudeScope::User, ignore_case = true)]
+        scope: setup::ClaudeScope,
+        /// Skip installing or updating the bundled SKILL.md
+        #[arg(long)]
+        skip_skill: bool,
+        /// Unregister `pleb` from the target harness(es)
+        #[arg(long)]
+        remove: bool,
+        /// Print planned registration commands without modifying harness configs
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -726,6 +747,50 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 Ok(ExitCode::SUCCESS)
             }
         },
+        Command::Mcp => {
+            let ctx = Arc::new(
+                RuntimeContext::new(config).map_err(|e| CliError::runtime("context_error", e))?,
+            );
+            pleb::mcp::serve_stdio(ctx)
+                .await
+                .map_err(|e| CliError::runtime("mcp_error", e))?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Setup {
+            target,
+            scope,
+            skip_skill,
+            remove,
+            dry_run,
+        } => {
+            let opts = setup::SetupOptions {
+                target,
+                claude_scope: scope,
+                remove,
+                dry_run,
+                pleb_binary: None,
+            };
+            let mut report =
+                setup::run_setup(&opts).map_err(|e| CliError::runtime("setup_error", e))?;
+            if !skip_skill && !remove && !dry_run {
+                let targets = resolve_setup_skill_targets(target)?;
+                let installed = install_bundled_skill_targets(targets, false)?;
+                report.skills = installed
+                    .into_iter()
+                    .map(|e| setup::SkillInstallStatus {
+                        path: e.path,
+                        status: e.status,
+                    })
+                    .collect();
+            }
+            if json {
+                print_json(&report)?;
+            } else if !quiet {
+                let cef_probe = cef::probe_renderer_in(&config.state_dir);
+                print_setup_report(&report, &cef_probe);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Fetch {
             urls,
             format,
@@ -1656,6 +1721,69 @@ struct SkillInstallEntry {
     status: &'static str,
 }
 
+fn resolve_home_dir() -> Result<PathBuf, CliError> {
+    let home = std::env::var_os("HOME").filter(|v| !v.is_empty());
+    #[cfg(windows)]
+    let home = home.or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()));
+    home.map(PathBuf::from).ok_or_else(|| {
+        CliError::runtime(
+            "skill_error",
+            "cannot determine home directory (HOME is unset); pass --dir <PATH>",
+        )
+    })
+}
+
+fn resolve_setup_skill_targets(target: setup::SetupTarget) -> Result<Vec<PathBuf>, CliError> {
+    match target {
+        setup::SetupTarget::All => resolve_skill_install_targets(None),
+        setup::SetupTarget::Claude => Ok(vec![resolve_home_dir()?.join(".claude/skills/pleb")]),
+        setup::SetupTarget::Codex => Ok(vec![resolve_home_dir()?.join(".codex/skills/pleb")]),
+    }
+}
+
+fn print_setup_report(report: &setup::SetupReport, cef_probe: &RendererProbe) {
+    println!("pleb setup (binary: {})", report.pleb_binary);
+    for entry in &report.results {
+        let mut line = format!("  {}: {}", entry.target, entry.status);
+        if let Some(ref detail) = entry.detail {
+            line.push_str(&format!(" ({detail})"));
+        }
+        if entry.status == "planned" || entry.status == "not_found" {
+            line.push_str(&format!(" -> {}", entry.command));
+        }
+        println!("{line}");
+    }
+    for skill in &report.skills {
+        println!("  skill ({}): {}", skill.status, skill.path);
+    }
+    println!(
+        "  Cronet TLS: {}",
+        if cfg!(feature = "cronet") {
+            "enabled (Chromium 154)"
+        } else {
+            "disabled (reqwest fallback — build with --features cronet for Chrome TLS/HTTP2/QUIC)"
+        }
+    );
+    match cef_probe {
+        RendererProbe::Ready(path) => {
+            println!("  CEF renderer: ready ({})", path.display());
+        }
+        RendererProbe::ProtocolMismatch { path, .. } => {
+            println!(
+                "  CEF renderer: protocol mismatch at {} (rebuild: {})",
+                path.display(),
+                cef::rebuild_command_hint()
+            );
+        }
+        RendererProbe::NotInstalled => {
+            println!(
+                "  CEF renderer: not installed (optional SPA escalation: {})",
+                cef::rebuild_command_hint()
+            );
+        }
+    }
+}
+
 fn resolve_skill_install_targets(dir: Option<PathBuf>) -> Result<Vec<PathBuf>, CliError> {
     if let Some(explicit) = dir {
         if explicit.as_os_str().is_empty() {
@@ -1663,15 +1791,7 @@ fn resolve_skill_install_targets(dir: Option<PathBuf>) -> Result<Vec<PathBuf>, C
         }
         return Ok(vec![explicit]);
     }
-    let home = std::env::var_os("HOME").filter(|v| !v.is_empty());
-    #[cfg(windows)]
-    let home = home.or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()));
-    let home = home.map(PathBuf::from).ok_or_else(|| {
-        CliError::runtime(
-            "skill_error",
-            "cannot determine home directory (HOME is unset); pass --dir <PATH>",
-        )
-    })?;
+    let home = resolve_home_dir()?;
     Ok(vec![
         home.join(".agents/skills/pleb"),
         home.join(".gemini/config/skills/pleb"),
@@ -1702,6 +1822,13 @@ fn install_bundled_skill(
     force: bool,
 ) -> Result<Vec<SkillInstallEntry>, CliError> {
     let targets = resolve_skill_install_targets(dir)?;
+    install_bundled_skill_targets(targets, force)
+}
+
+fn install_bundled_skill_targets(
+    targets: Vec<PathBuf>,
+    force: bool,
+) -> Result<Vec<SkillInstallEntry>, CliError> {
     let mut entries = Vec::with_capacity(targets.len());
     for dest in targets {
         let skill_path = dest.join("SKILL.md");

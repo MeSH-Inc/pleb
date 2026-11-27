@@ -1,12 +1,13 @@
 # pleb
 
-> Local, MIT-licensed, zero-telemetry web acquisition and search CLI (`pleb`) and Rust library (`pleb`) by Memory Sync Hub LLC.
+> Local, MIT-licensed, zero-telemetry web acquisition CLI and stdio MCP server (`pleb`) by Memory Sync Hub LLC, built to unblock `403`s and empty JS shells in Claude Code and Codex.
 
-`pleb` converts public web pages, Markdown mirrors, syndication feeds, YouTube captions, and transcripts into compact Markdown, plain text, or CDP accessibility trees in a single `O(N)` DOM pass. Primary HTTP runs over Chromium 154 Cronet (or `reqwest` with `rustls` by default when compiled without `--features cronet`) with redirect-time SSRF protection, optional RFC 9421 Ed25519 Web Bot Auth signing, offscreen CEF (`pleb-renderer`, protocol `v5-meta`) via a shared Unix-socket daemon (`daemon.sock`), pluggable WebSocket CDP / Kitesurf rendering (`--render cdp`, `--format axtree`), zero-fetch resource and WebMCP tool indexing (`--tools`), and local multi-provider search (`pleb search`, `pleb auth`). Active anti-bot challenges fail fast (exit code `2`) without CAPTCHA solving or evasion scripts.
+`pleb` routes web fetches from the host machine over Chromium 154 Cronet (or cookie-jar `reqwest` when compiled without `--features cronet`) with redirect-time SSRF protection, captures WAF/CDN diagnostic headers into typed `block_reason` envelopes, recovers from `406`/`429` mismatches, optionally signs requests with RFC 9421 Ed25519 Web Bot Auth, escalates blocks and unhydrated JS shells to offscreen CEF (`pleb-renderer`, protocol `v5-meta`) via `daemon.sock` or WebSocket CDP / Kitesurf (`--render cdp`, `--format axtree`), exposes `pleb mcp` + `pleb setup` for Claude Code and Codex, indexes WebMCP tools (`--tools`), and runs multi-provider search (`pleb search`, `pleb auth`). Active anti-bot challenges fail fast (exit code `2`) without CAPTCHA solving or evasion scripts.
 
 ## Quick Start for Agents
 
-- **Using the `pleb` CLI (`cargo install pleb && pleb skill install`)**: read [skills/pleb/SKILL.md](skills/pleb/SKILL.md) (or run `pleb skill print`) for decision trees, flags, exit codes, and `pleb status --json` checks.
+- **Register `pleb mcp` with Claude Code and Codex (`pleb setup`)**: run `pleb setup` (or `pleb setup --dry-run`) to wire `pleb mcp` and install [skills/pleb/SKILL.md](skills/pleb/SKILL.md).
+- **Using the `pleb` CLI (`cargo install pleb && pleb skill install`)**: read [skills/pleb/SKILL.md](skills/pleb/SKILL.md) (or run `pleb skill print`) for decision trees, flags, exit codes, `block_reason`, and `pleb status --json` checks.
 - **Full single-file reference**: read [llms-full.txt](llms-full.txt) or [README-FULL.md](README-FULL.md) for JSON output schemas, environment variables, and agent composition patterns.
 - **Contributing to this repository**: read [AGENTS.md](AGENTS.md) first for build rules, hermetic test boundaries, and non-regression gates.
 
@@ -14,13 +15,13 @@
 
 - [skills/pleb/SKILL.md](skills/pleb/SKILL.md): Canonical version-locked agent skill embedded verbatim in `pleb skill print` / `pleb skill install`
 - [llms-full.txt](llms-full.txt): Single-file technical reference, schemas, environment variables, and benchmark report formatted for full-context LLM ingestion
-- [README.md](README.md): Overview, verified corpus benchmark summary, tool comparison, installation, and quick start
-- [README-FULL.md](README-FULL.md): Complete CLI reference, five-stage extraction pipeline, environment variables, JSON output schemas, comparison matrix, and packaging notes
+- [README.md](README.md): Overview, harness setup, verified corpus benchmark summary, tool comparison, installation, and quick start
+- [README-FULL.md](README-FULL.md): Complete CLI & MCP reference, five-stage extraction pipeline, environment variables, JSON output schemas, comparison matrix, and packaging notes
 - [examples/corpus_benchmark.rs](examples/corpus_benchmark.rs): Reproducible corpus byte/token reduction and extraction throughput harness
 
 ## Packaging and Distribution
 
-- [Cargo.toml](Cargo.toml): Cargo crate manifest (`pleb`, default `reqwest` TLS or optional `cronet` feature)
+- [Cargo.toml](Cargo.toml): Cargo crate manifest (`pleb`, default `reqwest` TLS with `cookies` or optional `cronet` feature)
 - [packaging/homebrew/pleb.rb](packaging/homebrew/pleb.rb): Homebrew formula template for tap distribution
 - [scripts/download-cronet-macos.sh](scripts/download-cronet-macos.sh): macOS arm64 prebuilt Chromium 154 `libcronet.a` downloader
 - [scripts/download-cronet-linux.sh](scripts/download-cronet-linux.sh): Linux `x86_64` / `aarch64` prebuilt Chromium 154 `libcronet.so` downloader
@@ -33,6 +34,7 @@
 - [AGENTS.md](AGENTS.md): Build rules, host installation sync, hermetic test boundaries, and non-regression gates
 - [data/site-rules.json](data/site-rules.json): Bundled host rewrite and mandatory CEF overrides
 - [tests/corpus_evaluation.rs](tests/corpus_evaluation.rs): Corpus non-regression test harness across all `45` fixtures
+- [tests/unblock_canary_tests.rs](tests/unblock_canary_tests.rs): Hermetic block-diagnostic tests and opt-in live harness-403 unblock canary
 - [LICENSE](LICENSE): MIT license and upstream attribution (`wickproject/wick`)
 
 ## Historical Milestone Specifications

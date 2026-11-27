@@ -800,6 +800,9 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "representation_url",
         "failed_pages",
         "--focus",
+        "pleb mcp",
+        "pleb setup",
+        "block_reason",
     ] {
         assert!(
             readme_full.contains(required),
@@ -826,6 +829,9 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "acquired_sha256",
         "representation_url",
         "--focus",
+        "pleb mcp",
+        "pleb setup",
+        "block_reason",
     ] {
         assert!(
             llms_full_txt.contains(required),
@@ -921,6 +927,9 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "content_outcome",
         "acquired_sha256",
         "--focus",
+        "pleb mcp",
+        "pleb setup",
+        "block_reason",
     ] {
         assert!(
             skill_md.contains(required),

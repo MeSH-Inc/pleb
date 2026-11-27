@@ -1,15 +1,17 @@
 # pleb — Complete Technical Reference for AI Agents
 
-> Local, MIT-licensed, zero-telemetry web acquisition and search CLI (`pleb`) and Rust library (`pleb`), maintained by Memory Sync Hub LLC and forked from [wickproject/wick](https://github.com/wickproject/wick).
+> Local, MIT-licensed, zero-telemetry web acquisition CLI and stdio MCP server (`pleb`) by Memory Sync Hub LLC, forked from [wickproject/wick](https://github.com/wickproject/wick) to resolve agent-harness `403` blocks and empty JS shells.
 
-Verify any host installation before relying on `pleb` flags or state guarantees:
+Verify any host installation and wire Claude Code / Codex MCP integration:
 
 ```bash
+pleb setup [--target all|claude|codex] [--scope user|local|project] [--skip-skill] [--remove] [--dry-run]
+pleb mcp
 pleb status --json
 pleb skill print
 ```
 
-Healthy Cronet + CEF installations report `"cronet_enabled": true`, `"cef_renderer": { "status": "ready", "expected_protocol": "v5-meta" }`, `"cdp_renderer"`, `"agent_identity"`, and `"state_dir": "<home>/.pleb"`. Standard builds without `--features cronet` report `"cronet_enabled": false` and use `reqwest` (`rustls`). The transport daemon (`daemon.sock`) starts lazily on demand and reports `"protocol_version": 4` while running (`null` when stopped).
+Healthy Cronet + CEF installations report `"cronet_enabled": true`, `"cef_renderer": { "status": "ready", "expected_protocol": "v5-meta" }`, `"cdp_renderer"`, `"agent_identity"`, and `"state_dir": "<home>/.pleb"`. Standard builds without `--features cronet` report `"cronet_enabled": false` and use `reqwest` (`rustls` with a session cookie jar enabled, surfacing a rebuild hint in `status` and block diagnostics when non-Chrome TLS fingerprints trigger `403`s). The transport daemon (`daemon.sock`) starts lazily on demand and reports `"protocol_version": 4` while running (`null` when stopped).
 
 ## Behavioral Boundaries
 
@@ -114,6 +116,8 @@ Notes:
   - Interactive `set` reads `/dev/tty` with echo off. Expected formats: `web-bot-auth-jwk` expects an Ed25519 private OKP JWK JSON object (`kty`, `crv`, `d`, `x`; multi-line JSON allowed via `--stdin`); `web-bot-auth-agent` expects an `https://` URL (no whitespace/query/fragment); `cdp-access-host` expects bare `host[:port]` (no scheme/path); `searxng` expects an `http://` or `https://` base URL.
 - `pleb crawl <URL> [-d 2] [-n 10] [--extract clean|article|full] [--path-filter PREFIX] [--no-robots]` (respects `robots.txt` + `Crawl-delay` by default; max `--depth 5`, `--max-pages 50`, `10,000`-byte per-page cap, `100,000`-byte plain output cap; exits non-zero if the seed URL fails)
 - `pleb map <URL> [-n 100] [--path-filter PREFIX] [--no-sitemap] [--no-robots]` (max `--limit 5000`; sitemaps plus up to `20` HTML page crawls)
+- `pleb mcp` *(newline-delimited JSON-RPC 2.0 stdio MCP server exposing `pleb_fetch`, `pleb_search`, `pleb_crawl`, `pleb_map`, and `pleb_status`)*
+- `pleb setup [--target all|claude|codex] [--scope user|local|project] [--skip-skill] [--remove] [--dry-run]` *(registers `pleb mcp` + bundled skill into Claude Code and Codex)*
 - `pleb status [--json]`, `pleb daemon <status|stop|run>`, `pleb session clear`, `pleb skill print [--json]`, `pleb skill install [--dir <PATH>] [--force]`
 
 ## Environment Variables
@@ -142,7 +146,7 @@ Notes:
 | :--- | :--- |
 | `0` | Success (check `warning` / `Warning:` if a JS shell could not be rendered) |
 | `1` | Invalid flags/input, missing/mismatched CEF or CDP renderer, size overflow, transport failure, or heterogeneous all-failed batch |
-| `2` | Origin block (`403`/`503`, login/cookie wall), active bot challenge, or `robots.txt` disallow |
+| `2` | Origin block (`403`/`429`/`503`, login/cookie wall), active bot challenge, or `robots.txt` disallow (see `block_reason`) |
 | `3` | Origin HTTP `4xx`/`5xx` error (including low-prose soft-`404`) |
 | `4` | Partial batch failure (mixed success and failure) |
 | `5` | Unsupported binary payload in non-raw mode (use `--stage` or `--format raw -o <path>`) |
@@ -154,11 +158,14 @@ Notes:
 {"error":"HTTP 404 error fetching https://example.com/missing","kind":"http_error","exit_code":3}
 ```
 
-Known `kind` values: `invalid_input`, `invalid_url`, `robots_disallowed`, `blocked`, `challenge`, `http_error`, `unsupported_content_type`, `cef_unavailable`, `cdp_unavailable`, `timeout`, `response_too_large`, `transport`, `redirect_blocked`, `search_error`, `auth_error`, `crawl_error`, `map_error`, `daemon_error`, `session_error`, `status_error`, `skill_error`, `runtime_error`, `serialization_error`, `context_error`, `io_error`.
+When an error is a block or challenge, `"block_reason"` is included (`cloudflare_challenge`, `bot_challenge`, `edge_waf_block`, `origin_forbidden`, `login_wall`, `cookie_wall`, `rate_limited`).
+
+Known `kind` values: `invalid_input`, `invalid_url`, `robots_disallowed`, `blocked`, `challenge`, `http_error`, `unsupported_content_type`, `cef_unavailable`, `cdp_unavailable`, `timeout`, `response_too_large`, `transport`, `redirect_blocked`, `search_error`, `auth_error`, `crawl_error`, `map_error`, `daemon_error`, `session_error`, `status_error`, `skill_error`, `mcp_error`, `setup_error`, `runtime_error`, `serialization_error`, `context_error`, `io_error`.
 
 Key JSON schemas (`--json` / `--jsonl`):
 - **`FetchOutput`** (`FetchMetadataOutput` omits `content`): `url`, `final_url`, optional `representation_url` *(set when distinct from `final_url`, e.g., Markdown mirror)*, `status_code`, `content_type`, `title`, `content` *(omitted with `--metadata-only`)*, `content_bytes`, `strategy` (`cronet`, `reqwest`, `cef`, `cdp`, `raw_source`, `markdown_mirror`, `markdown_negotiated`), `content_outcome` (`complete` | `incomplete_shell`), `acquired_sha256` *(SHA-256 hex of acquired source body)*, `escalated`, `truncated`, `timing_ms`, optional `warning` *(present when an unrendered or post-render JS shell returns partial HTML or a `--stage-resources` selector is absent)*, optional `resources` (`ResourceDescriptor[]`), optional `tools` (`WebMcpToolDescriptor[]`).
-- **`BatchItemResult`**: untagged union on `ok` (`true` matches `FetchOutput` with optional `content`, `representation_url`, `warning`, `resources`, `tools`; `false` has `url`, `ok`, `error`, `kind`, `exit_code`).
+- **`BatchItemResult`**: untagged union on `ok` (`true` matches `FetchOutput` with optional `content`, `representation_url`, `warning`, `resources`, `tools`; `false` has `url`, `ok`, `error`, `kind`, optional `block_reason`, `exit_code`).
+- **`SetupReport`** (`pleb setup --json`): `pleb_binary`, `dry_run`, `remove`, `results` (`[{ target, status, binary, command, detail? }]`), optional `skills` (`[{ path, status }]`).
 - **`StagedAssetOutput`**: `url`, `final_url`, `status_code`, `content_type`, `byte_count`, `staged_path`, `timing_ms`.
 - **`ResourceDescriptor`**: `identifier` (`r1`, ...), `kind` (`diagram`, `image`, `transcript`, `document`, `dataset`, `schema`), `url`, `salience` (`high`, `medium`), plus optional `mime_hint`, `section_heading`, `label`, `dimensions`, `staged_path`, `byte_count`, `content_type`.
 - **`WebMcpToolDescriptor`**: `name`, `description`, optional `title`, `source` (`declarative` | `imperative`), optional `input_schema`, optional `annotations` (`read_only`, `autosubmit`, `untrusted_content`), optional `action_url`, optional `method`.
@@ -204,6 +211,7 @@ cargo fmt --check
 cargo clippy --all-targets --features cronet -- -D warnings
 cargo test --features cronet --locked
 cargo test --test corpus_evaluation
+cargo test --features cronet --test unblock_canary_tests -- --ignored --nocapture
 ```
 
 For complete design history and contributor rules, see [README.md](README.md), [README-FULL.md](README-FULL.md), and [AGENTS.md](AGENTS.md).

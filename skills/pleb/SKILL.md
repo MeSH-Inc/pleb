@@ -1,6 +1,6 @@
 ---
 name: pleb
-description: Local web acquisition, search, crawl, and browser-rendering CLI (Cronet/reqwest HTTP, v5-meta CEF daemon, CDP/Kitesurf axtree, structured source bypass, YouTube captions, feed/transcript extraction, WebMCP indexing, Web Bot Auth signing, resource staging, and local credential vault). Use when fetching pages that resist built-in web fetch, searching the web via pleb search, storing search/signing keys via pleb auth, crawling or mapping sites, rendering SPAs/accessibility trees, staging diagrams/PDFs/transcripts, or diagnosing daemon and CEF state.
+description: Local browser-grade web fetcher (CLI + stdio MCP server) that bypasses agent-harness 403 blocks, datacenter-IP walls, and empty JS shells by fetching from the user's machine over Chrome TLS (Cronet) and offscreen Chromium (CEF v5-meta), with web search, site crawl/map, and resource staging. Use immediately whenever built-in web fetch returns HTTP 403/429/503, login/cookie blocks, or an empty JavaScript shell, or when you need MCP tools (`pleb_fetch`, `pleb_search`), `pleb setup` harness registration, or clean Markdown from resistant sites.
 metadata:
   author: Memory Sync Hub LLC
   repository: https://github.com/MeSH-Inc/pleb
@@ -9,38 +9,40 @@ metadata:
 
 # pleb
 
-Local, MIT-licensed, zero-telemetry web acquisition and search CLI by Memory Sync Hub LLC.
+Local, MIT-licensed, zero-telemetry web acquisition CLI and stdio MCP server by Memory Sync Hub LLC, designed to eliminate HTTP `403` blocks and empty SPA shells in AI coding harnesses (Claude Code, Codex, and local agents).
 
-## Identity and Version Contract
+## Harness Setup, MCP Server, and Readiness Check
 
-Verify the active `pleb` binary before relying on `pleb`-specific flags:
+Register `pleb mcp` (`pleb_fetch`, `pleb_search`, `pleb_crawl`, `pleb_map`, `pleb_status`) and the bundled `SKILL.md` into Claude Code and Codex, or run the stdio MCP server directly:
 
 ```bash
+pleb setup [--target all|claude|codex] [--scope user|local|project] [--skip-skill] [--remove] [--dry-run]
+pleb mcp
 pleb status --json
 ```
 
-Genuine `pleb` installations report `"version"`, `"cef_renderer": { "expected_protocol": "v5-meta" }`, `"cdp_renderer"`, `"agent_identity"`, and `"daemon": { "supported": true }` (the unified `daemon.sock` transport daemon starts lazily on demand and reports `protocol_version: 4` while running; `protocol_version: null` when stopped is normal). `"cronet_enabled"` is `true` for `--features cronet` source builds and `false` for pure-Rust `reqwest` (`rustls`) builds (`cargo install pleb`) — both share the same CLI contract.
+Genuine `pleb` installations report `"version"`, `"cef_renderer": { "expected_protocol": "v5-meta" }`, `"cdp_renderer"`, `"agent_identity"`, and `"daemon": { "supported": true }` (the unified `daemon.sock` transport daemon starts lazily on demand and reports `protocol_version: 4` while running; `protocol_version: null` when stopped is normal). `"cronet_enabled"` is `true` for `--features cronet` source builds (Chromium 154 TLS/HTTP2/QUIC) and `false` for pure-Rust `reqwest` (`rustls` with session cookies enabled; rebuild with `--features cronet` when WAFs reject non-Chrome TLS fingerprints).
 
 ---
 
-## Decision Tree 1 — Page Acquisition and Escalation
+## Decision Tree 1 — Resolving 403s, Empty Shells, and Page Acquisition
 
-1. **Default fetch (`--render auto --source auto --extract clean`):**
+1. **Default local browser-grade fetch (`--render auto --source auto --extract clean`):**
    ```bash
    pleb fetch <url>
    ```
-   - Skips `robots.txt` by default on single-URL fetches (pass `--respect-robots` to enforce).
+   - Runs from the host machine IP over Chrome TLS (`Cronet`, or `reqwest` with session cookie jar), skipping `robots.txt` by default on single-URL fetches (pass `--respect-robots` to enforce).
+   - **Automatic CEF / CDP escalation & header diagnostics:** escalates `403`/`503` blocks and unhydrated JS/SvelteKit/React SPA shells to local CEF (`v5-meta`) or a configured CDP / Kitesurf WebSocket endpoint (`--cdp-url` / `PLEB_CDP_URL`; pass `--prefer-cdp` / `PLEB_PREFER_CDP=1` to prefer CDP over CEF). Response headers (`Server`, `CF-Mitigated`, `CF-Ray`, `Retry-After`, `WWW-Authenticate`, `x-amzn-waf-action`) populate a typed `block_reason` (`cloudflare_challenge`, `bot_challenge`, `edge_waf_block`, `origin_forbidden`, `login_wall`, `cookie_wall`, `rate_limited`) and diagnostic detail; `406 Not Acceptable` under `--source negotiate` automatically retries once with standard HTML `Accept`, and short `429` (`Retry-After <= 5s`) performs a bounded retry. If a JS shell is detected when neither CEF nor CDP is available (or escalation fails), `pleb` exits `0` with an explicit `Warning:` on `stderr` and `FetchOutput.warning`. Active bot challenges fail fast (exit `2`) without retries.
    - **Web Bot Auth (RFC 9421 Ed25519):** When `web-bot-auth-jwk` and `web-bot-auth-agent` are configured, public `https://` acquisitions attach `Signature`, `Signature-Input`, and `Signature-Agent` headers (pass `--no-web-bot-auth` / `PLEB_NO_WEB_BOT_AUTH=1` to disable; `http://`, local/private targets, `pleb search`, `robots.txt`, `sitemap.xml`, and CDP handshakes stay unsigned).
    - **Structured source resolution (`--source auto`):** automatically rewrites GitHub `/blob/`, GitLab `/-/blob/`, and Gist URLs to lossless raw source (`strategy: "raw_source"`, with automatic HTML fallback on `404`/binary), and follows RFC 8288 `Link` / HTML `<link rel="alternate" type="text/markdown">` mirrors (`strategy: "markdown_mirror"`).
    - **First-class non-HTML & YouTube extraction:** handles native `text/markdown` (YAML frontmatter `title` promotion + relative link resolution + fence-safe truncation), RSS 2.0 / Atom 1.0 / JSON Feed 1.1 digests, WebVTT (`.vtt`) / SubRip (`.srt`) transcripts, and `youtube.com`/`youtu.be` watch metadata, descriptions, chapters, and caption tracks (`ytInitialPlayerResponse` over Cronet without CEF; pull captions via `--resources transcripts` or `--stage-resources`).
    - **Extraction scopes (`--extract`):** `clean` (default: strips nav/footer/aside/banners/scripts across the whole page), `article` (scopes to primary `<article>` / `<main>`), or `full` (keeps full body, YAML frontmatter, and verbatim feed/transcript XML/JSON).
    - **Transport & redirect SSRF guard:** both Cronet (Chromium 154) and `reqwest` block `3xx` redirects to non-HTTP(S) schemes or private/loopback/IMDS hosts from public origins (`redirect_blocked` transport error).
-   - **Automatic CEF / CDP escalation:** escalates `403`/`503` blocks and unhydrated JS/SvelteKit/React SPA shells to local CEF (`v5-meta`) or a configured CDP / Kitesurf WebSocket endpoint (`--cdp-url` / `PLEB_CDP_URL`; pass `--prefer-cdp` / `PLEB_PREFER_CDP=1` to prefer CDP over CEF). If a JS shell is detected when neither CEF nor CDP is available (or escalation fails), `pleb` exits `0` with an explicit `Warning:` on `stderr` and `FetchOutput.warning`. Active bot challenges fail fast (exit `2`) without retries.
 2. **Documentation Markdown negotiation (`--source negotiate`):**
    ```bash
    pleb fetch --source negotiate <url>
    ```
-   Sends `Accept: text/markdown` on the primary request (`strategy: "markdown_negotiated"`) and probes `<path>.md` if HTML returns without an advertised alternate. Use `--source none` (or `--format html` / `--format raw` / `--format axtree` / `--render cef` / `--render cdp`) to disable source resolution.
+   Sends `Accept: text/markdown` on the primary request (`strategy: "markdown_negotiated"`, falling back once to standard HTML `Accept` on `406`) and probes `<path>.md` if HTML returns without an advertised alternate. Use `--source none` (or `--format html` / `--format raw` / `--format axtree` / `--render cef` / `--render cdp`) to disable source resolution.
 3. **Forced Chromium or Remote CDP / Kitesurf rendering (`--render cef` / `--render cdp`):**
    ```bash
    pleb fetch --render cef --wait-for-selector "<css>" <url>
@@ -49,7 +51,7 @@ Genuine `pleb` installations report `"version"`, `"cef_renderer": { "expected_pr
    ```
    Use `--render cronet` to force network-only transport without spawning CEF or connecting to CDP. CDP fails closed when `--proxy` is set so WebSockets never bypass `--proxy`; plaintext `ws://` is restricted to loopback hosts (`peer_addr().ip().is_loopback()` verified). Local Docker/`wrangler` Kitesurf runs page JS in `workerd`, which is not a hardened sandbox — target Cloudflare Workers Dynamic Workers (or an OS-sandboxed browser) for untrusted public sites.
 4. **Active bot challenge or login wall (exit code `2`):**
-   `pleb` never solves CAPTCHAs or runs anti-bot bypass scripts. Stop retrying via `pleb` and switch to an interactive browser session.
+   `pleb` never solves CAPTCHAs or runs anti-bot bypass scripts. Inspect `block_reason` (`cloudflare_challenge`, `bot_challenge`, `login_wall`, `edge_waf_block`, `rate_limited`); stop retrying via `pleb` on active challenges/logins and switch to an interactive browser session.
 
 ---
 
@@ -113,7 +115,7 @@ Genuine `pleb` installations report `"version"`, `"cef_renderer": { "expected_pr
 | :--- | :--- |
 | `0` | Success (check `warning` if JS shell was unrendered) |
 | `1` | Invalid flags/input, unavailable/mismatched CEF or CDP renderer, response-size overflow, transport failure, or heterogeneous all-failed batch |
-| `2` | Origin block (`403`/`503`), anti-bot challenge, or `robots.txt` disallow |
+| `2` | Origin block (`403`/`429`/`503`), anti-bot challenge, login/cookie wall, or `robots.txt` disallow (see `block_reason`) |
 | `3` | Origin HTTP `4xx`/`5xx` error |
 | `4` | Partial batch failure (mixed success and failure) |
 | `5` | Unsupported binary content type in non-raw mode (re-run with `--stage` or `--format raw --output <path>`) |
@@ -121,10 +123,10 @@ Genuine `pleb` installations report `"version"`, `"cef_renderer": { "expected_pr
 
 Key `--json` / `--jsonl` outputs:
 - **`FetchOutput`**: `{ url, final_url, representation_url?, status_code, content_type, title, content, content_bytes, strategy, content_outcome, acquired_sha256, escalated, truncated, timing_ms, warning?, resources?, tools? }` (`--metadata-only` omits `content`; `content_outcome` is `complete` or `incomplete_shell`).
-- **`BatchItemResult`**: untagged on `ok` (`true` -> `FetchOutput` fields with `content?`; `false` -> `{ url, ok, error, kind, exit_code }`).
+- **`BatchItemResult`**: untagged on `ok` (`true` -> `FetchOutput` fields with `content?`; `false` -> `{ url, ok, error, kind, block_reason?, exit_code }`).
 - **`StagedAssetOutput`**: `{ url, final_url, status_code, content_type, byte_count, staged_path, timing_ms }`.
 - **`SearchResponse`**: `{ provider, providers_used?, results: [{ title, url, snippet, extra_snippets? }] }`.
-- **Error envelope on `stderr` (`--json` / `--jsonl`)**: `{"error":"...","kind":"...","exit_code":N}` (`kind`: `invalid_input`, `invalid_url`, `robots_disallowed`, `blocked`, `challenge`, `http_error`, `unsupported_content_type`, `cef_unavailable`, `cdp_unavailable`, `timeout`, `response_too_large`, `transport`, `search_error`, `auth_error`, `crawl_error`, `map_error`, `daemon_error`, `session_error`, `status_error`, `skill_error`, `io_error`).
+- **Error envelope on `stderr` (`--json` / `--jsonl`)**: `{"error":"...","kind":"...","block_reason":"...","exit_code":N}` (`block_reason` included on blocks/challenges: `cloudflare_challenge`, `bot_challenge`, `edge_waf_block`, `origin_forbidden`, `login_wall`, `cookie_wall`, `rate_limited`; `kind`: `invalid_input`, `invalid_url`, `robots_disallowed`, `blocked`, `challenge`, `http_error`, `unsupported_content_type`, `cef_unavailable`, `cdp_unavailable`, `timeout`, `response_too_large`, `transport`, `search_error`, `auth_error`, `crawl_error`, `map_error`, `daemon_error`, `session_error`, `status_error`, `skill_error`, `mcp_error`, `setup_error`, `io_error`).
 
 ---
 
@@ -133,4 +135,4 @@ Key `--json` / `--jsonl` outputs:
 - **State directory (`PLEB_HOME` / `--state-dir`, default `~/.pleb`, `0o700`):** holds `data/`, `cef-cache/`, `artifacts/`, `daemon.sock`, `daemon.log`, `site-cache.json`, `search-state.json`, `credentials.enc` (`0o600`), `credentials.json` (`0o600`), and optional local `site-rules.json`.
 - **Daemon controls:** auto-starts `daemon.sock` (idle exit `--daemon-idle-timeout` / `PLEB_DAEMON_IDLE_SECONDS`, default `300`; bypass via `--no-daemon` / `PLEB_NO_DAEMON`). Manage with `pleb daemon status`, `pleb daemon stop`, and `pleb session clear` (stops daemon and clears `data/`, `cef-cache/`, `artifacts/`, `site-cache.json`, and `search-state.json` while preserving `credentials.enc`, `credentials.json`, Keychain `vault-key`, `site-rules.json`, and `cef/`).
 - **CEF `v5-meta` installer & overrides:** rebuild from the repository root via `bash scripts/install-cef-mac.sh --force` (macOS arm64) or `bash scripts/install-cef-linux.sh --force` (Linux `x86_64` / `aarch64`, runs natively under Ozone headless without Xvfb when `DISPLAY` is unset or empty; both support `--prefix <dir>`). Override binaries in tests/scripts with `PLEB_CEF_RENDERER`, `PLEB_DAEMON_EXECUTABLE`, and `PLEB_NO_HOME_CEF=1`.
-- **Version-locked skill maintenance from any machine with `pleb` installed:** run `pleb skill print` to emit this skill, or `pleb skill install [--dir <path>] [--force]` to write it into local agent skill directories without needing a source checkout.
+- **Version-locked skill maintenance from any machine with `pleb` installed:** run `pleb skill print` to emit this skill, `pleb skill install [--dir <path>] [--force]` to write it into local agent skill directories, or `pleb setup` to register `pleb mcp` and install skills in one step.

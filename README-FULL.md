@@ -210,6 +210,8 @@ CLI / Library Call
 | :--- | :--- |
 | `src/main.rs` | `clap` CLI definition, subcommand dispatch, TTY/stdin secret reading, JSON/text output and error envelopes |
 | `src/lib.rs` | Public Rust library surface (`pleb`) exposing all subsystems |
+| `src/mcp.rs` | Stdio JSON-RPC 2.0 MCP server (`pleb mcp`) exposing `pleb_fetch`, `pleb_search`, `pleb_crawl`, `pleb_map`, and `pleb_status` |
+| `src/setup.rs` | Claude Code and Codex MCP + skill registration helper (`pleb setup`) |
 | `src/context.rs` | `RuntimeConfig`, `RuntimeContext`, private directory/lock helpers (`0o700`/`0o600`), atomic writes, and `session clear` |
 | `src/fetch.rs` | Single-URL, raw, direct-stage, and concurrent batch fetch orchestration, resource enrichment, and `FetchError` exit mapping |
 | `src/crawl.rs` | Bounded concurrent wave crawler (`pleb crawl`) and sitemap/`robots.txt` URL mapper (`pleb map`) |
@@ -236,9 +238,11 @@ CLI / Library Call
 
 ### Primary HTTP Transport (Cronet and `reqwest`)
 
-When compiled with `--features cronet`, `pleb` links a prebuilt static/shared Chromium `154.0.8037.49` Cronet library (`darwin_arm64`, `linux_amd64`, or `linux_arm64`) to produce browser-identical TLS, HTTP/2, and QUIC fingerprints, paired with matching Chrome `154` `User-Agent`, greased `Sec-Ch-Ua`, `Accept-Encoding` (`gzip, deflate, br, zstd`), and navigation/subresource `Sec-Fetch-*` headers. Without `--features cronet`, `pleb` falls back to `reqwest` (`rustls`).
+When compiled with `--features cronet`, `pleb` links a prebuilt static/shared Chromium `154.0.8037.49` Cronet library (`darwin_arm64`, `linux_amd64`, or `linux_arm64`) to produce browser-identical TLS, HTTP/2, and QUIC fingerprints, paired with matching Chrome `154` `User-Agent`, greased `Sec-Ch-Ua`, `Accept-Encoding` (`gzip, deflate, br, zstd`), and navigation/subresource `Sec-Fetch-*` headers. Without `--features cronet`, `pleb` falls back to `reqwest` (`rustls` with an enabled session cookie jar `cookie_store` for first-party redirect cookies) and includes a rebuild hint in `pleb status` and block diagnostics when non-Chrome TLS fingerprints encounter `403`s.
 
 Both Cronet (`on_redirect_received`) and `reqwest` (`redirect::Policy`) enforce redirect-time SSRF protection: `3xx` hops must remain on `http`/`https`, public origins cannot pivot to loopback, RFC 1918, link-local/IMDS, or `.local`/`.internal` targets, and local origins are restricted to same-host hops. Disallowed redirects cancel immediately with a typed `redirect_blocked` transport error.
+
+Transport responses also capture bounded, control-byte-sanitized diagnostic headers (`Server`, `CF-Mitigated`, `CF-Ray`, `Retry-After`, `WWW-Authenticate`, `x-amzn-waf-action`, `x-datadome`, `x-sucuri-id`, `x-iinfo`) into `DiagnosticHeaders` so origin vs. edge WAF vs. active bot-challenge responses are cleanly distinguishable across both direct and `daemon.sock` IPC paths.
 
 ### Offscreen CEF Renderer (`v5-meta`)
 
@@ -256,10 +260,12 @@ In `--render auto` mode (default):
 
 1. `pleb` checks bundled and local `site-rules.json` (by default `reddit.com`/`www.reddit.com` rewrite to `old.reddit.com` over Cronet, and `x.com`/`twitter.com` route to CEF waiting for `article`), then consults `<state_dir>/site-cache.json`.
 2. Unless a rule or cached strategy selects CEF first, `pleb` fetches via Cronet/`reqwest` and classifies the response:
-   - `403`/`503` without an active bot challenge -> `Blocked` (escalates to CEF if available).
-   - `403`/`503` or `200` interstitial matching an active bot challenge -> `Challenge` (fails fast with exit code `2`; no duplicate CEF retry).
-   - `200` HTML with low prose volume matching an unhydrated SPA/JS shell -> `JavaScriptShell` (escalates to CEF if available).
-   - `200` HTML with low prose volume redirected to an authentication path, containing a password form, or presenting a cookie wall -> `Blocked` (exit code `2`).
+   - `406 Not Acceptable` when sending `Accept: text/markdown` -> automatically retries once with standard HTML `Accept` headers.
+   - `429 Too Many Requests` with integer `Retry-After <= 5s` -> performs one bounded retry within remaining timeout; persistent `429`s classify as `Blocked` (`block_reason: "rate_limited"`, exit code `2`).
+   - `403`/`503` without an active bot challenge -> `Blocked` (`block_reason: "edge_waf_block"` or `"origin_forbidden"`, escalating to CEF/CDP if available).
+   - `403`/`503` (including `CF-Mitigated: challenge` or `x-amzn-waf-action: challenge`/`captcha` headers) or `200` interstitial matching an active bot challenge -> `Challenge` (`block_reason: "cloudflare_challenge"` or `"bot_challenge"`, failing fast with exit code `2` and no duplicate CEF retry).
+   - `200` HTML with low prose volume matching an unhydrated SPA/JS shell -> `JavaScriptShell` (escalates to CEF/CDP if available).
+   - `200` HTML with low prose volume redirected to an authentication path or containing a password form -> `Blocked` (`block_reason: "login_wall"`, exit code `2`); cookie consent gates classify as `Blocked` (`block_reason: "cookie_wall"`, exit code `2`).
    - `200` HTML with `< 300` prose bytes and a soft-404 title -> `HttpError` (`404`, exit code `3`).
    - Other `4xx`/`5xx` statuses -> `HttpError` (exit code `3`).
 3. Successful escalations are recorded in `site-cache.json` so subsequent requests to the same host avoid repeating failed probes.
@@ -606,9 +612,11 @@ pleb search --extra-snippets "cronet http2"
 | `--path-filter <PREFIX>` | none | Restrict to URLs whose path starts with `<PREFIX>` (`crawl`, `map`). |
 | `--no-robots` | `false` | Ignore `robots.txt` restrictions (`crawl`, `map`). |
 
-### Daemon, Session, Status, and Skill Commands
+### Daemon, Session, Status, MCP, Setup, and Skill Commands
 
 ```bash
+pleb setup                  # Register `pleb mcp` + bundled skill into Claude Code and Codex (--target, --scope, --skip-skill, --remove, --dry-run)
+pleb mcp                    # Run stdio JSON-RPC 2.0 MCP server (pleb_fetch, pleb_search, pleb_crawl, pleb_map, pleb_status)
 pleb status                 # Binary, Cronet, CEF, daemon, state dir, search providers (--json supported)
 pleb daemon status          # Transport daemon status (--json supported)
 pleb daemon stop            # Stop the running transport daemon (--json supported)
@@ -664,7 +672,7 @@ pleb skill install          # Write bundled SKILL.md into local agent skill dire
 | :--- | :--- |
 | `0` | Success |
 | `1` | Invalid or conflicting CLI flags/input, unavailable/mismatched CEF or CDP renderer, response-size overflow, network/transport failure, or heterogeneous all-failed batch |
-| `2` | Blocked by origin (`403`/`503`, login/cookie wall), active anti-bot challenge, or `robots.txt` disallow |
+| `2` | Blocked by origin (`403`/`429`/`503`, login/cookie wall), active anti-bot challenge, or `robots.txt` disallow (see `block_reason`) |
 | `3` | Origin HTTP `4xx`/`5xx` error (including low-prose soft-`404` HTML pages) |
 | `4` | Partial batch failure (some URLs succeeded and some failed) |
 | `5` | Unsupported binary content type in non-raw mode (re-run with `--stage` or `--format raw --output <path>`) |
@@ -675,6 +683,8 @@ When `--json` or `--jsonl` is passed, CLI errors are emitted on `stderr` as a si
 ```json
 {"error":"HTTP 404 error fetching https://example.com/missing","kind":"http_error","exit_code":3}
 ```
+
+When an error is a block or challenge, `"block_reason"` is included on `stderr` (and on `BatchItemFailure`): `cloudflare_challenge`, `bot_challenge`, `edge_waf_block`, `origin_forbidden`, `login_wall`, `cookie_wall`, or `rate_limited`.
 
 ---
 
@@ -709,7 +719,7 @@ All `--json` and `--jsonl` payloads serialize directly from `pleb`'s Rust output
 Multi-URL and `stdin` (`-`) fetches emit an array (`--json`) or newline-delimited stream (`--jsonl`) of untagged `BatchItemResult` objects discriminated by `ok`:
 
 - **Success (`ok: true`)**: `url`, `ok`, `final_url`, `representation_url` (omitted when identical to `final_url`), `status_code`, `content_type`, `title`, `strategy`, `content_outcome`, `acquired_sha256`, `escalated`, `truncated`, `timing_ms`, `content_bytes`, plus `warning` (omitted when absent), `content` (omitted with `--metadata-only`), `resources` (omitted when empty), and `tools` (omitted when empty).
-- **Failure (`ok: false`)**: `url`, `ok`, `error`, `kind`, `exit_code`.
+- **Failure (`ok: false`)**: `url`, `ok`, `error`, `kind`, `block_reason` (optional `BlockReason`), `exit_code`.
 
 ### `StagedAssetOutput` (`pleb fetch --stage --json`)
 
@@ -757,6 +767,7 @@ Multi-URL and `stdin` (`-`) fetches emit an array (`--json`) or newline-delimite
 | `pleb session clear` | `cleared`, `state_dir` |
 | `pleb skill print` | `name`, `version`, `content` |
 | `pleb skill install` | `name`, `version`, `installed` (`[{ path, status }]`) |
+| `pleb setup` (`SetupReport`) | `pleb_binary`, `dry_run`, `remove`, `results` (`[{ target, status, binary, command, detail? }]`), `skills` (`[{ path, status }]`, omitted when empty) |
 
 ---
 
@@ -769,6 +780,7 @@ cargo fmt --check
 cargo clippy --all-targets --features cronet -- -D warnings
 cargo test --features cronet
 cargo test --test corpus_evaluation
+cargo test --features cronet --test unblock_canary_tests -- --ignored --nocapture  # opt-in live 403 canary
 cargo test --test cef_protocol_tests -- --ignored  # opt-in live v5-meta CEF smoke test
 ```
 
