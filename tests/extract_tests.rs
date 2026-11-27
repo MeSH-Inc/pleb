@@ -2587,3 +2587,54 @@ fn focus_projection_recovers_late_sections_splits_identifiers_and_enforces_byte_
         );
     }
 }
+
+#[test]
+fn pilcrow_stripping_summary_heading_order_and_anchor_tooltip_compaction() {
+    let url = Url::parse("https://docs.example.org/api").unwrap();
+    let html = r##"<!doctype html><html><head><title>API</title></head><body><main>
+        <h1>API</h1>
+        <p id="p1">Body paragraph with <a href="/type.html" title="type std::Type">Type</a>.<a href="#p1" class="pilcrow">¶</a><a href="#p1">🔗</a></p>
+        <p>Keep <a href="https://ext.example.org/doc">¶</a>, <a href="#s1">Section ¶</a>, <a href="#n">§</a>, and <img src="/fig.png" alt="Fig" title="Figure Caption">.</p>
+        <details open><summary><section><span class="rightside">1.77.0 · <a href="/src.rs">Source</a></span><h4>pub fn clear_poison(&amp;self)</h4></section></summary><p>Clears poison.</p></details>
+        <details open><summary><p>Block preface stays first.</p><h4>Block Summary</h4></summary><p>Body.</p></details>
+    </main></body></html>"##;
+
+    let md = extract_document(html, &url, Some("text/html"), &ExtractOptions::default()).unwrap();
+    assert!(md
+        .content
+        .contains("[Type](https://docs.example.org/type.html)"));
+    assert!(!md.content.contains("type std::Type"));
+    assert!(!md.content.contains("[¶](#p1)"));
+    assert!(!md.content.contains("[🔗](#p1)"));
+    assert!(md.content.contains("[¶](https://ext.example.org/doc)"));
+    assert!(md.content.contains("[Section ¶](#s1)"));
+    assert!(md.content.contains("[§](#n)"));
+    assert!(md
+        .content
+        .contains("![Fig](https://docs.example.org/fig.png \"Figure Caption\")"));
+    let clear_pos = md.content.find("#### pub fn clear\\_poison").unwrap();
+    let since_pos = md.content.find("1.77.0 · [Source]").unwrap();
+    assert!(
+        clear_pos < since_pos,
+        "expected heading before version badge:\n{}",
+        md.content
+    );
+    let block_pre_pos = md.content.find("Block preface stays first.").unwrap();
+    let block_h_pos = md.content.find("#### Block Summary").unwrap();
+    assert!(
+        block_pre_pos < block_h_pos,
+        "block child inside <summary> must not reorder"
+    );
+
+    let txt = extract_document(
+        html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions {
+            format: OutputFormat::Text,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(txt.content.find("pub fn clear_poison").unwrap() < txt.content.find("1.77.0").unwrap());
+}

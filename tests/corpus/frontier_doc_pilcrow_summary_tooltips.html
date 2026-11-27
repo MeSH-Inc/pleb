@@ -1,0 +1,26 @@
+<!-- pleb-fixture: {"tier":"ratchet","url":"https://docs.example.org/spec/mutex","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"Mutex API & Spec","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["Intro paragraph stays before section heading.\n\n## Details","[LockResult](https://docs.example.org/type.LockResult.html)","[Section 2 ¶](#sec-2)","[¶](https://external.example.org/rfc)","[§](#note)","![Arch](https://docs.example.org/arch.png \"Pipeline Diagram\")","#### pub fn [clear\\_poison](#method.clear_poison)(&self)\n\n1.77.0 · [Source](https://docs.example.org/src/mutex.rs)"],"forbidden_substrings":["[¶](#p-1)","[¶](#p-2)","[🔗](#p-3)","type std::sync::LockResult","struct std::sync::Mutex"],"minimum_output_bytes":180,"maximum_output_bytes":900}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Mutex API &amp; Spec</title></head>
+<body>
+  <main>
+    <h1>Mutex API &amp; Spec</h1>
+    <p>Intro paragraph stays before section heading.</p>
+    <h2>Details</h2>
+    <p id="p-1">See <a href="/type.LockResult.html" title="type std::sync::LockResult">LockResult</a> and <a href="/struct.Mutex.html" title="struct std::sync::Mutex">Mutex</a>.<a href="#p-1" class="pilcrow">¶</a></p>
+    <p id="p-2">Trailing fragment pilcrow without class.<a href="#p-2">¶</a></p>
+    <p id="p-3">Trailing fragment link glyph.<a href="#p-3">🔗</a></p>
+    <p>Inverse guards: <a href="#sec-2">Section 2 ¶</a>, <a href="https://external.example.org/rfc">¶</a>, and <a href="#note">§</a>.</p>
+    <p><img src="/arch.png" alt="Arch" title="Pipeline Diagram"></p>
+    <details open>
+      <summary>
+        <section id="method.clear_poison" class="method">
+          <span class="rightside"><span class="since">1.77.0</span> · <a href="/src/mutex.rs">Source</a></span>
+          <h4>pub fn <a href="#method.clear_poison">clear_poison</a>(&amp;self)</h4>
+        </section>
+      </summary>
+      <p>Clear the poisoned state from a mutex.</p>
+    </details>
+  </main>
+</body>
+</html>

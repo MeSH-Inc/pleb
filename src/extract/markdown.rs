@@ -55,16 +55,11 @@ pub fn html_to_compact_markdown(
     builder = builder.add_handler(
         vec!["a"],
         move |handlers: &dyn Handlers, element: Element| {
-            let mut href: Option<&str> = None;
-            let mut title: Option<&str> = None;
-            for attr in element.attrs.iter() {
-                let name: &str = attr.name.local.as_ref();
-                if name == "href" {
-                    href = Some(&attr.value);
-                } else if name == "title" {
-                    title = Some(&attr.value);
-                }
-            }
+            let href = element
+                .attrs
+                .iter()
+                .find(|a| a.name.local.as_ref() == "href")
+                .map(|a| a.value.as_ref());
 
             let inner = handlers.walk_children(element.node).content;
             let (leading_ws, core, trailing_ws) = split_document_whitespace(&inner);
@@ -84,11 +79,7 @@ pub fn html_to_compact_markdown(
                 ResolvedUrl::Drop | ResolvedUrl::UnwrapText => Some(inner.into()),
                 ResolvedUrl::Resolved(dest) => {
                     let formatted_dest = format_destination(&dest);
-                    let formatted_title = format_title(title);
-                    let out = format!(
-                        "{leading_ws}[{core}]({formatted_dest}{formatted_title}){trailing_ws}"
-                    );
-                    Some(out.into())
+                    Some(format!("{leading_ws}[{core}]({formatted_dest}){trailing_ws}").into())
                 }
             }
         },

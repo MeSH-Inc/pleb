@@ -836,10 +836,17 @@ fn is_heading_permalink_anchor(node: NodeRef<'_, Node>) -> bool {
 
     let has_permalink_class = el.attr("class").is_some_and(|cls| {
         cls.split_whitespace().any(|tok| {
-            tok.eq_ignore_ascii_case("headerlink")
-                || tok.eq_ignore_ascii_case("anchor")
-                || tok.eq_ignore_ascii_case("anchor-link")
-                || tok.eq_ignore_ascii_case("heading-anchor")
+            matches!(
+                tok.to_ascii_lowercase().as_str(),
+                "headerlink"
+                    | "anchor"
+                    | "anchor-link"
+                    | "heading-anchor"
+                    | "pilcrow"
+                    | "permalink"
+                    | "self-link"
+                    | "section-anchor"
+            )
         })
     });
 
@@ -849,10 +856,6 @@ fn is_heading_permalink_anchor(node: NodeRef<'_, Node>) -> bool {
             Node::Element(e) if matches!(e.name(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
         )
     });
-
-    if !has_permalink_class && !inside_heading {
-        return false;
-    }
 
     let mut text = String::new();
     collect_raw_text(node, &mut text);
@@ -866,7 +869,10 @@ fn is_heading_permalink_anchor(node: NodeRef<'_, Node>) -> bool {
                 )
         })
         .collect();
-    matches!(cleaned.as_str(), "" | "#" | "§" | "¶" | "🔗")
+    if matches!(cleaned.as_str(), "¶" | "🔗") {
+        return true;
+    }
+    (has_permalink_class || inside_heading) && matches!(cleaned.as_str(), "" | "#" | "§")
 }
 
 fn collect_selector_ids(doc: &Html, selector: &Selector, out: &mut Vec<NodeId>) {
@@ -968,6 +974,71 @@ fn select_root_id(doc: &Html, mode: ExtractMode, metrics: &HashMap<NodeId, NodeM
     body_id
 }
 
+fn summary_heading_reordered_children<'a>(
+    node: NodeRef<'a, Node>,
+    tag: &str,
+) -> Option<Vec<NodeRef<'a, Node>>> {
+    let in_summary_header = tag == "summary"
+        || (matches!(tag, "section" | "div" | "header")
+            && node
+                .parent()
+                .is_some_and(|p| matches!(p.value(), Node::Element(e) if e.name() == "summary")));
+    if !in_summary_header {
+        return None;
+    }
+    let children: Vec<_> = node.children().collect();
+    let h_idx = children.iter().position(|c| {
+        matches!(c.value(), Node::Element(e) if matches!(e.name(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6"))
+    })?;
+    if h_idx == 0 {
+        return None;
+    }
+    let is_inline_meta = |t: &str| {
+        matches!(
+            t,
+            "span"
+                | "a"
+                | "small"
+                | "time"
+                | "code"
+                | "em"
+                | "strong"
+                | "sup"
+                | "sub"
+                | "b"
+                | "i"
+                | "kbd"
+                | "abbr"
+                | "mark"
+        )
+    };
+    let mut has_visible = false;
+    for &prefix in &children[..h_idx] {
+        match prefix.value() {
+            Node::Text(t) => has_visible |= !t.trim().is_empty(),
+            Node::Element(e) if is_inline_meta(e.name()) => {
+                if prefix.descendants().any(|d| {
+                    d != prefix
+                        && matches!(d.value(), Node::Element(de) if !is_inline_meta(de.name()))
+                }) {
+                    return None;
+                }
+                let mut text = String::new();
+                collect_raw_text(prefix, &mut text);
+                has_visible |= !text.trim().is_empty();
+            }
+            Node::Comment(_) => {}
+            _ => return None,
+        }
+    }
+    has_visible.then(|| {
+        std::iter::once(children[h_idx])
+            .chain(children[..h_idx].iter().copied())
+            .chain(children[h_idx + 1..].iter().copied())
+            .collect()
+    })
+}
+
 fn serialize_pruned_html(node: NodeRef<'_, Node>, in_interactive: bool, out: &mut String) {
     match node.value() {
         Node::Text(text) => push_escaped_text(text, out),
@@ -1054,8 +1125,14 @@ fn serialize_pruned_html(node: NodeRef<'_, Node>, in_interactive: bool, out: &mu
             }
 
             let child_interactive = in_interactive || is_svg_chrome_ancestor(el);
-            for child in node.children() {
-                serialize_pruned_html(child, child_interactive, out);
+            if let Some(ordered) = summary_heading_reordered_children(node, tag) {
+                for child in ordered {
+                    serialize_pruned_html(child, child_interactive, out);
+                }
+            } else {
+                for child in node.children() {
+                    serialize_pruned_html(child, child_interactive, out);
+                }
             }
 
             out.push_str("</");
@@ -1775,8 +1852,14 @@ fn collect_plain_text(
 
             let child_pre = in_pre || tag == "pre";
             let child_interactive = in_interactive || is_svg_chrome_ancestor(el);
-            for child in node.children() {
-                collect_plain_text(child, child_pre, child_interactive, out);
+            if let Some(ordered) = summary_heading_reordered_children(node, tag) {
+                for child in ordered {
+                    collect_plain_text(child, child_pre, child_interactive, out);
+                }
+            } else {
+                for child in node.children() {
+                    collect_plain_text(child, child_pre, child_interactive, out);
+                }
             }
 
             if is_cell && !out.is_empty() && !out.ends_with([' ', '\n']) {
