@@ -219,5 +219,52 @@
       ],
       "forbidden_substrings": []
     }
+  ],
+  "live_tasks": [
+    {
+      "id": "live_cloudflare_markdown_agents",
+      "family": "live_markdown_negotiation",
+      "url": "https://developers.cloudflare.com/fundamentals/reference/markdown-for-agents/",
+      "query": "Accept text/markdown content negotiation vary header response",
+      "required_evidence": [
+        "Accept: text/markdown",
+        "content-type: text/markdown",
+        "vary: accept"
+      ]
+    },
+    {
+      "id": "live_sqlite_wal",
+      "family": "live_technical_spec",
+      "url": "https://sqlite.org/wal.html",
+      "query": "SQLite WAL read-only database media conditions journal mode",
+      "required_evidence": [
+        "3.22.0",
+        "immutable query parameter",
+        "PRAGMA journal_mode=DELETE"
+      ]
+    },
+    {
+      "id": "live_rust_mutex",
+      "family": "live_api_reference",
+      "url": "https://doc.rust-lang.org/std/sync/struct.Mutex.html",
+      "query": "Mutex poisoned state recovery clear poison underlying data",
+      "required_evidence": [
+        "pub fn clear_poison(&self)",
+        "1.77.0",
+        "pub fn into_inner(self) -> LockResult<T>",
+        "If another user of this mutex panicked while holding the mutex"
+      ]
+    },
+    {
+      "id": "live_github_rust_readme",
+      "family": "live_source_rewrite",
+      "url": "https://github.com/rust-lang/rust/blob/master/README.md",
+      "query": "Quick Start Installing from Source INSTALL.md rust-analyzer",
+      "required_evidence": [
+        "Quick Start",
+        "INSTALL.md",
+        "rust-analyzer"
+      ]
+    }
   ]
 }

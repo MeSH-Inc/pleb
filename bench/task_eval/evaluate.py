@@ -18,10 +18,16 @@ external static/BM25 extractors on identical frozen HTML inputs:
   - pleb_clean_full:     unbounded default clean Markdown
   - pleb_article_full:   unbounded article extraction
   - pleb_prefix_budget:  existing --max-bytes prefix truncation at budget B
-  - pleb_focus_proto:    prototype heading-aware BM25 + enclosing-heading projection over clean Markdown
+  - pleb_focus_cli:      compiled `pleb fetch --focus <query> --max-bytes <N>` BM25 section projection
   - trafilatura_full:    Trafilatura Markdown extraction (favor_recall=True, include_tables=True)
   - html2text_full:      html2text Markdown conversion baseline
   - crawl4ai_bm25_ref:   BM25Okapi chunk-filter reference (Crawl4AI BM25ContentFilter pattern)
+
+Optional paired live-URL track (`--live-track` / `--live-only`):
+  Compares `pleb_live_clean` and `pleb_live_focus` head-to-head against direct
+  `Accept: text/markdown` HTTP requests (Cloudflare Markdown-for-Agents baseline),
+  Jina Reader (`r.jina.ai`, optional `JINA_API_KEY`), and Firecrawl (`/v1/scrape`
+  when `FIRECRAWL_API_KEY` is set).
 
 Run with pinned o200k_base tokenization via uv:
   uv run bench/task_eval/evaluate.py --pleb-bin ./target/release/pleb
@@ -30,6 +36,7 @@ Run with pinned o200k_base tokenization via uv:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.server
 import json
 import math
@@ -41,6 +48,8 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -436,7 +445,7 @@ def normalize_ws(text: str) -> str:
 
 
 def unescape_markdown_punct(text: str) -> str:
-    return re.sub(r"\\([\\`*_{}\[\]()#+\-.!~|])", r"\1", text)
+    return re.sub(r"\\([\\`*_{}\[\]()#+\-.!~|<>])", r"\1", text)
 
 
 def run_pleb(
@@ -568,13 +577,7 @@ def evaluate_external_extractor(
         tokens = counter.count(visible)
         if task["answerable"]:
             norm_visible = normalize_ws(visible)
-            norm_evidence = normalize_for_evidence(visible)
-            hits = sum(
-                1
-                for needle in task["required_evidence"]
-                if normalize_ws(needle) in norm_visible
-                or normalize_ws(needle) in norm_evidence
-            )
+            hits = count_evidence_hits(visible, task["required_evidence"])
             res_ok = True
             if task.get("expected_resource_url_suffix"):
                 res_ok = task["expected_resource_url_suffix"] in visible
@@ -739,14 +742,7 @@ def evaluate_strategy(
                 outcome = out_json.get("content_outcome")
                 usable_rejected = outcome != "complete"
 
-                norm_visible = normalize_ws(visible)
-                norm_evidence = normalize_for_evidence(visible)
-                hits = sum(
-                    1
-                    for needle in task["required_evidence"]
-                    if normalize_ws(needle) in norm_visible
-                    or normalize_ws(needle) in norm_evidence
-                )
+                hits = count_evidence_hits(visible, task["required_evidence"])
                 res_ok = True
                 if task.get("expected_resource_url_suffix"):
                     suffix = task["expected_resource_url_suffix"]
@@ -832,6 +828,305 @@ def evaluate_strategy(
         shutil.rmtree(state_dir, ignore_errors=True)
 
 
+def count_evidence_hits(visible: str, needles: list[str]) -> int:
+    norm_visible = normalize_ws(visible)
+    norm_evidence = normalize_for_evidence(visible)
+    return sum(
+        1
+        for needle in needles
+        if normalize_ws(needle) in norm_visible or normalize_ws(needle) in norm_evidence
+    )
+
+
+def fetch_http_text(
+    url: str,
+    headers: dict[str, str],
+    body: bytes | None = None,
+    timeout_s: float = 20.0,
+) -> tuple[int, str, str, float, str | None]:
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST" if body else "GET")
+    t0 = time.perf_counter()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read()
+            ctype = resp.headers.get("Content-Type", "")
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            return resp.status, ctype, raw.decode("utf-8", errors="replace"), elapsed_ms, None
+    except urllib.error.HTTPError as exc:
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        return exc.code, exc.headers.get("Content-Type", "") if exc.headers else "", "", elapsed_ms, f"HTTP {exc.code}"
+    except Exception as exc:
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        return 0, "", "", elapsed_ms, str(exc)
+
+
+def evaluate_live_track(
+    live_tasks: list[dict[str, Any]],
+    pleb_bin: str,
+    budget_tokens: int,
+    competitors: list[str],
+    counter: TokenCounter,
+) -> dict[str, Any]:
+    """Opt-in paired live-URL comparison: pleb vs Accept:text/markdown, r.jina.ai, and Firecrawl."""
+    strategies = ["pleb_live_clean", "pleb_live_focus"]
+    if "accept_markdown" in competitors:
+        strategies.append("accept_markdown_direct")
+    if "jina" in competitors:
+        strategies.append("jina_reader")
+    if "firecrawl" in competitors:
+        strategies.append("firecrawl_api")
+
+    state_dir = tempfile.mkdtemp(prefix=f"pleb-live-{os.getpid()}-", dir="/tmp")
+    per_strategy: dict[str, list[dict[str, Any]]] = {s: [] for s in strategies}
+    firecrawl_key = os.environ.get("FIRECRAWL_API_KEY", "").strip()
+    jina_key = os.environ.get("JINA_API_KEY", "").strip()
+
+    try:
+        for task in live_tasks:
+            url = task["url"]
+            needles = task["required_evidence"]
+
+            for strat in ("pleb_live_clean", "pleb_live_focus"):
+                extra = (
+                    [
+                        "--focus",
+                        task["query"],
+                        "--max-bytes",
+                        str(max(512, (budget_tokens - 140) * 3)),
+                    ]
+                    if strat == "pleb_live_focus"
+                    else []
+                )
+                exit_code, out_json, err_json, elapsed_ms = run_pleb(pleb_bin, state_dir, url, extra)
+                if exit_code == 0 and out_json is not None:
+                    visible = build_model_visible_envelope(out_json, out_json.get("content", ""))
+                    tokens = counter.count(visible)
+                    hits = count_evidence_hits(visible, needles)
+                    within = tokens <= budget_tokens
+                    complete = out_json.get("content_outcome") == "complete"
+                    per_strategy[strat].append(
+                        {
+                            "task_id": task["id"],
+                            "url": url,
+                            "status": "ok" if complete else f"outcome:{out_json.get('content_outcome')}",
+                            "representation": out_json.get("strategy", ""),
+                            "sha256": (out_json.get("acquired_sha256") or "")[:12],
+                            "evidence_hits": hits,
+                            "evidence_total": len(needles),
+                            "within_budget": within,
+                            "supported": complete and within and hits == len(needles),
+                            "tokens": tokens,
+                            "latency_ms": elapsed_ms,
+                        }
+                    )
+                else:
+                    msg = (err_json or {}).get("error", f"exit_{exit_code}")
+                    per_strategy[strat].append(
+                        {
+                            "task_id": task["id"],
+                            "url": url,
+                            "status": f"error:{msg[:40]}",
+                            "representation": "",
+                            "sha256": "",
+                            "evidence_hits": 0,
+                            "evidence_total": len(needles),
+                            "within_budget": True,
+                            "supported": False,
+                            "tokens": counter.count(json.dumps(err_json or {})),
+                            "latency_ms": elapsed_ms,
+                        }
+                    )
+
+            if "accept_markdown_direct" in per_strategy:
+                status, ctype, text, elapsed_ms, err = fetch_http_text(
+                    url,
+                    {
+                        "Accept": "text/markdown, text/html;q=0.9",
+                        "User-Agent": "pleb-bench/1.0",
+                    },
+                )
+                visible = f"URL: {url}\n\n{text}" if not err else ""
+                tokens = counter.count(visible) if visible else 0
+                hits = count_evidence_hits(visible, needles) if visible else 0
+                within = tokens <= budget_tokens
+                per_strategy["accept_markdown_direct"].append(
+                    {
+                        "task_id": task["id"],
+                        "url": url,
+                        "status": "ok" if not err else f"error:{err}",
+                        "representation": ctype.split(";")[0].strip(),
+                        "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()[:12] if text else "",
+                        "evidence_hits": hits,
+                        "evidence_total": len(needles),
+                        "within_budget": within,
+                        "supported": (not err) and within and hits == len(needles),
+                        "tokens": tokens,
+                        "latency_ms": elapsed_ms,
+                    }
+                )
+
+            if "jina_reader" in per_strategy:
+                jina_headers = {
+                    "Accept": "text/markdown",
+                    "User-Agent": "pleb-bench/1.0",
+                }
+                if jina_key:
+                    jina_headers["Authorization"] = f"Bearer {jina_key}"
+                status, ctype, text, elapsed_ms, err = fetch_http_text(
+                    f"https://r.jina.ai/{url}",
+                    jina_headers,
+                    timeout_s=25.0,
+                )
+                visible = f"URL: {url}\n\n{text}" if not err else ""
+                tokens = counter.count(visible) if visible else 0
+                hits = count_evidence_hits(visible, needles) if visible else 0
+                within = tokens <= budget_tokens
+                row_status = (
+                    "ok"
+                    if not err
+                    else (
+                        "auth_required(set JINA_API_KEY)"
+                        if status == 401 and not jina_key
+                        else ("rate_limited" if status == 429 else f"error:{err}")
+                    )
+                )
+                per_strategy["jina_reader"].append(
+                    {
+                        "task_id": task["id"],
+                        "url": url,
+                        "status": row_status,
+                        "representation": ctype.split(";")[0].strip(),
+                        "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()[:12] if text else "",
+                        "evidence_hits": hits,
+                        "evidence_total": len(needles),
+                        "within_budget": within,
+                        "supported": (not err) and within and hits == len(needles),
+                        "tokens": tokens,
+                        "latency_ms": elapsed_ms,
+                    }
+                )
+
+            if "firecrawl_api" in per_strategy:
+                if not firecrawl_key:
+                    per_strategy["firecrawl_api"].append(
+                        {
+                            "task_id": task["id"],
+                            "url": url,
+                            "status": "skipped_no_api_key",
+                            "representation": "",
+                            "sha256": "",
+                            "evidence_hits": 0,
+                            "evidence_total": len(needles),
+                            "within_budget": True,
+                            "supported": False,
+                            "tokens": 0,
+                            "latency_ms": 0.0,
+                        }
+                    )
+                else:
+                    payload = json.dumps(
+                        {"url": url, "formats": ["markdown"], "onlyMainContent": True}
+                    ).encode("utf-8")
+                    status, _, raw_resp, elapsed_ms, err = fetch_http_text(
+                        "https://api.firecrawl.dev/v1/scrape",
+                        {
+                            "Authorization": f"Bearer {firecrawl_key}",
+                            "Content-Type": "application/json",
+                            "User-Agent": "pleb-bench/1.0",
+                        },
+                        body=payload,
+                        timeout_s=30.0,
+                    )
+                    md = ""
+                    if not err:
+                        try:
+                            parsed = json.loads(raw_resp)
+                            md = (parsed.get("data") or {}).get("markdown", "")
+                        except json.JSONDecodeError:
+                            err = "invalid_json"
+                    visible = f"URL: {url}\n\n{md}" if (not err and md) else ""
+                    tokens = counter.count(visible) if visible else 0
+                    hits = count_evidence_hits(visible, needles) if visible else 0
+                    within = tokens <= budget_tokens
+                    per_strategy["firecrawl_api"].append(
+                        {
+                            "task_id": task["id"],
+                            "url": url,
+                            "status": "ok" if (not err and md) else f"error:{err or 'empty'}",
+                            "representation": "firecrawl:markdown",
+                            "sha256": hashlib.sha256(md.encode("utf-8")).hexdigest()[:12] if md else "",
+                            "evidence_hits": hits,
+                            "evidence_total": len(needles),
+                            "within_budget": within,
+                            "supported": (not err) and bool(md) and within and hits == len(needles),
+                            "tokens": tokens,
+                            "latency_ms": elapsed_ms,
+                        }
+                    )
+    finally:
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+    summaries: list[dict[str, Any]] = []
+    for strat in strategies:
+        rows = per_strategy[strat]
+        attempted = sum(1 for r in rows if r["status"] != "skipped_no_api_key")
+        supported = sum(1 for r in rows if r["supported"])
+        ev_full = sum(1 for r in rows if r["evidence_hits"] == r["evidence_total"] and r["status"] == "ok")
+        total_tokens = sum(r["tokens"] for r in rows if r["status"] != "skipped_no_api_key")
+        lats = sorted(r["latency_ms"] for r in rows if r["status"] != "skipped_no_api_key")
+        p95_idx = min(len(lats) - 1, math.ceil(0.95 * len(lats)) - 1) if lats else 0
+        notes = sorted({r["status"] for r in rows if r["status"] != "ok"})
+        summaries.append(
+            {
+                "strategy": strat,
+                "budget_tokens": budget_tokens,
+                "attempted": attempted,
+                "total": len(rows),
+                "supported": supported,
+                "evidence_full": ev_full,
+                "mean_tokens": total_tokens / attempted if attempted else 0.0,
+                "tokens_per_supported": total_tokens / supported if supported else None,
+                "p95_latency_ms": lats[p95_idx] if lats else 0.0,
+                "notes": ", ".join(notes) if notes else "ok",
+                "tasks": rows,
+            }
+        )
+    return {"budget_tokens": budget_tokens, "task_count": len(live_tasks), "runs": summaries}
+
+
+def print_live_markdown_report(live_report: dict[str, Any]) -> None:
+    print("\n## Opt-In Live-Pair Track\n")
+    print(
+        f"- **Budget:** {live_report['budget_tokens']} tok | **Live URLs:** {live_report['task_count']}\n"
+    )
+    print(
+        "| Strategy | Supported | Evidence Full | Mean Tok | Tok / Supported | p95 ms | Notes |"
+    )
+    print("| :--- | ---: | ---: | ---: | ---: | ---: | :--- |")
+    for run in live_report["runs"]:
+        c_succ = (
+            f"{run['tokens_per_supported']:.0f}"
+            if run["tokens_per_supported"] is not None
+            else "inf"
+        )
+        print(
+            f"| `{run['strategy']}` | {run['supported']}/{run['attempted']} | "
+            f"{run['evidence_full']}/{run['attempted']} | {run['mean_tokens']:.0f} | "
+            f"{c_succ} | {run['p95_latency_ms']:.1f} | {run['notes']} |"
+        )
+    print("\n### Per-URL Live Breakdown\n")
+    print("| Task | Strategy | Status | Repr | Evidence | Tok | Budget OK | ms |")
+    print("| :--- | :--- | :--- | :--- | ---: | ---: | :---: | ---: |")
+    for run in live_report["runs"]:
+        for r in run["tasks"]:
+            ok_mark = "yes" if r["within_budget"] else "no"
+            print(
+                f"| `{r['task_id']}` | `{run['strategy']}` | {r['status']} | "
+                f"`{r['representation']}` | {r['evidence_hits']}/{r['evidence_total']} | "
+                f"{r['tokens']} | {ok_mark} | {r['latency_ms']:.1f} |"
+            )
+
+
 def print_markdown_report(report: dict[str, Any]) -> None:
     print("# pleb Held-Out Task Evaluation Scorecard\n")
     print(f"- **Tokenizer:** `{report['tokenizer']}`")
@@ -888,11 +1183,33 @@ def main() -> None:
         action="store_true",
         help="Skip single warm-up CLI invocation before timing (measures cold binary load on first run)",
     )
+    parser.add_argument(
+        "--live-track",
+        action="store_true",
+        help="Also run opt-in paired live-URL comparison (pleb vs Accept:text/markdown, r.jina.ai, Firecrawl)",
+    )
+    parser.add_argument(
+        "--live-only",
+        action="store_true",
+        help="Run only the opt-in live-URL comparison track (skip offline frozen fixtures)",
+    )
+    parser.add_argument(
+        "--live-competitors",
+        default="accept_markdown,jina,firecrawl",
+        help="Comma-separated live competitors: accept_markdown,jina,firecrawl",
+    )
+    parser.add_argument(
+        "--live-budget",
+        type=int,
+        default=4000,
+        help="Model-visible token budget for the live-pair track",
+    )
     parser.add_argument("--json-out", help="Optional path to write full JSON report")
     args = parser.parse_args()
 
     manifest = json.loads(TASKS_PATH.read_text(encoding="utf-8"))
     tasks = manifest["tasks"]
+    live_tasks = manifest.get("live_tasks", [])
     budgets = [int(x.strip()) for x in args.budgets.split(",") if x.strip()]
     counter = TokenCounter()
 
@@ -909,34 +1226,48 @@ def main() -> None:
     )
 
     runs: list[dict[str, Any]] = []
-    with FixtureHTTPServer(tasks) as srv:
-        if not args.no_warmup and tasks:
-            warm_dir = tempfile.mkdtemp(prefix=f"pleb-warm-{os.getpid()}-", dir="/tmp")
-            try:
-                run_pleb(args.pleb_bin, warm_dir, f"{srv.base_url}{tasks[0]['path']}", [])
-            finally:
-                shutil.rmtree(warm_dir, ignore_errors=True)
-        for budget in budgets:
-            for strategy in pleb_strategies:
-                runs.append(
-                    evaluate_strategy(
-                        strategy=strategy,
-                        tasks=tasks,
-                        base_url=srv.base_url,
-                        pleb_bin=args.pleb_bin,
-                        budget_tokens=budget,
-                        counter=counter,
+    if not args.live_only:
+        with FixtureHTTPServer(tasks) as srv:
+            if not args.no_warmup and tasks:
+                warm_dir = tempfile.mkdtemp(prefix=f"pleb-warm-{os.getpid()}-", dir="/tmp")
+                try:
+                    run_pleb(args.pleb_bin, warm_dir, f"{srv.base_url}{tasks[0]['path']}", [])
+                finally:
+                    shutil.rmtree(warm_dir, ignore_errors=True)
+            for budget in budgets:
+                for strategy in pleb_strategies:
+                    runs.append(
+                        evaluate_strategy(
+                            strategy=strategy,
+                            tasks=tasks,
+                            base_url=srv.base_url,
+                            pleb_bin=args.pleb_bin,
+                            budget_tokens=budget,
+                            counter=counter,
+                        )
                     )
-                )
-            for strategy in external_strategies:
-                runs.append(
-                    evaluate_external_extractor(
-                        strategy=strategy,
-                        tasks=tasks,
-                        budget_tokens=budget,
-                        counter=counter,
+                for strategy in external_strategies:
+                    runs.append(
+                        evaluate_external_extractor(
+                            strategy=strategy,
+                            tasks=tasks,
+                            budget_tokens=budget,
+                            counter=counter,
+                        )
                     )
-                )
+
+    live_report = None
+    if args.live_track or args.live_only:
+        live_competitors = [
+            c.strip() for c in args.live_competitors.split(",") if c.strip()
+        ]
+        live_report = evaluate_live_track(
+            live_tasks=live_tasks,
+            pleb_bin=args.pleb_bin,
+            budget_tokens=args.live_budget,
+            competitors=live_competitors,
+            counter=counter,
+        )
 
     report = {
         "tokenizer": counter.name,
@@ -946,8 +1277,12 @@ def main() -> None:
         "wild_count": sum(1 for t in tasks if t["family"] == "wild_production_docs"),
         "unavailable_count": sum(1 for t in tasks if not t["answerable"]),
         "runs": runs,
+        "live_track": live_report,
     }
-    print_markdown_report(report)
+    if runs:
+        print_markdown_report(report)
+    if live_report is not None:
+        print_live_markdown_report(live_report)
     if args.json_out:
         Path(args.json_out).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
