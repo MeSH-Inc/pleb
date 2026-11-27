@@ -169,6 +169,55 @@
         "OVERRIDE_CLOAKED_OPACITY_ZERO",
         "OVERRIDE_CLOAKED_FONT_ZERO"
       ]
+    },
+    {
+      "id": "wild_sqlite_wal_readonly_caveat",
+      "family": "wild_production_docs",
+      "answerable": true,
+      "fixture": "fixtures/wild_sqlite_wal.html",
+      "path": "/wal.html",
+      "status_code": 200,
+      "content_type": "text/html; charset=utf-8",
+      "query": "SQLite WAL read-only database media conditions journal mode",
+      "required_evidence": [
+        "3.22.0",
+        "immutable query parameter",
+        "PRAGMA journal_mode=DELETE"
+      ],
+      "forbidden_substrings": []
+    },
+    {
+      "id": "wild_rust_mutex_poison_recovery",
+      "family": "wild_production_docs",
+      "answerable": true,
+      "fixture": "fixtures/wild_rust_mutex.html",
+      "path": "/std/sync/struct.Mutex.html",
+      "status_code": 200,
+      "content_type": "text/html; charset=utf-8",
+      "query": "Mutex poisoned state recovery clear poison underlying data",
+      "required_evidence": [
+        "pub fn clear_poison(&self)",
+        "1.77.0",
+        "pub fn into_inner(self) -> LockResult<T>",
+        "If another user of this mutex panicked while holding the mutex"
+      ],
+      "forbidden_substrings": []
+    },
+    {
+      "id": "wild_rfc9421_signature_base_rules",
+      "family": "wild_production_docs",
+      "answerable": true,
+      "fixture": "fixtures/wild_rfc9421.html",
+      "path": "/doc/html/rfc9421",
+      "status_code": 200,
+      "content_type": "text/html; charset=utf-8",
+      "query": "Creating the Signature Base ABNF @signature-params duplicate component error",
+      "required_evidence": [
+        "signature-base = *( signature-base-line LF ) signature-params-line",
+        "If the component identifier (including its parameters) has already been added to the signature base, produce an error.",
+        "If the component identifier contains the req parameter and the target message is a request, produce an error."
+      ],
+      "forbidden_substrings": []
     }
   ]
 }

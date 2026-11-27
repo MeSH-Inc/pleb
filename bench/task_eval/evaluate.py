@@ -3,17 +3,25 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #   "tiktoken>=0.8.0",
+#   "trafilatura>=2.0.0",
+#   "html2text>=2024.2.26",
+#   "rank-bm25>=0.2.2",
+#   "beautifulsoup4>=4.12.3",
 # ]
 # ///
 """Held-out task-level evaluation harness for pleb (external to the production binary).
 
 Evaluates S(B) (evidence-supported task completions within pinned model-visible token budget B),
 C_success (model-visible tokens per supported completion), false-usable / usable-rejected
-confusion counts, concealed-injection leakage, and wall latency across:
+confusion counts, concealed-injection leakage, and wall latency across pleb modes and
+external static/BM25 extractors on identical frozen HTML inputs:
   - pleb_clean_full:     unbounded default clean Markdown
   - pleb_article_full:   unbounded article extraction
   - pleb_prefix_budget:  existing --max-bytes prefix truncation at budget B
   - pleb_focus_proto:    prototype heading-aware BM25 + enclosing-heading projection over clean Markdown
+  - trafilatura_full:    Trafilatura Markdown extraction (favor_recall=True, include_tables=True)
+  - html2text_full:      html2text Markdown conversion baseline
+  - crawl4ai_bm25_ref:   BM25Okapi chunk-filter reference (Crawl4AI BM25ContentFilter pattern)
 
 Run with pinned o200k_base tokenization via uv:
   uv run bench/task_eval/evaluate.py --pleb-bin ./target/release/pleb
@@ -127,10 +135,51 @@ def tokenize_terms(text: str) -> list[str]:
     return re.findall(r"[a-z0-9][a-z0-9_.:/\-+=]*", text.lower())
 
 
+def strip_markdown_inline_links(text: str) -> str:
+    # Unwrap [label](url "optional title") -> label while preserving image/code text.
+    return re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+
+
+def normalize_for_evidence(text: str) -> str:
+    unlinked = strip_markdown_inline_links(unescape_markdown_punct(text))
+    no_inline_ticks = re.sub(r"`([^`\n]+)`", r"\1", unlinked)
+    return normalize_ws(no_inline_ticks)
+
+
+def split_section_subblocks(body: str) -> list[str]:
+    """Split a large section body into intact paragraphs / fenced code blocks / tables."""
+    blocks: list[str] = []
+    cur: list[str] = []
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+    for line in body.splitlines():
+        stripped = line.lstrip()
+        if not in_fence and len(stripped) >= 3 and stripped[0] in ("`", "~"):
+            run = len(stripped) - len(stripped.lstrip(stripped[0]))
+            if run >= 3:
+                in_fence = True
+                fence_char = stripped[0]
+                fence_len = run
+        elif in_fence:
+            t = line.strip()
+            if len(t) >= fence_len and set(t) == {fence_char}:
+                in_fence = False
+        if not in_fence and not line.strip():
+            if cur:
+                blocks.append("\n".join(cur).strip())
+                cur = []
+        else:
+            cur.append(line)
+    if cur:
+        blocks.append("\n".join(cur).strip())
+    return [b for b in blocks if b]
+
+
 def project_focus_markdown(
     markdown: str, query: str, budget_tokens: int, counter: TokenCounter
 ) -> str:
-    """Prototype heading-aware BM25 projection preserving intact sections, code, tables, and TOC."""
+    """Prototype heading-aware BM25 projection preserving intact sections, code, tables, and bounded TOC."""
     if counter.count(markdown) <= budget_tokens:
         return markdown
 
@@ -142,7 +191,10 @@ def project_focus_markdown(
     if not q_terms:
         return markdown
 
-    doc_tokens = [tokenize_terms(f"{s.heading}\n{s.body}") for s in sections]
+    doc_tokens = [
+        tokenize_terms(f"{strip_markdown_inline_links(s.heading)}\n{s.body}")
+        for s in sections
+    ]
     n_docs = len(sections)
     avgdl = sum(len(t) for t in doc_tokens) / max(1, n_docs)
     df: Counter[str] = Counter()
@@ -157,7 +209,7 @@ def project_focus_markdown(
         tf = Counter(toks)
         dl = len(toks)
         score = 0.0
-        heading_terms = set(tokenize_terms(sections[idx].heading))
+        heading_terms = set(tokenize_terms(strip_markdown_inline_links(sections[idx].heading)))
         for term in q_terms:
             f = tf.get(term, 0)
             if f == 0:
@@ -168,35 +220,108 @@ def project_focus_markdown(
             if term in heading_terms:
                 term_score *= 1.6
             score += term_score
-        # Modest lead prior for the document title / overview section (index 0)
         if idx == 0:
             score += 0.35
         scores.append(score)
 
-    def render_selected(selected_indices: set[int]) -> str:
-        parts: list[str] = []
-        if preamble:
-            parts.append(preamble)
-        collapsed_headings: list[str] = []
+    toc_budget = max(40, min(140, budget_tokens // 10))
+
+    def format_bounded_toc(selected_indices: set[int]) -> str:
+        collapsed: list[str] = []
         for s in sections:
             if s.index in selected_indices:
-                block = f"{s.heading}\n\n{s.body}" if s.body else s.heading
+                continue
+            label = re.sub(r"^#+\s*", "", strip_markdown_inline_links(s.heading)).strip()
+            label = normalize_ws(unescape_markdown_punct(label))
+            if label:
+                collapsed.append(label)
+        if not collapsed:
+            return ""
+        kept: list[str] = []
+        for idx_c, item in enumerate(collapsed):
+            rem = len(collapsed) - idx_c - 1
+            suffix = f" | ... (+{rem} more)" if rem > 0 else ""
+            candidate = "<!-- Collapsed sections: " + " | ".join(kept + [item]) + suffix + " -->"
+            if counter.count(candidate) > toc_budget:
+                rem_all = len(collapsed) - len(kept)
+                if kept:
+                    return (
+                        "<!-- Collapsed sections: "
+                        + " | ".join(kept)
+                        + f" | ... (+{rem_all} more) -->"
+                    )
+                return f"<!-- Collapsed sections: {rem_all} omitted -->"
+            kept.append(item)
+        return "<!-- Collapsed sections: " + " | ".join(kept) + " -->"
+
+    def render_selected(selected_indices: set[int], overrides: dict[int, str] | None = None) -> str:
+        parts: list[str] = []
+        if preamble and counter.count(preamble) <= budget_tokens // 5:
+            parts.append(preamble)
+        for s in sections:
+            if s.index in selected_indices:
+                body = overrides[s.index] if overrides and s.index in overrides else s.body
+                block = f"{s.heading}\n\n{body}" if body else s.heading
                 parts.append(block)
-            else:
-                clean_h = re.sub(r"^#+\s*", "", s.heading).strip()
-                collapsed_headings.append(clean_h)
-        if collapsed_headings:
-            parts.append(
-                "<!-- Collapsed sections: " + " | ".join(collapsed_headings) + " -->"
-            )
+        toc = format_bounded_toc(selected_indices)
+        if toc:
+            parts.append(toc)
         return "\n\n".join(p for p in parts if p)
 
-    # Always keep the document title heading (if H1 is section 0) as framing when affordable.
+    def compress_oversized_section(sec: SectionBlock, max_sec_tokens: int) -> str | None:
+        subblocks = split_section_subblocks(sec.body)
+        if len(subblocks) <= 1:
+            return None
+        sub_toks = [tokenize_terms(sb) for sb in subblocks]
+        s_avgdl = sum(len(t) for t in sub_toks) / max(1, len(sub_toks))
+        s_df: Counter[str] = Counter()
+        for toks in sub_toks:
+            for term in set(toks):
+                s_df[term] += 1
+        s_scores: list[float] = []
+        for idx_b, toks in enumerate(sub_toks):
+            tf = Counter(toks)
+            dl = len(toks)
+            sc = 0.0
+            for term in q_terms:
+                f = tf.get(term, 0)
+                if f == 0:
+                    continue
+                idf = math.log((len(sub_toks) - s_df[term] + 0.5) / (s_df[term] + 0.5) + 1.0)
+                denom = f + k1 * (1.0 - b + b * dl / max(1.0, s_avgdl))
+                sc += idf * (f * (k1 + 1.0)) / max(1e-9, denom)
+            # Keep lead paragraph / definition block slightly favored for context
+            if idx_b == 0:
+                sc += 0.25
+            s_scores.append(sc)
+        ranked_b = sorted(range(len(subblocks)), key=lambda i: (-s_scores[i], i))
+        chosen: set[int] = set()
+        for i in ranked_b:
+            # Prefer keeping top-scoring block together with its immediate next block (e.g., code/table)
+            trial = set(chosen)
+            trial.add(i)
+            cand = "\n\n".join(subblocks[j] for j in sorted(trial))
+            if counter.count(f"{sec.heading}\n\n{cand}") <= max_sec_tokens:
+                chosen = trial
+        if not chosen:
+            return None
+        ordered = sorted(chosen)
+        out_parts: list[str] = []
+        prev = -1
+        for j in ordered:
+            if prev >= 0 and j > prev + 1:
+                out_parts.append("[...]")
+            out_parts.append(subblocks[j])
+            prev = j
+        return "\n\n".join(out_parts)
+
     ranked = sorted(range(n_docs), key=lambda i: (-scores[i], i))
     selected: set[int] = set()
+    overrides: dict[int, str] = {}
+
     if sections[0].level == 1:
         cand = render_selected({0})
-        if counter.count(cand) <= budget_tokens:
+        if counter.count(cand) <= budget_tokens // 3:
             selected.add(0)
 
     for idx in ranked:
@@ -204,31 +329,46 @@ def project_focus_markdown(
             continue
         trial = set(selected)
         trial.add(idx)
-        # Include immediate parent heading if this is a nested section
         if sections[idx].level > 1:
             for prev in range(idx - 1, -1, -1):
                 if sections[prev].level < sections[idx].level:
-                    if not sections[prev].body or len(sections[prev].body) < 400:
+                    if not sections[prev].body or len(sections[prev].body) < 300:
                         trial.add(prev)
                     break
-        rendered = render_selected(trial)
+        rendered = render_selected(trial, overrides)
         if counter.count(rendered) <= budget_tokens:
             selected = trial
+        elif scores[idx] > 0:
+            # Section is high-scoring but too large intact: compress its sub-blocks to fit remaining budget.
+            base_tokens = counter.count(render_selected(selected, overrides))
+            rem_tokens = budget_tokens - base_tokens - 24
+            if rem_tokens >= 180:
+                compressed = compress_oversized_section(sections[idx], rem_tokens)
+                if compressed is not None:
+                    trial_ov = dict(overrides)
+                    trial_ov[idx] = compressed
+                    trial_sel = set(selected)
+                    trial_sel.add(idx)
+                    if counter.count(render_selected(trial_sel, trial_ov)) <= budget_tokens:
+                        selected = trial_sel
+                        overrides = trial_ov
 
     if not selected:
-        # Fallback: pick highest-scoring section and trim cleanly by lines inside budget.
         top = ranked[0]
+        compressed = compress_oversized_section(sections[top], budget_tokens - toc_budget - 16)
+        if compressed is not None:
+            return render_selected({top}, {top: compressed})
         raw = render_selected({top})
         lines = raw.splitlines()
-        kept: list[str] = []
+        kept_lines: list[str] = []
         for line in lines:
-            candidate = "\n".join(kept + [line])
+            candidate = "\n".join(kept_lines + [line])
             if counter.count(candidate) > budget_tokens:
                 break
-            kept.append(line)
-        return "\n".join(kept)
+            kept_lines.append(line)
+        return "\n".join(kept_lines)
 
-    return render_selected(selected)
+    return render_selected(selected, overrides)
 
 
 class FixtureHTTPServer:
@@ -356,6 +496,180 @@ def build_model_visible_envelope(payload: dict[str, Any], content: str) -> str:
     return "\n".join(lines) + "\n\n" + content
 
 
+def evaluate_external_extractor(
+    strategy: str,
+    tasks: list[dict[str, Any]],
+    budget_tokens: int,
+    counter: TokenCounter,
+) -> dict[str, Any]:
+    """Evaluate frozen HTML directly with external Python extractors for head-to-head comparison."""
+    import bs4  # type: ignore
+    import html2text  # type: ignore
+    import trafilatura  # type: ignore
+    from rank_bm25 import BM25Okapi  # type: ignore
+
+    rows: list[dict[str, Any]] = []
+    for task in tasks:
+        html = (ROOT_DIR / task["fixture"]).read_text(encoding="utf-8", errors="replace")
+        t0 = time.perf_counter()
+        if strategy == "trafilatura_full":
+            extracted = (
+                trafilatura.extract(
+                    html,
+                    output_format="markdown",
+                    include_tables=True,
+                    include_links=True,
+                    favor_recall=True,
+                )
+                or ""
+            )
+        elif strategy == "html2text_full":
+            conv = html2text.HTML2Text()
+            conv.body_width = 0
+            extracted = conv.handle(html)
+        elif strategy == "crawl4ai_bm25_ref":
+            # Faithful Crawl4AI BM25ContentFilter pattern: split HTML into text chunks,
+            # rank with BM25Okapi against query, and pack highest-scoring chunks within budget B.
+            soup = bs4.BeautifulSoup(html, "html.parser")
+            for tag in soup(["script", "style", "noscript", "template"]):
+                tag.decompose()
+            raw_chunks: list[str] = []
+            for el in soup.find_all(["h1", "h2", "h3", "h4", "p", "pre", "table", "li", "blockquote"]):
+                if el.find_parent(["pre", "table"]) is not None:
+                    continue
+                text = " ".join(el.get_text(" ", strip=True).split())
+                if text:
+                    raw_chunks.append(text)
+            if raw_chunks:
+                corpus = [tokenize_terms(c) or ["_"] for c in raw_chunks]
+                bm25 = BM25Okapi(corpus)
+                q_toks = tokenize_terms(task["query"])
+                scores = bm25.get_scores(q_toks) if q_toks else [0.0] * len(raw_chunks)
+                ranked = sorted(range(len(raw_chunks)), key=lambda i: (-scores[i], i))
+                kept_idx: list[int] = []
+                used_toks = 0
+                for i in ranked:
+                    if scores[i] <= 0 and kept_idx:
+                        break
+                    c_toks = counter.count(raw_chunks[i])
+                    if used_toks + c_toks > max(128, budget_tokens - 32):
+                        continue
+                    kept_idx.append(i)
+                    used_toks += c_toks
+                kept_idx.sort()
+                extracted = "\n\n".join(raw_chunks[i] for i in kept_idx)
+            else:
+                extracted = ""
+        else:
+            raise ValueError(f"unknown external strategy: {strategy}")
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+        visible = f"URL: https://frozen.local{task['path']}\n\n{extracted}"
+        tokens = counter.count(visible)
+        if task["answerable"]:
+            norm_visible = normalize_ws(visible)
+            norm_evidence = normalize_for_evidence(visible)
+            hits = sum(
+                1
+                for needle in task["required_evidence"]
+                if normalize_ws(needle) in norm_visible
+                or normalize_ws(needle) in norm_evidence
+            )
+            res_ok = True
+            if task.get("expected_resource_url_suffix"):
+                res_ok = task["expected_resource_url_suffix"] in visible
+            norm_lower = norm_visible.lower()
+            norm_unescaped_lower = normalize_ws(unescape_markdown_punct(visible)).lower()
+            leaked = any(
+                normalize_ws(forb).lower() in norm_lower
+                or normalize_ws(forb).lower() in norm_unescaped_lower
+                for forb in task.get("forbidden_substrings", [])
+            )
+            usable_rejected = not extracted.strip()
+            supported = (
+                not usable_rejected
+                and tokens <= budget_tokens
+                and hits == len(task["required_evidence"])
+                and res_ok
+                and not leaked
+            )
+            rows.append(
+                {
+                    "task_id": task["id"],
+                    "family": task["family"],
+                    "answerable": True,
+                    "supported": supported,
+                    "usable_rejected": usable_rejected,
+                    "false_usable": False,
+                    "injection_leaked": leaked,
+                    "evidence_hits": hits,
+                    "evidence_total": len(task["required_evidence"]),
+                    "resource_matched": res_ok,
+                    "tokens": tokens,
+                    "latency_ms": elapsed_ms,
+                    "within_budget": tokens <= budget_tokens,
+                }
+            )
+        else:
+            # Static extractors lack HTTP status/challenge/login-wall triage:
+            # non-empty output on an unavailable page is a silent false-usable result.
+            non_empty = bool(extracted.strip())
+            rows.append(
+                {
+                    "task_id": task["id"],
+                    "family": task["family"],
+                    "answerable": False,
+                    "supported": not non_empty,
+                    "usable_rejected": False,
+                    "false_usable": non_empty,
+                    "injection_leaked": False,
+                    "evidence_hits": 0 if non_empty else 1,
+                    "evidence_total": 1,
+                    "tokens": tokens,
+                    "latency_ms": elapsed_ms,
+                    "within_budget": tokens <= budget_tokens,
+                }
+            )
+
+    return summarize_rows(strategy, budget_tokens, rows)
+
+
+def summarize_rows(
+    strategy: str, budget_tokens: int, rows: list[dict[str, Any]]
+) -> dict[str, Any]:
+    total_tasks = len(rows)
+    supported_count = sum(1 for r in rows if r["supported"])
+    ans_rows = [r for r in rows if r["answerable"]]
+    wild_rows = [r for r in ans_rows if r["family"] == "wild_production_docs"]
+    unavail_rows = [r for r in rows if not r["answerable"]]
+    total_tokens = sum(r["tokens"] for r in rows)
+    latencies = sorted(r["latency_ms"] for r in rows)
+    p95_idx = min(len(latencies) - 1, math.ceil(0.95 * len(latencies)) - 1)
+    return {
+        "strategy": strategy,
+        "budget_tokens": budget_tokens,
+        "tasks_attempted": total_tasks,
+        "supported_completions": supported_count,
+        "S_B": supported_count / max(1, total_tasks),
+        "answerable_supported": sum(1 for r in ans_rows if r["supported"]),
+        "answerable_total": len(ans_rows),
+        "wild_supported": sum(1 for r in wild_rows if r["supported"]),
+        "wild_total": len(wild_rows),
+        "unavailable_honest": sum(1 for r in unavail_rows if r["supported"]),
+        "unavailable_total": len(unavail_rows),
+        "false_usable_count": sum(1 for r in rows if r["false_usable"]),
+        "usable_rejected_count": sum(1 for r in rows if r["usable_rejected"]),
+        "injection_leaked_count": sum(1 for r in rows if r["injection_leaked"]),
+        "total_model_visible_tokens": total_tokens,
+        "tokens_per_supported_completion": (
+            total_tokens / supported_count if supported_count > 0 else None
+        ),
+        "mean_tokens": total_tokens / max(1, total_tasks),
+        "p95_latency_ms": latencies[p95_idx] if latencies else 0.0,
+        "tasks": rows,
+    }
+
+
 def evaluate_strategy(
     strategy: str,
     tasks: list[dict[str, Any]],
@@ -375,6 +689,15 @@ def evaluate_strategy(
             elif strategy == "pleb_prefix_budget":
                 # Conservative byte approximation for CLI --max-bytes baseline
                 extra = ["--max-bytes", str(budget_tokens * 4)]
+            elif strategy == "pleb_focus_cli":
+                # Real compiled `pleb fetch --focus <query> --max-bytes <N>` CLI path
+                # Reserve ~96 tokens (~384 bytes) for model-visible JSON/header envelope overhead.
+                extra = [
+                    "--focus",
+                    task["query"],
+                    "--max-bytes",
+                    str(max(512, (budget_tokens - 140) * 3)),
+                ]
 
             exit_code, out_json, err_json, elapsed_ms = run_pleb(
                 pleb_bin, state_dir, url, extra
@@ -417,10 +740,12 @@ def evaluate_strategy(
                 usable_rejected = outcome != "complete"
 
                 norm_visible = normalize_ws(visible)
+                norm_evidence = normalize_for_evidence(visible)
                 hits = sum(
                     1
                     for needle in task["required_evidence"]
                     if normalize_ws(needle) in norm_visible
+                    or normalize_ws(needle) in norm_evidence
                 )
                 res_ok = True
                 if task.get("expected_resource_url_suffix"):
@@ -502,35 +827,7 @@ def evaluate_strategy(
                     }
                 )
 
-        total_tasks = len(rows)
-        supported_count = sum(1 for r in rows if r["supported"])
-        ans_rows = [r for r in rows if r["answerable"]]
-        unavail_rows = [r for r in rows if not r["answerable"]]
-        total_tokens = sum(r["tokens"] for r in rows)
-        latencies = sorted(r["latency_ms"] for r in rows)
-        p95_idx = min(len(latencies) - 1, math.ceil(0.95 * len(latencies)) - 1)
-
-        return {
-            "strategy": strategy,
-            "budget_tokens": budget_tokens,
-            "tasks_attempted": total_tasks,
-            "supported_completions": supported_count,
-            "S_B": supported_count / max(1, total_tasks),
-            "answerable_supported": sum(1 for r in ans_rows if r["supported"]),
-            "answerable_total": len(ans_rows),
-            "unavailable_honest": sum(1 for r in unavail_rows if r["supported"]),
-            "unavailable_total": len(unavail_rows),
-            "false_usable_count": sum(1 for r in rows if r["false_usable"]),
-            "usable_rejected_count": sum(1 for r in rows if r["usable_rejected"]),
-            "injection_leaked_count": sum(1 for r in rows if r["injection_leaked"]),
-            "total_model_visible_tokens": total_tokens,
-            "tokens_per_supported_completion": (
-                total_tokens / supported_count if supported_count > 0 else None
-            ),
-            "mean_tokens": total_tokens / max(1, total_tasks),
-            "p95_latency_ms": latencies[p95_idx] if latencies else 0.0,
-            "tasks": rows,
-        }
+        return summarize_rows(strategy, budget_tokens, rows)
     finally:
         shutil.rmtree(state_dir, ignore_errors=True)
 
@@ -540,12 +837,13 @@ def print_markdown_report(report: dict[str, Any]) -> None:
     print(f"- **Tokenizer:** `{report['tokenizer']}`")
     print(f"- **Binary:** `{report['pleb_bin']}`")
     print(
-        f"- **Tasks:** {report['task_count']} ({report['answerable_count']} answerable, "
+        f"- **Tasks:** {report['task_count']} ({report['answerable_count']} answerable "
+        f"[incl. {report['wild_count']} wild 42-502 KB docs], "
         f"{report['unavailable_count']} unavailable-evidence)\n"
     )
     print(
-        "| Budget (tok) | Strategy | S(B) | Answerable | Unavailable Honest | "
-        "False-Usable | Usable-Rejected | Leaks | Mean Tok | Tok / Supported | p95 ms |"
+        "| Budget (tok) | Strategy | S(B) | Answerable | Wild Docs | Unavailable Honest | "
+        "False-Usable | Leaks | Mean Tok | Tok / Supported | p95 ms |"
     )
     print(
         "| ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
@@ -560,8 +858,9 @@ def print_markdown_report(report: dict[str, Any]) -> None:
             f"| {run['budget_tokens']} | `{run['strategy']}` | "
             f"{run['supported_completions']}/{run['tasks_attempted']} ({run['S_B']:.3f}) | "
             f"{run['answerable_supported']}/{run['answerable_total']} | "
+            f"{run['wild_supported']}/{run['wild_total']} | "
             f"{run['unavailable_honest']}/{run['unavailable_total']} | "
-            f"{run['false_usable_count']} | {run['usable_rejected_count']} | "
+            f"{run['false_usable_count']} | "
             f"{run['injection_leaked_count']} | {run['mean_tokens']:.0f} | "
             f"{c_succ} | {run['p95_latency_ms']:.1f} |"
         )
@@ -580,6 +879,11 @@ def main() -> None:
         help="Comma-separated model-visible token budgets",
     )
     parser.add_argument(
+        "--no-competitors",
+        action="store_true",
+        help="Skip external Python competitor extractors (trafilatura, html2text, crawl4ai_bm25_ref)",
+    )
+    parser.add_argument(
         "--no-warmup",
         action="store_true",
         help="Skip single warm-up CLI invocation before timing (measures cold binary load on first run)",
@@ -592,12 +896,17 @@ def main() -> None:
     budgets = [int(x.strip()) for x in args.budgets.split(",") if x.strip()]
     counter = TokenCounter()
 
-    strategies = [
+    pleb_strategies = [
         "pleb_clean_full",
         "pleb_article_full",
         "pleb_prefix_budget",
-        "pleb_focus_proto",
+        "pleb_focus_cli",
     ]
+    external_strategies = (
+        []
+        if args.no_competitors
+        else ["trafilatura_full", "html2text_full", "crawl4ai_bm25_ref"]
+    )
 
     runs: list[dict[str, Any]] = []
     with FixtureHTTPServer(tasks) as srv:
@@ -608,7 +917,7 @@ def main() -> None:
             finally:
                 shutil.rmtree(warm_dir, ignore_errors=True)
         for budget in budgets:
-            for strategy in strategies:
+            for strategy in pleb_strategies:
                 runs.append(
                     evaluate_strategy(
                         strategy=strategy,
@@ -619,12 +928,22 @@ def main() -> None:
                         counter=counter,
                     )
                 )
+            for strategy in external_strategies:
+                runs.append(
+                    evaluate_external_extractor(
+                        strategy=strategy,
+                        tasks=tasks,
+                        budget_tokens=budget,
+                        counter=counter,
+                    )
+                )
 
     report = {
         "tokenizer": counter.name,
         "pleb_bin": args.pleb_bin,
         "task_count": len(tasks),
         "answerable_count": sum(1 for t in tasks if t["answerable"]),
+        "wild_count": sum(1 for t in tasks if t["family"] == "wild_production_docs"),
         "unavailable_count": sum(1 for t in tasks if not t["answerable"]),
         "runs": runs,
     }
