@@ -3068,3 +3068,60 @@ fn clean_extract_prunes_hidden_lightbox_decorative_imgs_and_sr_custom_elements_w
         .contains("Unconditional Bootstrap hidden pruned."));
     assert!(full.content.contains("/bg.png"));
 }
+
+#[test]
+fn block_anchor_dedups_repeated_permalink_while_preserving_first_and_inline_links() {
+    let url = Url::parse("https://example.com/r/rust/").unwrap();
+    let html = r#"<html><body><main>
+        <article>
+            <h2><a href="/r/rust/posts/1">First Post Title</a></h2>
+            <a href="/r/rust/posts/1"><p>First paragraph body.</p><p>Second paragraph body.</p></a>
+        </article>
+        <article>
+            <h2><a href="/r/rust/posts/2">Second Post Title</a></h2>
+            <a href="/r/rust/posts/2"><p>Single paragraph summary.</p></a>
+        </article>
+        <article>
+            <a href="/r/rust/posts/unseen"><p>Unseen block one.</p><p>Unseen block two.</p></a>
+        </article>
+        <p>Inline <a href="/r/rust/posts/inline">first inline</a> and <a href="/r/rust/posts/inline">second inline</a> stay linked.</p>
+    </main></body></html>"#;
+
+    let res = extract_document(
+        html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions {
+            mode: ExtractMode::Full,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert!(res
+        .content
+        .contains("[First Post Title](https://example.com/r/rust/posts/1)"));
+    assert!(res.content.contains("First paragraph body."));
+    assert!(res.content.contains("Second paragraph body."));
+    assert!(!res
+        .content
+        .contains("[https://example.com/r/rust/posts/1](https://example.com/r/rust/posts/1)"));
+
+    assert!(res
+        .content
+        .contains("[Second Post Title](https://example.com/r/rust/posts/2)"));
+    assert!(res.content.contains("Single paragraph summary."));
+    assert!(!res
+        .content
+        .contains("[Single paragraph summary.](https://example.com/r/rust/posts/2)"));
+
+    assert!(res.content.contains(
+        "[https://example.com/r/rust/posts/unseen](https://example.com/r/rust/posts/unseen)"
+    ));
+    assert!(res
+        .content
+        .contains("[first inline](https://example.com/r/rust/posts/inline)"));
+    assert!(res
+        .content
+        .contains("[second inline](https://example.com/r/rust/posts/inline)"));
+}

@@ -52,6 +52,7 @@ pub fn html_to_compact_markdown(
     );
 
     let anchor_base = base_url.clone();
+    let seen_hrefs = std::sync::Mutex::new(std::collections::HashSet::<String>::new());
     builder = builder.add_handler(
         vec!["a"],
         move |handlers: &dyn Handlers, element: Element| {
@@ -78,7 +79,18 @@ pub fn html_to_compact_markdown(
             match resolve_and_clean_url(raw_href, &anchor_base) {
                 ResolvedUrl::Drop | ResolvedUrl::UnwrapText => Some(inner.into()),
                 ResolvedUrl::Resolved(dest) => {
-                    let body = format_anchor_markdown(core, &dest, &format_destination(&dest));
+                    let wraps_block = leading_ws.contains("\n\n") || trailing_ws.contains("\n\n");
+                    let already_linked = !seen_hrefs
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(dest.clone());
+                    let body = format_anchor_markdown(
+                        core,
+                        &dest,
+                        &format_destination(&dest),
+                        wraps_block,
+                        already_linked,
+                    );
                     Some(format!("{leading_ws}{body}{trailing_ws}").into())
                 }
             }
@@ -139,7 +151,13 @@ pub(crate) fn split_atx_heading(trimmed_start: &str) -> Option<(u8, &str, &str)>
     (!heading_text.is_empty()).then_some((hashes as u8, &trimmed_start[..hashes + 1], heading_text))
 }
 
-fn format_anchor_markdown(core: &str, dest: &str, formatted_dest: &str) -> String {
+fn format_anchor_markdown(
+    core: &str,
+    dest: &str,
+    formatted_dest: &str,
+    wraps_block: bool,
+    already_linked: bool,
+) -> String {
     let (first_line, rest) = core
         .split_once('\n')
         .map_or((core, None), |(f, r)| (f, Some(r)));
@@ -150,7 +168,13 @@ fn format_anchor_markdown(core: &str, dest: &str, formatted_dest: &str) -> Strin
         };
     }
     if core.contains("\n\n") || core.lines().any(|l| parse_opening_fence(l).is_some()) {
-        format!("{core}\n\n[{dest}]({formatted_dest})")
+        if already_linked {
+            core.to_string()
+        } else {
+            format!("{core}\n\n[{dest}]({formatted_dest})")
+        }
+    } else if already_linked && wraps_block {
+        core.to_string()
     } else {
         format!("[{core}]({formatted_dest})")
     }
