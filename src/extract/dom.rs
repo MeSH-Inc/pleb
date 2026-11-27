@@ -47,6 +47,15 @@ const BOILERPLATE_ATTR_PATTERNS: &[&str] = &[
     "mdbook-help-container",
     "wbc-editpage",
     "printfooter",
+    "promotedlink",
+    "promoted-post",
+    "sponsored-post",
+    "ad-slot",
+    "ad-banner",
+    "ad-container",
+    "ad-link-bar",
+    "left-sidebar",
+    "right-sidebar",
 ];
 
 const CODE_GUTTER_CLASSES: &[&str] = &[
@@ -522,11 +531,15 @@ fn prune_dom(doc: &mut Html, mode: ExtractMode) -> HashMap<NodeId, NodeMetrics> 
         }
 
         for el in doc.select(&ATTR_SEL) {
-            let name = el.value().name();
-            if matches!(name, "html" | "body" | "main" | "article") {
+            let val = el.value();
+            if matches!(val.name(), "html" | "body") || is_landmark_element(val) {
                 continue;
             }
-            if is_boilerplate_attr(el.value().attr("id"), el.value().attr("class")) {
+            if is_boilerplate_attr(val.attr("id"), val.attr("class"))
+                && !el.descendants().any(|d| {
+                    matches!(d.value(), Node::Element(e) if e.name() == "h1" || is_landmark_element(e))
+                })
+            {
                 to_detach.push(el.id());
             }
         }
@@ -899,7 +912,7 @@ fn is_boilerplate_attr(id: Option<&str>, class: Option<&str>) -> bool {
 
     if BOILERPLATE_ATTR_PATTERNS
         .iter()
-        .any(|pat| combined.contains(pat))
+        .any(|pat| contains_word_prefix(&combined, pat))
     {
         return true;
     }
@@ -908,6 +921,19 @@ fn is_boilerplate_attr(id: Option<&str>, class: Option<&str>) -> bool {
         .unwrap_or("")
         .split_whitespace()
         .any(|tok| tok.eq_ignore_ascii_case("sr-only"))
+}
+
+fn contains_word_prefix(haystack: &str, needle: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let mut offset = 0;
+    while let Some(rel) = haystack[offset..].find(needle) {
+        let start = offset + rel;
+        if start == 0 || !bytes[start - 1].is_ascii_alphanumeric() {
+            return true;
+        }
+        offset = start + 1;
+    }
+    false
 }
 
 fn select_root_id(doc: &Html, mode: ExtractMode, metrics: &HashMap<NodeId, NodeMetrics>) -> NodeId {

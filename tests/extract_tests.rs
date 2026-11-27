@@ -2638,3 +2638,122 @@ fn pilcrow_stripping_summary_heading_order_and_anchor_tooltip_compaction() {
     .unwrap();
     assert!(txt.content.find("pub fn clear_poison").unwrap() < txt.content.find("1.77.0").unwrap());
 }
+
+#[test]
+fn clean_extract_preserves_article_prose_mentioning_ad_and_sidebar_tokens() {
+    let url = Url::parse("https://docs.example.com/dom-patterns").unwrap();
+    let html = r#"<!doctype html>
+<html><head><title>DOM Patterns</title></head><body>
+<div id="left-sidebar-container" class="left-sidebar"><button>Continue with Google</button></div>
+<main><article>
+  <h1>DOM Patterns</h1>
+  <p>Classes such as promotedlink, sponsored-post, ad-slot, and left-sidebar frequently wrap feed promotions and side rails in modern web apps.</p>
+</article>
+<div class="thread-container"><p>Thread content stays intact.</p></div>
+<div class="download-container"><p>Download binary details stay intact.</p></div>
+<div class="lead-banner"><p>Lead summary stays intact.</p></div>
+<div class="upload-slot"><p>Upload instructions stay intact.</p></div>
+<shreddit-ad-post class="promotedlink"><div class="ad-link-bar"><a href="https://ads.example.com">Shop Now</a></div></shreddit-ad-post>
+</main>
+</body></html>"#;
+
+    let doc = extract_document(html, &url, Some("text/html"), &ExtractOptions::default()).unwrap();
+    for expected in [
+        "DOM Patterns",
+        "promotedlink",
+        "sponsored-post",
+        "ad-slot",
+        "left-sidebar",
+        "Thread content stays intact.",
+        "Download binary details stay intact.",
+        "Lead summary stays intact.",
+        "Upload instructions stay intact.",
+    ] {
+        assert!(
+            doc.content.contains(expected),
+            "prose token {expected:?} must be kept; got:\n{}",
+            doc.content
+        );
+    }
+    assert!(!doc.content.contains("Shop Now"));
+    assert!(!doc.content.contains("Continue with Google"));
+}
+
+#[test]
+fn clean_extract_preserves_sidebar_wrapper_containing_main_landmark_or_h1() {
+    let url = Url::parse("https://docs.example.com/layout").unwrap();
+    let wrapped_main = r#"<!doctype html>
+<html><head><title>Wrapped Main</title></head><body>
+<div class="left-sidebar"><main><h1>Real Title</h1><p>Body paragraph with substantial technical documentation content so clean extraction keeps it intact.</p></main></div>
+</body></html>"#;
+    let main_doc = extract_document(
+        wrapped_main,
+        &url,
+        Some("text/html"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert!(main_doc.content.contains("Real Title"));
+    assert!(main_doc
+        .content
+        .contains("substantial technical documentation"));
+
+    let wrapped_h1 = r#"<!doctype html>
+<html><head><title>Wrapped Heading</title></head><body>
+<div class="right-sidebar"><h1>Standalone Heading</h1><p>Core article text inside a mislabeled wrapper must survive boilerplate attribute pruning.</p></div>
+</body></html>"#;
+    let h1_doc = extract_document(
+        wrapped_h1,
+        &url,
+        Some("text/html"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert!(h1_doc.content.contains("Standalone Heading"));
+    assert!(h1_doc.content.contains("Core article text"));
+}
+
+#[test]
+fn compact_markdown_collapses_horizontal_rules_while_preserving_setext_and_fenced_blocks() {
+    let input = "* * *\n\n# Top Section\n\n* * *\n\n* * *\n\nSetext Heading\n---\n\n```yaml\n---\nkey: value\n---\n```\n\nBody text.\n\n* * *\n\n---\n";
+    let out = compact_markdown(input);
+
+    assert!(
+        out.starts_with("# Top Section"),
+        "leading HR should be trimmed; got:\n{out}"
+    );
+    assert!(
+        out.ends_with("Body text."),
+        "trailing HRs should be trimmed; got:\n{out}"
+    );
+    assert_eq!(
+        out.matches("* * *").count(),
+        1,
+        "consecutive outside-fence HRs should collapse to one; got:\n{out}"
+    );
+    assert!(
+        out.contains("Setext Heading\n---"),
+        "Setext H2 underline must remain intact; got:\n{out}"
+    );
+    assert!(
+        out.contains("```yaml\n---\nkey: value\n---\n```"),
+        "YAML frontmatter-style fenced block dividers must remain intact; got:\n{out}"
+    );
+}
+
+#[test]
+fn compact_markdown_collapses_duplicate_empty_alt_icons_and_keeps_distinct() {
+    let input = "[![](https://cdn.example.com/a.png) ![](https://cdn.example.com/a.png) r/rust](https://example.com/r/rust)\n\n![](https://cdn.example.com/a.png) ![](https://cdn.example.com/b.png)\n\n![](https://en.wikipedia.org/wiki/Foo_(bar).png) ![](https://en.wikipedia.org/wiki/Foo_(bar).png) Wiki";
+    let out = compact_markdown(input);
+
+    assert!(out.contains("[![](https://cdn.example.com/a.png) r/rust](https://example.com/r/rust)"));
+    assert!(
+        out.contains("![](https://cdn.example.com/a.png) ![](https://cdn.example.com/b.png)"),
+        "distinct icon images must both remain; got:\n{out}"
+    );
+    assert!(
+        out.contains("![](https://en.wikipedia.org/wiki/Foo_(bar).png) Wiki"),
+        "balanced-paren URL duplicate should collapse cleanly; got:\n{out}"
+    );
+    assert_eq!(out.matches("Foo_(bar).png").count(), 1);
+}

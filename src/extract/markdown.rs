@@ -348,25 +348,26 @@ pub fn open_fence_at(md: &str, cut: usize) -> Option<(char, usize, usize, usize)
 /// - Remove column-width padding inside pipe tables
 /// - Normalize table separator cells (`------` -> `---`)
 /// - Collapse 3+ consecutive newlines down to 2 (one blank line)
+/// - Collapse duplicate horizontal rules, trim leading/trailing ones, and dedup adjacent `![](u)` icons
 /// - Trim trailing horizontal whitespace per line
 pub fn compact_markdown(md: &str) -> String {
     let mut out_lines: Vec<String> = Vec::new();
     let mut fence = FenceTracker::default();
     let mut blank_run = 0usize;
+    let mut last_was_hr = false;
 
     for raw_line in md.lines() {
-        match fence.step(raw_line) {
-            FenceLine::Opening => {
-                out_lines.push(raw_line.trim_end().to_string());
-                blank_run = 0;
-                continue;
-            }
-            FenceLine::Inside | FenceLine::Closing => {
-                out_lines.push(raw_line.to_string());
-                blank_run = 0;
-                continue;
-            }
-            FenceLine::Outside => {}
+        let step = fence.step(raw_line);
+        if !matches!(step, FenceLine::Outside) {
+            last_was_hr = false;
+            blank_run = 0;
+            let kept = if matches!(step, FenceLine::Opening) {
+                raw_line.trim_end()
+            } else {
+                raw_line
+            };
+            out_lines.push(kept.to_string());
+            continue;
         }
 
         let trimmed_end = raw_line.trim_end();
@@ -377,16 +378,79 @@ pub fn compact_markdown(md: &str) -> String {
             }
             continue;
         }
+        let allow_setext = !last_was_hr && out_lines.last().is_some_and(|p| !p.is_empty());
+        if is_thematic_break(trimmed_end, allow_setext) {
+            if out_lines.is_empty() || last_was_hr {
+                continue;
+            }
+            last_was_hr = true;
+            blank_run = 0;
+            out_lines.push(trimmed_end.to_string());
+            continue;
+        }
+        last_was_hr = false;
         blank_run = 0;
 
-        out_lines.push(compact_table_row(trimmed_end).unwrap_or_else(|| trimmed_end.to_string()));
+        let deduped = dedup_adjacent_empty_alt_images(trimmed_end);
+        out_lines.push(compact_table_row(&deduped).unwrap_or_else(|| deduped.into_owned()));
     }
 
-    while out_lines.last().is_some_and(String::is_empty) {
-        out_lines.pop();
+    while let Some(last) = out_lines.last() {
+        if last.is_empty() || std::mem::take(&mut last_was_hr) {
+            out_lines.pop();
+        } else {
+            break;
+        }
     }
 
     out_lines.join("\n")
+}
+
+fn is_thematic_break(line: &str, allow_setext_dash: bool) -> bool {
+    let t = line.trim();
+    let Some(m) = t.bytes().find(|b| !b.is_ascii_whitespace()) else {
+        return false;
+    };
+    matches!(m, b'*' | b'-' | b'_')
+        && !(m == b'-' && allow_setext_dash)
+        && t.bytes().all(|b| b == m || b.is_ascii_whitespace())
+        && t.bytes().filter(|&b| b == m).count() >= 3
+}
+
+fn dedup_adjacent_empty_alt_images(line: &str) -> std::borrow::Cow<'_, str> {
+    if !line.contains("![](") {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let (mut out, mut i) = (String::with_capacity(line.len()), 0);
+    while let Some(rel) = line[i..].find("![](") {
+        let start = i + rel;
+        out.push_str(&line[i..start]);
+        let mut depth = 1usize;
+        let Some(tok_end) = line[start + 4..].char_indices().find_map(|(k, c)| match c {
+            '(' => {
+                depth += 1;
+                None
+            }
+            ')' if depth == 1 => Some(start + 4 + k + 1),
+            ')' => {
+                depth -= 1;
+                None
+            }
+            _ => None,
+        }) else {
+            out.push_str("![](");
+            i = start + 4;
+            continue;
+        };
+        let tok = &line[start..tok_end];
+        out.push_str(tok);
+        i = tok_end;
+        while let Some(rest) = line[i..].trim_start_matches([' ', '\t']).strip_prefix(tok) {
+            i = line.len() - rest.len();
+        }
+    }
+    out.push_str(&line[i..]);
+    std::borrow::Cow::Owned(out)
 }
 
 fn compact_table_row(line: &str) -> Option<String> {

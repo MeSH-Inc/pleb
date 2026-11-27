@@ -1,0 +1,34 @@
+<!-- pleb-fixture: {"tier":"ratchet","url":"https://feed.example.com/r/rust/","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"Systems Discussion","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["Migrating our Messages API to Rust","How advertising pipelines handle attribution","Comparing CSS sidebar layouts"],"forbidden_substrings":["Advertisement: Save","Shop Now","Sponsored Cloud Tier","Join the most real place on the internet","Continue with Google","* * * * * *","![](https://feed.example.com/assets/icon.png) ![](https://feed.example.com/assets/icon.png)"],"expected_images":["https://feed.example.com/assets/icon.png"],"minimum_output_bytes":120,"maximum_output_bytes":1200,"expected_structure":{"minimum_headings":2}}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><title>Systems Discussion</title></head>
+<body>
+  <div id="left-sidebar-container" class="left-sidebar">
+    <p>Join the most real place on the internet</p>
+    <a href="/auth/google">Continue with Google</a>
+    <a href="/login">Continue with Email</a>
+  </div>
+  <main>
+    <h1>Systems Discussion</h1>
+    <img src="/assets/icon.png" alt="">
+    <img src="/assets/icon.png" alt="">
+    <hr>
+    <hr>
+    <article>
+      <h2><a href="/r/rust/posts/1">Migrating our Messages API to Rust</a></h2>
+      <p>How advertising pipelines handle attribution cleanly across low-latency consumers.</p>
+    </article>
+    <shreddit-ad-post id="t3_ad1" class="promotedlink block" call-to-action="Shop Now">
+      <p>Advertisement: Save 30% on cloud widgets today.</p>
+      <div class="ad-link-bar"><a href="https://ad.example.com/shop">Shop Now</a></div>
+    </shreddit-ad-post>
+    <div class="sponsored-post">
+      <p>Sponsored Cloud Tier — Deploy managed widgets in seconds.</p>
+    </div>
+    <article>
+      <h2><a href="/r/rust/posts/2">Comparing CSS sidebar layouts</a></h2>
+      <p>Practical trade-offs between subgrid and container queries for responsive columns.</p>
+    </article>
+  </main>
+</body>
+</html>
