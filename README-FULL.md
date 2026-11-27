@@ -282,7 +282,7 @@ When `--cdp-url` (`PLEB_CDP_URL`) is configured (and `--proxy` is unset so WebSo
 
 ### Web Bot Auth (RFC 9421 Ed25519)
 
-When `web-bot-auth-jwk` (Ed25519 private JWK) and `web-bot-auth-agent` (`https://` signature-agent URL) are configured via `pleb auth set`, `pleb fetch` signs public `https://` acquisition requests with RFC 9421 `Signature`, `Signature-Input` (`@authority` and `signature-agent`, `tag="web-bot-auth"`, RFC 7638 `keyid`), and `Signature-Agent` headers. Plaintext `http://`, local/private targets, `pleb search`, `robots.txt`, `sitemap.xml`, and CDP handshakes stay unsigned, and cross-authority / downgrade redirects strip or re-sign headers hop-by-hop. Pass `--no-web-bot-auth` (`PLEB_NO_WEB_BOT_AUTH`) to disable signing.
+Run `pleb auth init-web-bot-auth --agent https://<your-domain>` to generate an Ed25519 keypair into your local credential store and print the public directory JSON to host at `https://<your-domain>/.well-known/http-message-signatures-directory` (or import an existing keypair with `pleb auth set web-bot-auth-jwk` and `web-bot-auth-agent`). When both are configured, `pleb fetch` signs public `https://` acquisition requests with RFC 9421 `Signature`, `Signature-Input` (`@authority` and `signature-agent`, `tag="web-bot-auth"`, RFC 7638 `keyid`), and `Signature-Agent` headers. Plaintext `http://`, local/private targets, `pleb search`, `robots.txt`, `sitemap.xml`, and CDP handshakes stay unsigned, and cross-authority / downgrade redirects strip or re-sign headers hop-by-hop. Pass `--no-web-bot-auth` (`PLEB_NO_WEB_BOT_AUTH`) to disable signing.
 
 ### Unified Transport Daemon (`daemon.sock`)
 
@@ -596,6 +596,7 @@ pleb search --extra-snippets "cronet http2"
 | :--- | :--- |
 | `pleb auth set <provider> [--stdin] [--storage <auto\|keychain\|file>]` | Stores a credential (`brave`, `tavily`, `serper`, `exa`, `searxng`, `web-bot-auth-jwk`, `web-bot-auth-agent`, `cdp-access-client-id`, `cdp-access-client-secret`, `cdp-access-host`) via hidden TTY prompt or `--stdin` and clears stale search cooldowns. |
 | `pleb auth remove <provider> [--storage <auto\|keychain\|file>]` | Deletes stored credentials, clears cooldowns, and warns if an env var still overrides the provider. |
+| `pleb auth init-web-bot-auth --agent <URL> [--storage <auto\|keychain\|file>] [--force]` | Generates an Ed25519 keypair + validates `agent`, stores `web-bot-auth-jwk` & `web-bot-auth-agent`, and prints public directory JSON (no private `"d"` key material emitted). |
 | `pleb auth status` | Reports search provider statuses, `agent_identity` (`keyid`), and `cdp_access` (`access_host`) configuration (supports `--json`). |
 
 ### `pleb crawl` and `pleb map`
@@ -615,7 +616,8 @@ pleb search --extra-snippets "cronet http2"
 ### Daemon, Session, Status, MCP, Setup, and Skill Commands
 
 ```bash
-pleb setup                  # Register `pleb mcp` + bundled skill into Claude Code and Codex (--target, --scope, --skip-skill, --remove, --dry-run)
+pleb setup                  # Register `pleb mcp`, Claude Code WebFetch hook (--hooks fallback|redirect|none), and skill (--target, --scope, --skip-skill, --remove, --dry-run)
+pleb hook claude-webfetch  # Claude Code WebFetch hook adapter (--mode fallback|redirect)
 pleb mcp                    # Run stdio JSON-RPC 2.0 MCP server (pleb_fetch, pleb_search, pleb_crawl, pleb_map, pleb_status)
 pleb status                 # Binary, Cronet, CEF, daemon, state dir, search providers (--json supported)
 pleb daemon status          # Transport daemon status (--json supported)
@@ -648,6 +650,7 @@ pleb skill install          # Write bundled SKILL.md into local agent skill dire
 | `PLEB_CEF_RENDERER` | Explicit path to a `v5-meta` `pleb-renderer` binary (overrides `<state_dir>/cef` discovery). |
 | `PLEB_NO_HOME_CEF=1` | Disables fallback discovery of `~/.pleb/cef` (used in hermetic tests). |
 | `PLEB_DAEMON_EXECUTABLE` | Explicit path to the `pleb` executable spawned when auto-starting the background daemon. |
+| `PLEB_CLAUDE_SETTINGS` | Optional override for Claude Code's `settings.json` path edited by `pleb setup --hooks`. |
 | `RUST_LOG` | Overrides default `tracing` filter on `stderr`. |
 
 ### State Directory Layout (`<state_dir>`, mode `0o700`)
@@ -762,12 +765,13 @@ Multi-URL and `stdin` (`-`) fetches emit an array (`--json`) or newline-delimite
 | `pleb crawl` (`CrawlResult`) | `pages` (`[{ url, title, content, depth, status_code, strategy, content_outcome, truncated, acquired_sha256, warning? }]`), `failed_pages` (`[{ url, depth, error, kind }]`, omitted when empty), `urls_discovered`, `timing_ms` |
 | `pleb map` (`MapResult`) | `urls` (`string[]`), `timing_ms`, `from_sitemap` |
 | `pleb auth set` | `provider`, `stored`, `source` |
+| `pleb auth init-web-bot-auth` | `keyid`, `agent_url`, `directory_url`, `jwk_source`, `agent_source`, `public_jwk`, `directory_json` |
 | `pleb auth remove` | `provider`, `removed`, `removed_from`, `env_var_still_set` |
 | `pleb daemon stop` | `stopped` |
 | `pleb session clear` | `cleared`, `state_dir` |
 | `pleb skill print` | `name`, `version`, `content` |
 | `pleb skill install` | `name`, `version`, `installed` (`[{ path, status }]`) |
-| `pleb setup` (`SetupReport`) | `pleb_binary`, `dry_run`, `remove`, `results` (`[{ target, status, binary, command, detail? }]`), `skills` (`[{ path, status }]`, omitted when empty) |
+| `pleb setup` (`SetupReport`) | `pleb_binary`, `dry_run`, `remove`, `results` (`[{ target, status, binary, command, detail? }]`), `hook` (`{ target, mode, status, settings_path, detail? }`, omitted when skipped), `skills` (`[{ path, status }]`, omitted when empty) |
 
 ---
 

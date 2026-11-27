@@ -1,7 +1,12 @@
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
+use serde_json::{json, Map, Value};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static SETTINGS_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -31,10 +36,32 @@ impl ClaudeScope {
     }
 }
 
+/// Claude Code WebFetch hook mode installed into Claude settings.json.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookMode {
+    #[default]
+    Fallback,
+    Redirect,
+    None,
+}
+
+impl HookMode {
+    /// Returns the CLI/JSON kebab/snake identifier for this hook mode.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fallback => "fallback",
+            Self::Redirect => "redirect",
+            Self::None => "none",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SetupOptions {
     pub target: SetupTarget,
     pub claude_scope: ClaudeScope,
+    pub hooks: HookMode,
     pub remove: bool,
     pub dry_run: bool,
     pub pleb_binary: Option<PathBuf>,
@@ -45,6 +72,7 @@ impl Default for SetupOptions {
         Self {
             target: SetupTarget::All,
             claude_scope: ClaudeScope::User,
+            hooks: HookMode::Fallback,
             remove: false,
             dry_run: false,
             pleb_binary: None,
@@ -68,12 +96,25 @@ pub struct SkillInstallStatus {
     pub status: &'static str,
 }
 
+/// Outcome of configuring or removing the Claude Code WebFetch hook.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HookSetupResult {
+    pub target: &'static str,
+    pub mode: &'static str,
+    pub status: &'static str,
+    pub settings_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SetupReport {
     pub pleb_binary: String,
     pub dry_run: bool,
     pub remove: bool,
     pub results: Vec<HarnessSetupResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook: Option<HookSetupResult>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<SkillInstallStatus>,
 }
@@ -138,13 +179,352 @@ pub fn run_setup(options: &SetupOptions) -> Result<SetupReport> {
         )?);
     }
 
+    let hook = if matches!(options.target, SetupTarget::All | SetupTarget::Claude)
+        && options.hooks != HookMode::None
+    {
+        let claude_detected = results
+            .iter()
+            .any(|r| r.target == "claude" && r.status != "not_found");
+        configure_claude_hooks(
+            options.claude_scope,
+            options.hooks,
+            &pleb_str,
+            options.remove,
+            options.dry_run,
+            options.target == SetupTarget::Claude || claude_detected,
+        )?
+    } else {
+        None
+    };
+
     Ok(SetupReport {
         pleb_binary: pleb_str,
         dry_run: options.dry_run,
         remove: options.remove,
         results,
+        hook,
         skills: Vec::new(),
     })
+}
+
+const HOOK_EVENTS: [&str; 2] = ["PreToolUse", "PostToolUseFailure"];
+const MAX_HOOK_STDIN_BYTES: u64 = 256 * 1024;
+
+/// Executes the Claude Code `WebFetch` hook protocol for `PreToolUse` (`redirect`) or `PostToolUseFailure` (`fallback`).
+pub fn run_claude_webfetch_hook(
+    mode: HookMode,
+    stdin: &mut impl Read,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> Result<u8> {
+    let mut buf = Vec::new();
+    stdin.take(MAX_HOOK_STDIN_BYTES).read_to_end(&mut buf)?;
+    if mode == HookMode::None {
+        return Ok(0);
+    }
+
+    let parsed = (!buf.is_empty())
+        .then(|| serde_json::from_slice::<Value>(&buf).ok())
+        .flatten();
+    if parsed
+        .as_ref()
+        .and_then(|v| v.get("is_interrupt"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(0);
+    }
+
+    let sanitized_url = parsed
+        .as_ref()
+        .and_then(|v| v.get("tool_input"))
+        .and_then(|ti| ti.get("url"))
+        .and_then(Value::as_str)
+        .map(|s| {
+            s.chars()
+                .filter(|c| !c.is_control())
+                .take(1024)
+                .collect::<String>()
+        })
+        .filter(|s| !s.trim().is_empty());
+
+    match mode {
+        HookMode::Fallback => {
+            let msg = match sanitized_url {
+                Some(url) => format!(
+                    "WebFetch failed for {url}. Retry with the local `pleb_fetch` MCP tool (url=\"{url}\") — `pleb` runs from the host machine over Chrome TLS (Cronet) with automatic 403/SPA escalation — or run `pleb fetch`."
+                ),
+                None => "WebFetch failed. Retry with the local `pleb_fetch` MCP tool or `pleb fetch <url>` (`pleb` uses host Chrome TLS and local escalation instead of datacenter IPs).".to_string(),
+            };
+            let payload = json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUseFailure",
+                    "additionalContext": msg,
+                }
+            });
+            writeln!(stdout, "{payload}")?;
+            stdout.flush()?;
+            Ok(0)
+        }
+        HookMode::Redirect => {
+            let msg = match sanitized_url {
+                Some(url) => format!(
+                    "Use the local `pleb_fetch` MCP tool (url=\"{url}\") or `pleb fetch \"{url}\"` instead of built-in WebFetch: `pleb` fetches from the host machine over Chrome TLS (Cronet) with automatic 403/SPA escalation."
+                ),
+                None => "Use the local `pleb_fetch` MCP tool or `pleb fetch <url>` instead of built-in WebFetch.".to_string(),
+            };
+            writeln!(stderr, "{msg}")?;
+            stderr.flush()?;
+            Ok(2)
+        }
+        HookMode::None => Ok(0),
+    }
+}
+
+fn configure_claude_hooks(
+    scope: ClaudeScope,
+    mode: HookMode,
+    pleb_bin: &str,
+    remove: bool,
+    dry_run: bool,
+    claude_explicit_or_present: bool,
+) -> Result<Option<HookSetupResult>> {
+    let settings_override = std::env::var_os("PLEB_CLAUDE_SETTINGS")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let settings_path = match &settings_override {
+        Some(p) => p.clone(),
+        None => resolve_claude_settings_path(scope)?,
+    };
+    let path_str = settings_path.display().to_string();
+
+    let exists = settings_path.exists();
+    if !claude_explicit_or_present && settings_override.is_none() && !exists {
+        return Ok(None);
+    }
+
+    let hook_cmd = format_hook_command(pleb_bin, mode);
+    if dry_run {
+        return Ok(Some(HookSetupResult {
+            target: "claude",
+            mode: mode.as_str(),
+            status: "planned",
+            settings_path: path_str,
+            detail: Some(if remove {
+                "remove pleb WebFetch hook".to_string()
+            } else {
+                format!("{} -> {}", hook_event_name(mode), hook_cmd)
+            }),
+        }));
+    }
+
+    if !exists && remove {
+        return Ok(Some(HookSetupResult {
+            target: "claude",
+            mode: mode.as_str(),
+            status: "not_present",
+            settings_path: path_str,
+            detail: None,
+        }));
+    }
+
+    let mut root: Value = if exists {
+        let raw = std::fs::read_to_string(&settings_path)
+            .with_context(|| format!("failed to read {}", settings_path.display()))?;
+        if raw.trim().is_empty() {
+            Value::Object(Map::new())
+        } else {
+            let parsed: Value = serde_json::from_str(&raw)
+                .with_context(|| format!("invalid JSON in {}", settings_path.display()))?;
+            if !parsed.is_object() {
+                bail!(
+                    "expected top-level JSON object in {}",
+                    settings_path.display()
+                );
+            }
+            parsed
+        }
+    } else {
+        Value::Object(Map::new())
+    };
+
+    let original = root.clone();
+    let removed_any = strip_pleb_webfetch_hooks(&mut root);
+
+    let status = if remove {
+        if removed_any {
+            "removed"
+        } else {
+            "not_present"
+        }
+    } else {
+        insert_pleb_webfetch_hook(&mut root, mode, &hook_cmd, &settings_path)?;
+        if root == original {
+            "up_to_date"
+        } else {
+            "configured"
+        }
+    };
+
+    if root != original || (!exists && !remove) {
+        let mut encoded = serde_json::to_string_pretty(&root)?;
+        encoded.push('\n');
+        write_settings_atomic(&settings_path, encoded.as_bytes())?;
+    }
+
+    Ok(Some(HookSetupResult {
+        target: "claude",
+        mode: mode.as_str(),
+        status,
+        settings_path: path_str,
+        detail: (!remove).then(|| format!("event={}", hook_event_name(mode))),
+    }))
+}
+
+fn hook_event_name(mode: HookMode) -> &'static str {
+    match mode {
+        HookMode::Fallback => "PostToolUseFailure",
+        HookMode::Redirect => "PreToolUse",
+        HookMode::None => "",
+    }
+}
+
+fn format_hook_command(pleb_bin: &str, mode: HookMode) -> String {
+    let quoted = if !pleb_bin.is_empty()
+        && pleb_bin
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'-' | b'.' | b':'))
+    {
+        pleb_bin.to_string()
+    } else {
+        format!("'{}'", pleb_bin.replace('\'', "'\\''"))
+    };
+    format!("{quoted} hook claude-webfetch --mode {}", mode.as_str())
+}
+
+fn is_pleb_webfetch_hook_command(cmd: &str) -> bool {
+    cmd.contains("hook claude-webfetch") && cmd.contains("pleb")
+}
+
+fn strip_pleb_webfetch_hooks(root: &mut Value) -> bool {
+    let Some(root_obj) = root.as_object_mut() else {
+        return false;
+    };
+    let Some(hooks_obj) = root_obj.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return false;
+    };
+
+    let mut removed_any = false;
+    for event in HOOK_EVENTS {
+        let Some(entries) = hooks_obj.get_mut(event).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        entries.retain_mut(|entry| {
+            let Some(entry_obj) = entry.as_object_mut() else {
+                return true;
+            };
+            let Some(inner_hooks) = entry_obj.get_mut("hooks").and_then(Value::as_array_mut) else {
+                return true;
+            };
+            let before_len = inner_hooks.len();
+            inner_hooks.retain(|h| {
+                let is_ours = h
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_pleb_webfetch_hook_command);
+                if is_ours {
+                    removed_any = true;
+                }
+                !is_ours
+            });
+            !(inner_hooks.len() != before_len && inner_hooks.is_empty())
+        });
+        if entries.is_empty() {
+            hooks_obj.remove(event);
+        }
+    }
+
+    if hooks_obj.is_empty() {
+        root_obj.remove("hooks");
+    }
+    removed_any
+}
+
+fn insert_pleb_webfetch_hook(
+    root: &mut Value,
+    mode: HookMode,
+    command: &str,
+    settings_path: &Path,
+) -> Result<()> {
+    let root_obj = root.as_object_mut().ok_or_else(|| {
+        anyhow::anyhow!(
+            "expected top-level JSON object in {}",
+            settings_path.display()
+        )
+    })?;
+    let hooks_entry = root_obj
+        .entry("hooks")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let hooks_obj = hooks_entry.as_object_mut().ok_or_else(|| {
+        anyhow::anyhow!(
+            "expected \"hooks\" to be a JSON object in {}",
+            settings_path.display()
+        )
+    })?;
+    let event = hook_event_name(mode);
+    let event_entry = hooks_obj
+        .entry(event)
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let event_arr = event_entry.as_array_mut().ok_or_else(|| {
+        anyhow::anyhow!(
+            "expected hooks.{event} to be a JSON array in {}",
+            settings_path.display()
+        )
+    })?;
+    event_arr.push(json!({
+        "matcher": "WebFetch",
+        "hooks": [{
+            "type": "command",
+            "command": command,
+        }],
+    }));
+    Ok(())
+}
+
+fn resolve_claude_settings_path(scope: ClaudeScope) -> Result<PathBuf> {
+    match scope {
+        ClaudeScope::User => {
+            let home = std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .context("cannot resolve HOME for Claude settings path")?;
+            Ok(home.join(".claude").join("settings.json"))
+        }
+        ClaudeScope::Project => Ok(PathBuf::from(".claude").join("settings.json")),
+        ClaudeScope::Local => Ok(PathBuf::from(".claude").join("settings.local.json")),
+    }
+}
+
+fn write_settings_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        anyhow::anyhow!("settings path {} missing parent directory", path.display())
+    })?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("settings.json");
+    let seq = SETTINGS_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = parent.join(format!(".{file_name}.tmp.{}.{seq}", std::process::id()));
+    std::fs::write(&tmp_path, bytes)
+        .with_context(|| format!("failed to write temporary settings {}", tmp_path.display()))?;
+    if let Err(err) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err).with_context(|| format!("failed to replace {}", path.display()));
+    }
+    Ok(())
 }
 
 fn format_manual_command(cli_name: &str, args: &[&str]) -> String {

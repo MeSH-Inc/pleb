@@ -16,7 +16,8 @@ Local, MIT-licensed, zero-telemetry web acquisition CLI and stdio MCP server by 
 Register `pleb mcp` (`pleb_fetch`, `pleb_search`, `pleb_crawl`, `pleb_map`, `pleb_status`) and the bundled `SKILL.md` into Claude Code and Codex, or run the stdio MCP server directly:
 
 ```bash
-pleb setup [--target all|claude|codex] [--scope user|local|project] [--skip-skill] [--remove] [--dry-run]
+pleb setup [--target all|claude|codex] [--scope user|local|project] [--hooks fallback|redirect|none] [--skip-skill] [--remove] [--dry-run]
+pleb hook claude-webfetch --mode <fallback|redirect>
 pleb mcp
 pleb status --json
 ```
@@ -88,6 +89,7 @@ Genuine `pleb` installations report `"version"`, `"cef_renderer": { "expected_pr
 - **Tool-owned credential storage (`env -> <state_dir>/credentials.enc (AES-256-GCM wrapped by one macOS Keychain vault-key item) -> <state_dir>/credentials.json`):**
   ```bash
   pleb auth set <brave|tavily|serper|exa|searxng|web-bot-auth-jwk|web-bot-auth-agent|cdp-access-client-id|cdp-access-client-secret|cdp-access-host> [--stdin] [--storage auto|keychain|file]
+  pleb auth init-web-bot-auth --agent <https-url> [--storage auto|keychain|file] [--force]
   pleb auth remove <provider> [--storage auto|keychain|file]
   pleb auth status [--json]
   ```
@@ -126,7 +128,7 @@ Key `--json` / `--jsonl` outputs:
 - **`BatchItemResult`**: untagged on `ok` (`true` -> `FetchOutput` fields with `content?`; `false` -> `{ url, ok, error, kind, block_reason?, exit_code }`).
 - **`StagedAssetOutput`**: `{ url, final_url, status_code, content_type, byte_count, staged_path, timing_ms }`.
 - **`SearchResponse`**: `{ provider, providers_used?, results: [{ title, url, snippet, extra_snippets? }] }`.
-- **Error envelope on `stderr` (`--json` / `--jsonl`)**: `{"error":"...","kind":"...","block_reason":"...","exit_code":N}` (`block_reason` included on blocks/challenges: `cloudflare_challenge`, `bot_challenge`, `edge_waf_block`, `origin_forbidden`, `login_wall`, `cookie_wall`, `rate_limited`; `kind`: `invalid_input`, `invalid_url`, `robots_disallowed`, `blocked`, `challenge`, `http_error`, `unsupported_content_type`, `cef_unavailable`, `cdp_unavailable`, `timeout`, `response_too_large`, `transport`, `search_error`, `auth_error`, `crawl_error`, `map_error`, `daemon_error`, `session_error`, `status_error`, `skill_error`, `mcp_error`, `setup_error`, `io_error`).
+- **Error envelope on `stderr` (`--json` / `--jsonl`)**: `{"error":"...","kind":"...","block_reason":"...","exit_code":N}` (`block_reason` included on blocks/challenges: `cloudflare_challenge`, `bot_challenge`, `edge_waf_block`, `origin_forbidden`, `login_wall`, `cookie_wall`, `rate_limited`; `kind`: `invalid_input`, `invalid_url`, `robots_disallowed`, `blocked`, `challenge`, `http_error`, `unsupported_content_type`, `cef_unavailable`, `cdp_unavailable`, `timeout`, `response_too_large`, `transport`, `search_error`, `auth_error`, `crawl_error`, `map_error`, `daemon_error`, `session_error`, `status_error`, `skill_error`, `mcp_error`, `setup_error`, `hook_error`, `io_error`).
 
 ---
 
@@ -134,5 +136,5 @@ Key `--json` / `--jsonl` outputs:
 
 - **State directory (`PLEB_HOME` / `--state-dir`, default `~/.pleb`, `0o700`):** holds `data/`, `cef-cache/`, `artifacts/`, `daemon.sock`, `daemon.log`, `site-cache.json`, `search-state.json`, `credentials.enc` (`0o600`), `credentials.json` (`0o600`), and optional local `site-rules.json`.
 - **Daemon controls:** auto-starts `daemon.sock` (idle exit `--daemon-idle-timeout` / `PLEB_DAEMON_IDLE_SECONDS`, default `300`; bypass via `--no-daemon` / `PLEB_NO_DAEMON`). Manage with `pleb daemon status`, `pleb daemon stop`, and `pleb session clear` (stops daemon and clears `data/`, `cef-cache/`, `artifacts/`, `site-cache.json`, and `search-state.json` while preserving `credentials.enc`, `credentials.json`, Keychain `vault-key`, `site-rules.json`, and `cef/`).
-- **CEF `v5-meta` installer & overrides:** rebuild from the repository root via `bash scripts/install-cef-mac.sh --force` (macOS arm64) or `bash scripts/install-cef-linux.sh --force` (Linux `x86_64` / `aarch64`, runs natively under Ozone headless without Xvfb when `DISPLAY` is unset or empty; both support `--prefix <dir>`). Override binaries in tests/scripts with `PLEB_CEF_RENDERER`, `PLEB_DAEMON_EXECUTABLE`, and `PLEB_NO_HOME_CEF=1`.
+- **CEF `v5-meta` installer & overrides:** rebuild from the repository root via `bash scripts/install-cef-mac.sh --force` (macOS arm64) or `bash scripts/install-cef-linux.sh --force` (Linux `x86_64` / `aarch64`, runs natively under Ozone headless without Xvfb when `DISPLAY` is unset or empty; both support `--prefix <dir>`). Override binaries in tests/scripts with `PLEB_CEF_RENDERER`, `PLEB_DAEMON_EXECUTABLE`, `PLEB_NO_HOME_CEF=1`, and `PLEB_CLAUDE_SETTINGS`.
 - **Version-locked skill maintenance from any machine with `pleb` installed:** run `pleb skill print` to emit this skill, `pleb skill install [--dir <path>] [--force]` to write it into local agent skill directories, or `pleb setup` to register `pleb mcp` and install skills in one step.

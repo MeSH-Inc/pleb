@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use ring::rand::{SecureRandom, SystemRandom};
-use ring::signature::Ed25519KeyPair;
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
@@ -1067,6 +1067,112 @@ fn resolve_provider_results_with_store(
     }
 
     Ok(slots)
+}
+
+/// Public output returned by [`init_web_bot_auth`], omitting private key material.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WebBotAuthInitResult {
+    pub keyid: String,
+    pub agent_url: String,
+    pub directory_url: String,
+    pub jwk_source: CredentialSource,
+    pub agent_source: CredentialSource,
+    pub public_jwk: serde_json::Value,
+    pub directory_json: serde_json::Value,
+}
+
+/// Generates an Ed25519 Web Bot Auth identity, stores the private JWK and agent URL, and returns the public directory payload.
+pub fn init_web_bot_auth(
+    state_dir: &Path,
+    agent_url: &str,
+    storage: CredentialStorage,
+    force: bool,
+) -> Result<WebBotAuthInitResult> {
+    let validated_agent = validate_credential(CredentialProvider::WebBotAuthAgent, agent_url)?;
+    if storage == CredentialStorage::Keychain {
+        require_keychain_available()?;
+    }
+
+    let existing = resolve_credentials(
+        state_dir,
+        &[
+            CredentialProvider::WebBotAuthJwk,
+            CredentialProvider::WebBotAuthAgent,
+        ],
+    )?;
+    if !force && !existing.is_empty() {
+        bail!("Web Bot Auth credentials already configured; pass --force to rotate");
+    }
+
+    let mut dir_parsed = url::Url::parse(validated_agent.as_str())?;
+    dir_parsed.set_path("/.well-known/http-message-signatures-directory");
+    dir_parsed.set_query(None);
+    dir_parsed.set_fragment(None);
+    let directory_url = dir_parsed.to_string();
+
+    let mut seed = ZeroizingBytes(vec![0u8; 32]);
+    let rng = SystemRandom::new();
+    rng.fill(&mut seed.0)
+        .map_err(|_| anyhow::anyhow!("system CSPRNG failed while generating Ed25519 seed"))?;
+    let keypair = Ed25519KeyPair::from_seed_unchecked(&seed.0)
+        .map_err(|_| anyhow::anyhow!("failed to build Ed25519 keypair from generated seed"))?;
+    let x_bytes: [u8; 32] = keypair
+        .public_key()
+        .as_ref()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("unexpected Ed25519 public key length"))?;
+
+    let d_b64 = SecretString::new(URL_SAFE_NO_PAD.encode(&seed.0));
+    let x_b64 = URL_SAFE_NO_PAD.encode(x_bytes);
+    let private_jwk = SecretString::new(format!(
+        r#"{{"crv":"Ed25519","d":"{}","kty":"OKP","x":"{}"}}"#,
+        d_b64.as_str(),
+        x_b64
+    ));
+    let keyid = crate::transport::web_bot_auth::ed25519_jwk_thumbprint(&x_bytes);
+
+    let jwk_source = set_credential(
+        state_dir,
+        CredentialProvider::WebBotAuthJwk,
+        private_jwk.as_str(),
+        storage,
+    )?;
+    let agent_source = match set_credential(
+        state_dir,
+        CredentialProvider::WebBotAuthAgent,
+        validated_agent.as_str(),
+        storage,
+    ) {
+        Ok(src) => src,
+        Err(err) => {
+            if !existing.contains_key(&CredentialProvider::WebBotAuthJwk) {
+                let _ = remove_credential(state_dir, CredentialProvider::WebBotAuthJwk, storage);
+            }
+            return Err(err);
+        }
+    };
+
+    let public_jwk = serde_json::json!({
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "x": x_b64,
+        "kid": keyid,
+        "use": "sig",
+        "alg": "EdDSA",
+    });
+    let directory_json = serde_json::json!({
+        "keys": [public_jwk.clone()]
+    });
+
+    Ok(WebBotAuthInitResult {
+        keyid,
+        agent_url: validated_agent.as_str().to_string(),
+        directory_url,
+        jwk_source,
+        agent_source,
+        public_jwk,
+        directory_json,
+    })
 }
 
 fn resolve_with_system_store(

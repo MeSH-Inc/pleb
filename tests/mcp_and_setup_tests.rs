@@ -425,6 +425,7 @@ async fn setup_registers_and_removes_claude_and_codex_via_mock_clis() {
     // 3. Targeted `--target claude --scope local --skip-skill` touches only Claude.
     std::fs::remove_file(&log_file).unwrap();
     let claude_only = Command::new(pleb_bin)
+        .current_dir(&fake_home)
         .env("HOME", &fake_home)
         .env("PLEB_NO_HOME_CEF", "1")
         .env("PLEB_NO_KEYCHAIN", "1")
@@ -517,6 +518,294 @@ async fn setup_registers_and_removes_claude_and_codex_via_mock_clis() {
     assert_eq!(missing_explicit.status.code(), Some(1));
     let missing_err: Value = serde_json::from_slice(&missing_explicit.stderr).unwrap();
     assert_eq!(missing_err["kind"], "setup_error");
+
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn setup_claude_webfetch_hooks_preserve_settings_switch_modes_and_run_protocol() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+
+    let work = hermetic_dir("hooks");
+    let fake_home = work.join("home");
+    std::fs::create_dir_all(&fake_home).unwrap();
+    let state_dir = work.join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let settings_path = work.join("claude/settings.json");
+    std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+    let mock_claude = work.join("mock-claude.sh");
+    std::fs::write(&mock_claude, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&mock_claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let pleb_bin = env!("CARGO_BIN_EXE_pleb");
+
+    // Seed existing settings and unrelated user hooks that must survive every transition.
+    let initial_settings = json!({
+        "theme": "dark",
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "Bash",
+                    "hooks": [{ "type": "command", "command": "/usr/local/bin/audit-bash" }]
+                }
+            ],
+            "PostToolUseFailure": [
+                {
+                    "matcher": "Read",
+                    "hooks": [{ "type": "command", "command": "/usr/local/bin/on-read-fail" }]
+                }
+            ]
+        }
+    });
+    std::fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&initial_settings).unwrap(),
+    )
+    .unwrap();
+
+    // 1. Install default fallback hook (PostToolUseFailure) via --hooks fallback.
+    let fb = Command::new(pleb_bin)
+        .env("HOME", &fake_home)
+        .env("PLEB_NO_HOME_CEF", "1")
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .env("PLEB_CLAUDE_BIN", &mock_claude)
+        .env("PLEB_CLAUDE_SETTINGS", &settings_path)
+        .env("PLEB_SETUP_BINARY", "/fake/bin/pleb")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args(["--json", "setup", "--target", "claude", "--skip-skill"])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        fb.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fb.stderr)
+    );
+    let fb_json: Value = serde_json::from_slice(&fb.stdout).unwrap();
+    assert_eq!(fb_json["hook"]["status"], "configured");
+    assert_eq!(fb_json["hook"]["mode"], "fallback");
+
+    let after_fb: Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(after_fb["theme"], "dark");
+    assert_eq!(after_fb["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+    let post_entries = after_fb["hooks"]["PostToolUseFailure"].as_array().unwrap();
+    assert_eq!(post_entries.len(), 2);
+    assert_eq!(
+        post_entries[1]["hooks"][0]["command"],
+        "/fake/bin/pleb hook claude-webfetch --mode fallback"
+    );
+
+    // 2. Repeating the same hook install is idempotent (`up_to_date`).
+    let fb_again = Command::new(pleb_bin)
+        .env("HOME", &fake_home)
+        .env("PLEB_NO_HOME_CEF", "1")
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .env("PLEB_CLAUDE_BIN", &mock_claude)
+        .env("PLEB_CLAUDE_SETTINGS", &settings_path)
+        .env("PLEB_SETUP_BINARY", "/fake/bin/pleb")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args([
+            "--json",
+            "setup",
+            "--target",
+            "claude",
+            "--hooks",
+            "fallback",
+            "--skip-skill",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(fb_again.status.success());
+    let fb_again_json: Value = serde_json::from_slice(&fb_again.stdout).unwrap();
+    assert_eq!(fb_again_json["hook"]["status"], "up_to_date");
+
+    // 3. Switching to `--hooks redirect` removes PostToolUseFailure pleb entry and installs PreToolUse.
+    let redir = Command::new(pleb_bin)
+        .env("HOME", &fake_home)
+        .env("PLEB_NO_HOME_CEF", "1")
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .env("PLEB_CLAUDE_BIN", &mock_claude)
+        .env("PLEB_CLAUDE_SETTINGS", &settings_path)
+        .env("PLEB_SETUP_BINARY", "/fake/bin/pleb")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args([
+            "--json",
+            "setup",
+            "--target",
+            "claude",
+            "--hooks",
+            "redirect",
+            "--skip-skill",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(redir.status.success());
+    let redir_json: Value = serde_json::from_slice(&redir.stdout).unwrap();
+    assert_eq!(redir_json["hook"]["status"], "configured");
+    assert_eq!(redir_json["hook"]["mode"], "redirect");
+
+    let after_redir: Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(
+        after_redir["hooks"]["PostToolUseFailure"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let pre_entries = after_redir["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(pre_entries.len(), 2);
+    assert_eq!(
+        pre_entries[1]["hooks"][0]["command"],
+        "/fake/bin/pleb hook claude-webfetch --mode redirect"
+    );
+
+    // 4. `--remove` strips only pleb's hook and leaves unrelated settings/hooks intact.
+    let removed = Command::new(pleb_bin)
+        .env("HOME", &fake_home)
+        .env("PLEB_NO_HOME_CEF", "1")
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .env("PLEB_CLAUDE_BIN", &mock_claude)
+        .env("PLEB_CLAUDE_SETTINGS", &settings_path)
+        .env("PLEB_SETUP_BINARY", "/fake/bin/pleb")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args(["--json", "setup", "--target", "claude", "--remove"])
+        .output()
+        .await
+        .unwrap();
+    assert!(removed.status.success());
+    let rem_json: Value = serde_json::from_slice(&removed.stdout).unwrap();
+    assert_eq!(rem_json["hook"]["status"], "removed");
+    let after_rem: Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(after_rem, initial_settings);
+
+    // 5. Runtime hook adapter: fallback returns exit 0 JSON additionalContext; redirect exits 2 on stderr.
+    let mut fb_child = Command::new(pleb_bin)
+        .args(["hook", "claude-webfetch", "--mode", "fallback"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fb_child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"tool_name":"WebFetch","tool_input":{"url":"https://docs.example.com/a"},"error":"HTTP 403"}"#)
+        .await
+        .unwrap();
+    let fb_hook_out = fb_child.wait_with_output().await.unwrap();
+    assert_eq!(fb_hook_out.status.code(), Some(0));
+    let fb_hook_json: Value = serde_json::from_slice(&fb_hook_out.stdout).unwrap();
+    assert_eq!(
+        fb_hook_json["hookSpecificOutput"]["hookEventName"],
+        "PostToolUseFailure"
+    );
+    let ctx = fb_hook_json["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(ctx.contains("pleb_fetch"));
+    assert!(ctx.contains("https://docs.example.com/a"));
+
+    let mut redir_child = Command::new(pleb_bin)
+        .args(["hook", "claude-webfetch", "--mode", "redirect"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    redir_child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"tool_name":"WebFetch","tool_input":{"url":"https://docs.example.com/b"}}"#)
+        .await
+        .unwrap();
+    let redir_hook_out = redir_child.wait_with_output().await.unwrap();
+    assert_eq!(redir_hook_out.status.code(), Some(2));
+    assert!(redir_hook_out.stdout.is_empty());
+    let redir_err = String::from_utf8_lossy(&redir_hook_out.stderr);
+    assert!(redir_err.contains("pleb_fetch"));
+    assert!(redir_err.contains("https://docs.example.com/b"));
+
+    // 6. CLI `pleb auth init-web-bot-auth --json` emits public directory JSON without private key d.
+    let wba_out = Command::new(pleb_bin)
+        .env("PLEB_NO_HOME_CEF", "1")
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .env_remove("PLEB_WEB_BOT_AUTH_JWK")
+        .env_remove("PLEB_WEB_BOT_AUTH_AGENT")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args([
+            "--json",
+            "auth",
+            "init-web-bot-auth",
+            "--agent",
+            "https://bot.example.com",
+            "--storage",
+            "file",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        wba_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wba_out.stderr)
+    );
+    let wba_json: Value = serde_json::from_slice(&wba_out.stdout).unwrap();
+    assert_eq!(wba_json["agent_url"], "https://bot.example.com");
+    assert_eq!(
+        wba_json["directory_url"],
+        "https://bot.example.com/.well-known/http-message-signatures-directory"
+    );
+    assert!(wba_json["public_jwk"]["d"].is_null());
+    assert!(!String::from_utf8_lossy(&wba_out.stdout).contains("\"d\""));
+
+    // 7. Bare `--hooks --dry-run` plans fallback hook without creating settings.json.
+    let dry_settings_path = work.join("nonexistent-claude/settings.json");
+    let dry_hooks = Command::new(pleb_bin)
+        .env("HOME", &fake_home)
+        .env("PLEB_NO_HOME_CEF", "1")
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .env("PLEB_CLAUDE_BIN", &mock_claude)
+        .env("PLEB_CLAUDE_SETTINGS", &dry_settings_path)
+        .env("PLEB_SETUP_BINARY", "/fake/bin/pleb")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args([
+            "--json",
+            "setup",
+            "--target",
+            "claude",
+            "--hooks",
+            "--dry-run",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        dry_hooks.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dry_hooks.stderr)
+    );
+    assert!(
+        !dry_settings_path.exists(),
+        "--dry-run must not create Claude settings.json"
+    );
+    let dry_hooks_json: Value = serde_json::from_slice(&dry_hooks.stdout).unwrap();
+    assert_eq!(dry_hooks_json["hook"]["status"], "planned");
+    assert_eq!(dry_hooks_json["hook"]["mode"], "fallback");
 
     let _ = std::fs::remove_dir_all(&work);
 }

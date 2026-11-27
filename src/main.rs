@@ -260,6 +260,16 @@ enum Command {
         /// Claude Code MCP scope (user, local, or project)
         #[arg(long, value_enum, default_value_t = setup::ClaudeScope::User, ignore_case = true)]
         scope: setup::ClaudeScope,
+        /// Claude Code WebFetch hook mode (fallback, redirect, or none)
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = setup::HookMode::Fallback,
+            default_missing_value = "fallback",
+            num_args = 0..=1,
+            ignore_case = true
+        )]
+        hooks: setup::HookMode,
         /// Skip installing or updating the bundled SKILL.md
         #[arg(long)]
         skip_skill: bool,
@@ -269,6 +279,21 @@ enum Command {
         /// Print planned registration commands without modifying harness configs
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Run harness hook adapters invoked by Claude Code
+    Hook {
+        #[command(subcommand)]
+        action: HookAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookAction {
+    /// Claude Code WebFetch hook adapter (PostToolUseFailure fallback or PreToolUse redirect)
+    ClaudeWebfetch {
+        /// Hook mode configured in Claude Code settings
+        #[arg(long, value_enum, default_value_t = setup::HookMode::Fallback, ignore_case = true)]
+        mode: setup::HookMode,
     },
 }
 
@@ -297,6 +322,18 @@ enum AuthAction {
     },
     /// Show search provider, Web Bot Auth, and CDP Access credential and cooldown status
     Status,
+    /// Generate an Ed25519 Web Bot Auth keypair and print its public directory JSON
+    InitWebBotAuth {
+        /// HTTPS signature-agent URL for your crawler/agent identity
+        #[arg(long)]
+        agent: String,
+        /// Credential storage backend
+        #[arg(long, value_enum, default_value_t = CredentialStorage::Auto, ignore_case = true)]
+        storage: CredentialStorage,
+        /// Overwrite existing Web Bot Auth credentials
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -729,6 +766,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
         Command::Setup {
             target,
             scope,
+            hooks,
             skip_skill,
             remove,
             dry_run,
@@ -736,6 +774,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             let opts = setup::SetupOptions {
                 target,
                 claude_scope: scope,
+                hooks,
                 remove,
                 dry_run,
                 pleb_binary: None,
@@ -761,6 +800,17 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Hook { action } => match action {
+            HookAction::ClaudeWebfetch { mode } => {
+                let mut stdin = std::io::stdin().lock();
+                let mut stdout = std::io::stdout().lock();
+                let mut stderr = std::io::stderr().lock();
+                let code =
+                    setup::run_claude_webfetch_hook(mode, &mut stdin, &mut stdout, &mut stderr)
+                        .map_err(|e| CliError::runtime("hook_error", e))?;
+                Ok(ExitCode::from(code))
+            }
+        },
         Command::Fetch {
             urls,
             format,
@@ -1189,6 +1239,47 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     print_json(&payload)?;
                 } else {
                     print_auth_statuses(&payload);
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+            AuthAction::InitWebBotAuth {
+                agent,
+                storage,
+                force,
+            } => {
+                let res = auth::init_web_bot_auth(&config.state_dir, &agent, storage, force)
+                    .map_err(|e| CliError::runtime("auth_error", e))?;
+                for provider in [
+                    CredentialProvider::WebBotAuthJwk,
+                    CredentialProvider::WebBotAuthAgent,
+                ] {
+                    if std::env::var(provider.env_var())
+                        .map(|v| !v.trim().is_empty())
+                        .unwrap_or(false)
+                    {
+                        eprintln!(
+                            "warning: {} is set in the environment and will take precedence over the stored credential",
+                            provider.env_var()
+                        );
+                    }
+                }
+                if json {
+                    print_json(&res)?;
+                } else if !quiet {
+                    println!("Initialized Web Bot Auth identity (keyid: {})", res.keyid);
+                    println!(
+                        "  Agent URL: {} ({})",
+                        res.agent_url,
+                        credential_source_label(res.agent_source)
+                    );
+                    println!(
+                        "  Private JWK: stored ({})",
+                        credential_source_label(res.jwk_source)
+                    );
+                    println!("  Publish this JSON at {}:", res.directory_url);
+                    let pretty = serde_json::to_string_pretty(&res.directory_json)
+                        .map_err(|e| CliError::runtime("serialization_error", e))?;
+                    println!("{pretty}");
                 }
                 Ok(ExitCode::SUCCESS)
             }
@@ -1711,6 +1802,16 @@ fn print_setup_report(report: &setup::SetupReport, cef_probe: &RendererProbe) {
     }
     for skill in &report.skills {
         println!("  skill ({}): {}", skill.status, skill.path);
+    }
+    if let Some(ref hook) = report.hook {
+        let mut line = format!(
+            "  claude hook ({}, mode={}): {}",
+            hook.status, hook.mode, hook.settings_path
+        );
+        if let Some(ref detail) = hook.detail {
+            line.push_str(&format!(" ({detail})"));
+        }
+        println!("{line}");
     }
     println!(
         "  Cronet TLS: {}",

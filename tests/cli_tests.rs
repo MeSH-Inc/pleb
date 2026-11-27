@@ -802,6 +802,10 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "--focus",
         "pleb mcp",
         "pleb setup",
+        "--hooks",
+        "hook claude-webfetch",
+        "PLEB_CLAUDE_SETTINGS",
+        "init-web-bot-auth",
         "block_reason",
     ] {
         assert!(
@@ -831,6 +835,10 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "--focus",
         "pleb mcp",
         "pleb setup",
+        "--hooks",
+        "hook claude-webfetch",
+        "PLEB_CLAUDE_SETTINGS",
+        "init-web-bot-auth",
         "block_reason",
     ] {
         assert!(
@@ -929,6 +937,10 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "--focus",
         "pleb mcp",
         "pleb setup",
+        "--hooks",
+        "hook claude-webfetch",
+        "PLEB_CLAUDE_SETTINGS",
+        "init-web-bot-auth",
         "block_reason",
     ] {
         assert!(

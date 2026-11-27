@@ -1,5 +1,5 @@
 use pleb::auth::{
-    all_credential_statuses, remove_credential, resolve_agent_identity_status,
+    all_credential_statuses, init_web_bot_auth, remove_credential, resolve_agent_identity_status,
     resolve_cdp_access_status, resolve_credential, set_credential, CredentialProvider,
     CredentialSource, CredentialStorage, ResolvedCredential, SecretString, MAX_SECRET_BYTES,
 };
@@ -737,4 +737,71 @@ fn validates_web_bot_auth_agent_and_cdp_access_credentials_and_status() {
     );
     assert!(!CredentialProvider::WebBotAuthJwk.is_search_provider());
     assert!(CredentialProvider::Brave.is_search_provider());
+}
+
+#[test]
+fn init_web_bot_auth_generates_keypair_omits_private_d_and_integrates_with_signer() {
+    let dir = TempStateDir::new();
+    let _env = EnvGuard::new(&[
+        ("PLEB_WEB_BOT_AUTH_JWK", None),
+        ("PLEB_WEB_BOT_AUTH_AGENT", None),
+    ]);
+
+    let first = init_web_bot_auth(
+        &dir.path,
+        "https://agent.example.com/",
+        CredentialStorage::File,
+        false,
+    )
+    .unwrap();
+    assert_eq!(first.agent_url, "https://agent.example.com/");
+    assert_eq!(
+        first.directory_url,
+        "https://agent.example.com/.well-known/http-message-signatures-directory"
+    );
+    assert_eq!(first.jwk_source, CredentialSource::File);
+    assert_eq!(first.agent_source, CredentialSource::File);
+    assert!(first.public_jwk["d"].is_null());
+    assert_eq!(first.public_jwk["kid"], first.keyid);
+    assert_eq!(first.directory_json["keys"][0], first.public_jwk);
+
+    let serialized = serde_json::to_string(&first).unwrap();
+    assert!(
+        !serialized.contains("\"d\""),
+        "public init result must never include private d parameter: {serialized}"
+    );
+
+    let signer = pleb::transport::web_bot_auth::WebBotAuthSigner::from_state_dir(&dir.path)
+        .unwrap()
+        .expect("signer should load initialized credentials");
+    assert_eq!(signer.key_id(), first.keyid);
+    assert_eq!(signer.signature_agent(), "https://agent.example.com/");
+
+    // Re-running without --force must fail instead of overwriting keys silently.
+    assert!(init_web_bot_auth(
+        &dir.path,
+        "https://agent.example.com",
+        CredentialStorage::File,
+        false,
+    )
+    .is_err());
+
+    // Re-running with --force rotates to a new keypair.
+    let rotated = init_web_bot_auth(
+        &dir.path,
+        "https://agent2.example.com",
+        CredentialStorage::File,
+        true,
+    )
+    .unwrap();
+    assert_ne!(rotated.keyid, first.keyid);
+    assert_eq!(rotated.agent_url, "https://agent2.example.com");
+    let rotated_signer = pleb::transport::web_bot_auth::WebBotAuthSigner::from_state_dir(&dir.path)
+        .unwrap()
+        .expect("signer should load rotated credentials");
+    assert_eq!(rotated_signer.key_id(), rotated.keyid);
+    assert_eq!(
+        rotated_signer.signature_agent(),
+        "https://agent2.example.com"
+    );
 }
