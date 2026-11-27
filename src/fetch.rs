@@ -398,28 +398,19 @@ pub async fn fetch_document(
         }
     }
 
-    if needs_enrichment && options.extract.focus.is_some() {
-        if let Some(ref query) = options.extract.focus {
-            let budget = options
-                .extract
-                .max_bytes
-                .unwrap_or(extract::focus::DEFAULT_FOCUS_MAX_BYTES);
-            let (projected, did_truncate) = extract::focus::focus_document(
-                &extracted.content,
-                query,
-                budget,
-                options.extract.format == OutputFormat::Markdown,
-            );
-            extracted.content = projected;
-            extracted.truncated |= did_truncate;
-        }
-    } else if (needs_enrichment || is_axtree) && options.extract.max_bytes.is_some() {
-        let (truncated_content, did_truncate) = extract::apply_format_limit(
+    if (needs_enrichment
+        && (options.extract.focus.is_some() || options.extract.max_bytes.is_some()))
+        || (is_axtree && options.extract.max_bytes.is_some())
+    {
+        let (projected, did_truncate) = extract::apply_focus_or_limit(
             &extracted.content,
             options.extract.format,
+            needs_enrichment
+                .then_some(options.extract.focus.as_deref())
+                .flatten(),
             options.extract.max_bytes,
         );
-        extracted.content = truncated_content;
+        extracted.content = projected;
         extracted.truncated |= did_truncate;
     }
 

@@ -100,26 +100,15 @@ pub fn wrap_raw_code_document(
     language: Option<&str>,
     options: &ExtractOptions,
 ) -> ExtractedDocument {
-    if options.format == OutputFormat::Markdown {
-        let fence_len = (longest_backtick_run(code) + 1).max(3);
-        let fence = "`".repeat(fence_len);
+    let raw = if options.format == OutputFormat::Markdown {
+        let fence = "`".repeat((longest_backtick_run(code) + 1).max(3));
         let lang = language.unwrap_or("");
         let trimmed_code = code.trim_end_matches('\n');
-        let raw = format!("# {filename}\n\n{fence}{lang}\n{trimmed_code}\n{fence}");
-        let (content, truncated) = match options.max_bytes {
-            Some(max) => markdown::truncate_markdown(&raw, max),
-            None => (raw, false),
-        };
-        return ExtractedDocument {
-            title: Some(filename.to_string()),
-            content,
-            truncated,
-            resources: Vec::new(),
-            tools: Vec::new(),
-        };
-    }
-
-    let (content, truncated) = apply_utf8_limit(code, options.max_bytes);
+        format!("# {filename}\n\n{fence}{lang}\n{trimmed_code}\n{fence}")
+    } else {
+        code.to_string()
+    };
+    let (content, truncated) = apply_format_limit(&raw, options.format, options.max_bytes);
     ExtractedDocument {
         title: Some(filename.to_string()),
         content,
@@ -206,17 +195,14 @@ pub fn extract_document_parsed(
         }
     }
     if defer_limit {
-        if let Some(ref query) = options.focus {
-            let budget = options.max_bytes.unwrap_or(focus::DEFAULT_FOCUS_MAX_BYTES);
-            let (projected, did_truncate) = focus::focus_document(
-                &doc.content,
-                query,
-                budget,
-                options.format == OutputFormat::Markdown,
-            );
-            doc.content = projected;
-            doc.truncated |= did_truncate;
-        }
+        let (projected, did_truncate) = apply_focus_or_limit(
+            &doc.content,
+            options.format,
+            options.focus.as_deref(),
+            options.max_bytes,
+        );
+        doc.content = projected;
+        doc.truncated |= did_truncate;
     }
     Ok(doc)
 }
@@ -265,43 +251,17 @@ fn extract_document_parsed_inner(
         });
     }
 
-    if options.format == OutputFormat::Html {
-        let doc = parsed.unwrap_or_else(|| ParsedHtml::parse(body));
-        let title = doc.title();
-        let effective_base = doc.effective_base_url(page_url);
-        let tools = doc.extract_webmcp_tools(page_url);
-        let resources = doc.extract_resources(options.mode, &effective_base);
-        let (content, truncated) = apply_utf8_limit(body, options.max_bytes);
-        return Ok(ExtractedDocument {
-            title,
-            content,
-            truncated,
-            resources,
-            tools,
-        });
-    }
-
     let doc = parsed.unwrap_or_else(|| ParsedHtml::parse(body));
     let title = doc.title();
     let effective_base = doc.effective_base_url(page_url);
     let tools = doc.extract_webmcp_tools(page_url);
 
-    match options.format {
-        OutputFormat::Text => {
-            let (raw_content, resources) =
-                doc.into_plain_text_and_resources(options.mode, &effective_base);
-            let (content, truncated) = match options.max_bytes {
-                Some(max) => truncate_utf8(&raw_content, max),
-                None => (raw_content, false),
-            };
-            Ok(ExtractedDocument {
-                title,
-                content,
-                truncated,
-                resources,
-                tools,
-            })
-        }
+    let (raw_content, resources) = match options.format {
+        OutputFormat::Html => (
+            body.to_string(),
+            doc.extract_resources(options.mode, &effective_base),
+        ),
+        OutputFormat::Text => doc.into_plain_text_and_resources(options.mode, &effective_base),
         OutputFormat::Markdown => {
             let (pruned, resources) =
                 doc.into_pruned_html_and_resources(options.mode, &effective_base);
@@ -315,27 +275,25 @@ fn extract_document_parsed_inner(
             let raw_content = match &title {
                 Some(t) if !starts_with_title_heading(trimmed_md, t) => {
                     if trimmed_md.is_empty() {
-                        format!("# {}", t)
+                        format!("# {t}")
                     } else {
-                        format!("# {}\n\n{}", t, trimmed_md)
+                        format!("# {t}\n\n{trimmed_md}")
                     }
                 }
                 _ => trimmed_md.to_string(),
             };
-            let (content, truncated) = match options.max_bytes {
-                Some(max) => markdown::truncate_markdown(&raw_content, max),
-                None => (raw_content, false),
-            };
-            Ok(ExtractedDocument {
-                title,
-                content,
-                truncated,
-                resources,
-                tools,
-            })
+            (raw_content, resources)
         }
-        OutputFormat::Html | OutputFormat::Raw | OutputFormat::Axtree => unreachable!(),
-    }
+        OutputFormat::Raw | OutputFormat::Axtree => unreachable!(),
+    };
+    let (content, truncated) = apply_format_limit(&raw_content, options.format, options.max_bytes);
+    Ok(ExtractedDocument {
+        title,
+        content,
+        truncated,
+        resources,
+        tools,
+    })
 }
 
 /// Detect binary payloads by MIME type or leading magic/NUL bytes (for missing/octet-stream MIMEs).
@@ -399,6 +357,25 @@ pub(crate) fn apply_utf8_limit(text: &str, max_bytes: Option<usize>) -> (String,
         Some(max) => truncate_utf8(text, max),
         None => (text.to_string(), false),
     }
+}
+
+pub(crate) fn apply_focus_or_limit(
+    content: &str,
+    format: OutputFormat,
+    focus: Option<&str>,
+    max_bytes: Option<usize>,
+) -> (String, bool) {
+    if let Some(query) = focus {
+        if matches!(format, OutputFormat::Markdown | OutputFormat::Text) {
+            return focus::focus_document(
+                content,
+                query,
+                max_bytes.unwrap_or(focus::DEFAULT_FOCUS_MAX_BYTES),
+                format == OutputFormat::Markdown,
+            );
+        }
+    }
+    apply_format_limit(content, format, max_bytes)
 }
 
 pub(crate) fn apply_format_limit(
