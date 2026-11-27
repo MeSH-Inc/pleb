@@ -2,8 +2,9 @@ use pleb::extract::markdown::{compact_markdown, open_fence_at};
 use pleb::extract::url::{clean_url, resolve_and_clean_url, ResolvedUrl};
 use pleb::extract::{
     decode_text_bytes, detect_binary_content, extract_document, extract_document_bytes,
-    format_resource_manifest_markdown, truncate_markdown, truncate_utf8, wrap_raw_code_document,
-    ExtractMode, ExtractOptions, OutputFormat, ParsedHtml, ResourceKind, ResourceSalience,
+    format_resource_manifest_markdown, resource_identifier, truncate_markdown, truncate_utf8,
+    wrap_raw_code_document, ExtractMode, ExtractOptions, OutputFormat, ParsedHtml, ResourceKind,
+    ResourceSalience,
 };
 use url::Url;
 
@@ -1240,9 +1241,12 @@ fn resource_descriptor_salience_indexing_and_manifest_formatting() {
 
     let res = &md_doc.resources;
     assert_eq!(res.len(), 8, "unexpected resources: {res:#?}");
+    for item in res {
+        assert_eq!(item.identifier, resource_identifier(&item.url));
+        assert!(item.identifier.starts_with("r_") && item.identifier.len() == 10);
+    }
 
-    // r1: figure picture diagram
-    assert_eq!(res[0].identifier, "r1");
+    // figure picture diagram
     assert_eq!(res[0].kind, ResourceKind::Diagram);
     assert_eq!(res[0].salience, ResourceSalience::High);
     assert_eq!(
@@ -1253,14 +1257,12 @@ fn resource_descriptor_salience_indexing_and_manifest_formatting() {
     assert_eq!(res[0].label.as_deref(), Some("Cluster Raft Topology | v2"));
     assert_eq!(res[0].dimensions, Some((1200, 600)));
 
-    // r2: descriptive prose image (Medium)
-    assert_eq!(res[1].identifier, "r2");
+    // descriptive prose image (Medium)
     assert_eq!(res[1].kind, ResourceKind::Image);
     assert_eq!(res[1].salience, ResourceSalience::Medium);
     assert_eq!(res[1].url, "https://docs.example.com/img/banner-photo.jpg");
 
-    // r3 & r4: video tracks
-    assert_eq!(res[2].identifier, "r3");
+    // video tracks
     assert_eq!(res[2].kind, ResourceKind::Transcript);
     assert_eq!(res[2].salience, ResourceSalience::High);
     assert_eq!(res[2].url, "https://docs.example.com/media/demo.vtt");
@@ -1268,28 +1270,23 @@ fn resource_descriptor_salience_indexing_and_manifest_formatting() {
     assert_eq!(res[2].mime_hint.as_deref(), Some("text/vtt"));
     assert_eq!(res[2].section_heading.as_deref(), Some("Walkthrough Video"));
 
-    assert_eq!(res[3].identifier, "r4");
     assert_eq!(res[3].kind, ResourceKind::Transcript);
     assert_eq!(res[3].url, "https://docs.example.com/media/demo.srt");
     assert_eq!(res[3].label.as_deref(), Some("es"));
     assert_eq!(res[3].mime_hint.as_deref(), Some("application/x-subrip"));
 
-    // r5..r8: PDF, CSV, OpenAPI YAML, llms.txt (deduplicated protocol.pdf)
-    assert_eq!(res[4].identifier, "r5");
+    // PDF, CSV, OpenAPI YAML, llms.txt (deduplicated protocol.pdf)
     assert_eq!(res[4].kind, ResourceKind::Document);
     assert_eq!(res[4].url, "https://docs.example.com/specs/protocol.pdf");
     assert_eq!(res[4].mime_hint.as_deref(), Some("application/pdf"));
     assert_eq!(res[4].section_heading.as_deref(), Some("Specs & Data"));
 
-    assert_eq!(res[5].identifier, "r6");
     assert_eq!(res[5].kind, ResourceKind::Dataset);
     assert_eq!(res[5].url, "https://docs.example.com/data/benchmarks.csv");
 
-    assert_eq!(res[6].identifier, "r7");
     assert_eq!(res[6].kind, ResourceKind::Schema);
     assert_eq!(res[6].url, "https://docs.example.com/api/openapi.yaml");
 
-    assert_eq!(res[7].identifier, "r8");
     assert_eq!(res[7].kind, ResourceKind::Schema);
     assert_eq!(res[7].url, "https://docs.example.com/llms.txt");
 
@@ -1299,8 +1296,80 @@ fn resource_descriptor_salience_indexing_and_manifest_formatting() {
     assert!(manifest.starts_with(
         "## Linked Resources\n\n| ID | Kind | Salience | Section | Dimensions | Label | URL |\n"
     ));
-    assert!(manifest.contains("| r1 | diagram | high | Architecture | 1200x600 | Cluster Raft Topology \\| v2 | https://docs.example.com/img/cluster-topology.webp |"));
-    assert!(manifest.contains("| r5 | document | high | Specs & Data | - | Protocol RFC | https://docs.example.com/specs/protocol.pdf |"));
+    assert!(manifest.contains(&format!(
+        "| {} | diagram | high | Architecture | 1200x600 | Cluster Raft Topology \\| v2 | https://docs.example.com/img/cluster-topology.webp |",
+        res[0].identifier
+    )));
+    assert!(manifest.contains(&format!(
+        "| {} | document | high | Specs & Data | - | Protocol RFC | https://docs.example.com/specs/protocol.pdf |",
+        res[4].identifier
+    )));
+}
+
+#[test]
+fn resource_identifiers_stay_stable_across_reordering_and_filter_avatar_noise() {
+    let url = Url::parse("https://feed.example.com/r/rust").unwrap();
+    let html_order_a = r#"<!doctype html><html><body><main>
+        <h1>r/rust</h1>
+        <img src="https://styles.redditmedia.com/t5_1/styles/profileIcon_abc.webp" alt="Profile badge">
+        <img src="https://styles.redditmedia.com/t5_2/styles/communityIcon_xyz.png" alt="Community icon long label">
+        <img src="https://styles.redditmedia.com/t5_3/styles/userIcon_def.png" alt="Moderator user icon">
+        <img src="https://cdn.example.com/u/custom.jpg" alt="u/alice_developer avatar">
+        <figure><img src="/img/arch-diagram.png" alt="System diagram"><figcaption>System diagram</figcaption></figure>
+        <a href="/specs/protocol.pdf">Protocol PDF</a>
+    </main></body></html>"#;
+    let html_order_b = r#"<!doctype html><html><body><main>
+        <h1>r/rust</h1>
+        <a href="/specs/new-other.pdf">Inserted Newer Post PDF</a>
+        <a href="/specs/protocol.pdf">Protocol PDF</a>
+        <figure><img src="/img/arch-diagram.png" alt="System diagram"><figcaption>System diagram</figcaption></figure>
+    </main></body></html>"#;
+
+    let doc_a = extract_document(
+        html_order_a,
+        &url,
+        Some("text/html"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    let doc_b = extract_document(
+        html_order_b,
+        &url,
+        Some("text/html"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        doc_a.resources.len(),
+        2,
+        "avatars/icons must be excluded: {:#?}",
+        doc_a.resources
+    );
+    let diag_a = doc_a
+        .resources
+        .iter()
+        .find(|r| r.url.ends_with("/arch-diagram.png"))
+        .unwrap();
+    let pdf_a = doc_a
+        .resources
+        .iter()
+        .find(|r| r.url.ends_with("/protocol.pdf"))
+        .unwrap();
+    let diag_b = doc_b
+        .resources
+        .iter()
+        .find(|r| r.url.ends_with("/arch-diagram.png"))
+        .unwrap();
+    let pdf_b = doc_b
+        .resources
+        .iter()
+        .find(|r| r.url.ends_with("/protocol.pdf"))
+        .unwrap();
+
+    assert_eq!(diag_a.identifier, diag_b.identifier);
+    assert_eq!(pdf_a.identifier, pdf_b.identifier);
+    assert_eq!(diag_a.identifier, resource_identifier(&diag_a.url));
 }
 
 #[test]

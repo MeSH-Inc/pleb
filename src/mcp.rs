@@ -234,11 +234,11 @@ fn tool_definitions() -> Value {
                     "resources": {
                         "type": "string",
                         "enum": ["none", "manifest", "transcripts", "diagrams", "all"],
-                        "description": "Linked asset handling: none indexes zero-fetch cues; manifest appends resource table; transcripts inlines captions; diagrams/all stage assets"
+                        "description": "Linked asset handling: none (default) skips asset downloads and appends a zero-fetch Resources cue when diagrams/docs/transcripts exist; manifest appends a Linked Resources table of stable IDs and URLs; transcripts inlines captions; diagrams stages high-salience visuals locally; all stages diagrams/docs/datasets/schemas and inlines transcripts"
                     },
                     "stage_resources": {
                         "type": "string",
-                        "description": "Comma-separated resource IDs (e.g., \"r1,r3\") or URLs to stage locally or inline"
+                        "description": "Comma-separated stable resource IDs from a prior Resources cue or resources='manifest' (e.g., \"r_a1b2c3d4\") or exact resource URLs to download locally (returns local file paths in a Staged header; transcripts are also inlined). Re-fetches the page on each call."
                     },
                     "focus": { "type": "string", "description": "Optional query for BM25 section projection" },
                     "max_bytes": { "type": "integer", "minimum": 1, "description": "Maximum UTF-8 bytes of returned content" },
@@ -375,7 +375,7 @@ async fn call_fetch(
             if resources == ResourcePolicy::None && !has_stage_request {
                 if let Some(cue) = fetch::format_resource_cue_with_hint(
                     &res.resources,
-                    "pass resources=\"manifest\" or stage_resources=\"r1,r2\" to pleb_fetch",
+                    "pass resources=\"manifest\" or stage_resources=\"<ids>\" to pleb_fetch",
                 ) {
                     lines.push(cue);
                 }

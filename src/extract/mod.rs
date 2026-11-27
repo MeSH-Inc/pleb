@@ -16,7 +16,8 @@ pub use charset::decode_text_bytes;
 pub use dom::ParsedHtml;
 pub use markdown::truncate_markdown;
 pub use resources::{
-    format_resource_manifest_markdown, ResourceDescriptor, ResourceKind, ResourceSalience,
+    format_resource_manifest_markdown, resource_identifier, ResourceDescriptor, ResourceKind,
+    ResourceSalience,
 };
 pub use webmcp::{
     format_webmcp_cue, format_webmcp_manifest_markdown, merge_webmcp_tools, sanitize_webmcp_tool,

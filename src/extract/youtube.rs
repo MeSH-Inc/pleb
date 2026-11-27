@@ -195,7 +195,7 @@ fn extract_caption_resources(
             None => format!("Captions ({lang})"),
         };
         out.push(ResourceDescriptor {
-            identifier: format!("r{}", out.len() + 1),
+            identifier: super::resources::resource_identifier(&url_str),
             url: url_str,
             kind: ResourceKind::Transcript,
             salience: ResourceSalience::High,

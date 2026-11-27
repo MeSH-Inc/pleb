@@ -399,7 +399,7 @@ pleb fetch --max-bytes 4096 https://docs.example.com/replication
 ````
 
 ```text
-Resources: 1 diagram (r1) — pass --resources manifest or --stage-resources <ids>
+Resources: 1 diagram (r_a1b2c3d4) — pass --resources manifest or --stage-resources <ids>
 ```
 
 ### Non-HTML First-Class Formats
@@ -424,7 +424,7 @@ Resources: 1 diagram (r1) — pass --resources manifest or --stage-resources <id
 
 ## Resource Indexing and Staging
 
-During its single `O(N)` DOM pass, `pleb fetch` indexes linked non-prose resources (`diagram`, `image`, `transcript`, `document`, `dataset`, `schema`) and assigns deterministic IDs (`r1`, `r2`, ...) with `section_heading`, `label`, `dimensions`, and `salience` metadata while making zero subresource network requests. Inline content `<svg>` diagrams also rescue readable `<text>` labels directly into Markdown (`[Diagram: ...]`).
+During its single `O(N)` DOM pass, `pleb fetch` indexes linked non-prose resources (`diagram`, `image`, `transcript`, `document`, `dataset`, `schema`) and assigns deterministic URL-derived IDs (`r_<8hex>`, e.g., `r_a1b2c3d4`) with `section_heading`, `label`, `dimensions`, and `salience` metadata while making zero subresource network requests. Inline content `<svg>` diagrams also rescue readable `<text>` labels directly into Markdown (`[Diagram: ...]`).
 
 ### Resource Policies (`--resources`)
 
@@ -438,7 +438,7 @@ During its single `O(N)` DOM pass, `pleb fetch` indexes linked non-prose resourc
 
 ### Selective and Direct Staging
 
-- `--stage-resources <IDS>`: Comma-separated resource IDs (for example `r1,r3`) from a page's indexed resources to selectively stage or inline.
+- `--stage-resources <IDS>`: Comma-separated deterministic resource IDs (for example `r_a1b2c3d4,r_5e6f7a8b`) or exact resource URLs from a page's indexed resources to selectively stage or inline.
 - `--stage`: Directly downloads and stages a single binary/document URL into `<state_dir>/artifacts/`, printing its local path (or JSON metadata with `--json`). Conflicts with `--output`, `--metadata-only`, `--jsonl`, `--format raw`, and batch mode.
 - `--referer <URL>`: Supplies a parent page URL to compute `strict-origin-when-cross-origin` `Referer` and `Sec-Fetch-Site` (`same-origin`, `same-site`, `cross-site`) headers on direct asset fetches.
 
@@ -552,7 +552,7 @@ pleb search --urls-only "rust async runtime" | pleb fetch -
 | `--source <MODE>` | `auto` *(default)*, `negotiate`, `none` | Structured source and Markdown mirror policy. |
 | `--resources <POLICY>` | `none` *(default)*, `manifest`, `transcripts`, `diagrams`, `all` | Linked resource enrichment policy. |
 | `--tools <POLICY>` | `none` *(default)*, `manifest` | WebMCP tool indexing policy (`manifest` appends `## Page Tools (WebMCP)`). |
-| `--stage-resources <IDS>` | comma-separated IDs (e.g., `r1,r3`) | Selectively stage or inline indexed resources from the page. |
+| `--stage-resources <IDS>` | comma-separated IDs (e.g., `r_a1b2c3d4,r_5e6f7a8b`) or URLs | Selectively stage or inline indexed resources from the page. |
 | `--referer <URL>` | URL | Parent page URL used to compute `Referer` and `Sec-Fetch-*` headers. |
 | `--stage` | flag | Stage a single binary/document URL into `<state_dir>/artifacts/` and print its path (or JSON). |
 | `--wait-for-selector <CSS>` | CSS selector | Selector to wait for during CEF or CDP rendering. |

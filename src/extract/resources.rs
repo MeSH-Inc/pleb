@@ -78,10 +78,21 @@ const IMAGE_NOISE_URL_PATTERNS: &[&str] = &[
     "badge",
     "avatar",
     "gravatar",
+    "profileicon",
+    "communityicon",
+    "usericon",
     "emoji",
     "1x1",
     "pixel",
 ];
+
+/// Compute a deterministic URL-derived resource identifier (`r_<8hex>`) so resource IDs stay
+/// stable across re-fetches even when surrounding feed items shift.
+pub fn resource_identifier(url: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, url.as_bytes());
+    let b = digest.as_ref();
+    format!("r_{:02x}{:02x}{:02x}{:02x}", b[0], b[1], b[2], b[3])
+}
 
 const TECHNICAL_VISUAL_CUES: &[&str] = &[
     "diagram",
@@ -171,7 +182,7 @@ impl ResourceIndexContext<'_> {
         if !self.seen_urls.insert(url.clone()) {
             return;
         }
-        let identifier = format!("r{}", self.resources.len() + 1);
+        let identifier = resource_identifier(&url);
         self.resources.push(ResourceDescriptor {
             identifier,
             kind,
@@ -326,6 +337,14 @@ fn maybe_index_image(
     };
 
     let large_dims = width.is_some_and(|w| w >= 300) && height.is_some_and(|h| h >= 150);
+    if !in_figure
+        && !large_dims
+        && label
+            .as_deref()
+            .is_some_and(|l| l.to_ascii_lowercase().ends_with(" avatar"))
+    {
+        return;
+    }
     let is_diagram =
         in_figure || large_dims || has_technical_visual_cue(label.as_deref(), resolved_url.path());
 

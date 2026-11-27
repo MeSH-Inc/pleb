@@ -306,10 +306,12 @@ async fn mcp_initialize_list_fetch_block_diagnostics_and_status() {
     let diag_default_text = diag_default["result"]["content"][0]["text"]
         .as_str()
         .unwrap();
+    let diagram_id = pleb::extract::resource_identifier(&format!("{base}/diagram.png"));
     assert!(
         diag_default_text.contains("resources=\"manifest\"")
-            && diag_default_text.contains("stage_resources=\"r1,r2\""),
-        "expected MCP-native cue, got: {diag_default_text}"
+            && diag_default_text.contains("stage_resources=\"<ids>\"")
+            && diag_default_text.contains(&diagram_id),
+        "expected MCP-native cue with deterministic diagram id {diagram_id}, got: {diag_default_text}"
     );
     assert!(
         !diag_default_text.contains("--stage-resources"),
@@ -339,6 +341,7 @@ async fn mcp_initialize_list_fetch_block_diagnostics_and_status() {
         .unwrap();
     assert!(
         diag_manifest_text.contains("## Linked Resources")
+            && diag_manifest_text.contains(&format!("| {diagram_id} |"))
             && diag_manifest_text.contains("/diagram.png"),
         "manifest text={diag_manifest_text}"
     );
@@ -355,7 +358,7 @@ async fn mcp_initialize_list_fetch_block_diagnostics_and_status() {
                 "arguments": {
                     "url": format!("{base}/diagram-page"),
                     "render": "cronet",
-                    "stage_resources": "r1"
+                    "stage_resources": diagram_id
                 }
             }
         }),
@@ -366,8 +369,38 @@ async fn mcp_initialize_list_fetch_block_diagnostics_and_status() {
         .as_str()
         .unwrap();
     assert!(
-        diag_staged_text.contains("Staged: r1="),
-        "expected Staged header line, got: {diag_staged_text}"
+        diag_staged_text.contains(&format!("Staged: {diagram_id}=")),
+        "expected Staged header line for {diagram_id}, got: {diag_staged_text}"
+    );
+
+    let diag_missing = send_rpc(
+        &mut writer,
+        &mut reader,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 64,
+            "method": "tools/call",
+            "params": {
+                "name": "pleb_fetch",
+                "arguments": {
+                    "url": format!("{base}/diagram-page"),
+                    "render": "cronet",
+                    "stage_resources": "r_deadbeef"
+                }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(diag_missing["result"]["isError"], false);
+    let diag_missing_text = diag_missing["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(
+        diag_missing_text.contains("Warning:")
+            && diag_missing_text.contains("r_deadbeef")
+            && diag_missing_text.contains("not found")
+            && !diag_missing_text.contains("Staged:"),
+        "drifted/unknown ID must warn cleanly without staging another resource, got: {diag_missing_text}"
     );
 
     // 7. Unknown tool -> -32602; unknown method -> -32601.
