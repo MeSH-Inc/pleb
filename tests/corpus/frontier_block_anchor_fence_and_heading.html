@@ -1,0 +1,22 @@
+<!-- pleb-fixture: {"tier":"ratchet","url":"https://feed.example.com/r/rust/","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"Rust Feed","variants":[{"name":"clean_md","format":"markdown","mode":"clean","require_balanced_fences":true,"expected_substrings":["Weekly Rust Highlights","Community Q&A thread","Compiler hints example:","Tokio Networking Notes","Async patterns after code block."],"expected_code_blocks":[{"language":null,"snippet":"error[E0308]: mismatched types"}],"expected_links":["https://feed.example.com/r/rust/posts/highlight","https://feed.example.com/r/rust/posts/hints","https://feed.example.com/r/rust/posts/next"],"forbidden_substrings":["[## Weekly Rust Highlights","```](https://feed.example.com/","* * * * * *"],"minimum_output_bytes":120,"maximum_output_bytes":1500,"expected_structure":{"minimum_headings":2,"minimum_code_blocks":1}}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><title>Rust Feed</title></head>
+<body>
+  <main>
+    <h1>Rust Feed</h1>
+    <article>
+      <a href="/r/rust/posts/highlight"><h2>Weekly Rust Highlights</h2><p>Community Q&amp;A thread</p></a>
+    </article>
+    <article>
+      <a href="/r/rust/posts/hints"><p>Compiler hints example:</p><pre><code>error[E0308]: mismatched types</code></pre></a>
+    </article>
+    <hr>
+    <hr>
+    <article>
+      <h2><a href="/r/rust/posts/next">Tokio Networking Notes</a></h2>
+      <p>Async patterns after code block.</p>
+    </article>
+  </main>
+</body>
+</html>

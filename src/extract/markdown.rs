@@ -78,8 +78,8 @@ pub fn html_to_compact_markdown(
             match resolve_and_clean_url(raw_href, &anchor_base) {
                 ResolvedUrl::Drop | ResolvedUrl::UnwrapText => Some(inner.into()),
                 ResolvedUrl::Resolved(dest) => {
-                    let formatted_dest = format_destination(&dest);
-                    Some(format!("{leading_ws}[{core}]({formatted_dest}){trailing_ws}").into())
+                    let body = format_anchor_markdown(core, &dest, &format_destination(&dest));
+                    Some(format!("{leading_ws}{body}{trailing_ws}").into())
                 }
             }
         },
@@ -128,6 +128,32 @@ fn split_document_whitespace(text: &str) -> (&str, &str, &str) {
     let core = trimmed_start.trim_end_matches(['\t', '\n', '\r', ' ']);
     let trailing_ws = &trimmed_start[core.len()..];
     (leading_ws, core, trailing_ws)
+}
+
+pub(crate) fn split_atx_heading(trimmed_start: &str) -> Option<(u8, &str, &str)> {
+    let hashes = trimmed_start.bytes().take_while(|&b| b == b'#').count();
+    if !(1..=6).contains(&hashes) || !trimmed_start[hashes..].starts_with(' ') {
+        return None;
+    }
+    let heading_text = trimmed_start[hashes + 1..].trim();
+    (!heading_text.is_empty()).then_some((hashes as u8, &trimmed_start[..hashes + 1], heading_text))
+}
+
+fn format_anchor_markdown(core: &str, dest: &str, formatted_dest: &str) -> String {
+    let (first_line, rest) = core
+        .split_once('\n')
+        .map_or((core, None), |(f, r)| (f, Some(r)));
+    if let Some((_, prefix, heading_text)) = split_atx_heading(first_line) {
+        return match rest {
+            Some(after) => format!("{prefix}[{heading_text}]({formatted_dest})\n{after}"),
+            None => format!("{prefix}[{heading_text}]({formatted_dest})"),
+        };
+    }
+    if core.contains("\n\n") || core.lines().any(|l| parse_opening_fence(l).is_some()) {
+        format!("{core}\n\n[{dest}]({formatted_dest})")
+    } else {
+        format!("[{core}]({formatted_dest})")
+    }
 }
 
 fn has_unbalanced_parens(s: &str) -> bool {

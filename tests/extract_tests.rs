@@ -2757,3 +2757,55 @@ fn compact_markdown_collapses_duplicate_empty_alt_icons_and_keeps_distinct() {
     );
     assert_eq!(out.matches("Foo_(bar).png").count(), 1);
 }
+
+#[test]
+fn anchor_block_formatting_preserves_inline_hashes_code_and_balances_fences() {
+    let url = Url::parse("https://docs.example.com/cards").unwrap();
+    let html = r#"<!doctype html>
+<html><head><title>Anchor Block Cards</title></head><body><main>
+  <h1>Anchor Block Cards</h1>
+  <p>
+    <a href="/issue/123">#123</a>,
+    <a href="/c">C#</a>,
+    <a href="/fn"><code>fn main()</code></a>,
+    <a href="/d">- 2026 release</a>
+  </p>
+  <a href="/p"><p>Single inline paragraph</p></a>
+  <article>
+    <a href="/card"><h2>Card Heading</h2><p>Card body</p></a>
+  </article>
+  <article>
+    <a href="/code"><pre><code>let x = 1;</code></pre></a>
+    <hr>
+    <hr>
+    <p>Trailing prose</p>
+  </article>
+</main></body></html>"#;
+
+    let doc = extract_document(html, &url, Some("text/html"), &ExtractOptions::default()).unwrap();
+    for inline in [
+        "[#123](https://docs.example.com/issue/123)",
+        "[C#](https://docs.example.com/c)",
+        "[`fn main()`](https://docs.example.com/fn)",
+        "[Single inline paragraph](https://docs.example.com/p)",
+        "2026 release](https://docs.example.com/d)",
+    ] {
+        assert!(
+            doc.content.contains(inline),
+            "inline anchor {inline:?} must stay inline; got:\n{}",
+            doc.content
+        );
+    }
+    assert!(doc
+        .content
+        .contains("## [Card Heading](https://docs.example.com/card)"));
+    assert!(doc.content.contains("Card body"));
+    assert!(!doc.content.contains("[## Card Heading"));
+    assert!(open_fence_at(&doc.content, doc.content.len()).is_none());
+    assert!(doc
+        .content
+        .contains("[https://docs.example.com/code](https://docs.example.com/code)"));
+    assert!(doc.content.contains("let x = 1;"));
+    assert!(doc.content.contains("Trailing prose"));
+    assert_eq!(doc.content.matches("* * *").count(), 1);
+}
