@@ -23,6 +23,14 @@ external static/BM25 extractors on identical frozen HTML inputs:
   - html2text_full:      html2text Markdown conversion baseline
   - crawl4ai_bm25_ref:   BM25Okapi chunk-filter reference (Crawl4AI BM25ContentFilter pattern)
 
+Multi-URL stdin batch track (runs offline by default unless `--no-batch`):
+  Compares `pleb_batch_clean` vs. `pleb_batch_focus` over `pleb fetch - --jsonl`
+  with mixed relevant, distractor, unavailable-evidence, and cloaked-injection URLs.
+
+Optional CEF SPA hydration track (`--cef-track`):
+  Verifies static `--render cronet` honest `incomplete_shell` triage vs. local
+  `v5-meta` CEF `--render cef` full and `--focus` JS-hydrated recovery.
+
 Optional paired live-URL track (`--live-track` / `--live-only`):
   Compares `pleb_live_clean` and `pleb_live_focus` head-to-head against direct
   `Accept: text/markdown` HTTP requests (Cloudflare Markdown-for-Agents baseline),
@@ -453,9 +461,14 @@ def run_pleb(
     state_dir: str,
     url: str,
     extra_args: list[str],
+    allow_home_cef: bool = False,
+    render_mode: str = "cronet",
 ) -> tuple[int, dict[str, Any] | None, dict[str, Any] | None, float]:
     env = os.environ.copy()
-    env["PLEB_NO_HOME_CEF"] = "1"
+    if not allow_home_cef:
+        env["PLEB_NO_HOME_CEF"] = "1"
+    else:
+        env.pop("PLEB_NO_HOME_CEF", None)
     env["PLEB_NO_KEYCHAIN"] = "1"
     env.pop("PLEB_CDP_URL", None)
     cmd = [
@@ -466,7 +479,7 @@ def run_pleb(
         "--json",
         "fetch",
         "--render",
-        "cronet",
+        render_mode,
         *extra_args,
         url,
     ]
@@ -486,6 +499,50 @@ def run_pleb(
         except json.JSONDecodeError:
             err_json = None
     return proc.returncode, out_json, err_json, elapsed_ms
+
+
+def run_pleb_batch(
+    pleb_bin: str,
+    state_dir: str,
+    urls: list[str],
+    extra_args: list[str],
+) -> tuple[int, list[dict[str, Any]], float]:
+    env = os.environ.copy()
+    env["PLEB_NO_HOME_CEF"] = "1"
+    env["PLEB_NO_KEYCHAIN"] = "1"
+    env.pop("PLEB_CDP_URL", None)
+    cmd = [
+        pleb_bin,
+        "--state-dir",
+        state_dir,
+        "--no-daemon",
+        "fetch",
+        "-",
+        "--jsonl",
+        "--render",
+        "cronet",
+        *extra_args,
+    ]
+    t0 = time.perf_counter()
+    proc = subprocess.run(
+        cmd,
+        input="\n".join(urls) + "\n",
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    items: list[dict[str, Any]] = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            items.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return proc.returncode, items, elapsed_ms
 
 
 def build_model_visible_envelope(payload: dict[str, Any], content: str) -> str:
@@ -1127,6 +1184,276 @@ def print_live_markdown_report(live_report: dict[str, Any]) -> None:
             )
 
 
+def evaluate_batch_tasks(
+    batch_tasks: list[dict[str, Any]],
+    base_url: str,
+    pleb_bin: str,
+    budget_tokens: int,
+    counter: TokenCounter,
+) -> dict[str, Any]:
+    """Evaluate multi-URL stdin batch pipelines (`pleb fetch - --jsonl`) comparing clean vs --focus."""
+    state_dir = tempfile.mkdtemp(prefix=f"pleb-batch-{os.getpid()}-", dir="/tmp")
+    runs: list[dict[str, Any]] = []
+    try:
+        for strategy in ("pleb_batch_clean", "pleb_batch_focus"):
+            rows: list[dict[str, Any]] = []
+            for task in batch_tasks:
+                urls = [f"{base_url}{p}" for p in task["paths"]]
+                extra: list[str] = []
+                if strategy == "pleb_batch_focus":
+                    per_url_toks = max(250, (budget_tokens - len(urls) * 90) // max(1, len(urls)))
+                    extra = [
+                        "--focus",
+                        task["query"],
+                        "--max-bytes",
+                        str(per_url_toks * 3),
+                    ]
+                _, items, elapsed_ms = run_pleb_batch(pleb_bin, state_dir, urls, extra)
+                by_path: dict[str, dict[str, Any]] = {}
+                visible_parts: list[str] = []
+                for it in items:
+                    u = it.get("url", "")
+                    path = u[len(base_url) :] if u.startswith(base_url) else u
+                    by_path[path] = it
+                    if it.get("ok"):
+                        visible_parts.append(
+                            build_model_visible_envelope(it, it.get("content", ""))
+                        )
+                    else:
+                        visible_parts.append(json.dumps(it))
+
+                combined_visible = "\n\n".join(visible_parts)
+                tokens = counter.count(combined_visible)
+                within_budget = tokens <= budget_tokens
+                hits = count_evidence_hits(combined_visible, task["required_evidence"])
+                norm_lower = normalize_ws(combined_visible).lower()
+                norm_unescaped_lower = normalize_ws(
+                    unescape_markdown_punct(combined_visible)
+                ).lower()
+                leaked = any(
+                    normalize_ws(forb).lower() in norm_lower
+                    or normalize_ws(forb).lower() in norm_unescaped_lower
+                    for forb in task.get("forbidden_substrings", [])
+                )
+
+                expected_unavail = task.get("expected_unavailable", {})
+                unavail_honest = 0
+                false_usable = 0
+                for u_path, expected_sig in expected_unavail.items():
+                    it = by_path.get(u_path)
+                    if it is None:
+                        continue
+                    if expected_sig == "incomplete_shell":
+                        if it.get("ok") and it.get("content_outcome") == "incomplete_shell":
+                            unavail_honest += 1
+                        elif it.get("ok") and it.get("content_outcome") == "complete":
+                            false_usable += 1
+                    elif expected_sig == "exit_2":
+                        if (not it.get("ok")) and it.get("exit_code") == 2:
+                            unavail_honest += 1
+                        elif it.get("ok") and it.get("content_outcome") == "complete":
+                            false_usable += 1
+
+                supported = (
+                    within_budget
+                    and hits == len(task["required_evidence"])
+                    and unavail_honest == len(expected_unavail)
+                    and false_usable == 0
+                    and not leaked
+                )
+                rows.append(
+                    {
+                        "task_id": task["id"],
+                        "url_count": len(urls),
+                        "supported": supported,
+                        "evidence_hits": hits,
+                        "evidence_total": len(task["required_evidence"]),
+                        "unavailable_honest": unavail_honest,
+                        "unavailable_total": len(expected_unavail),
+                        "false_usable": false_usable,
+                        "leaked": leaked,
+                        "tokens": tokens,
+                        "within_budget": within_budget,
+                        "latency_ms": elapsed_ms,
+                    }
+                )
+            sup_cnt = sum(1 for r in rows if r["supported"])
+            tot_tok = sum(r["tokens"] for r in rows)
+            runs.append(
+                {
+                    "strategy": strategy,
+                    "budget_tokens": budget_tokens,
+                    "supported": sup_cnt,
+                    "total": len(rows),
+                    "false_usable": sum(r["false_usable"] for r in rows),
+                    "leaks": sum(1 for r in rows if r["leaked"]),
+                    "mean_tokens": tot_tok / max(1, len(rows)),
+                    "tokens_per_supported": tot_tok / sup_cnt if sup_cnt else None,
+                    "tasks": rows,
+                }
+            )
+    finally:
+        shutil.rmtree(state_dir, ignore_errors=True)
+    return {"budget_tokens": budget_tokens, "runs": runs}
+
+
+def print_batch_markdown_report(batch_report: dict[str, Any]) -> None:
+    print("\n## Multi-URL Batch Track (`pleb fetch - --jsonl`)\n")
+    print(f"- **Total Batch Budget:** {batch_report['budget_tokens']} tok across all URLs per task\n")
+    print("| Strategy | Supported | False-Usable | Leaks | Mean Batch Tok | Tok / Supported |")
+    print("| :--- | ---: | ---: | ---: | ---: | ---: |")
+    for r in batch_report["runs"]:
+        c_succ = f"{r['tokens_per_supported']:.0f}" if r["tokens_per_supported"] is not None else "inf"
+        print(
+            f"| `{r['strategy']}` | {r['supported']}/{r['total']} | {r['false_usable']} | "
+            f"{r['leaks']} | {r['mean_tokens']:.0f} | {c_succ} |"
+        )
+    print("\n| Task | URLs | Strategy | Evidence | Unavail Honest | Leaks | Batch Tok | Budget OK | ms |")
+    print("| :--- | ---: | :--- | ---: | ---: | ---: | ---: | :---: | ---: |")
+    for run in batch_report["runs"]:
+        for t in run["tasks"]:
+            ok_mark = "yes" if t["within_budget"] else "no"
+            print(
+                f"| `{t['task_id']}` | {t['url_count']} | `{run['strategy']}` | "
+                f"{t['evidence_hits']}/{t['evidence_total']} | "
+                f"{t['unavailable_honest']}/{t['unavailable_total']} | "
+                f"{1 if t['leaked'] else 0} | {t['tokens']} | {ok_mark} | {t['latency_ms']:.1f} |"
+            )
+
+
+def evaluate_cef_spa_track(
+    spa_tasks: list[dict[str, Any]],
+    base_url: str,
+    pleb_bin: str,
+    budget_tokens: int,
+    counter: TokenCounter,
+) -> dict[str, Any]:
+    """Opt-in CEF SPA hydration track comparing static Cronet shell triage vs CEF hydrated full & focus."""
+    state_dir = tempfile.mkdtemp(prefix=f"pleb-cef-{os.getpid()}-", dir="/tmp")
+    rows: list[dict[str, Any]] = []
+    try:
+        # Probe whether a ready v5-meta CEF renderer exists via `pleb status --json`.
+        probe_env = os.environ.copy()
+        probe_env.pop("PLEB_NO_HOME_CEF", None)
+        probe_env["PLEB_NO_KEYCHAIN"] = "1"
+        probe = subprocess.run(
+            [pleb_bin, "--state-dir", state_dir, "status", "--json"],
+            capture_output=True,
+            text=True,
+            env=probe_env,
+            check=False,
+        )
+        cef_ready = False
+        if probe.returncode == 0:
+            try:
+                cef_ready = (json.loads(probe.stdout).get("cef_renderer") or {}).get("status") == "ready"
+            except json.JSONDecodeError:
+                cef_ready = False
+
+        for task in spa_tasks:
+            url = f"{base_url}{task['path']}"
+            needles = task["required_evidence"]
+            for strat, render_mode, allow_cef, extra in (
+                ("pleb_cronet_only", "cronet", False, []),
+                ("pleb_cef_full", "cef", True, []),
+                (
+                    "pleb_cef_focus",
+                    "cef",
+                    True,
+                    ["--focus", task["query"], "--max-bytes", str(max(512, (budget_tokens - 140) * 3))],
+                ),
+            ):
+                if allow_cef and not cef_ready:
+                    rows.append(
+                        {
+                            "task_id": task["id"],
+                            "strategy": strat,
+                            "status": "skipped_no_cef_renderer",
+                            "outcome": "",
+                            "evidence_hits": 0,
+                            "evidence_total": len(needles),
+                            "leaked": False,
+                            "tokens": 0,
+                            "within_budget": True,
+                            "supported": False,
+                            "latency_ms": 0.0,
+                        }
+                    )
+                    continue
+                rc, out_json, err_json, elapsed_ms = run_pleb(
+                    pleb_bin,
+                    state_dir,
+                    url,
+                    extra,
+                    allow_home_cef=allow_cef,
+                    render_mode=render_mode,
+                )
+                if rc == 0 and out_json is not None:
+                    visible = build_model_visible_envelope(out_json, out_json.get("content", ""))
+                    tokens = counter.count(visible)
+                    outcome = out_json.get("content_outcome", "")
+                    hits = count_evidence_hits(visible, needles)
+                    norm_lower = normalize_ws(visible).lower()
+                    leaked = any(
+                        normalize_ws(forb).lower() in norm_lower
+                        for forb in task.get("forbidden_substrings", [])
+                    )
+                    within = tokens <= budget_tokens
+                    if strat == "pleb_cronet_only":
+                        supported = outcome == "incomplete_shell" and within
+                    else:
+                        supported = outcome == "complete" and within and hits == len(needles) and not leaked
+                    rows.append(
+                        {
+                            "task_id": task["id"],
+                            "strategy": strat,
+                            "status": "ok",
+                            "outcome": outcome,
+                            "evidence_hits": hits,
+                            "evidence_total": len(needles),
+                            "leaked": leaked,
+                            "tokens": tokens,
+                            "within_budget": within,
+                            "supported": supported,
+                            "latency_ms": elapsed_ms,
+                        }
+                    )
+                else:
+                    msg = (err_json or {}).get("error", f"exit_{rc}")
+                    rows.append(
+                        {
+                            "task_id": task["id"],
+                            "strategy": strat,
+                            "status": f"error:{msg[:40]}",
+                            "outcome": "",
+                            "evidence_hits": 0,
+                            "evidence_total": len(needles),
+                            "leaked": False,
+                            "tokens": counter.count(json.dumps(err_json or {})),
+                            "within_budget": True,
+                            "supported": False,
+                            "latency_ms": elapsed_ms,
+                        }
+                    )
+    finally:
+        shutil.rmtree(state_dir, ignore_errors=True)
+    return {"budget_tokens": budget_tokens, "cef_ready": cef_ready, "rows": rows}
+
+
+def print_cef_markdown_report(cef_report: dict[str, Any]) -> None:
+    print("\n## Opt-In CEF SPA Hydration Track\n")
+    print(f"- **Budget:** {cef_report['budget_tokens']} tok | **Local CEF Ready:** `{cef_report['cef_ready']}`\n")
+    print("| Task | Strategy | Status | Outcome | Evidence | Leaks | Tok | Budget OK | Supported | ms |")
+    print("| :--- | :--- | :--- | :--- | ---: | ---: | ---: | :---: | :---: | ---: |")
+    for r in cef_report["rows"]:
+        print(
+            f"| `{r['task_id']}` | `{r['strategy']}` | {r['status']} | `{r['outcome']}` | "
+            f"{r['evidence_hits']}/{r['evidence_total']} | {1 if r['leaked'] else 0} | "
+            f"{r['tokens']} | {'yes' if r['within_budget'] else 'no'} | "
+            f"{'yes' if r['supported'] else 'no'} | {r['latency_ms']:.1f} |"
+        )
+
+
 def print_markdown_report(report: dict[str, Any]) -> None:
     print("# pleb Held-Out Task Evaluation Scorecard\n")
     print(f"- **Tokenizer:** `{report['tokenizer']}`")
@@ -1204,12 +1531,36 @@ def main() -> None:
         default=4000,
         help="Model-visible token budget for the live-pair track",
     )
+    parser.add_argument(
+        "--batch-budget",
+        type=int,
+        default=4000,
+        help="Total model-visible token budget across all URLs in each multi-URL batch task",
+    )
+    parser.add_argument(
+        "--no-batch",
+        action="store_true",
+        help="Skip multi-URL stdin batch (`pleb fetch - --jsonl`) evaluation track",
+    )
+    parser.add_argument(
+        "--cef-track",
+        action="store_true",
+        help="Run opt-in local CEF SPA hydration track (requires installed v5-meta CEF renderer)",
+    )
+    parser.add_argument(
+        "--cef-budget",
+        type=int,
+        default=1500,
+        help="Model-visible token budget for the CEF SPA hydration track",
+    )
     parser.add_argument("--json-out", help="Optional path to write full JSON report")
     args = parser.parse_args()
 
     manifest = json.loads(TASKS_PATH.read_text(encoding="utf-8"))
     tasks = manifest["tasks"]
     live_tasks = manifest.get("live_tasks", [])
+    batch_tasks = manifest.get("batch_tasks", [])
+    spa_tasks = manifest.get("spa_tasks", [])
     budgets = [int(x.strip()) for x in args.budgets.split(",") if x.strip()]
     counter = TokenCounter()
 
@@ -1226,35 +1577,54 @@ def main() -> None:
     )
 
     runs: list[dict[str, Any]] = []
-    if not args.live_only:
-        with FixtureHTTPServer(tasks) as srv:
-            if not args.no_warmup and tasks:
-                warm_dir = tempfile.mkdtemp(prefix=f"pleb-warm-{os.getpid()}-", dir="/tmp")
-                try:
-                    run_pleb(args.pleb_bin, warm_dir, f"{srv.base_url}{tasks[0]['path']}", [])
-                finally:
-                    shutil.rmtree(warm_dir, ignore_errors=True)
-            for budget in budgets:
-                for strategy in pleb_strategies:
-                    runs.append(
-                        evaluate_strategy(
-                            strategy=strategy,
-                            tasks=tasks,
-                            base_url=srv.base_url,
-                            pleb_bin=args.pleb_bin,
-                            budget_tokens=budget,
-                            counter=counter,
+    batch_report = None
+    cef_report = None
+    if (not args.live_only) or args.cef_track:
+        with FixtureHTTPServer(tasks + spa_tasks) as srv:
+            if not args.live_only:
+                if not args.no_warmup and tasks:
+                    warm_dir = tempfile.mkdtemp(prefix=f"pleb-warm-{os.getpid()}-", dir="/tmp")
+                    try:
+                        run_pleb(args.pleb_bin, warm_dir, f"{srv.base_url}{tasks[0]['path']}", [])
+                    finally:
+                        shutil.rmtree(warm_dir, ignore_errors=True)
+                for budget in budgets:
+                    for strategy in pleb_strategies:
+                        runs.append(
+                            evaluate_strategy(
+                                strategy=strategy,
+                                tasks=tasks,
+                                base_url=srv.base_url,
+                                pleb_bin=args.pleb_bin,
+                                budget_tokens=budget,
+                                counter=counter,
+                            )
                         )
-                    )
-                for strategy in external_strategies:
-                    runs.append(
-                        evaluate_external_extractor(
-                            strategy=strategy,
-                            tasks=tasks,
-                            budget_tokens=budget,
-                            counter=counter,
+                    for strategy in external_strategies:
+                        runs.append(
+                            evaluate_external_extractor(
+                                strategy=strategy,
+                                tasks=tasks,
+                                budget_tokens=budget,
+                                counter=counter,
+                            )
                         )
+                if batch_tasks and not args.no_batch:
+                    batch_report = evaluate_batch_tasks(
+                        batch_tasks=batch_tasks,
+                        base_url=srv.base_url,
+                        pleb_bin=args.pleb_bin,
+                        budget_tokens=args.batch_budget,
+                        counter=counter,
                     )
+            if args.cef_track and spa_tasks:
+                cef_report = evaluate_cef_spa_track(
+                    spa_tasks=spa_tasks,
+                    base_url=srv.base_url,
+                    pleb_bin=args.pleb_bin,
+                    budget_tokens=args.cef_budget,
+                    counter=counter,
+                )
 
     live_report = None
     if args.live_track or args.live_only:
@@ -1277,10 +1647,16 @@ def main() -> None:
         "wild_count": sum(1 for t in tasks if t["family"] == "wild_production_docs"),
         "unavailable_count": sum(1 for t in tasks if not t["answerable"]),
         "runs": runs,
+        "batch_track": batch_report,
+        "cef_track": cef_report,
         "live_track": live_report,
     }
     if runs:
         print_markdown_report(report)
+    if batch_report is not None:
+        print_batch_markdown_report(batch_report)
+    if cef_report is not None:
+        print_cef_markdown_report(cef_report)
     if live_report is not None:
         print_live_markdown_report(live_report)
     if args.json_out:
