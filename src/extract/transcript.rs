@@ -120,7 +120,7 @@ fn clean_transcript_text(body: &str, is_markdown: bool) -> String {
 
         let (speaker, without_voice) = extract_voice_tag(trimmed);
         let stripped_tags = strip_inline_cue_tags(&without_voice);
-        let decoded = decode_basic_entities(&stripped_tags);
+        let decoded = super::feed::decode_xml_entities(&stripped_tags);
         let normalized = collapse_inline_whitespace(&decoded);
         let text = normalized.trim();
 
@@ -219,7 +219,7 @@ fn extract_voice_tag(line: &str) -> (Option<String>, String) {
                 } else {
                     tag_body
                 };
-                let cleaned = decode_basic_entities(name_part.trim());
+                let cleaned = super::feed::decode_xml_entities(name_part.trim());
                 let cleaned = cleaned.trim();
                 if !cleaned.is_empty() && speaker.is_none() {
                     speaker = Some(cleaned.to_string());
@@ -259,38 +259,5 @@ fn strip_inline_cue_tags(line: &str) -> String {
         i += ch.len_utf8();
     }
 
-    out
-}
-
-fn decode_basic_entities(input: &str) -> String {
-    if !input.contains('&') {
-        return input.to_string();
-    }
-    let mut out = String::with_capacity(input.len());
-    let mut rest = input;
-    while let Some(pos) = rest.find('&') {
-        out.push_str(&rest[..pos]);
-        rest = &rest[pos..];
-        let matched = [
-            ("&amp;", "&"),
-            ("&lt;", "<"),
-            ("&gt;", ">"),
-            ("&quot;", "\""),
-            ("&#39;", "'"),
-            ("&apos;", "'"),
-            ("&nbsp;", " "),
-        ]
-        .iter()
-        .find_map(|(ent, rep)| rest.strip_prefix(ent).map(|tail| (*rep, tail)));
-
-        if let Some((rep, tail)) = matched {
-            out.push_str(rep);
-            rest = tail;
-        } else {
-            out.push('&');
-            rest = &rest[1..];
-        }
-    }
-    out.push_str(rest);
     out
 }

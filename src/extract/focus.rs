@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use super::markdown::{open_fence_at, truncate_markdown, FenceLine, FenceTracker};
+use super::markdown::{
+    open_fence_at, split_atx_heading, truncate_markdown, FenceLine, FenceTracker,
+};
 
 /// Default byte budget (~4,000 tokens) when `--focus` is used without explicit `--max-bytes`.
 pub const DEFAULT_FOCUS_MAX_BYTES: usize = 16_000;
@@ -294,7 +296,7 @@ fn split_sections<'a>(markdown: &'a str) -> (String, Vec<SectionBlock<'a>>) {
 
     for line in markdown.lines() {
         if fence.step(line) == FenceLine::Outside {
-            if let Some(level) = parse_atx_heading_level(line.trim_start()) {
+            if let Some((level, _, _)) = split_atx_heading(line.trim_start()) {
                 flush(cur_heading.take(), &mut cur_lines, &mut sections);
                 cur_heading = Some((line, level));
                 continue;
@@ -333,14 +335,6 @@ fn split_subblocks(body: &str) -> Vec<String> {
     }
     flush(&mut cur, &mut blocks);
     blocks
-}
-
-fn parse_atx_heading_level(trimmed_start: &str) -> Option<u8> {
-    let hashes = trimmed_start.bytes().take_while(|&b| b == b'#').count();
-    ((1..=6).contains(&hashes)
-        && trimmed_start[hashes..].starts_with(' ')
-        && !trimmed_start[hashes..].trim().is_empty())
-    .then_some(hashes as u8)
 }
 
 fn strip_inline_markdown_links(text: &str) -> String {

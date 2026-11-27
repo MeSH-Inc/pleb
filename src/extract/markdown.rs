@@ -208,16 +208,19 @@ pub(crate) fn format_destination(dest: &str) -> String {
     }
 }
 
+fn collapse_lines(raw: &str) -> String {
+    raw.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn format_title(title: Option<&str>) -> String {
     let Some(raw) = title else {
         return String::new();
     };
-    let collapsed: String = raw
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let collapsed = collapse_lines(raw);
     if collapsed.is_empty() {
         return String::new();
     }
@@ -226,12 +229,7 @@ fn format_title(title: Option<&str>) -> String {
 }
 
 fn clean_alt_text(raw: &str) -> String {
-    let collapsed: String = raw
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let collapsed = collapse_lines(raw);
     let mut out = String::with_capacity(collapsed.len());
     for ch in collapsed.chars() {
         match ch {

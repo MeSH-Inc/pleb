@@ -771,7 +771,7 @@ fn parse_tag_name_and_attrs(tag_body: &str) -> Option<(String, Vec<(String, Stri
     Some((name, attrs))
 }
 
-fn decode_xml_entities(s: &str) -> String {
+pub(crate) fn decode_xml_entities(s: &str) -> String {
     if !s.contains('&') {
         return s.to_string();
     }
