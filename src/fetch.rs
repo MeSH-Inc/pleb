@@ -285,15 +285,6 @@ pub async fn fetch_target(
     target: FetchTarget,
     options: &FetchOptions,
 ) -> std::result::Result<FetchOutput, FetchError> {
-    let url_owned = match target {
-        FetchTarget::Navigate(u) => u,
-        FetchTarget::AttachCdp { .. } => {
-            return Err(FetchError::CdpUnavailable(
-                "passive CDP attach not yet implemented".to_string(),
-            ));
-        }
-    };
-    let url = url_owned.as_str();
     let start = Instant::now();
     if options.extract.format == OutputFormat::Raw {
         return Err(FetchError::Transport(anyhow::anyhow!(
@@ -322,6 +313,87 @@ pub async fn fetch_target(
         }
     }
 
+    match target {
+        FetchTarget::Navigate(ref url) => {
+            fetch_navigated(ctx, url, options, is_axtree, start).await
+        }
+        FetchTarget::AttachCdp {
+            ref expected_origin,
+        } => fetch_attached_cdp(ctx, expected_origin.as_deref(), options, is_axtree, start).await,
+    }
+}
+
+async fn fetch_attached_cdp(
+    ctx: &RuntimeContext,
+    expected_origin: Option<&str>,
+    options: &FetchOptions,
+    is_axtree: bool,
+    start: Instant,
+) -> std::result::Result<FetchOutput, FetchError> {
+    if options.render != RenderMode::Cdp {
+        return Err(FetchError::CdpUnavailable(
+            "--no-navigate requires --render cdp".to_string(),
+        ));
+    }
+    if ctx.config.proxy.is_some() {
+        return Err(FetchError::CdpUnavailable(
+            "CDP renderer cannot be used with --proxy because WebSocket CDP connections would bypass the proxy"
+                .to_string(),
+        ));
+    }
+    if !matches!(
+        options.resources,
+        ResourcePolicy::None | ResourcePolicy::Manifest
+    ) || !options.stage_resources.is_empty()
+    {
+        return Err(FetchError::CdpUnavailable(
+            "--no-navigate supports only --resources none or manifest (cannot issue subresource network fetches)"
+                .to_string(),
+        ));
+    }
+    if let Some(exp) = expected_origin {
+        let _ = parse_http_url(exp)?;
+    }
+
+    let cdp_url = ctx.configured_cdp_url().ok_or_else(|| {
+        FetchError::CdpUnavailable(
+            "--no-navigate requires --cdp-url or PLEB_CDP_URL pointing to ws://<loopback>/devtools/page/<id>"
+                .to_string(),
+        )
+    })?;
+    let max_response_bytes = ctx
+        .config
+        .max_response_bytes
+        .unwrap_or(DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES);
+    crate::transport::cdp::validate_loopback_page_cdp_url(&cdp_url)
+        .map_err(|e| map_cdp_error("attached-cdp-page", e, max_response_bytes))?;
+
+    let cdp = CdpRenderer::new(cdp_url.clone(), ctx.config.state_dir.clone(), None);
+    let opts = CdpRenderOptions {
+        wait_for_selector: options.wait_for_selector.clone(),
+        capture_axtree: is_axtree,
+        max_response_bytes,
+        allow_local_targets: true,
+    };
+    let res = cdp
+        .render_attached(expected_origin, &opts, ctx.config.cdp_timeout)
+        .await
+        .map_err(|e| map_cdp_error(expected_origin.unwrap_or(&cdp_url), e, max_response_bytes))?;
+
+    let requested_url = expected_origin
+        .map(str::to_string)
+        .unwrap_or_else(|| res.final_url.clone());
+    let page = classify_cdp_attach_result(expected_origin, res)?;
+    extract_and_finalize_page(ctx, &requested_url, page, options, is_axtree, start).await
+}
+
+async fn fetch_navigated(
+    ctx: &RuntimeContext,
+    url: &str,
+    options: &FetchOptions,
+    is_axtree: bool,
+    start: Instant,
+) -> std::result::Result<FetchOutput, FetchError> {
     let effective_render = if is_axtree && options.render == RenderMode::Auto {
         RenderMode::Cdp
     } else {
@@ -364,13 +436,24 @@ pub async fn fetch_target(
     )
     .await?;
 
+    extract_and_finalize_page(ctx, url, page, options, is_axtree, start).await
+}
+
+async fn extract_and_finalize_page(
+    ctx: &RuntimeContext,
+    url: &str,
+    page: AcquiredPage,
+    options: &FetchOptions,
+    is_axtree: bool,
+    start: Instant,
+) -> std::result::Result<FetchOutput, FetchError> {
     let acquired_sha256 = sha256_hex(page.body.as_bytes());
     let representation_url = page
         .extract_base_url
         .as_ref()
         .map(|u| u.as_str().to_string())
         .filter(|u| u != &page.final_url);
-    let final_url_parsed = url::Url::parse(&page.final_url).unwrap_or_else(|_| effective.clone());
+    let final_url_parsed = url::Url::parse(&page.final_url).or_else(|_| parse_http_url(url))?;
     let extract_url = page.extract_base_url.as_ref().unwrap_or(&final_url_parsed);
     let needs_enrichment = options.resources != ResourcePolicy::None
         || !options.stage_resources.is_empty()
@@ -2106,6 +2189,94 @@ fn format_block_detail(base: &str, diagnostics: &DiagnosticHeaders) -> String {
         );
     }
     detail
+}
+
+fn classify_cdp_attach_result(
+    expected_origin: Option<&str>,
+    res: CdpRenderResult,
+) -> std::result::Result<AcquiredPage, FetchError> {
+    if let Some(reason) = detect_interstitial_challenge(&res.html) {
+        return Err(FetchError::Challenge {
+            url: res.final_url,
+            status: 0,
+            reason,
+        });
+    }
+    let content_type = res
+        .content_type
+        .filter(|c| extract::is_html_content_type(Some(c)))
+        .or_else(|| Some("text/html".to_string()));
+    let mut parsed_html = None;
+    let empty_headers = DiagnosticHeaders::default();
+    match classify_response_with_headers(
+        200,
+        true,
+        expected_origin,
+        Some(&res.final_url),
+        &res.html,
+        &empty_headers,
+        &mut parsed_html,
+    ) {
+        ResponseClassification::Ok => Ok(AcquiredPage {
+            body: res.html,
+            final_url: res.final_url,
+            extract_base_url: None,
+            status_code: 0,
+            content_type,
+            strategy: "cdp_attach".to_string(),
+            content_outcome: ContentOutcome::Complete,
+            escalated: false,
+            warning: None,
+            parsed: parsed_html,
+            axtree_text: res.axtree_text,
+            imperative_tools: res.imperative_tools,
+        }),
+        ResponseClassification::JavaScriptShell { reason } => Ok(AcquiredPage {
+            body: res.html,
+            final_url: res.final_url,
+            extract_base_url: None,
+            status_code: 0,
+            content_type,
+            strategy: "cdp_attach".to_string(),
+            content_outcome: ContentOutcome::IncompleteShell,
+            escalated: false,
+            warning: Some(format!(
+                "JavaScript shell remained unhydrated in attached CDP page ({reason}); returning partial HTML"
+            )),
+            parsed: parsed_html,
+            axtree_text: res.axtree_text,
+            imperative_tools: res.imperative_tools,
+        }),
+        ResponseClassification::Blocked { reason, .. } => Err(FetchError::Blocked {
+            url: res.final_url,
+            status: 0,
+            reason,
+            detail: format_block_detail("attached CDP page blocked", &empty_headers),
+        }),
+        ResponseClassification::RateLimited {
+            retry_after_secs, ..
+        } => Err(FetchError::Blocked {
+            url: res.final_url,
+            status: 0,
+            reason: BlockReason::RateLimited,
+            detail: format_block_detail(
+                &match retry_after_secs {
+                    Some(secs) => format!("rate limited in attached CDP page (Retry-After: {secs}s)"),
+                    None => "rate limited in attached CDP page".to_string(),
+                },
+                &empty_headers,
+            ),
+        }),
+        ResponseClassification::Challenge { reason, .. } => Err(FetchError::Challenge {
+            url: res.final_url,
+            status: 0,
+            reason,
+        }),
+        ResponseClassification::HttpError { status } => Err(FetchError::HttpError {
+            url: res.final_url,
+            status,
+        }),
+    }
 }
 
 fn classify_cdp_result(

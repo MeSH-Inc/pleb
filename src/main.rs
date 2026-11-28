@@ -101,9 +101,11 @@ struct Cli {
 enum Command {
     /// Fetch one or more URLs (or '-' to read newline-separated URLs from stdin)
     Fetch {
-        /// Target URL(s) (http/https), or '-' to read URLs from stdin
-        #[arg(required = true)]
+        /// Target URL(s) (http/https), or '-' to read URLs from stdin (optional with --no-navigate as origin assertion)
         urls: Vec<String>,
+        /// Attach read-only to an already-loaded loopback /devtools/page/<id> tab without navigating
+        #[arg(long)]
+        no_navigate: bool,
         /// Output format
         #[arg(long, value_enum, default_value_t = OutputFormat::Markdown, ignore_case = true)]
         format: OutputFormat,
@@ -905,6 +907,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
         },
         Command::Fetch {
             urls,
+            no_navigate,
             format,
             extract,
             expand,
@@ -934,13 +937,65 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     "--metadata-only requires --json or --jsonl",
                 ));
             }
-            let is_stdin = urls.len() == 1 && urls[0] == "-";
-            if urls.len() > 1 && urls.iter().any(|u| u == "-") {
+            if !no_navigate && urls.is_empty() {
+                return Err(CliError::invalid_input(
+                    "a target URL (or '-' for stdin) is required unless --no-navigate is set",
+                ));
+            }
+            let is_stdin = !no_navigate && urls.len() == 1 && urls[0] == "-";
+            if !no_navigate && urls.len() > 1 && urls.iter().any(|u| u == "-") {
                 return Err(CliError::invalid_input(
                     "stdin '-' cannot be mixed with positional URLs",
                 ));
             }
-            let batch_mode = is_stdin || urls.len() > 1;
+            let batch_mode = !no_navigate && (is_stdin || urls.len() > 1);
+            let mut expected_attach_origin: Option<String> = None;
+            if no_navigate {
+                if urls.len() > 1 {
+                    return Err(CliError::invalid_input(
+                        "--no-navigate accepts at most one optional expected-origin URL",
+                    ));
+                }
+                if let Some(raw_expected) = urls.first() {
+                    if raw_expected == "-" {
+                        return Err(CliError::invalid_input(
+                            "--no-navigate cannot be combined with stdin '-' batch mode",
+                        ));
+                    }
+                    let parsed =
+                        fetch::parse_http_url(raw_expected).map_err(CliError::from_fetch)?;
+                    expected_attach_origin = Some(parsed.to_string());
+                }
+                if render != RenderMode::Cdp {
+                    return Err(CliError::invalid_input(
+                        "--no-navigate requires --render cdp",
+                    ));
+                }
+                if config.proxy.is_some() {
+                    return Err(CliError::invalid_input(
+                        "--no-navigate cannot be combined with --proxy",
+                    ));
+                }
+                let Some(cdp_raw) = config.cdp_url.as_deref() else {
+                    return Err(CliError::invalid_input(
+                        "--no-navigate requires --cdp-url or PLEB_CDP_URL pointing to ws://<loopback>/devtools/page/<id>",
+                    ));
+                };
+                if let Err(err) = pleb::transport::cdp::validate_loopback_page_cdp_url(cdp_raw) {
+                    return Err(CliError::invalid_input(err.to_string()));
+                }
+                if stage
+                    || format == OutputFormat::Raw
+                    || source == SourceMode::Negotiate
+                    || respect_robots
+                    || !matches!(resources, ResourcePolicy::None | ResourcePolicy::Manifest)
+                    || !stage_resources.is_empty()
+                {
+                    return Err(CliError::invalid_input(
+                        "--no-navigate forbids --stage, --format raw, --source negotiate, --respect-robots, --stage-resources, and network --resources modes",
+                    ));
+                }
+            }
 
             if stage && batch_mode {
                 return Err(CliError::invalid_input(
@@ -1091,13 +1146,25 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             };
 
             if !batch_mode {
-                let url = &target_urls[0];
-                let res = fetch::fetch_document(&ctx, url, &opts)
+                let (display_url, target) = if no_navigate {
+                    (
+                        expected_attach_origin
+                            .clone()
+                            .unwrap_or_else(|| "attached-cdp-page".to_string()),
+                        fetch::FetchTarget::AttachCdp {
+                            expected_origin: expected_attach_origin,
+                        },
+                    )
+                } else {
+                    let u = target_urls[0].clone();
+                    (u.clone(), fetch::FetchTarget::Navigate(u))
+                };
+                let res = fetch::fetch_target(&ctx, target, &opts)
                     .await
                     .map_err(CliError::from_fetch)?;
 
                 if jsonl {
-                    let item = BatchItemResult::from_result(url, Ok(res), metadata_only);
+                    let item = BatchItemResult::from_result(&display_url, Ok(res), metadata_only);
                     let encoded = serde_json::to_string(&item)
                         .map_err(|e| CliError::runtime("serialization_error", e))?;
                     println!("{encoded}");

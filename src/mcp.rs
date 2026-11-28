@@ -231,6 +231,10 @@ fn tool_definitions() -> Value {
                         "enum": ["auto", "cef", "cdp", "cronet"],
                         "description": "Transport mode: auto tries Chrome-TLS network fetch and escalates 403/JS shells to CEF/CDP; cronet stays network-only; cef/cdp force browser rendering"
                     },
+                    "no_navigate": {
+                        "type": "boolean",
+                        "description": "Attach read-only to an already-loaded loopback /devtools/page/<id> CDP tab without navigating (requires render='cdp'; url becomes optional origin assertion)"
+                    },
                     "source": {
                         "type": "string",
                         "enum": ["auto", "negotiate", "none"],
@@ -261,7 +265,7 @@ fn tool_definitions() -> Value {
                     "wait_for_selector": { "type": "string", "description": "CSS selector to wait for when CEF/CDP renders" },
                     "respect_robots": { "type": "boolean", "description": "Enforce robots.txt rules (default false for single-URL fetch)" }
                 },
-                "required": ["url"]
+                "required": []
             }
         },
         {
@@ -341,7 +345,30 @@ async fn call_fetch(
     ctx: &RuntimeContext,
     args: &serde_json::Map<String, Value>,
 ) -> std::result::Result<Value, RpcError> {
-    let url = required_str(args, "url")?;
+    let no_navigate = opt_bool(args, "no_navigate")?.unwrap_or(false);
+    let url = match args.get("url") {
+        None | Some(Value::Null) => {
+            if no_navigate {
+                None
+            } else {
+                return Err(RpcError::invalid_params("missing required parameter 'url'"));
+            }
+        }
+        Some(Value::String(raw)) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(RpcError::invalid_params(
+                    "parameter 'url' must be a non-empty http or https URL",
+                ));
+            }
+            let parsed = fetch::parse_http_url(trimmed)
+                .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+            Some(parsed.to_string())
+        }
+        Some(_) => {
+            return Err(RpcError::invalid_params("parameter 'url' must be a string"));
+        }
+    };
     let format = parse_opt_enum::<OutputFormat>(args, "format")?.unwrap_or(OutputFormat::Markdown);
     if format == OutputFormat::Raw {
         return Err(RpcError::invalid_params(
@@ -395,6 +422,36 @@ async fn call_fetch(
 
     let has_stage_request = !stage_resources.is_empty();
 
+    if no_navigate {
+        if render != RenderMode::Cdp {
+            return Err(RpcError::invalid_params(
+                "'no_navigate' requires render='cdp'",
+            ));
+        }
+        if ctx.config.proxy.is_some() {
+            return Err(RpcError::invalid_params(
+                "'no_navigate' cannot be combined with --proxy",
+            ));
+        }
+        let Some(cdp_raw) = ctx.configured_cdp_url() else {
+            return Err(RpcError::invalid_params(
+                "'no_navigate' requires PLEB_CDP_URL / --cdp-url pointing to ws://<loopback>/devtools/page/<id>",
+            ));
+        };
+        if let Err(err) = crate::transport::cdp::validate_loopback_page_cdp_url(&cdp_raw) {
+            return Err(RpcError::invalid_params(err.to_string()));
+        }
+        if source == SourceMode::Negotiate
+            || respect_robots
+            || !matches!(resources, ResourcePolicy::None | ResourcePolicy::Manifest)
+            || has_stage_request
+        {
+            return Err(RpcError::invalid_params(
+                "'no_navigate' forbids source='negotiate', respect_robots=true, stage_resources, and network resources policies",
+            ));
+        }
+    }
+
     let opts = FetchOptions {
         extract: ExtractOptions {
             format,
@@ -418,7 +475,15 @@ async fn call_fetch(
         ..Default::default()
     };
 
-    match fetch::fetch_document(ctx, &url, &opts).await {
+    let target = if no_navigate {
+        fetch::FetchTarget::AttachCdp {
+            expected_origin: url,
+        }
+    } else {
+        fetch::FetchTarget::Navigate(url.expect("validated above"))
+    };
+
+    match fetch::fetch_target(ctx, target, &opts).await {
         Ok(res) => {
             let mut lines = Vec::new();
             if let Some(ref title) = res.title {

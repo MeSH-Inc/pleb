@@ -127,44 +127,15 @@ impl CdpRenderer {
         Ok(arc_cfg)
     }
 
-    pub async fn render(
+    async fn connect_cdp_ws(
         &self,
-        url: &str,
-        options: &CdpRenderOptions,
-        timeout: Duration,
-    ) -> Result<CdpRenderResult> {
-        if self.proxy.is_some() {
-            return Err(cdp_err(
-                TransportErrorKind::Network,
-                "CDP renderer refuses to connect while --proxy is configured",
-            ));
-        }
-
-        let cdp_url = validate_cdp_url(&self.cdp_url)?;
-        let target_url = validate_target_url(url, &cdp_url, options)?;
-
-        if let Some(selector) = options.wait_for_selector.as_deref() {
-            scraper::Selector::parse(selector).map_err(|_| {
-                cdp_err(
-                    TransportErrorKind::InvalidSelector,
-                    format!("invalid CSS selector for --wait-for-selector: {selector}"),
-                )
-            })?;
-        }
-
-        if timeout.is_zero() {
-            return Err(cdp_err(
-                TransportErrorKind::Timeout,
-                format!("CDP render timed out before connecting for {url}"),
-            ));
-        }
-
-        let deadline = Instant::now() + timeout;
-        let is_page_endpoint = cdp_url.path().starts_with("/devtools/page/");
-        let ws_url = prepare_cdp_ws_url(&cdp_url, options.capture_axtree, is_page_endpoint);
-
+        ws_url: &Url,
+        target_url: Option<&Url>,
+        display_target: &str,
+        deadline: Instant,
+    ) -> Result<(WebSocketStream<MaybeTlsStream<TcpStream>>, IpAddr, u16)> {
         let access_headers = if ws_url.scheme() == "wss" {
-            resolve_cdp_access_headers(&self.state_dir, &cdp_url)?
+            resolve_cdp_access_headers(&self.state_dir, ws_url)?
         } else {
             None
         };
@@ -184,10 +155,10 @@ impl CdpRenderer {
             deadline,
             TcpStream::connect(&connect_addr),
             "CDP TCP connect",
-            url,
+            display_target,
         )
         .await
-        .map_err(|e| map_connect_io_or_transport(e, url))?;
+        .map_err(|e| map_connect_io_or_transport(e, display_target))?;
 
         let peer_ip = tcp_stream
             .peer_addr()
@@ -206,11 +177,13 @@ impl CdpRenderer {
             ));
         }
 
-        if is_ip_self_ssrf(&target_url, peer_ip, port) {
-            return Err(cdp_err(
-                TransportErrorKind::RedirectBlocked,
-                "target URL resolves to the configured CDP endpoint (self-SSRF blocked)",
-            ));
+        if let Some(target) = target_url {
+            if is_ip_self_ssrf(target, peer_ip, port) {
+                return Err(cdp_err(
+                    TransportErrorKind::RedirectBlocked,
+                    "target URL resolves to the configured CDP endpoint (self-SSRF blocked)",
+                ));
+            }
         }
 
         let mut request = ws_url.as_str().into_client_request().map_err(|_| {
@@ -252,10 +225,53 @@ impl CdpRenderer {
             deadline,
             client_async_tls_with_config(request, tcp_stream, Some(ws_config), Some(connector)),
             "CDP WebSocket handshake",
-            url,
+            display_target,
         )
         .await
-        .map_err(|e| map_ws_or_transport_error(e, url))?;
+        .map_err(|e| map_ws_or_transport_error(e, display_target))?;
+
+        Ok((ws_stream, peer_ip, port))
+    }
+
+    pub async fn render(
+        &self,
+        url: &str,
+        options: &CdpRenderOptions,
+        timeout: Duration,
+    ) -> Result<CdpRenderResult> {
+        if self.proxy.is_some() {
+            return Err(cdp_err(
+                TransportErrorKind::Network,
+                "CDP renderer refuses to connect while --proxy is configured",
+            ));
+        }
+
+        let cdp_url = validate_cdp_url(&self.cdp_url)?;
+        let target_url = validate_target_url(url, &cdp_url, options)?;
+
+        if let Some(selector) = options.wait_for_selector.as_deref() {
+            scraper::Selector::parse(selector).map_err(|_| {
+                cdp_err(
+                    TransportErrorKind::InvalidSelector,
+                    format!("invalid CSS selector for --wait-for-selector: {selector}"),
+                )
+            })?;
+        }
+
+        if timeout.is_zero() {
+            return Err(cdp_err(
+                TransportErrorKind::Timeout,
+                format!("CDP render timed out before connecting for {url}"),
+            ));
+        }
+
+        let deadline = Instant::now() + timeout;
+        let is_page_endpoint = cdp_url.path().starts_with("/devtools/page/");
+        let ws_url = prepare_cdp_ws_url(&cdp_url, options.capture_axtree, is_page_endpoint);
+
+        let (ws_stream, peer_ip, port) = self
+            .connect_cdp_ws(&ws_url, Some(&target_url), url, deadline)
+            .await?;
 
         let mut session = CdpSession::new(
             ws_stream,
@@ -272,6 +288,81 @@ impl CdpRenderer {
         session.teardown().await;
         outcome
     }
+
+    /// Snapshot an already-loaded loopback `/devtools/page/<id>` tab passively without navigating,
+    /// mutating layout, intercepting requests, or closing the target.
+    pub async fn render_attached(
+        &self,
+        expected_origin: Option<&str>,
+        options: &CdpRenderOptions,
+        timeout: Duration,
+    ) -> Result<CdpRenderResult> {
+        if self.proxy.is_some() {
+            return Err(cdp_err(
+                TransportErrorKind::Network,
+                "CDP renderer refuses to connect while --proxy is configured",
+            ));
+        }
+
+        let cdp_url = validate_loopback_page_cdp_url(&self.cdp_url)?;
+        let expected_url = match expected_origin {
+            Some(raw) => Some(validate_target_url(raw, &cdp_url, options)?),
+            None => None,
+        };
+
+        if let Some(selector) = options.wait_for_selector.as_deref() {
+            scraper::Selector::parse(selector).map_err(|_| {
+                cdp_err(
+                    TransportErrorKind::InvalidSelector,
+                    format!("invalid CSS selector for --wait-for-selector: {selector}"),
+                )
+            })?;
+        }
+
+        if timeout.is_zero() {
+            return Err(cdp_err(
+                TransportErrorKind::Timeout,
+                "CDP passive attach timed out before connecting",
+            ));
+        }
+
+        let display_target = expected_origin.unwrap_or("attached-cdp-page");
+        let deadline = Instant::now() + timeout;
+        let (ws_stream, peer_ip, port) = self
+            .connect_cdp_ws(&cdp_url, expected_url.as_ref(), display_target, deadline)
+            .await?;
+
+        let mut session =
+            PassiveAttachSession::new(ws_stream, deadline, cdp_url, peer_ip, port, expected_url);
+
+        let outcome = session.execute(options).await;
+        session.teardown().await;
+        outcome
+    }
+}
+
+/// Validate a loopback `ws://` `/devtools/page/<nonempty-id>` CDP endpoint for passive attach.
+pub fn validate_loopback_page_cdp_url(raw: &str) -> Result<Url> {
+    let parsed = validate_cdp_url(raw)?;
+    if parsed.scheme() != "ws" {
+        return Err(cdp_err(
+            TransportErrorKind::Network,
+            "passive --no-navigate attach supports only loopback ws:// CDP endpoints",
+        ));
+    }
+    let Some(page_id) = parsed.path().strip_prefix("/devtools/page/") else {
+        return Err(cdp_err(
+            TransportErrorKind::Network,
+            "passive --no-navigate attach requires a /devtools/page/<id> CDP endpoint",
+        ));
+    };
+    if page_id.is_empty() || page_id.contains('/') {
+        return Err(cdp_err(
+            TransportErrorKind::Network,
+            "passive --no-navigate attach requires a non-empty single-segment page ID in /devtools/page/<id>",
+        ));
+    }
+    Ok(parsed)
 }
 
 pub fn validate_cdp_url(raw: &str) -> Result<Url> {
@@ -735,6 +826,24 @@ struct FrameTreeNode {
 #[derive(Deserialize)]
 struct FrameTreeFrame {
     id: String,
+    #[serde(rename = "loaderId", default)]
+    loader_id: String,
+    #[serde(default)]
+    url: String,
+    #[serde(rename = "urlFragment", default)]
+    url_fragment: Option<String>,
+    #[serde(rename = "securityOrigin", default)]
+    security_origin: Option<String>,
+    #[serde(rename = "mimeType", default)]
+    mime_type: Option<String>,
+    #[serde(rename = "unreachableUrl", default)]
+    unreachable_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FrameStartedLoadingParams {
+    #[serde(rename = "frameId")]
+    frame_id: String,
 }
 
 #[derive(Deserialize)]
@@ -1855,6 +1964,11 @@ impl CdpSession {
                         format!("failed to serialize Accessibility.getFullAXTree payload: {e}"),
                     )
                 })?;
+                if raw_json.len() > max_bytes {
+                    return Err(anyhow::Error::new(ResponseTooLargeError {
+                        limit_bytes: max_bytes,
+                    }));
+                }
                 crate::extract::axtree::format_axtree_from_cdp_json(&raw_json)
             }
             RpcCallOutcome::RpcErr(err) if err.code == CDP_ERR_SERVER_ERROR => {
@@ -1895,6 +2009,846 @@ impl CdpSession {
         }
         let _ = tokio::time::timeout_at(teardown_deadline, self.ws.close(None)).await;
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttachedDocumentBinding {
+    frame_id: String,
+    loader_id: String,
+    url: String,
+    origin: (String, String, u16),
+    security_origin: Option<String>,
+    mime_type: Option<String>,
+}
+
+struct PassiveAttachSession {
+    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    deadline: Instant,
+    cdp_url: Url,
+    cdp_peer_ip: IpAddr,
+    cdp_port: u16,
+    expected_origin: Option<Url>,
+    next_id: i64,
+    unsolicited_events: usize,
+    unsolicited_event_bytes: usize,
+    ws_broken: bool,
+    binding: Option<AttachedDocumentBinding>,
+    document_invalidated: bool,
+    invalidation_reason: Option<String>,
+    cdp_tools: Vec<WebMcpToolDescriptor>,
+}
+
+impl PassiveAttachSession {
+    fn new(
+        ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        deadline: Instant,
+        cdp_url: Url,
+        cdp_peer_ip: IpAddr,
+        cdp_port: u16,
+        expected_origin: Option<Url>,
+    ) -> Self {
+        Self {
+            ws,
+            deadline,
+            cdp_url,
+            cdp_peer_ip,
+            cdp_port,
+            expected_origin,
+            next_id: 1,
+            unsolicited_events: 0,
+            unsolicited_event_bytes: 0,
+            ws_broken: false,
+            binding: None,
+            document_invalidated: false,
+            invalidation_reason: None,
+            cdp_tools: Vec::new(),
+        }
+    }
+
+    fn is_allowed_method(method: &str) -> bool {
+        matches!(
+            method,
+            "Page.enable"
+                | "Page.getFrameTree"
+                | "DOM.enable"
+                | "DOM.getDocument"
+                | "DOM.querySelector"
+                | "DOM.getOuterHTML"
+                | "Accessibility.getFullAXTree"
+                | "WebMCP.enable"
+        )
+    }
+
+    async fn call_typed<P: Serialize, R: for<'de> Deserialize<'de>>(
+        &mut self,
+        method: &str,
+        params: P,
+    ) -> Result<RpcCallOutcome<R>> {
+        debug_assert!(Self::is_allowed_method(method));
+        if !Self::is_allowed_method(method) {
+            return Err(cdp_err(
+                TransportErrorKind::ProtocolMismatch,
+                format!("forbidden outbound CDP method in passive attach: {method}"),
+            ));
+        }
+
+        let id = self.next_id;
+        self.next_id += 1;
+        let req = RpcRequest {
+            id,
+            method,
+            params,
+            session_id: None,
+        };
+        let encoded = serde_json::to_string(&req).map_err(|e| {
+            cdp_err(
+                TransportErrorKind::ProtocolMismatch,
+                format!("failed to serialize CDP request {method}: {e}"),
+            )
+        })?;
+        if Instant::now() >= self.deadline {
+            return Err(cdp_err(
+                TransportErrorKind::Timeout,
+                format!("CDP passive attach send timed out for {method}"),
+            ));
+        }
+        match tokio::time::timeout_at(self.deadline, self.ws.send(Message::Text(encoded.into())))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(ws_err)) => {
+                self.ws_broken = true;
+                return Err(map_tungstenite_error(ws_err, "attached-cdp-page"));
+            }
+            Err(_) => {
+                return Err(cdp_err(
+                    TransportErrorKind::Timeout,
+                    format!("CDP passive attach send timed out for {method}"),
+                ));
+            }
+        }
+
+        let text = self.read_until_reply(id, self.deadline).await?;
+        let envelope: RpcEnvelope<R> = serde_json::from_str(&text).map_err(|e| {
+            cdp_err(
+                TransportErrorKind::ProtocolMismatch,
+                format!("malformed CDP reply for {method}: {e}"),
+            )
+        })?;
+        if let Some(rpc_err) = envelope.error {
+            return Ok(RpcCallOutcome::RpcErr(rpc_err));
+        }
+        let result = envelope.result.ok_or_else(|| {
+            cdp_err(
+                TransportErrorKind::ProtocolMismatch,
+                format!("CDP reply for {method} missing result payload"),
+            )
+        })?;
+        Ok(RpcCallOutcome::Ok(result))
+    }
+
+    async fn call_required<P: Serialize, R: for<'de> Deserialize<'de>>(
+        &mut self,
+        method: &str,
+        params: P,
+    ) -> Result<R> {
+        match self.call_typed(method, params).await? {
+            RpcCallOutcome::Ok(r) => Ok(r),
+            RpcCallOutcome::RpcErr(err) => Err(rpc_failure_err(
+                &format!("CDP {method}"),
+                &err,
+                TransportErrorKind::LoadError,
+            )),
+        }
+    }
+
+    async fn call_best_effort<P: Serialize>(&mut self, method: &str, params: P) -> Result<bool> {
+        match self
+            .call_typed::<_, serde_json::Value>(method, params)
+            .await?
+        {
+            RpcCallOutcome::Ok(_) => Ok(true),
+            RpcCallOutcome::RpcErr(err) => {
+                if err.code != CDP_ERR_METHOD_NOT_FOUND {
+                    tracing::debug!(
+                        "passive CDP best-effort method {method} returned error ({}): {}",
+                        err.code,
+                        err.message
+                    );
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    fn invalidate(&mut self, reason: impl Into<String>) {
+        if !self.document_invalidated {
+            self.document_invalidated = true;
+            self.invalidation_reason = Some(reason.into());
+        }
+    }
+
+    fn check_not_invalidated(&self) -> Result<()> {
+        if self.document_invalidated {
+            return Err(cdp_err(
+                TransportErrorKind::LoadError,
+                self.invalidation_reason
+                    .as_deref()
+                    .unwrap_or("attached CDP page navigated during capture"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn account_unsolicited(&mut self, byte_len: usize) -> Result<()> {
+        self.unsolicited_events = self.unsolicited_events.saturating_add(1);
+        self.unsolicited_event_bytes = self.unsolicited_event_bytes.saturating_add(byte_len);
+        if self.unsolicited_events > MAX_UNSOLICITED_EVENTS
+            || self.unsolicited_event_bytes > MAX_EVENT_BYTES
+        {
+            return Err(cdp_err(
+                TransportErrorKind::ResponseTooLarge,
+                "CDP event stream exceeded safety bounds",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn read_until_reply(&mut self, awaited_id: i64, deadline: Instant) -> Result<String> {
+        loop {
+            if let Some(matched) = self.poll_ws_step(Some(awaited_id), deadline, false).await? {
+                return Ok(matched);
+            }
+        }
+    }
+
+    async fn pump_until(&mut self, stop_at: Instant) -> Result<()> {
+        let target_deadline = self.deadline.min(stop_at);
+        loop {
+            self.check_not_invalidated()?;
+            if Instant::now() >= target_deadline {
+                return Ok(());
+            }
+            match self.poll_ws_step(None, target_deadline, true).await? {
+                Some(_) => {}
+                None => return Ok(()),
+            }
+        }
+    }
+
+    async fn poll_ws_step(
+        &mut self,
+        awaited_id: Option<i64>,
+        deadline: Instant,
+        allow_slice_timeout: bool,
+    ) -> Result<Option<String>> {
+        self.check_not_invalidated()?;
+        if Instant::now() >= deadline {
+            if allow_slice_timeout && Instant::now() < self.deadline {
+                return Ok(None);
+            }
+            return Err(cdp_err(
+                TransportErrorKind::Timeout,
+                "CDP passive attach timed out",
+            ));
+        }
+        match tokio::time::timeout_at(deadline, self.ws.next()).await {
+            Ok(Some(Ok(msg))) => self.process_ws_message(msg, awaited_id),
+            Ok(Some(Err(ws_err))) => {
+                self.ws_broken = true;
+                Err(map_tungstenite_error(ws_err, "attached-cdp-page"))
+            }
+            Ok(None) => {
+                self.ws_broken = true;
+                Err(cdp_err(
+                    TransportErrorKind::Network,
+                    "CDP WebSocket closed before passive capture completed",
+                ))
+            }
+            Err(_) => {
+                if allow_slice_timeout && Instant::now() < self.deadline {
+                    Ok(None)
+                } else {
+                    Err(cdp_err(
+                        TransportErrorKind::Timeout,
+                        "CDP passive attach timed out",
+                    ))
+                }
+            }
+        }
+    }
+
+    fn process_ws_message(
+        &mut self,
+        msg: Message,
+        awaited_id: Option<i64>,
+    ) -> Result<Option<String>> {
+        match msg {
+            Message::Text(text) => {
+                let raw = text.as_str();
+                let header: RpcHeader = serde_json::from_str(raw).map_err(|e| {
+                    cdp_err(
+                        TransportErrorKind::ProtocolMismatch,
+                        format!("malformed JSON from CDP endpoint: {e}"),
+                    )
+                })?;
+
+                if let Some(msg_id) = header.id {
+                    if awaited_id == Some(msg_id) {
+                        return Ok(Some(raw.to_string()));
+                    }
+                    return Ok(None);
+                }
+
+                self.account_unsolicited(raw.len())?;
+
+                if let Some(method) = header.method.as_deref() {
+                    if header.session_id.is_none() {
+                        self.handle_passive_event(method, raw);
+                        self.check_not_invalidated()?;
+                    }
+                } else if let Some(err) = header.error {
+                    return Err(cdp_err(
+                        TransportErrorKind::ProtocolMismatch,
+                        format!("CDP error ({}): {}", err.code, err.message),
+                    ));
+                }
+                Ok(None)
+            }
+            Message::Binary(bin) => {
+                self.account_unsolicited(bin.len())?;
+                Ok(None)
+            }
+            Message::Ping(payload) | Message::Pong(payload) => {
+                self.account_unsolicited(payload.len())?;
+                Ok(None)
+            }
+            Message::Close(_) => {
+                self.ws_broken = true;
+                Err(cdp_err(
+                    TransportErrorKind::Network,
+                    "CDP WebSocket closed by remote endpoint",
+                ))
+            }
+            Message::Frame(_) => Ok(None),
+        }
+    }
+
+    fn handle_passive_event(&mut self, method: &str, raw: &str) {
+        match method {
+            "Page.frameNavigated" => {
+                if let Some(params) = parse_event_params::<FrameNavigatedParams>(raw) {
+                    if self
+                        .binding
+                        .as_ref()
+                        .is_some_and(|b| b.frame_id == params.frame.id)
+                    {
+                        self.invalidate("attached CDP page navigated during capture");
+                    }
+                }
+            }
+            "Page.navigatedWithinDocument" => {
+                if let Some(params) = parse_event_params::<NavigatedWithinDocumentParams>(raw) {
+                    if self
+                        .binding
+                        .as_ref()
+                        .is_some_and(|b| b.frame_id == params.frame_id && b.url != params.url)
+                    {
+                        self.invalidate(
+                            "attached CDP page navigated within document during capture",
+                        );
+                    }
+                }
+            }
+            "Page.frameStartedLoading" => {
+                if let Some(params) = parse_event_params::<FrameStartedLoadingParams>(raw) {
+                    if self
+                        .binding
+                        .as_ref()
+                        .is_some_and(|b| b.frame_id == params.frame_id)
+                    {
+                        self.invalidate("attached CDP page started loading during capture");
+                    }
+                }
+            }
+            "DOM.documentUpdated" => {
+                if self.binding.is_some() {
+                    self.invalidate("attached CDP document was replaced during capture");
+                }
+            }
+            "WebMCP.toolsAdded" => {
+                let Some(main_fid) = self.binding.as_ref().map(|b| b.frame_id.as_str()) else {
+                    return;
+                };
+                let Some(params) = parse_event_params::<WebMcpToolsAddedParams>(raw) else {
+                    return;
+                };
+                for tool in params.tools {
+                    if tool.frame_id.as_deref() != Some(main_fid) {
+                        continue;
+                    }
+                    let source = if tool.backend_node_id.is_some_and(|id| id > 0) {
+                        WebMcpToolSource::Declarative
+                    } else {
+                        WebMcpToolSource::Imperative
+                    };
+                    let annotations = WebMcpToolAnnotations {
+                        read_only: tool.annotations.as_ref().and_then(|a| a.read_only),
+                        autosubmit: tool.annotations.as_ref().and_then(|a| a.autosubmit),
+                        untrusted_content: Some(true),
+                    };
+                    let descriptor = WebMcpToolDescriptor {
+                        name: tool.name,
+                        description: tool.description,
+                        title: tool.title,
+                        source,
+                        input_schema: tool.input_schema,
+                        annotations: Some(annotations),
+                        action_url: None,
+                        method: None,
+                    };
+                    if let Some(clean) = sanitize_webmcp_tool(descriptor) {
+                        if let Some(existing) =
+                            self.cdp_tools.iter_mut().find(|t| t.name == clean.name)
+                        {
+                            *existing = clean;
+                        } else {
+                            self.cdp_tools.push(clean);
+                        }
+                    }
+                }
+            }
+            "WebMCP.toolsRemoved" => {
+                let Some(main_fid) = self.binding.as_ref().map(|b| b.frame_id.as_str()) else {
+                    return;
+                };
+                let Some(params) = parse_event_params::<WebMcpToolsRemovedParams>(raw) else {
+                    return;
+                };
+                for removed in params.tools {
+                    if removed.frame_id.as_deref() == Some(main_fid) {
+                        self.cdp_tools.retain(|t| t.name != removed.name);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn validate_frame_binding(
+        &self,
+        frame: &FrameTreeFrame,
+        options: &CdpRenderOptions,
+    ) -> Result<AttachedDocumentBinding> {
+        if frame.id.is_empty() {
+            return Err(cdp_err(
+                TransportErrorKind::ProtocolMismatch,
+                "Page.getFrameTree returned an empty main frame id",
+            ));
+        }
+        if frame.loader_id.is_empty() {
+            return Err(cdp_err(
+                TransportErrorKind::ProtocolMismatch,
+                "Page.getFrameTree returned an empty loaderId; cannot bind attached document identity",
+            ));
+        }
+        if frame
+            .unreachable_url
+            .as_deref()
+            .is_some_and(|u| !u.trim().is_empty())
+        {
+            return Err(cdp_err(
+                TransportErrorKind::LoadError,
+                "attached CDP page has an unreachableUrl error state",
+            ));
+        }
+        let mime_type = frame
+            .mime_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if mime_type
+            .as_deref()
+            .is_some_and(|m| crate::extract::detect_binary_content(Some(m), &[]).is_some())
+        {
+            return Err(cdp_err(
+                TransportErrorKind::LoadError,
+                "attached CDP page has an unsupported binary MIME type",
+            ));
+        }
+
+        let reconstructed = format!(
+            "{}{}",
+            frame.url,
+            frame.url_fragment.as_deref().unwrap_or("")
+        );
+        let live_url = validate_target_url(&reconstructed, &self.cdp_url, options)?;
+        if is_ip_self_ssrf(&live_url, self.cdp_peer_ip, self.cdp_port) {
+            return Err(cdp_err(
+                TransportErrorKind::RedirectBlocked,
+                "attached CDP page URL resolves to the CDP endpoint (self-SSRF blocked)",
+            ));
+        }
+        let live_origin = origin_tuple(&live_url).ok_or_else(|| {
+            cdp_err(
+                TransportErrorKind::LoadError,
+                "attached CDP page URL lacks a valid origin",
+            )
+        })?;
+
+        if let Some(ref exp) = self.expected_origin {
+            let exp_origin = origin_tuple(exp).ok_or_else(|| {
+                cdp_err(
+                    TransportErrorKind::LoadError,
+                    "expected origin URL lacks a valid origin",
+                )
+            })?;
+            if live_origin != exp_origin {
+                return Err(cdp_err(
+                    TransportErrorKind::RedirectBlocked,
+                    "attached CDP page origin does not match expected URL origin",
+                ));
+            }
+        }
+
+        let sec_origin = frame
+            .security_origin
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if let Some(ref sec) = sec_origin {
+            if sec == "null" {
+                return Err(cdp_err(
+                    TransportErrorKind::RedirectBlocked,
+                    "attached CDP page has an opaque null securityOrigin",
+                ));
+            }
+            let sec_parsed = Url::parse(sec).map_err(|_| {
+                cdp_err(
+                    TransportErrorKind::RedirectBlocked,
+                    "attached CDP page reported an invalid securityOrigin",
+                )
+            })?;
+            let sec_tuple = origin_tuple(&sec_parsed).ok_or_else(|| {
+                cdp_err(
+                    TransportErrorKind::RedirectBlocked,
+                    "attached CDP page reported an incomplete securityOrigin",
+                )
+            })?;
+            if sec_tuple != live_origin {
+                return Err(cdp_err(
+                    TransportErrorKind::RedirectBlocked,
+                    "attached CDP page securityOrigin does not match frame URL origin",
+                ));
+            }
+        }
+
+        Ok(AttachedDocumentBinding {
+            frame_id: frame.id.clone(),
+            loader_id: frame.loader_id.clone(),
+            url: live_url.to_string(),
+            origin: live_origin,
+            security_origin: sec_origin,
+            mime_type,
+        })
+    }
+
+    async fn verify_binding(
+        &mut self,
+        expected: &AttachedDocumentBinding,
+        options: &CdpRenderOptions,
+    ) -> Result<()> {
+        self.check_not_invalidated()?;
+        let tree: FrameTreeReply = self
+            .call_required("Page.getFrameTree", serde_json::json!({}))
+            .await?;
+        self.check_not_invalidated()?;
+        let current = self.validate_frame_binding(&tree.frame_tree.frame, options)?;
+        if current.frame_id != expected.frame_id
+            || current.loader_id != expected.loader_id
+            || current.url != expected.url
+            || current.origin != expected.origin
+            || current.security_origin != expected.security_origin
+        {
+            return Err(cdp_err(
+                TransportErrorKind::LoadError,
+                "attached CDP page identity changed during capture",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn read_outer_html(&mut self, max_bytes: usize) -> Result<String> {
+        for attempt in 0..2 {
+            self.check_not_invalidated()?;
+            let doc: GetDocumentReply = self
+                .call_required("DOM.getDocument", serde_json::json!({ "depth": 0 }))
+                .await?;
+            self.check_not_invalidated()?;
+            if doc.root.node_id <= 0 {
+                if attempt == 0 {
+                    continue;
+                }
+                return Err(cdp_err(
+                    TransportErrorKind::ProtocolMismatch,
+                    "DOM.getDocument returned nodeId 0",
+                ));
+            }
+            match self
+                .call_typed::<_, OuterHtmlReply>(
+                    "DOM.getOuterHTML",
+                    serde_json::json!({ "nodeId": doc.root.node_id }),
+                )
+                .await?
+            {
+                RpcCallOutcome::Ok(reply) => {
+                    self.check_not_invalidated()?;
+                    if reply.outer_html.len() > max_bytes {
+                        return Err(anyhow::Error::new(ResponseTooLargeError {
+                            limit_bytes: max_bytes,
+                        }));
+                    }
+                    return Ok(reply.outer_html);
+                }
+                RpcCallOutcome::RpcErr(err) if err.code == CDP_ERR_SERVER_ERROR && attempt == 0 => {
+                    continue;
+                }
+                RpcCallOutcome::RpcErr(err) => {
+                    return Err(rpc_failure_err(
+                        "DOM.getOuterHTML",
+                        &err,
+                        TransportErrorKind::LoadError,
+                    ));
+                }
+            }
+        }
+        Err(cdp_err(
+            TransportErrorKind::LoadError,
+            "DOM.getOuterHTML failed after retry",
+        ))
+    }
+
+    async fn wait_for_selector(
+        &mut self,
+        selector: &str,
+        binding: &AttachedDocumentBinding,
+        options: &CdpRenderOptions,
+    ) -> Result<()> {
+        loop {
+            self.check_not_invalidated()?;
+            let doc_reply = self
+                .call_typed::<_, GetDocumentReply>(
+                    "DOM.getDocument",
+                    serde_json::json!({ "depth": 0 }),
+                )
+                .await?;
+            self.check_not_invalidated()?;
+            let root_id = match doc_reply {
+                RpcCallOutcome::Ok(doc) => doc.root.node_id,
+                RpcCallOutcome::RpcErr(err) if err.code == CDP_ERR_SERVER_ERROR => 0,
+                RpcCallOutcome::RpcErr(err) => {
+                    return Err(rpc_failure_err(
+                        "DOM.getDocument",
+                        &err,
+                        TransportErrorKind::LoadError,
+                    ));
+                }
+            };
+
+            if root_id > 0 {
+                let query_reply = self
+                    .call_typed::<_, QuerySelectorReply>(
+                        "DOM.querySelector",
+                        serde_json::json!({ "nodeId": root_id, "selector": selector }),
+                    )
+                    .await?;
+                self.check_not_invalidated()?;
+                match query_reply {
+                    RpcCallOutcome::Ok(res) => {
+                        if let Some(err_msg) = res.error.filter(|s| !s.is_empty()) {
+                            return Err(cdp_err(
+                                TransportErrorKind::InvalidSelector,
+                                format!("invalid CSS selector {selector:?}: {err_msg}"),
+                            ));
+                        }
+                        if res.node_id > 0 {
+                            self.verify_binding(binding, options).await?;
+                            return Ok(());
+                        }
+                    }
+                    RpcCallOutcome::RpcErr(err) if err.code == CDP_ERR_SERVER_ERROR => {
+                        // Syntax was pre-validated by scraper::Selector::parse; retry on stale node.
+                    }
+                    RpcCallOutcome::RpcErr(err) => {
+                        return Err(rpc_failure_err(
+                            "DOM.querySelector",
+                            &err,
+                            TransportErrorKind::InvalidSelector,
+                        ));
+                    }
+                }
+            }
+
+            if Instant::now() >= self.deadline {
+                return Err(cdp_err(
+                    TransportErrorKind::Timeout,
+                    format!(
+                        "timed out waiting for selector {selector:?} on {}",
+                        binding.url
+                    ),
+                ));
+            }
+            self.pump_until(Instant::now() + SELECTOR_POLL_INTERVAL)
+                .await?;
+        }
+    }
+
+    async fn read_axtree(&mut self, frame_id: &str, max_bytes: usize) -> Result<String> {
+        match self
+            .call_typed::<_, serde_json::Value>(
+                "Accessibility.getFullAXTree",
+                serde_json::json!({ "frameId": frame_id }),
+            )
+            .await?
+        {
+            RpcCallOutcome::Ok(val) => {
+                self.check_not_invalidated()?;
+                let raw_json = serde_json::to_string(&val).map_err(|e| {
+                    cdp_err(
+                        TransportErrorKind::ProtocolMismatch,
+                        format!("failed to serialize Accessibility.getFullAXTree payload: {e}"),
+                    )
+                })?;
+                if raw_json.len() > max_bytes {
+                    return Err(anyhow::Error::new(ResponseTooLargeError {
+                        limit_bytes: max_bytes,
+                    }));
+                }
+                crate::extract::axtree::format_axtree_from_cdp_json(&raw_json)
+            }
+            RpcCallOutcome::RpcErr(err) if err.code == CDP_ERR_SERVER_ERROR => {
+                Err(anyhow::Error::new(ResponseTooLargeError {
+                    limit_bytes: max_bytes,
+                }))
+            }
+            RpcCallOutcome::RpcErr(err) => Err(rpc_failure_err(
+                "Accessibility.getFullAXTree",
+                &err,
+                TransportErrorKind::LoadError,
+            )),
+        }
+    }
+
+    async fn execute(&mut self, options: &CdpRenderOptions) -> Result<CdpRenderResult> {
+        let _: EmptyReply = self
+            .call_required("Page.enable", serde_json::json!({}))
+            .await?;
+        let _ = self
+            .call_best_effort("DOM.enable", serde_json::json!({}))
+            .await?;
+
+        let frame_tree: FrameTreeReply = self
+            .call_required("Page.getFrameTree", serde_json::json!({}))
+            .await?;
+        let binding = self.validate_frame_binding(&frame_tree.frame_tree.frame, options)?;
+        self.binding = Some(binding.clone());
+
+        if self
+            .call_best_effort("WebMCP.enable", serde_json::json!({}))
+            .await?
+        {
+            self.pump_until(Instant::now() + Duration::from_millis(100))
+                .await?;
+        }
+
+        let max_bytes = if options.max_response_bytes > 0 {
+            options.max_response_bytes
+        } else {
+            MAX_HTML_BYTES
+        };
+
+        let mut outer_html = self.read_outer_html(max_bytes).await?;
+        self.verify_binding(&binding, options).await?;
+
+        // Fail fast on active challenges or walls before waiting on `--wait-for-selector`.
+        let mut parsed_pre = None;
+        let pre_cls = crate::policy::classify_response_with_context(
+            200,
+            true,
+            self.expected_origin.as_ref().map(Url::as_str),
+            Some(&binding.url),
+            &outer_html,
+            &mut parsed_pre,
+        );
+        let early_block = crate::policy::detect_interstitial_challenge(&outer_html).is_some()
+            || matches!(
+                pre_cls,
+                crate::policy::ResponseClassification::Challenge { .. }
+                    | crate::policy::ResponseClassification::Blocked { .. }
+            );
+        if early_block {
+            let imperative_tools = self
+                .cdp_tools
+                .iter()
+                .filter(|t| t.source == WebMcpToolSource::Imperative)
+                .cloned()
+                .collect();
+            return Ok(CdpRenderResult {
+                html: outer_html,
+                final_url: binding.url,
+                status_code: 0,
+                content_type: binding.mime_type.or_else(|| Some("text/html".to_string())),
+                link_header: None,
+                axtree_text: None,
+                imperative_tools,
+            });
+        }
+
+        if let Some(selector) = options.wait_for_selector.as_deref() {
+            self.wait_for_selector(selector, &binding, options).await?;
+            outer_html = self.read_outer_html(max_bytes).await?;
+        }
+
+        let axtree_text = if options.capture_axtree {
+            Some(self.read_axtree(&binding.frame_id, max_bytes).await?)
+        } else {
+            None
+        };
+
+        self.verify_binding(&binding, options).await?;
+
+        let imperative_tools = self
+            .cdp_tools
+            .iter()
+            .filter(|t| t.source == WebMcpToolSource::Imperative)
+            .cloned()
+            .collect();
+        Ok(CdpRenderResult {
+            html: outer_html,
+            final_url: binding.url,
+            status_code: 0,
+            content_type: binding.mime_type.or_else(|| Some("text/html".to_string())),
+            link_header: None,
+            axtree_text,
+            imperative_tools,
+        })
+    }
+
+    async fn teardown(&mut self) {
+        if self.ws_broken {
+            return;
+        }
+        let teardown_deadline = Instant::now() + TEARDOWN_GRACE;
+        let _ = tokio::time::timeout_at(teardown_deadline, self.ws.close(None)).await;
+    }
+}
+
+fn origin_tuple(url: &Url) -> Option<(String, String, u16)> {
+    let host = canonical_url_host(url)?;
+    let port = url.port_or_known_default()?;
+    Some((url.scheme().to_ascii_lowercase(), host, port))
 }
 
 fn header_case_insensitive(headers: &HashMap<String, String>, needle: &str) -> Option<String> {
