@@ -413,32 +413,36 @@ async fn run_daemon_exits_immediately_when_live_daemon_responds_to_ping() {
 #[tokio::test]
 async fn daemon_round_trips_structured_transport_error_kinds() {
     use pleb::transport::cef::{CefProtocolError, CefTimeoutError};
-    use pleb::transport::{ResponseTooLargeError, TransportError, TransportErrorKind};
+    use pleb::transport::{
+        is_retryable_network_error, ResponseTooLargeError, TransportError, TransportErrorKind,
+    };
 
     let dir = TempStateDir::new();
     let sock = socket_path(dir.path());
     let listener = UnixListener::bind(&sock).unwrap();
 
-    let cases: Vec<(TransportErrorKind, Option<usize>)> = vec![
-        (TransportErrorKind::LoadError, None),
-        (TransportErrorKind::InvalidSelector, None),
-        (TransportErrorKind::Canceled, None),
-        (TransportErrorKind::Network, None),
-        (TransportErrorKind::Timeout, None),
-        (TransportErrorKind::ProtocolMismatch, None),
-        (TransportErrorKind::RedirectBlocked, None),
-        (TransportErrorKind::ResponseTooLarge, Some(4096)),
+    let cases: Vec<(TransportErrorKind, Option<usize>, bool)> = vec![
+        (TransportErrorKind::LoadError, None, false),
+        (TransportErrorKind::InvalidSelector, None, false),
+        (TransportErrorKind::Canceled, None, false),
+        (TransportErrorKind::Network, None, false),
+        (TransportErrorKind::Network, None, true),
+        (TransportErrorKind::Timeout, None, false),
+        (TransportErrorKind::ProtocolMismatch, None, false),
+        (TransportErrorKind::RedirectBlocked, None, false),
+        (TransportErrorKind::ResponseTooLarge, Some(4096), false),
     ];
 
     let server_cases = cases.clone();
     let server = tokio::spawn(async move {
-        for (kind, limit) in server_cases {
+        for (kind, limit, retryable) in server_cases {
             let (stream, _) = listener.accept().await.unwrap();
             let (read_half, mut write_half) = stream.into_split();
             let mut reader = BufReader::new(read_half);
             let mut line = String::new();
             let _ = reader.read_line(&mut line).await;
-            let hdr = DaemonResponseHeader::err("structured failure", Some(kind), limit);
+            let hdr = DaemonResponseHeader::err("structured failure", Some(kind), limit)
+                .with_retryable(retryable);
             let mut enc = serde_json::to_string(&hdr).unwrap();
             enc.push('\n');
             write_half.write_all(enc.as_bytes()).await.unwrap();
@@ -446,7 +450,7 @@ async fn daemon_round_trips_structured_transport_error_kinds() {
         }
     });
 
-    for (kind, limit) in cases {
+    for (kind, limit, retryable) in cases {
         let err = daemon_http_get_with_executable(
             dir.path(),
             None,
@@ -474,6 +478,11 @@ async fn daemon_round_trips_structured_transport_error_kinds() {
                     .downcast_ref::<TransportError>()
                     .expect("expected TransportError");
                 assert_eq!(te.kind, other);
+                assert_eq!(te.retryable, retryable);
+                assert_eq!(
+                    is_retryable_network_error(&err),
+                    other == TransportErrorKind::Network && retryable
+                );
             }
         }
     }

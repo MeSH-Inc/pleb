@@ -24,9 +24,9 @@ use crate::transport::cdp::{CdpRenderOptions, CdpRenderResult, CdpRenderer};
 use crate::transport::cef::{CefRenderOptions, CefRenderResult, CefRenderer};
 use crate::transport::web_bot_auth::execute_signed_get;
 use crate::transport::{
-    transport_error_kind, DiagnosticHeaders, RequestHeaderOptions, ResponseTooLargeError,
-    SubresourceDest, TransportErrorKind, DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES,
-    DEFAULT_RAW_MAX_RESPONSE_BYTES,
+    is_retryable_network_error, transport_error_kind, DiagnosticHeaders, RequestHeaderOptions,
+    ResponseTooLargeError, SubresourceDest, TransportErrorKind,
+    DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES, DEFAULT_RAW_MAX_RESPONSE_BYTES,
 };
 
 const MAX_TRANSCRIPT_FETCHES: usize = 4;
@@ -1347,6 +1347,9 @@ async fn acquire_page(
         || (source_mode == SourceMode::Auto && rule.is_some_and(|r| r.accept_markdown));
     let mut retried_406 = false;
     let mut retried_429 = false;
+    let mut retried_network = false;
+    let mut used_http1_fallback = false;
+    let mut network_strategy = ctx.client.transport_name();
     let mut current_url = url_str.to_string();
     let mut current_parsed = parsed.clone();
     let mut visited_refresh = std::collections::HashSet::from([current_url.clone()]);
@@ -1362,16 +1365,107 @@ async fn acquire_page(
                 accept_markdown: effective_accept_markdown,
                 ..Default::default()
             };
-            let resp = execute_signed_get(
-                &ctx.client,
-                &current_url,
-                ctx.config.timeout,
-                max_bytes,
-                &req_opts,
-                signer.as_deref(),
-            )
-            .await
-            .map_err(|e| map_transport_error(&current_url, e, max_bytes))?;
+            let primary_res = if used_http1_fallback {
+                let remaining = http_deadline
+                    .saturating_duration_since(Instant::now())
+                    .max(Duration::from_millis(1));
+                let h1_client = ctx.http1_fallback_client().map_err(FetchError::Transport)?;
+                execute_signed_get(
+                    &h1_client,
+                    &current_url,
+                    remaining,
+                    max_bytes,
+                    &req_opts,
+                    signer.as_deref(),
+                )
+                .await
+            } else {
+                execute_signed_get(
+                    &ctx.client,
+                    &current_url,
+                    ctx.config.timeout,
+                    max_bytes,
+                    &req_opts,
+                    signer.as_deref(),
+                )
+                .await
+            };
+            let resp = match primary_res {
+                Ok(resp) => resp,
+                Err(primary_err) => {
+                    let remaining = http_deadline.saturating_duration_since(Instant::now());
+                    if !retried_network
+                        && is_retryable_network_error(&primary_err)
+                        && remaining >= Duration::from_millis(250)
+                    {
+                        retried_network = true;
+                        tracing::debug!(
+                            url = %current_url,
+                            error = %primary_err,
+                            "primary transport failed with retryable network error; trying HTTP/1.1 fallback"
+                        );
+                        let h1_res = match ctx.http1_fallback_client() {
+                            Ok(h1_client) => execute_signed_get(
+                                &h1_client,
+                                &current_url,
+                                remaining,
+                                max_bytes,
+                                &req_opts,
+                                signer.as_deref(),
+                            )
+                            .await
+                            .map(|resp| (h1_client.transport_name(), resp)),
+                            Err(err) => Err(err),
+                        };
+                        match h1_res {
+                            Ok((h1_strategy, h1_resp)) => {
+                                if cfg!(feature = "cronet")
+                                    && plan.escalation == EscalationBackend::None
+                                    && matches!(h1_resp.status, 403 | 429 | 503)
+                                {
+                                    return Err(map_transport_error(
+                                        &current_url,
+                                        primary_err,
+                                        max_bytes,
+                                    ));
+                                }
+                                fallback_used = true;
+                                used_http1_fallback = true;
+                                network_strategy = h1_strategy;
+                                h1_resp
+                            }
+                            Err(h1_err) => {
+                                tracing::debug!(
+                                    url = %current_url,
+                                    error = %h1_err,
+                                    "HTTP/1.1 fallback failed after primary network error"
+                                );
+                                if let Some(escalated) = try_network_error_browser_escalation(
+                                    ctx,
+                                    plan.escalation,
+                                    cdp_renderer.as_deref(),
+                                    host,
+                                    start,
+                                    &current_url,
+                                    effective_selector,
+                                    capture_axtree,
+                                )
+                                .await
+                                {
+                                    return escalated;
+                                }
+                                return Err(map_transport_error(
+                                    &current_url,
+                                    primary_err,
+                                    max_bytes,
+                                ));
+                            }
+                        }
+                    } else {
+                        return Err(map_transport_error(&current_url, primary_err, max_bytes));
+                    }
+                }
+            };
             let status = resp.status;
             let final_url = resp.final_url.clone();
             let content_type = resp.content_type.clone();
@@ -1465,11 +1559,8 @@ async fn acquire_page(
 
     let record_network_page =
         |body, final_url, extract_base_url, content_type, strategy: &str, parsed| -> AcquiredPage {
-            ctx.site_cache.record(
-                host,
-                ctx.client.transport_name(),
-                start.elapsed().as_millis() as u64,
-            );
+            ctx.site_cache
+                .record(host, network_strategy, start.elapsed().as_millis() as u64);
             AcquiredPage {
                 body,
                 final_url,
@@ -1532,7 +1623,7 @@ async fn acquire_page(
                 final_url,
                 None,
                 content_type,
-                ctx.client.transport_name(),
+                network_strategy,
                 parsed_html,
             ))
         }
@@ -1608,7 +1699,7 @@ async fn acquire_page(
                 extract_base_url: None,
                 status_code: status,
                 content_type,
-                strategy: ctx.client.transport_name().to_string(),
+                strategy: network_strategy.to_string(),
                 content_outcome: ContentOutcome::IncompleteShell,
                 escalated: fallback_used,
                 warning,
@@ -1723,6 +1814,62 @@ enum RendererEscalation {
     Completed(Box<std::result::Result<AcquiredPage, FetchError>>),
     Unavailable(FetchError),
     RenderFailed(FetchError),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn try_network_error_browser_escalation(
+    ctx: &RuntimeContext,
+    escalation: EscalationBackend,
+    cdp_renderer: Option<&CdpRenderer>,
+    host: &str,
+    start: Instant,
+    url: &str,
+    wait_for_selector: Option<&str>,
+    capture_axtree: bool,
+) -> Option<std::result::Result<AcquiredPage, FetchError>> {
+    let (backend, outcome) = match escalation {
+        EscalationBackend::Cef => (
+            "CEF",
+            try_cef_escalation(ctx, host, start, url, wait_for_selector).await,
+        ),
+        EscalationBackend::Cdp => {
+            let cdp = cdp_renderer?;
+            (
+                "CDP",
+                try_cdp_escalation(
+                    ctx,
+                    cdp,
+                    host,
+                    start,
+                    url,
+                    wait_for_selector,
+                    capture_axtree,
+                )
+                .await,
+            )
+        }
+        EscalationBackend::None => return None,
+    };
+    match outcome {
+        RendererEscalation::Completed(res) => Some(*res),
+        RendererEscalation::RenderFailed(err)
+            if matches!(
+                err,
+                FetchError::Challenge { .. } | FetchError::HttpError { .. }
+            ) =>
+        {
+            Some(Err(err))
+        }
+        RendererEscalation::Unavailable(err) | RendererEscalation::RenderFailed(err) => {
+            tracing::warn!(
+                "network error on {} and {} escalation failed: {}",
+                host,
+                backend,
+                err
+            );
+            None
+        }
+    }
 }
 
 async fn try_cef_escalation(

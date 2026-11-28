@@ -842,7 +842,7 @@ unsafe extern "C" fn on_failed(
     complete(
         &boxed,
         Err(CronetAttemptError {
-            err: anyhow::Error::new(TransportError::new(kind, msg)),
+            err: anyhow::Error::new(TransportError::new(kind, msg).with_retryable(retryable_err)),
             retryable: retryable_err,
         }),
     );

@@ -233,6 +233,7 @@ pub struct RuntimeContext {
     pub site_cache: SiteCache,
     pub robots: RobotsCache,
     http_client: Mutex<Option<reqwest::Client>>,
+    http1_client: Mutex<Option<Arc<TransportClient>>>,
     web_bot_auth_signer: Mutex<Option<Option<Arc<WebBotAuthSigner>>>>,
     cdp_renderer: Mutex<Option<Option<Arc<CdpRenderer>>>>,
 }
@@ -295,6 +296,7 @@ impl RuntimeContext {
             site_cache,
             robots,
             http_client: Mutex::new(None),
+            http1_client: Mutex::new(None),
             web_bot_auth_signer: Mutex::new(None),
             cdp_renderer: Mutex::new(None),
         })
@@ -378,6 +380,24 @@ impl RuntimeContext {
         }
         let client = builder.build()?;
         *guard = Some(client.clone());
+        Ok(client)
+    }
+
+    /// Lazily build a shared HTTP/1.1-only fallback `TransportClient` respecting
+    /// the configured proxy and timeout.
+    pub fn http1_fallback_client(&self) -> Result<Arc<TransportClient>> {
+        let mut guard = self
+            .http1_client
+            .lock()
+            .map_err(|_| anyhow::anyhow!("HTTP/1.1 fallback client lock poisoned"))?;
+        if let Some(ref client) = *guard {
+            return Ok(Arc::clone(client));
+        }
+        let client = Arc::new(TransportClient::new_http1(
+            self.config.proxy.as_deref(),
+            self.config.timeout,
+        )?);
+        *guard = Some(Arc::clone(&client));
         Ok(client)
     }
 }

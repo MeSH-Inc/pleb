@@ -3193,3 +3193,383 @@ async fn typed_outcomes_representation_identity_crawl_fidelity_and_rendered_shel
     assert_eq!(crawl_res.failed_pages[0].kind, "http_error");
     assert_eq!(crawl_res.failed_pages[0].depth, 1);
 }
+
+#[tokio::test]
+async fn network_error_http1_fallback_and_browser_escalation_guards() {
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::{json, Value};
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    // Cronet performs 1 internal retry (2 attempts total); direct reqwest performs 1 attempt.
+    let primary_attempts: usize = if cfg!(feature = "cronet") { 2 } else { 1 };
+    let recover_hits = Arc::new(AtomicUsize::new(0));
+    let drop_always_hits = Arc::new(AtomicUsize::new(0));
+    let akamai_cronet_hits = Arc::new(AtomicUsize::new(0));
+    let akamai_auto_hits = Arc::new(AtomicUsize::new(0));
+    let drop_escalate_hits = Arc::new(AtomicUsize::new(0));
+
+    let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", http_listener.local_addr().unwrap());
+
+    let recover_srv = Arc::clone(&recover_hits);
+    let drop_always_srv = Arc::clone(&drop_always_hits);
+    let akamai_cronet_srv = Arc::clone(&akamai_cronet_hits);
+    let akamai_auto_srv = Arc::clone(&akamai_auto_hits);
+    let drop_escalate_srv = Arc::clone(&drop_escalate_hits);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = http_listener.accept().await else {
+                break;
+            };
+            let recover_c = Arc::clone(&recover_srv);
+            let drop_always_c = Arc::clone(&drop_always_srv);
+            let akamai_cronet_c = Arc::clone(&akamai_cronet_srv);
+            let akamai_auto_c = Arc::clone(&akamai_auto_srv);
+            let drop_escalate_c = Arc::clone(&drop_escalate_srv);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                match path {
+                    "/recover-h1" => {
+                        let hit = recover_c.fetch_add(1, Ordering::SeqCst);
+                        if hit < primary_attempts {
+                            drop(socket);
+                            return;
+                        }
+                        let resp = http_response(
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            b"<html><head><title>HTTP1 OK</title></head><body><main><p>Recovered via HTTP/1.1 fallback.</p></main></body></html>",
+                        );
+                        let _ = socket.write_all(&resp).await;
+                    }
+                    "/drop-always" => {
+                        drop_always_c.fetch_add(1, Ordering::SeqCst);
+                        drop(socket);
+                    }
+                    "/akamai-cronet-only" => {
+                        let hit = akamai_cronet_c.fetch_add(1, Ordering::SeqCst);
+                        if hit < primary_attempts {
+                            drop(socket);
+                            return;
+                        }
+                        let body = b"<html><head><title>Blocked</title></head><body>Access Denied</body></html>";
+                        let hdr = format!(
+                            "HTTP/1.1 403 Forbidden\r\nServer: AkamaiGHost\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = socket.write_all(hdr.as_bytes()).await;
+                        let _ = socket.write_all(body).await;
+                    }
+                    "/akamai-auto" => {
+                        let hit = akamai_auto_c.fetch_add(1, Ordering::SeqCst);
+                        if hit < primary_attempts {
+                            drop(socket);
+                            return;
+                        }
+                        let body = b"<html><head><title>Blocked</title></head><body>Access Denied</body></html>";
+                        let hdr = format!(
+                            "HTTP/1.1 403 Forbidden\r\nServer: AkamaiGHost\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = socket.write_all(hdr.as_bytes()).await;
+                        let _ = socket.write_all(body).await;
+                    }
+                    "/drop-escalate" => {
+                        drop_escalate_c.fetch_add(1, Ordering::SeqCst);
+                        drop(socket);
+                    }
+                    _ => {
+                        let _ = socket
+                            .write_all(&http_response("404 Not Found", "text/plain", b"missing"))
+                            .await;
+                    }
+                }
+            });
+        }
+    });
+
+    // Mock CDP server tracking browser escalations.
+    let cdp_hits = Arc::new(AtomicUsize::new(0));
+    let cdp_hits_srv = Arc::clone(&cdp_hits);
+    let cdp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cdp_port = cdp_listener.local_addr().unwrap().port();
+    let cdp_ws = format!("ws://127.0.0.1:{cdp_port}/devtools/browser");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = cdp_listener.accept().await else {
+                break;
+            };
+            let hits = Arc::clone(&cdp_hits_srv);
+            tokio::spawn(async move {
+                let Ok(mut ws) = accept_async(stream).await else {
+                    return;
+                };
+                hits.fetch_add(1, Ordering::SeqCst);
+                let mut nav_url = String::from("http://127.0.0.1/");
+                while let Some(Ok(Message::Text(text))) = ws.next().await {
+                    let Ok(req) = serde_json::from_str::<Value>(&text) else {
+                        continue;
+                    };
+                    let id = req.get("id").and_then(Value::as_u64);
+                    let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+                    let sid = req
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    let frame = |fid: Option<u64>, m: Option<&str>, payload: Value| -> Message {
+                        let mut obj = serde_json::Map::new();
+                        if let Some(i) = fid {
+                            obj.insert("id".into(), json!(i));
+                            obj.insert("result".into(), payload);
+                        } else if let Some(meth) = m {
+                            obj.insert("method".into(), json!(meth));
+                            obj.insert("params".into(), payload);
+                        }
+                        if let Some(ref s) = sid {
+                            obj.insert("sessionId".into(), json!(s));
+                        }
+                        Message::Text(Value::Object(obj).to_string().into())
+                    };
+                    let replies = match method {
+                        "Target.createTarget" => {
+                            vec![frame(id, None, json!({ "targetId": "t-net" }))]
+                        }
+                        "Target.attachToTarget" => {
+                            vec![frame(id, None, json!({ "sessionId": "s-net" }))]
+                        }
+                        "Target.closeTarget" | "Page.enable" | "DOM.enable" | "Network.enable"
+                        | "Fetch.enable" | "WebMCP.enable" => {
+                            vec![frame(id, None, json!({}))]
+                        }
+                        "Page.getFrameTree" => vec![frame(
+                            id,
+                            None,
+                            json!({ "frameTree": { "frame": { "id": "mf-net" } } }),
+                        )],
+                        "Page.navigate" => {
+                            if let Some(u) = req
+                                .get("params")
+                                .and_then(|p| p.get("url"))
+                                .and_then(Value::as_str)
+                            {
+                                nav_url = u.to_string();
+                            }
+                            vec![
+                                frame(
+                                    None,
+                                    Some("Network.responseReceived"),
+                                    json!({
+                                        "requestId": "req-net",
+                                        "frameId": "mf-net",
+                                        "type": "Document",
+                                        "response": {
+                                            "url": nav_url,
+                                            "status": 200,
+                                            "headers": { "Content-Type": "text/html; charset=utf-8" }
+                                        }
+                                    }),
+                                ),
+                                frame(id, None, json!({ "frameId": "mf-net" })),
+                                frame(None, Some("Page.loadEventFired"), json!({})),
+                            ]
+                        }
+                        "DOM.getDocument" => {
+                            vec![frame(id, None, json!({ "root": { "nodeId": 1 } }))]
+                        }
+                        "DOM.getOuterHTML" => vec![frame(
+                            id,
+                            None,
+                            json!({
+                                "outerHTML": "<!doctype html><html><head><title>CDP Recovered</title></head><body><main><h1>Recovered</h1><p>Browser escalation recovered after primary transport reset.</p></main></body></html>"
+                            }),
+                        )],
+                        _ => {
+                            let mut obj = json!({
+                                "id": id,
+                                "error": { "code": -32601, "message": "not found" }
+                            });
+                            if let Some(ref s) = sid {
+                                obj["sessionId"] = json!(s);
+                            }
+                            vec![Message::Text(obj.to_string().into())]
+                        }
+                    };
+                    for msg in replies {
+                        if ws.send(msg).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let cronet_dir = temp_state_dir();
+    let cronet_ctx = RuntimeContext::new(RuntimeConfig {
+        state_dir: cronet_dir.path().to_path_buf(),
+        cef_renderer_executable: Some(cronet_dir.path().join("no-cef")),
+        timeout: Duration::from_secs(5),
+        no_web_bot_auth: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let cronet_opts = FetchOptions {
+        render: RenderMode::Cronet,
+        ..Default::default()
+    };
+
+    // 1. Bounded 1x HTTP/1.1 fallback recovers after primary exhausts retries.
+    let recovered = fetch_document(&cronet_ctx, &format!("{base}/recover-h1"), &cronet_opts)
+        .await
+        .expect("HTTP/1.1 fallback should recover after repeated primary resets");
+    assert_eq!(recovered.status_code, 200);
+    assert_eq!(recovered.strategy, "reqwest");
+    assert!(recovered.escalated);
+    assert!(recovered
+        .content
+        .contains("Recovered via HTTP/1.1 fallback."));
+    assert_eq!(
+        recover_hits.load(Ordering::SeqCst),
+        primary_attempts + 1,
+        "expected primary attempts plus exactly one HTTP/1.1 fallback attempt"
+    );
+
+    // 2. Persistent drops obey the 1x fallback guard and fail with FetchError::Transport.
+    let drop_err = fetch_document(&cronet_ctx, &format!("{base}/drop-always"), &cronet_opts)
+        .await
+        .unwrap_err();
+    assert!(matches!(drop_err, FetchError::Transport(_)));
+    assert_eq!(drop_err.exit_code(), 1);
+    assert_eq!(
+        drop_always_hits.load(Ordering::SeqCst),
+        primary_attempts + 1
+    );
+
+    // 3. Under RenderMode::Cronet (no escalation), a Cronet network reset whose reqwest h1
+    //    fallback gets AkamaiGHost 403 preserves the primary Cronet TransportError.
+    let akamai_cronet_err = fetch_document(
+        &cronet_ctx,
+        &format!("{base}/akamai-cronet-only"),
+        &cronet_opts,
+    )
+    .await
+    .unwrap_err();
+    if cfg!(feature = "cronet") {
+        assert!(
+            matches!(akamai_cronet_err, FetchError::Transport(_)),
+            "expected primary Cronet Transport error, got: {akamai_cronet_err:?}"
+        );
+        assert_eq!(akamai_cronet_err.exit_code(), 1);
+    } else {
+        assert!(matches!(
+            akamai_cronet_err,
+            FetchError::Blocked { status: 403, .. }
+        ));
+    }
+    assert_eq!(
+        akamai_cronet_hits.load(Ordering::SeqCst),
+        primary_attempts + 1
+    );
+
+    // 4. Inverse false-positive guard: non-retryable Network error (connection refused)
+    //    must NOT invoke browser escalation.
+    let closed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed_addr = closed_listener.local_addr().unwrap();
+    drop(closed_listener);
+
+    let auto_dir_refused = temp_state_dir();
+    let auto_ctx_refused = RuntimeContext::new(RuntimeConfig {
+        state_dir: auto_dir_refused.path().to_path_buf(),
+        cef_renderer_executable: Some(auto_dir_refused.path().join("no-cef")),
+        cdp_url: Some(cdp_ws.clone()),
+        cdp_timeout: Duration::from_secs(5),
+        timeout: Duration::from_secs(5),
+        no_web_bot_auth: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let refused_err = fetch_document(
+        &auto_ctx_refused,
+        &format!("http://{closed_addr}/"),
+        &FetchOptions::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(refused_err, FetchError::Transport(_)));
+    assert_eq!(
+        cdp_hits.load(Ordering::SeqCst),
+        0,
+        "connection refused must not escalate to browser renderer"
+    );
+
+    // 5. RenderMode::Auto escalates to browser when primary resets and h1 gets Akamai 403.
+    let auto_dir_akamai = temp_state_dir();
+    let auto_ctx_akamai = RuntimeContext::new(RuntimeConfig {
+        state_dir: auto_dir_akamai.path().to_path_buf(),
+        cef_renderer_executable: Some(auto_dir_akamai.path().join("no-cef")),
+        cdp_url: Some(cdp_ws.clone()),
+        cdp_timeout: Duration::from_secs(5),
+        timeout: Duration::from_secs(5),
+        no_web_bot_auth: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let akamai_recovered = fetch_document(
+        &auto_ctx_akamai,
+        &format!("{base}/akamai-auto"),
+        &FetchOptions::default(),
+    )
+    .await
+    .expect("Auto mode should escalate to CDP after Cronet reset + Akamai h1 403");
+    assert_eq!(akamai_recovered.strategy, "cdp");
+    assert!(akamai_recovered.escalated);
+    assert!(akamai_recovered
+        .content
+        .contains("Browser escalation recovered"));
+    assert_eq!(
+        akamai_auto_hits.load(Ordering::SeqCst),
+        primary_attempts + 1
+    );
+    assert_eq!(cdp_hits.load(Ordering::SeqCst), 1);
+
+    // 6. RenderMode::Auto escalates to browser when both primary and HTTP/1.1 fallback drop.
+    let auto_dir_drop = temp_state_dir();
+    let auto_ctx_drop = RuntimeContext::new(RuntimeConfig {
+        state_dir: auto_dir_drop.path().to_path_buf(),
+        cef_renderer_executable: Some(auto_dir_drop.path().join("no-cef")),
+        cdp_url: Some(cdp_ws),
+        cdp_timeout: Duration::from_secs(5),
+        timeout: Duration::from_secs(5),
+        no_web_bot_auth: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let drop_recovered = fetch_document(
+        &auto_ctx_drop,
+        &format!("{base}/drop-escalate"),
+        &FetchOptions::default(),
+    )
+    .await
+    .expect("Auto mode should escalate to CDP when both primary and HTTP/1.1 drop");
+    assert_eq!(drop_recovered.strategy, "cdp");
+    assert!(drop_recovered.escalated);
+    assert!(drop_recovered
+        .content
+        .contains("Browser escalation recovered"));
+    assert_eq!(
+        drop_escalate_hits.load(Ordering::SeqCst),
+        primary_attempts + 1
+    );
+    assert_eq!(cdp_hits.load(Ordering::SeqCst), 2);
+}

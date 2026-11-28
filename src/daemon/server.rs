@@ -18,8 +18,8 @@ use super::protocol::{
 use crate::context::ensure_private_dir;
 use crate::transport::cef::{CefRenderOptions, CefRenderer};
 use crate::transport::{
-    transport_error_kind, RequestHeaderOptions, ResponseTooLargeError, TransportClient,
-    TransportErrorKind,
+    is_retryable_network_error, transport_error_kind, RequestHeaderOptions, ResponseTooLargeError,
+    TransportClient, TransportErrorKind,
 };
 
 const MAX_PROXY_SLOTS: usize = 4;
@@ -502,6 +502,7 @@ async fn handle_connection(
                                 let kind =
                                     transport_error_kind(&err).unwrap_or(TransportErrorKind::Network);
                                 DaemonResponseHeader::err(err.to_string(), Some(kind), None)
+                                    .with_retryable(is_retryable_network_error(&err))
                             };
                             let _ = write_frame(&mut write_half, &hdr, &[]).await;
                         }

@@ -118,6 +118,8 @@ pub struct DaemonResponseHeader {
     pub error: Option<String>,
     #[serde(default)]
     pub error_kind: Option<TransportErrorKind>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub error_retryable: bool,
     #[serde(default)]
     pub limit_bytes: Option<usize>,
 }
@@ -141,6 +143,7 @@ impl DaemonResponseHeader {
             body_bytes: 0,
             error: None,
             error_kind: None,
+            error_retryable: false,
             limit_bytes: None,
         }
     }
@@ -157,6 +160,11 @@ impl DaemonResponseHeader {
             limit_bytes,
             ..Self::ok_empty()
         }
+    }
+
+    pub fn with_retryable(mut self, retryable: bool) -> Self {
+        self.error_retryable = retryable;
+        self
     }
 }
 

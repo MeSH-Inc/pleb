@@ -200,6 +200,7 @@ pub enum TransportErrorKind {
 pub struct TransportError {
     pub kind: TransportErrorKind,
     pub message: String,
+    pub retryable: bool,
 }
 
 impl TransportError {
@@ -207,8 +208,19 @@ impl TransportError {
         Self {
             kind,
             message: message.into(),
+            retryable: false,
         }
     }
+
+    pub fn with_retryable(mut self, retryable: bool) -> Self {
+        self.retryable = retryable;
+        self
+    }
+}
+
+pub fn is_retryable_network_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<TransportError>()
+        .is_some_and(|te| te.kind == TransportErrorKind::Network && te.retryable)
 }
 
 pub fn transport_error_kind(err: &anyhow::Error) -> Option<TransportErrorKind> {
@@ -255,12 +267,10 @@ impl HttpResponse {
 }
 
 enum TransportBackend {
-    Direct {
-        #[cfg(feature = "cronet")]
-        engine: cronet::Engine,
-        #[cfg(not(feature = "cronet"))]
+    #[cfg(feature = "cronet")]
+    Cronet { engine: cronet::Engine },
+    Reqwest {
         inner: reqwest::Client,
-        #[cfg(not(feature = "cronet"))]
         no_redirect_client: reqwest::Client,
     },
     #[cfg(unix)]
@@ -279,10 +289,10 @@ pub struct TransportClient {
     default_timeout: Duration,
 }
 
-#[cfg(not(feature = "cronet"))]
 fn build_reqwest_client(
     proxy: Option<&str>,
     redirect_policy: reqwest::redirect::Policy,
+    http1_only: bool,
 ) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .user_agent(chrome_user_agent())
@@ -292,7 +302,11 @@ fn build_reqwest_client(
         .brotli(true)
         .deflate(true);
 
-    if let Some(proxy_url) = proxy {
+    if http1_only {
+        builder = builder.http1_only();
+    }
+
+    if let Some(proxy_url) = proxy.map(str::trim).filter(|s| !s.is_empty()) {
         builder = builder.proxy(reqwest::Proxy::all(proxy_url)?);
     }
 
@@ -309,25 +323,35 @@ impl TransportClient {
         {
             let engine = cronet::Engine::new(storage_path, &chrome_user_agent(), proxy)?;
             Ok(Self {
-                backend: TransportBackend::Direct { engine },
+                backend: TransportBackend::Cronet { engine },
                 default_timeout: timeout,
             })
         }
         #[cfg(not(feature = "cronet"))]
         {
             let _ = storage_path;
-            let inner = build_reqwest_client(proxy, reqwest_redirect_policy())?;
-            let no_redirect_client =
-                build_reqwest_client(proxy, reqwest::redirect::Policy::none())?;
-
-            Ok(Self {
-                backend: TransportBackend::Direct {
-                    inner,
-                    no_redirect_client,
-                },
-                default_timeout: timeout,
-            })
+            Self::new_reqwest(proxy, timeout, false)
         }
+    }
+
+    /// Build a direct HTTP/1.1-only `reqwest` client used as a bounded fallback when
+    /// primary HTTP/2 or QUIC connections reset across retries.
+    pub fn new_http1(proxy: Option<&str>, timeout: Duration) -> Result<Self> {
+        Self::new_reqwest(proxy, timeout, true)
+    }
+
+    fn new_reqwest(proxy: Option<&str>, timeout: Duration, http1_only: bool) -> Result<Self> {
+        let inner = build_reqwest_client(proxy, reqwest_redirect_policy(), http1_only)?;
+        let no_redirect_client =
+            build_reqwest_client(proxy, reqwest::redirect::Policy::none(), http1_only)?;
+
+        Ok(Self {
+            backend: TransportBackend::Reqwest {
+                inner,
+                no_redirect_client,
+            },
+            default_timeout: timeout,
+        })
     }
 
     #[cfg(unix)]
@@ -363,10 +387,18 @@ impl TransportClient {
     }
 
     pub fn transport_name(&self) -> &'static str {
-        if cfg!(feature = "cronet") {
-            "cronet"
-        } else {
-            "reqwest"
+        match self.backend {
+            #[cfg(feature = "cronet")]
+            TransportBackend::Cronet { .. } => "cronet",
+            TransportBackend::Reqwest { .. } => "reqwest",
+            #[cfg(unix)]
+            TransportBackend::Daemon { .. } => {
+                if cfg!(feature = "cronet") {
+                    "cronet"
+                } else {
+                    "reqwest"
+                }
+            }
         }
     }
 
@@ -422,115 +454,35 @@ impl TransportClient {
                 )
                 .await
             }
-            TransportBackend::Direct {
-                #[cfg(feature = "cronet")]
-                engine,
-                #[cfg(not(feature = "cronet"))]
+            #[cfg(feature = "cronet")]
+            TransportBackend::Cronet { engine } => {
+                let headers = request_header_pairs(true, url, opts)?;
+                let disable_redirects = opts.disable_redirects || opts.web_bot_auth.is_some();
+                let resp = engine
+                    .get_with_redirects(url, &headers, timeout, max_body_bytes, disable_redirects)
+                    .await?;
+                Ok(HttpResponse {
+                    status: resp.status_code,
+                    final_url: resp.final_url,
+                    content_type: resp.content_type,
+                    link_header: resp.link_header,
+                    location_header: resp.location_header,
+                    diagnostics: resp.diagnostics,
+                    body: resp.body,
+                })
+            }
+            TransportBackend::Reqwest {
                 inner,
-                #[cfg(not(feature = "cronet"))]
                 no_redirect_client,
             } => {
-                #[cfg(feature = "cronet")]
-                {
-                    let headers = request_header_pairs(true, url, opts)?;
-                    let disable_redirects = opts.disable_redirects || opts.web_bot_auth.is_some();
-                    let resp = engine
-                        .get_with_redirects(
-                            url,
-                            &headers,
-                            timeout,
-                            max_body_bytes,
-                            disable_redirects,
-                        )
-                        .await?;
-                    Ok(HttpResponse {
-                        status: resp.status_code,
-                        final_url: resp.final_url,
-                        content_type: resp.content_type,
-                        link_header: resp.link_header,
-                        location_header: resp.location_header,
-                        diagnostics: resp.diagnostics,
-                        body: resp.body,
-                    })
-                }
-                #[cfg(not(feature = "cronet"))]
-                {
-                    let headers = request_headers_reqwest(url, opts)?;
-                    let no_redirects = opts.disable_redirects || opts.web_bot_auth.is_some();
-                    let client = if no_redirects {
-                        no_redirect_client
-                    } else {
-                        inner
-                    };
-                    let fut = async {
-                        let mut resp = client
-                            .get(url)
-                            .headers(headers)
-                            .timeout(timeout)
-                            .send()
-                            .await
-                            .map_err(map_reqwest_send_error)?;
-                        let final_url = resp.url().to_string();
-                        let status = resp.status().as_u16();
-                        let content_type = resp
-                            .headers()
-                            .get(reqwest::header::CONTENT_TYPE)
-                            .and_then(|v| v.to_str().ok())
-                            .map(|s| s.to_string());
-                        let link_values: Vec<&str> = resp
-                            .headers()
-                            .get_all(reqwest::header::LINK)
-                            .iter()
-                            .filter_map(|v| v.to_str().ok())
-                            .filter(|s| !s.is_empty())
-                            .collect();
-                        let link_header = if link_values.is_empty() {
-                            None
-                        } else {
-                            Some(link_values.join(", "))
-                        };
-                        let location_header = if (300..400).contains(&status) {
-                            resp.headers()
-                                .get(reqwest::header::LOCATION)
-                                .and_then(|v| v.to_str().ok())
-                                .map(|s| s.to_string())
-                        } else {
-                            None
-                        };
-                        let mut diagnostics = DiagnosticHeaders::default();
-                        for (name, value) in resp.headers() {
-                            if let Ok(val_str) = value.to_str() {
-                                diagnostics.capture_header(name.as_str(), val_str);
-                            }
-                        }
-                        let mut body = Vec::new();
-                        while let Some(chunk) = resp.chunk().await? {
-                            if body.len().saturating_add(chunk.len()) > max_body_bytes {
-                                return Err(anyhow::Error::new(ResponseTooLargeError {
-                                    limit_bytes: max_body_bytes,
-                                }));
-                            }
-                            body.extend_from_slice(&chunk);
-                        }
-                        Ok(HttpResponse {
-                            status,
-                            final_url,
-                            content_type,
-                            link_header,
-                            location_header,
-                            diagnostics,
-                            body,
-                        })
-                    };
-
-                    match tokio::time::timeout(timeout, fut).await {
-                        Ok(res) => res,
-                        Err(_) => Err(anyhow::Error::new(TransportError::new(
-                            TransportErrorKind::Timeout,
-                            format!("request timed out after {:?}", timeout),
-                        ))),
-                    }
-                }
+                let headers = request_headers_reqwest(url, opts)?;
+                let no_redirects = opts.disable_redirects || opts.web_bot_auth.is_some();
+                let client = if no_redirects {
+                    no_redirect_client
+                } else {
+                    inner
+                };
+                execute_reqwest_get(client, url, headers, timeout, max_body_bytes).await
             }
         }
     }
@@ -726,7 +678,79 @@ fn chrome_header_pairs(include_zstd: bool) -> Vec<(&'static str, String)> {
     ]
 }
 
-#[cfg(not(feature = "cronet"))]
+async fn execute_reqwest_get(
+    client: &reqwest::Client,
+    url: &str,
+    headers: reqwest::header::HeaderMap,
+    timeout: Duration,
+    max_body_bytes: usize,
+) -> Result<HttpResponse> {
+    let fut = async {
+        let mut resp = client
+            .get(url)
+            .headers(headers)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(map_reqwest_send_error)?;
+        let final_url = resp.url().to_string();
+        let status = resp.status().as_u16();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let link_values: Vec<&str> = resp
+            .headers()
+            .get_all(reqwest::header::LINK)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let link_header = (!link_values.is_empty()).then(|| link_values.join(", "));
+        let location_header = if (300..400).contains(&status) {
+            resp.headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        } else {
+            None
+        };
+        let mut diagnostics = DiagnosticHeaders::default();
+        for (name, value) in resp.headers() {
+            if let Ok(val_str) = value.to_str() {
+                diagnostics.capture_header(name.as_str(), val_str);
+            }
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(map_reqwest_send_error)? {
+            if body.len().saturating_add(chunk.len()) > max_body_bytes {
+                return Err(anyhow::Error::new(ResponseTooLargeError {
+                    limit_bytes: max_body_bytes,
+                }));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(HttpResponse {
+            status,
+            final_url,
+            content_type,
+            link_header,
+            location_header,
+            diagnostics,
+            body,
+        })
+    };
+
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(res) => res,
+        Err(_) => Err(anyhow::Error::new(TransportError::new(
+            TransportErrorKind::Timeout,
+            format!("request timed out after {:?}", timeout),
+        ))),
+    }
+}
+
 fn request_headers_reqwest(
     url: &str,
     opts: &RequestHeaderOptions,
@@ -742,14 +766,12 @@ fn request_headers_reqwest(
     Ok(headers)
 }
 
-#[cfg(not(feature = "cronet"))]
 #[derive(Debug, thiserror::Error)]
 #[error("blocked unsafe redirect to {target}")]
 struct BlockedRedirectError {
     target: String,
 }
 
-#[cfg(not(feature = "cronet"))]
 fn reqwest_redirect_policy() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
         if attempt.previous().len() >= 10 {
@@ -764,7 +786,6 @@ fn reqwest_redirect_policy() -> reqwest::redirect::Policy {
     })
 }
 
-#[cfg(not(feature = "cronet"))]
 fn map_reqwest_send_error(err: reqwest::Error) -> anyhow::Error {
     let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(&err);
     while let Some(source) = cur {
@@ -776,7 +797,16 @@ fn map_reqwest_send_error(err: reqwest::Error) -> anyhow::Error {
         }
         cur = source.source();
     }
-    anyhow::Error::from(err)
+    if err.is_timeout() {
+        return anyhow::Error::new(TransportError::new(
+            TransportErrorKind::Timeout,
+            err.to_string(),
+        ));
+    }
+    let retryable = !err.is_builder() && !err.is_connect();
+    anyhow::Error::new(
+        TransportError::new(TransportErrorKind::Network, err.to_string()).with_retryable(retryable),
+    )
 }
 
 #[cfg(test)]
@@ -981,6 +1011,97 @@ mod tests {
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, b"cookie_ok\n");
         assert_eq!(resp.diagnostics.server.as_deref(), Some("cloudflare"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http1_fallback_client_enforces_redirects_and_classifies_retryable_errors() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let first_line = req.lines().next().unwrap_or("");
+                    let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+                    match path {
+                        "/h1" => {
+                            assert!(
+                                first_line.ends_with("HTTP/1.1"),
+                                "expected HTTP/1.1 request line, got: {first_line}"
+                            );
+                            let _ = socket
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nh1")
+                                .await;
+                        }
+                        "/drop" => drop(socket),
+                        "/redir-imds" => {
+                            let _ = socket
+                                .write_all(b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                .await;
+                        }
+                        _ => {
+                            let _ = socket
+                                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                .await;
+                        }
+                    }
+                });
+            }
+        });
+
+        let h1 = TransportClient::new_http1(None, Duration::from_secs(5))
+            .expect("http1 fallback client should build");
+        assert_eq!(h1.transport_name(), "reqwest");
+
+        let ok = h1.get(&format!("http://{addr}/h1")).await.unwrap();
+        assert_eq!(ok.status, 200);
+        assert_eq!(ok.body, b"h1");
+
+        let blocked_redir = h1
+            .get(&format!("http://{addr}/redir-imds"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            transport_error_kind(&blocked_redir),
+            Some(TransportErrorKind::RedirectBlocked)
+        );
+        assert!(!is_retryable_network_error(&blocked_redir));
+
+        let drop_err = h1.get(&format!("http://{addr}/drop")).await.unwrap_err();
+        assert_eq!(
+            transport_error_kind(&drop_err),
+            Some(TransportErrorKind::Network)
+        );
+        assert!(is_retryable_network_error(&drop_err));
+
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_addr = closed.local_addr().unwrap();
+        drop(closed);
+        let refused_err = h1
+            .get(&format!("http://{closed_addr}/refused"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            transport_error_kind(&refused_err),
+            Some(TransportErrorKind::Network)
+        );
+        assert!(
+            !is_retryable_network_error(&refused_err),
+            "connection refused must not be marked retryable"
+        );
+
         server.abort();
     }
 }

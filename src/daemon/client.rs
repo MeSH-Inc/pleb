@@ -253,8 +253,13 @@ fn map_daemon_error(hdr: &DaemonResponseHeader, default_msg: &str) -> anyhow::Er
         Some(TransportErrorKind::ResponseTooLarge) => anyhow::Error::new(ResponseTooLargeError {
             limit_bytes: hdr.limit_bytes.unwrap_or(0),
         }),
-        Some(kind) => anyhow::Error::new(TransportError::new(kind, msg)),
-        None => anyhow::Error::new(TransportError::new(TransportErrorKind::Network, msg)),
+        Some(kind) => {
+            anyhow::Error::new(TransportError::new(kind, msg).with_retryable(hdr.error_retryable))
+        }
+        None => anyhow::Error::new(
+            TransportError::new(TransportErrorKind::Network, msg)
+                .with_retryable(hdr.error_retryable),
+        ),
     }
 }
 
