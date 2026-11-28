@@ -1339,38 +1339,40 @@ async fn passive_attach_enforces_outbound_rpc_allowlist_and_ignores_fetch_pause_
     assert!(res.html.contains("Logged in dashboard content."));
     wait_for_close_frame(&log).await;
 
-    let guard = log.lock().unwrap();
-    assert_eq!(guard.request_uris, vec!["/devtools/page/tab-123"]);
-    let methods: Vec<&str> = guard.rpcs.iter().map(|r| r.method.as_str()).collect();
-    for required in [
-        "Page.enable",
-        "Page.getFrameTree",
-        "DOM.getDocument",
-        "DOM.getOuterHTML",
-    ] {
-        assert!(
-            methods.contains(&required),
-            "missing required passive method {required} in {methods:?}"
-        );
+    {
+        let guard = log.lock().unwrap();
+        assert_eq!(guard.request_uris, vec!["/devtools/page/tab-123"]);
+        let methods: Vec<&str> = guard.rpcs.iter().map(|r| r.method.as_str()).collect();
+        for required in [
+            "Page.enable",
+            "Page.getFrameTree",
+            "DOM.getDocument",
+            "DOM.getOuterHTML",
+        ] {
+            assert!(
+                methods.contains(&required),
+                "missing required passive method {required} in {methods:?}"
+            );
+        }
+        for forbidden in [
+            "Fetch.enable",
+            "Fetch.continueRequest",
+            "Fetch.failRequest",
+            "Network.enable",
+            "Page.navigate",
+            "Kitesurf.setLayoutMode",
+            "Target.createTarget",
+            "Target.attachToTarget",
+            "Target.closeTarget",
+            "Browser.close",
+        ] {
+            assert!(
+                !methods.contains(&forbidden),
+                "forbidden method {forbidden} sent during passive attach: {methods:?}"
+            );
+        }
+        assert!(guard.received_close_frame);
     }
-    for forbidden in [
-        "Fetch.enable",
-        "Fetch.continueRequest",
-        "Fetch.failRequest",
-        "Network.enable",
-        "Page.navigate",
-        "Kitesurf.setLayoutMode",
-        "Target.createTarget",
-        "Target.attachToTarget",
-        "Target.closeTarget",
-        "Browser.close",
-    ] {
-        assert!(
-            !methods.contains(&forbidden),
-            "forbidden method {forbidden} sent during passive attach: {methods:?}"
-        );
-    }
-    assert!(guard.received_close_frame);
 
     // Abrupt WebSocket EOF mid-attach fails cleanly with zero forbidden RPCs.
     let drop_handler: RpcHandler = Arc::new(|id, method, session_id, _params, _log| match method {
