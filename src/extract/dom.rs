@@ -224,13 +224,7 @@ impl ParsedHtml {
     /// Compute bottom-up `NodeMetrics` in a single `O(N)` post-order pass over the DOM,
     /// returning `(metrics_by_node, visited_node_count)`.
     pub fn compute_node_metrics(&self) -> (HashMap<NodeId, NodeMetrics>, usize) {
-        let root_id = self.doc.root_element().id();
-        let mut map = HashMap::new();
-        let mut visits = 0usize;
-        if let Some(root) = self.doc.tree.get(root_id) {
-            walk_node_metrics(root, false, false, &mut map, &mut visits, None);
-        }
-        (map, visits)
+        collect_doc_metrics(&self.doc, None)
     }
 
     pub fn text_metrics(&self) -> DomTextMetrics {
@@ -240,21 +234,9 @@ impl ParsedHtml {
     }
 
     fn compute_text_metrics(&self) -> DomTextMetrics {
-        let root_id = self.doc.root_element().id();
-        let body_id = self
-            .doc
-            .select(&BODY_SEL)
-            .next()
-            .map(|el| el.id())
-            .unwrap_or(root_id);
-
+        let body_id = body_or_root_id(&self.doc);
         let mut scan = TextMetricsScan::default();
-        let mut map = HashMap::new();
-        let mut visits = 0usize;
-
-        if let Some(root) = self.doc.tree.get(root_id) {
-            walk_node_metrics(root, false, false, &mut map, &mut visits, Some(&mut scan));
-        }
+        let (map, _) = collect_doc_metrics(&self.doc, Some(&mut scan));
 
         let body_metrics = map.get(&body_id).copied().unwrap_or_default();
         let visible_text_len = body_metrics.prose_bytes + body_metrics.code_bytes;
@@ -395,6 +377,33 @@ fn is_landmark_element(el: &scraper::node::Element) -> bool {
             .is_some_and(|r| r.eq_ignore_ascii_case("main"))
 }
 
+fn is_inert_tag(tag: &str) -> bool {
+    matches!(tag, "script" | "style" | "noscript" | "template")
+}
+
+fn is_heading_tag(tag: &str) -> bool {
+    matches!(tag, "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
+}
+
+fn body_or_root_id(doc: &Html) -> NodeId {
+    doc.select(&BODY_SEL)
+        .next()
+        .map(|el| el.id())
+        .unwrap_or_else(|| doc.root_element().id())
+}
+
+fn collect_doc_metrics(
+    doc: &Html,
+    scan: Option<&mut TextMetricsScan>,
+) -> (HashMap<NodeId, NodeMetrics>, usize) {
+    let mut map = HashMap::new();
+    let mut visits = 0usize;
+    if let Some(root) = doc.tree.get(doc.root_element().id()) {
+        walk_node_metrics(root, false, false, &mut map, &mut visits, scan);
+    }
+    (map, visits)
+}
+
 fn is_protected_container(el: &scraper::node::Element) -> bool {
     is_landmark_element(el) || el.name() == "table"
 }
@@ -449,7 +458,7 @@ fn walk_node_metrics(
                 }
                 return NodeMetrics::default();
             }
-            if matches!(tag, "style" | "noscript" | "template" | "svg") {
+            if is_inert_tag(tag) || tag == "svg" {
                 return NodeMetrics::default();
             }
             if let Some(s) = scan.as_deref_mut() {
@@ -472,7 +481,7 @@ fn walk_node_metrics(
 
             let mut acc = NodeMetrics {
                 link_count: usize::from(entering_link),
-                heading_count: usize::from(matches!(tag, "h1" | "h2" | "h3" | "h4" | "h5" | "h6")),
+                heading_count: usize::from(is_heading_tag(tag)),
                 form_count: usize::from(tag == "form"),
                 has_landmark: is_protected_container(el),
                 ..Default::default()
@@ -612,25 +621,16 @@ fn prune_dom(doc: &mut Html, mode: ExtractMode) -> HashMap<NodeId, NodeMetrics> 
     detach_nodes(doc, to_detach);
 
     // Single-pass O(N) metrics for landmark-protected link-density pruning & root selection.
-    let root_id = doc.root_element().id();
-    let mut metrics = HashMap::new();
-    let mut visits = 0usize;
-    if let Some(root) = doc.tree.get(root_id) {
-        walk_node_metrics(root, false, false, &mut metrics, &mut visits, None);
-    }
+    let (mut metrics, _) = collect_doc_metrics(doc, None);
 
     if matches!(mode, ExtractMode::Clean | ExtractMode::Article) {
         let mut density_detach = Vec::new();
-        if let Some(root) = doc.tree.get(root_id) {
+        if let Some(root) = doc.tree.get(doc.root_element().id()) {
             collect_link_density_prune_ids(root, false, false, &metrics, &mut density_detach);
         }
         if !density_detach.is_empty() {
             detach_nodes(doc, density_detach);
-            metrics.clear();
-            visits = 0;
-            if let Some(root) = doc.tree.get(root_id) {
-                walk_node_metrics(root, false, false, &mut metrics, &mut visits, None);
-            }
+            metrics = collect_doc_metrics(doc, None).0;
         }
     }
 
@@ -662,7 +662,7 @@ fn collect_link_density_prune_ids(
     };
 
     let tag = el.name();
-    let now_protected = in_protected || is_landmark_element(el) || tag == "table";
+    let now_protected = in_protected || is_protected_container(el);
     let now_header = in_header || tag == "header";
 
     if !now_protected && !matches!(tag, "html" | "body" | "head" | "header") {
@@ -688,7 +688,7 @@ fn collect_link_density_prune_ids(
 }
 
 pub(crate) fn is_element_hidden_or_inert(el: &scraper::node::Element) -> bool {
-    matches!(el.name(), "template" | "noscript" | "script" | "style")
+    is_inert_tag(el.name())
         || (el.name() == "dialog" && el.attr("open").is_none())
         || el.attr("hidden").is_some()
         || el
@@ -705,6 +705,12 @@ pub(crate) fn is_hidden_or_inert(node: NodeRef<'_, Node>) -> bool {
 
 fn eq_any_ci(s: &str, opts: &[&str]) -> bool {
     opts.iter().any(|o| s.eq_ignore_ascii_case(o))
+}
+
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    s.get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .map(|_| &s[prefix.len()..])
 }
 
 fn parse_css_zero(val: &str) -> bool {
@@ -740,20 +746,19 @@ pub(crate) fn is_inline_hidden_style(style: &str) -> bool {
             })
             .map_or(trimmed, |i| trimmed[..i].trim_end());
         let zero_clip = prop.eq_ignore_ascii_case("clip")
-            && val.len() >= 7
-            && val[..5].eq_ignore_ascii_case("rect(")
-            && val.ends_with(')')
-            && {
-                let mut n = 0usize;
-                val[5..val.len() - 1]
-                    .split(|c: char| c == ',' || c.is_ascii_whitespace())
-                    .filter(|s| !s.is_empty())
-                    .all(|p| {
-                        n += 1;
-                        parse_css_zero(p)
-                    })
-                    && n == 4
-            };
+            && strip_prefix_ci(val, "rect(")
+                .and_then(|s| s.strip_suffix(')'))
+                .is_some_and(|inner| {
+                    let mut n = 0usize;
+                    inner
+                        .split(|c: char| c == ',' || c.is_ascii_whitespace())
+                        .filter(|s| !s.is_empty())
+                        .all(|p| {
+                            n += 1;
+                            parse_css_zero(p)
+                        })
+                        && n == 4
+                });
         if (prop.eq_ignore_ascii_case("display") && val.eq_ignore_ascii_case("none"))
             || (prop.eq_ignore_ascii_case("visibility") && eq_any_ci(val, &["hidden", "collapse"]))
             || (eq_any_ci(prop, &["opacity", "font-size"]) && parse_css_zero(val))
@@ -762,7 +767,7 @@ pub(crate) fn is_inline_hidden_style(style: &str) -> bool {
             || (prop.eq_ignore_ascii_case("clip-path")
                 && ["inset(50%", "inset(100%", "circle(0"]
                     .iter()
-                    .any(|p| val.len() >= p.len() && val[..p.len()].eq_ignore_ascii_case(p)))
+                    .any(|p| strip_prefix_ci(val, p).is_some()))
         {
             return true;
         }
@@ -777,12 +782,20 @@ pub(crate) fn is_inline_hidden_style(style: &str) -> bool {
     (overflow_hidden && zero_box) || (positioned && offscreen)
 }
 
-pub(crate) fn collapsed_node_text(node: NodeRef<'_, Node>) -> Option<String> {
-    let mut raw = String::new();
-    collect_raw_text(node, &mut raw);
-    let collapsed = collapse_inline_whitespace(&raw);
+fn collapse_non_empty(raw: &str) -> Option<String> {
+    let collapsed = collapse_inline_whitespace(raw);
     let trimmed = collapsed.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn node_raw_text(node: NodeRef<'_, Node>) -> String {
+    let mut raw = String::new();
+    collect_raw_text(node, &mut raw);
+    raw
+}
+
+pub(crate) fn collapsed_node_text(node: NodeRef<'_, Node>) -> Option<String> {
+    collapse_non_empty(&node_raw_text(node))
 }
 
 fn is_skip_text(node: NodeRef<'_, Node>) -> bool {
@@ -876,16 +889,11 @@ fn is_heading_permalink_anchor(node: NodeRef<'_, Node>) -> bool {
         })
     });
 
-    let inside_heading = node.ancestors().any(|anc| {
-        matches!(
-            anc.value(),
-            Node::Element(e) if matches!(e.name(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
-        )
-    });
+    let inside_heading = node
+        .ancestors()
+        .any(|anc| matches!(anc.value(), Node::Element(e) if is_heading_tag(e.name())));
 
-    let mut text = String::new();
-    collect_raw_text(node, &mut text);
-    let cleaned: String = text
+    let cleaned: String = node_raw_text(node)
         .chars()
         .filter(|&c| {
             !c.is_whitespace()
@@ -916,24 +924,18 @@ fn contains_heading_or_landmark(node: NodeRef<'_, Node>) -> bool {
     )
 }
 
-fn is_boilerplate_attr(id: Option<&str>, class: Option<&str>) -> bool {
-    let class_lower = class.map(str::to_ascii_lowercase);
-    let mut combined = String::new();
-    if let Some(id) = id {
-        combined.push_str(&id.to_ascii_lowercase());
-        combined.push(' ');
-    }
-    if let Some(class) = &class_lower {
-        combined.push_str(class);
-    }
-    if combined.is_empty() {
-        return false;
-    }
-
+fn has_boilerplate_pattern(lower: &str) -> bool {
     BOILERPLATE_ATTR_PATTERNS
         .iter()
-        .any(|pat| contains_word_prefix(&combined, pat))
-        || class_lower.as_deref().is_some_and(has_hidden_or_sr_class)
+        .any(|pat| contains_word_prefix(lower, pat))
+}
+
+fn is_boilerplate_attr(id: Option<&str>, class: Option<&str>) -> bool {
+    id.is_some_and(|v| has_boilerplate_pattern(&v.to_ascii_lowercase()))
+        || class.is_some_and(|v| {
+            let lower = v.to_ascii_lowercase();
+            has_boilerplate_pattern(&lower) || has_hidden_or_sr_class(&lower)
+        })
 }
 
 fn has_hidden_or_sr_class(lower: &str) -> bool {
@@ -973,11 +975,7 @@ fn contains_word_prefix(haystack: &str, needle: &str) -> bool {
 }
 
 fn select_root_id(doc: &Html, mode: ExtractMode, metrics: &HashMap<NodeId, NodeMetrics>) -> NodeId {
-    let body_id = doc
-        .select(&BODY_SEL)
-        .next()
-        .map(|el| el.id())
-        .unwrap_or_else(|| doc.root_element().id());
+    let body_id = body_or_root_id(doc);
 
     if mode != ExtractMode::Article {
         return body_id;
@@ -1049,9 +1047,9 @@ fn summary_heading_reordered_children<'a>(
         return None;
     }
     let children: Vec<_> = node.children().collect();
-    let h_idx = children.iter().position(|c| {
-        matches!(c.value(), Node::Element(e) if matches!(e.name(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6"))
-    })?;
+    let h_idx = children
+        .iter()
+        .position(|c| matches!(c.value(), Node::Element(e) if is_heading_tag(e.name())))?;
     if h_idx == 0 {
         return None;
     }
@@ -1085,9 +1083,7 @@ fn summary_heading_reordered_children<'a>(
                 }) {
                     return None;
                 }
-                let mut text = String::new();
-                collect_raw_text(prefix, &mut text);
-                has_visible |= !text.trim().is_empty();
+                has_visible |= !node_raw_text(prefix).trim().is_empty();
             }
             Node::Comment(_) => {}
             _ => return None,
@@ -1101,12 +1097,38 @@ fn summary_heading_reordered_children<'a>(
     })
 }
 
+fn for_each_ordered_child<'a>(
+    node: NodeRef<'a, Node>,
+    tag: &str,
+    mut f: impl FnMut(NodeRef<'a, Node>),
+) {
+    if let Some(ordered) = summary_heading_reordered_children(node, tag) {
+        for child in ordered {
+            f(child);
+        }
+    } else {
+        for child in node.children() {
+            f(child);
+        }
+    }
+}
+
+fn emit_math_tag(tex: &str, display: bool, out: &mut String) {
+    out.push_str("<math data-tex=\"");
+    push_escaped_attr(tex, out);
+    out.push_str(if display {
+        "\" data-display=\"1\"></math>"
+    } else {
+        "\" data-display=\"0\"></math>"
+    });
+}
+
 fn serialize_pruned_html(node: NodeRef<'_, Node>, in_interactive: bool, out: &mut String) {
     match node.value() {
         Node::Text(text) => push_escaped_text(text, out),
         Node::Element(el) => {
             let tag = el.name();
-            if matches!(tag, "script" | "style" | "noscript" | "template" | "track") {
+            if is_inert_tag(tag) || tag == "track" {
                 return;
             }
 
@@ -1123,14 +1145,7 @@ fn serialize_pruned_html(node: NodeRef<'_, Node>, in_interactive: bool, out: &mu
 
             if tag == "math" {
                 if let Some(tex) = find_tex_annotation(node) {
-                    let display = is_display_math(node, el);
-                    out.push_str("<math data-tex=\"");
-                    push_escaped_attr(&tex, out);
-                    out.push_str(if display {
-                        "\" data-display=\"1\"></math>"
-                    } else {
-                        "\" data-display=\"0\"></math>"
-                    });
+                    emit_math_tag(&tex, is_display_math(node, el), out);
                     return;
                 }
             }
@@ -1150,18 +1165,14 @@ fn serialize_pruned_html(node: NodeRef<'_, Node>, in_interactive: bool, out: &mu
             }
 
             if tag == "pre" {
-                let mut code = String::new();
-                collect_raw_text(node, &mut code);
+                let code = node_raw_text(node);
                 if !code.trim().is_empty() {
-                    let lang = node
-                        .descendants()
-                        .filter(|n| matches!(n.value(), Node::Element(e) if e.name() == "code"))
-                        .chain(std::iter::once(node))
-                        .chain(node.ancestors().take(3))
-                        .find_map(|n| match n.value() {
-                            Node::Element(e) => extract_lang_from_element(e),
-                            _ => None,
-                        });
+                    let lang = find_code_lang(
+                        node,
+                        node.descendants().filter(
+                            |n| matches!(n.value(), Node::Element(e) if e.name() == "code"),
+                        ),
+                    );
                     emit_code_block(lang.as_deref(), &code, out);
                     return;
                 }
@@ -1185,9 +1196,7 @@ fn serialize_pruned_html(node: NodeRef<'_, Node>, in_interactive: bool, out: &mu
                             }
                             _ => std::borrow::Cow::Borrowed(tex.as_str()),
                         };
-                        out.push_str("<math data-tex=\"");
-                        push_escaped_attr(tagged.as_ref(), out);
-                        out.push_str("\" data-display=\"1\"></math>");
+                        emit_math_tag(tagged.as_ref(), true, out);
                     }
                     return;
                 }
@@ -1209,15 +1218,9 @@ fn serialize_pruned_html(node: NodeRef<'_, Node>, in_interactive: bool, out: &mu
             }
 
             let child_interactive = in_interactive || is_svg_chrome_ancestor(el);
-            if let Some(ordered) = summary_heading_reordered_children(node, tag) {
-                for child in ordered {
-                    serialize_pruned_html(child, child_interactive, out);
-                }
-            } else {
-                for child in node.children() {
-                    serialize_pruned_html(child, child_interactive, out);
-                }
-            }
+            for_each_ordered_child(node, tag, |child| {
+                serialize_pruned_html(child, child_interactive, out);
+            });
 
             out.push_str("</");
             out.push_str(tag);
@@ -1300,32 +1303,24 @@ fn emit_img_tag(src: &str, alt: Option<&str>, title: Option<&str>, out: &mut Str
 }
 
 fn is_data_uri(url: &str) -> bool {
-    url.trim_start()
-        .get(..5)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+    strip_prefix_ci(url.trim_start(), "data:").is_some()
+}
+
+fn valid_img_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty() && !is_data_uri(trimmed)).then(|| trimmed.to_string())
 }
 
 pub(crate) fn resolve_img_src(el: &scraper::node::Element) -> Option<String> {
-    for attr in ["data-src", "data-lazy-src", "data-original"] {
-        if let Some(val) = el.attr(attr).map(str::trim) {
-            if !val.is_empty() && !is_data_uri(val) {
-                return Some(val.to_string());
-            }
-        }
-    }
-    if let Some(srcset) = el.attr("srcset") {
-        if let Some(best) = parse_best_srcset_url(srcset) {
-            if !is_data_uri(&best) {
-                return Some(best);
-            }
-        }
-    }
-    if let Some(src) = el.attr("src").map(str::trim) {
-        if !src.is_empty() && !is_data_uri(src) {
-            return Some(src.to_string());
-        }
-    }
-    None
+    ["data-src", "data-lazy-src", "data-original"]
+        .into_iter()
+        .find_map(|attr| el.attr(attr).and_then(valid_img_url))
+        .or_else(|| {
+            el.attr("srcset")
+                .and_then(parse_best_srcset_url)
+                .filter(|u| !is_data_uri(u))
+        })
+        .or_else(|| el.attr("src").and_then(valid_img_url))
 }
 
 pub(crate) fn resolve_picture_image(
@@ -1342,13 +1337,10 @@ pub(crate) fn resolve_picture_image(
         };
         match el.name() {
             "source" if best_source.is_none() => {
-                if let Some(srcset) = el.attr("srcset") {
-                    if let Some(url) = parse_best_srcset_url(srcset) {
-                        if !is_data_uri(&url) {
-                            best_source = Some(url);
-                        }
-                    }
-                }
+                best_source = el
+                    .attr("srcset")
+                    .and_then(parse_best_srcset_url)
+                    .filter(|u| !is_data_uri(u));
             }
             "img" => {
                 alt = el.attr("alt").map(str::to_string);
@@ -1359,8 +1351,7 @@ pub(crate) fn resolve_picture_image(
         }
     }
 
-    let chosen = best_source.or(img_src)?;
-    Some((chosen, alt, title))
+    Some((best_source.or(img_src)?, alt, title))
 }
 
 /// WHATWG descriptor-aware `srcset` parser that preserves commas inside URLs
@@ -1444,12 +1435,10 @@ fn find_tex_annotation(node: NodeRef<'_, Node>) -> Option<String> {
         if let Node::Element(el) = desc.value() {
             if el.name() == "annotation"
                 && el.attr("encoding").is_some_and(|enc| {
-                    enc.eq_ignore_ascii_case("application/x-tex")
-                        || enc.eq_ignore_ascii_case("application/x-latex")
+                    eq_any_ci(enc, &["application/x-tex", "application/x-latex"])
                 })
             {
-                let mut raw = String::new();
-                collect_raw_text(desc, &mut raw);
+                let raw = node_raw_text(desc);
                 let trimmed = raw.trim();
                 if !trimmed.is_empty() {
                     return Some(trimmed.to_string());
@@ -1471,10 +1460,7 @@ fn is_display_math(node: NodeRef<'_, Node>, el: &scraper::node::Element) -> bool
         matches!(
             anc.value(),
             Node::Element(e) if e.attr("class").is_some_and(|c| {
-                c.split_whitespace().any(|tok| {
-                    tok.eq_ignore_ascii_case("katex-display")
-                        || tok.eq_ignore_ascii_case("mjx-display")
-                })
+                c.split_whitespace().any(|tok| eq_any_ci(tok, &["katex-display", "mjx-display"]))
             })
         )
     })
@@ -1524,16 +1510,11 @@ fn has_svg_icon_class(el: &scraper::node::Element) -> bool {
     el.attr("class").is_some_and(|cls| {
         cls.split_whitespace().any(|raw| {
             let tok = raw.to_ascii_lowercase();
-            tok == "icon"
-                || tok.starts_with("icon-")
+            matches!(tok.as_str(), "icon" | "octicon" | "lucide" | "feather")
+                || ["icon-", "octicon-", "lucide-", "feather-", "fa-"]
+                    .iter()
+                    .any(|p| tok.starts_with(p))
                 || tok.ends_with("-icon")
-                || tok == "octicon"
-                || tok.starts_with("octicon-")
-                || tok == "lucide"
-                || tok.starts_with("lucide-")
-                || tok == "feather"
-                || tok.starts_with("feather-")
-                || tok.starts_with("fa-")
         })
     })
 }
@@ -1612,16 +1593,13 @@ fn walk_svg_text_segments(
         if is_svg_non_content_tag(tag) {
             continue;
         }
-        if tag.eq_ignore_ascii_case("text") || tag.eq_ignore_ascii_case("foreignobject") {
+        if eq_any_ci(tag, &["text", "foreignobject"]) {
             let mut raw = String::new();
             collect_svg_visible_text(child, &mut raw);
-            let collapsed = collapse_inline_whitespace(&raw);
-            let trimmed = collapsed.trim();
-            if !trimmed.is_empty()
-                && !is_ignored_svg_segment(trimmed)
-                && seen.insert(trimmed.to_string())
-            {
-                segments.push(trimmed.to_string());
+            if let Some(seg) = collapse_non_empty(&raw) {
+                if !is_ignored_svg_segment(&seg) && seen.insert(seg.clone()) {
+                    segments.push(seg);
+                }
             }
         } else {
             walk_svg_text_segments(child, segments, seen, max_segments);
@@ -1637,12 +1615,10 @@ fn collect_svg_visible_text(node: NodeRef<'_, Node>, out: &mut String) {
             if is_svg_non_content_tag(tag) {
                 return;
             }
-            let sep = tag.eq_ignore_ascii_case("tspan")
-                || tag.eq_ignore_ascii_case("div")
-                || tag.eq_ignore_ascii_case("p")
-                || tag.eq_ignore_ascii_case("br")
-                || tag.eq_ignore_ascii_case("li");
-            if sep && !out.is_empty() && !out.ends_with(char::is_whitespace) {
+            if eq_any_ci(tag, &["tspan", "div", "p", "br", "li"])
+                && !out.is_empty()
+                && !out.ends_with(char::is_whitespace)
+            {
                 out.push(' ');
             }
             for child in node.children() {
@@ -1659,68 +1635,47 @@ fn collect_svg_visible_text(node: NodeRef<'_, Node>, out: &mut String) {
 
 fn is_ignored_svg_segment(seg: &str) -> bool {
     let char_count = seg.chars().count();
-    if char_count > 80 {
-        return true;
-    }
-    if char_count == 1 {
-        let ch = seg.chars().next().unwrap();
-        if !ch.is_alphanumeric() {
-            return true;
-        }
-    }
-    false
+    char_count > 80 || (char_count == 1 && !seg.chars().next().unwrap().is_alphanumeric())
 }
 
 fn extract_svg_label(node: NodeRef<'_, Node>, el: &scraper::node::Element) -> Option<String> {
-    if let Some(label) = el.attr("aria-label") {
-        let collapsed = collapse_inline_whitespace(label);
-        let trimmed = collapsed.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
-    }
-    node.children()
-        .filter(|child| matches!(child.value(), Node::Element(e) if e.name() == "title"))
-        .find_map(collapsed_node_text)
+    el.attr("aria-label")
+        .and_then(collapse_non_empty)
+        .or_else(|| {
+            node.children()
+                .filter(|child| matches!(child.value(), Node::Element(e) if e.name() == "title"))
+                .find_map(collapsed_node_text)
+        })
 }
 
 fn try_extract_code_gutter_table(table: NodeRef<'_, Node>) -> Option<(Option<String>, String)> {
     // Never unwrap tables that contain <thead> or <th> headers.
-    for desc in table.descendants() {
-        if let Node::Element(el) = desc.value() {
-            if matches!(el.name(), "thead" | "th") {
-                return None;
-            }
-        }
-    }
-
-    let mut rows: Vec<(NodeRef<'_, Node>, NodeRef<'_, Node>)> = Vec::new();
-    collect_table_rows(table, &mut rows)?;
-    if rows.is_empty() {
+    if table
+        .descendants()
+        .any(|d| matches!(d.value(), Node::Element(el) if matches!(el.name(), "thead" | "th")))
+    {
         return None;
     }
 
-    let table_has_gutter_class = matches!(
-        table.value(),
-        Node::Element(el) if has_gutter_marker(el)
-    );
+    let mut rows = Vec::new();
+    collect_tbody_rows(table, false, &mut rows)?;
+    if rows.is_empty() || rows.iter().any(|tds| tds.len() != 2) {
+        return None;
+    }
 
-    let mut explicit_gutter = table_has_gutter_class;
+    let mut explicit_gutter = matches!(table.value(), Node::Element(el) if has_gutter_marker(el));
     let mut sequential_ints = rows.len() >= 3;
     let mut all_code_cells = true;
 
-    for (idx, (col0, col1)) in rows.iter().enumerate() {
+    for (idx, tds) in rows.iter().enumerate() {
+        let (col0, col1) = (tds[0], tds[1]);
         if matches!(col0.value(), Node::Element(el) if has_gutter_marker(el)) {
             explicit_gutter = true;
         }
-        if sequential_ints {
-            let mut n_text = String::new();
-            collect_raw_text(*col0, &mut n_text);
-            if n_text.trim().parse::<usize>().ok() != Some(idx + 1) {
-                sequential_ints = false;
-            }
+        if sequential_ints && node_raw_text(col0).trim().parse::<usize>().ok() != Some(idx + 1) {
+            sequential_ints = false;
         }
-        if !subtree_has_code_tag(*col1) {
+        if !subtree_has_code_tag(col1) {
             all_code_cells = false;
         }
     }
@@ -1729,39 +1684,50 @@ fn try_extract_code_gutter_table(table: NodeRef<'_, Node>) -> Option<(Option<Str
         return None;
     }
 
-    let lang = detect_code_language(table, &rows);
-    let mut lines = Vec::with_capacity(rows.len());
-    for (_, col1) in &rows {
-        let mut buf = String::new();
-        collect_raw_text(*col1, &mut buf);
-        lines.push(buf.trim_end_matches(['\r', '\n']).to_string());
-    }
+    let lang = find_code_lang(
+        table,
+        rows.first()
+            .into_iter()
+            .flat_map(|tds| tds[1].descendants()),
+    );
+    let lines: Vec<String> = rows
+        .iter()
+        .map(|tds| {
+            node_raw_text(tds[1])
+                .trim_end_matches(['\r', '\n'])
+                .to_string()
+        })
+        .collect();
 
     Some((lang, lines.join("\n")))
 }
 
-fn collect_table_rows<'a>(
-    table: NodeRef<'a, Node>,
-    rows: &mut Vec<(NodeRef<'a, Node>, NodeRef<'a, Node>)>,
+fn collect_tbody_rows<'a>(
+    node: NodeRef<'a, Node>,
+    strict: bool,
+    rows: &mut Vec<Vec<NodeRef<'a, Node>>>,
 ) -> Option<()> {
-    for child in table.children() {
+    for child in node.children() {
         let Node::Element(el) = child.value() else {
             continue;
         };
         match el.name() {
-            "tbody" => collect_table_rows(child, rows)?,
+            "tbody" => collect_tbody_rows(child, strict, rows)?,
             "tr" => {
                 let mut tds = Vec::new();
                 for cell in child.children() {
-                    if matches!(cell.value(), Node::Element(e) if e.name() == "td") {
-                        tds.push(cell);
+                    if let Node::Element(ce) = cell.value() {
+                        if ce.name() == "td" {
+                            tds.push(cell);
+                        } else if strict {
+                            return None;
+                        }
                     }
                 }
-                if tds.len() != 2 {
-                    return None;
-                }
-                rows.push((tds[0], tds[1]));
+                rows.push(tds);
             }
+            "colgroup" | "col" => {}
+            _ if strict => return None,
             _ => {}
         }
     }
@@ -1769,36 +1735,25 @@ fn collect_table_rows<'a>(
 }
 
 fn has_gutter_marker(el: &scraper::node::Element) -> bool {
-    if el.attr("data-line-number").is_some() {
-        return true;
-    }
-    el.attr("class").is_some_and(|cls| {
-        cls.split_whitespace().any(|tok| {
-            CODE_GUTTER_CLASSES
-                .iter()
-                .any(|pat| tok.eq_ignore_ascii_case(pat))
+    el.attr("data-line-number").is_some()
+        || el.attr("class").is_some_and(|cls| {
+            cls.split_whitespace()
+                .any(|tok| eq_any_ci(tok, CODE_GUTTER_CLASSES))
         })
-    })
 }
 
 fn subtree_has_code_tag(node: NodeRef<'_, Node>) -> bool {
-    node.descendants().any(|d| {
-        matches!(
-            d.value(),
-            Node::Element(el) if matches!(el.name(), "pre" | "code")
-        )
-    })
+    node.descendants()
+        .any(|d| matches!(d.value(), Node::Element(el) if matches!(el.name(), "pre" | "code")))
 }
 
-fn detect_code_language(
-    table: NodeRef<'_, Node>,
-    rows: &[(NodeRef<'_, Node>, NodeRef<'_, Node>)],
+fn find_code_lang<'a>(
+    container: NodeRef<'a, Node>,
+    inner: impl Iterator<Item = NodeRef<'a, Node>>,
 ) -> Option<String> {
-    rows.first()
-        .into_iter()
-        .flat_map(|(_, col1)| col1.descendants())
-        .chain(std::iter::once(table))
-        .chain(table.ancestors().take(3))
+    inner
+        .chain(std::iter::once(container))
+        .chain(container.ancestors().take(3))
         .find_map(|node| match node.value() {
             Node::Element(el) => extract_lang_from_element(el),
             _ => None,
@@ -1808,16 +1763,17 @@ fn detect_code_language(
 fn try_extract_equation_layout_table(
     table: NodeRef<'_, Node>,
 ) -> Option<Vec<(String, Option<String>)>> {
-    for desc in table.descendants().skip(1) {
-        if let Node::Element(el) = desc.value() {
-            if matches!(el.name(), "thead" | "th" | "caption" | "table") {
-                return None;
-            }
-        }
+    if table.descendants().skip(1).any(|d| {
+        matches!(
+            d.value(),
+            Node::Element(el) if matches!(el.name(), "thead" | "th" | "caption" | "table")
+        )
+    }) {
+        return None;
     }
 
     let mut rows = Vec::new();
-    collect_equation_rows(table, &mut rows)?;
+    collect_tbody_rows(table, true, &mut rows)?;
     if rows.is_empty() {
         return None;
     }
@@ -1844,8 +1800,7 @@ fn try_extract_equation_layout_table(
                 return None;
             }
 
-            let mut cell_text = String::new();
-            collect_raw_text(td, &mut cell_text);
+            let cell_text = node_raw_text(td);
             let trimmed = cell_text.trim();
             if trimmed.is_empty() {
                 continue;
@@ -1872,43 +1827,13 @@ fn try_extract_equation_layout_table(
     (!equations.is_empty()).then_some(equations)
 }
 
-fn collect_equation_rows<'a>(
-    node: NodeRef<'a, Node>,
-    rows: &mut Vec<Vec<NodeRef<'a, Node>>>,
-) -> Option<()> {
-    for child in node.children() {
-        let Node::Element(el) = child.value() else {
-            continue;
-        };
-        match el.name() {
-            "tbody" => collect_equation_rows(child, rows)?,
-            "tr" => {
-                let mut tds = Vec::new();
-                for cell in child.children() {
-                    if let Node::Element(ce) = cell.value() {
-                        if ce.name() == "td" {
-                            tds.push(cell);
-                        } else {
-                            return None;
-                        }
-                    }
-                }
-                rows.push(tds);
-            }
-            "colgroup" | "col" => {}
-            _ => return None,
-        }
-    }
-    Some(())
-}
-
 fn collect_td_math_cell(node: NodeRef<'_, Node>, out: &mut Vec<String>) -> bool {
     match node.value() {
         Node::Text(text) => text
             .chars()
             .all(|c| c.is_whitespace() || matches!(c, ',' | '.' | ';' | ':')),
         Node::Element(el) => {
-            if matches!(el.name(), "script" | "style" | "noscript" | "template") {
+            if is_inert_tag(el.name()) {
                 return true;
             }
             if el.name() == "math" {
@@ -1936,11 +1861,7 @@ fn has_eqno_marker(td: NodeRef<'_, Node>) -> bool {
             d.value(),
             Node::Element(el)
                 if (d == td || el.name() == "span")
-                    && el.attr("class").is_some_and(|c| {
-                        c.as_bytes()
-                            .windows(4)
-                            .any(|w| w.eq_ignore_ascii_case(b"eqno"))
-                    })
+                    && el.attr("class").is_some_and(|c| contains_ascii_ci(c.as_bytes(), b"eqno"))
         )
     })
 }
@@ -1992,9 +1913,9 @@ fn extract_lang_from_element(el: &scraper::node::Element) -> Option<String> {
                 }
             }
         }
-        if tok.len() >= 6 && tok[..6].eq_ignore_ascii_case("brush:") {
-            let candidate = if !tok[6..].is_empty() {
-                &tok[6..]
+        if let Some(rest) = strip_prefix_ci(tok, "brush:") {
+            let candidate = if !rest.is_empty() {
+                rest
             } else {
                 tokens.peek().copied().unwrap_or("")
             };
@@ -2009,7 +1930,7 @@ fn extract_lang_from_element(el: &scraper::node::Element) -> Option<String> {
 pub(crate) fn collect_raw_text(node: NodeRef<'_, Node>, out: &mut String) {
     match node.value() {
         Node::Text(text) => out.push_str(text),
-        Node::Element(el) if matches!(el.name(), "script" | "style" | "noscript" | "template") => {}
+        Node::Element(el) if is_inert_tag(el.name()) => {}
         _ => {
             for child in node.children() {
                 collect_raw_text(child, out);
@@ -2041,7 +1962,7 @@ fn collect_plain_text(
         }
         Node::Element(el) => {
             let tag = el.name();
-            if matches!(tag, "script" | "style" | "noscript" | "template") {
+            if is_inert_tag(tag) {
                 return;
             }
             if tag == "svg" {
@@ -2113,15 +2034,9 @@ fn collect_plain_text(
 
             let child_pre = in_pre || tag == "pre";
             let child_interactive = in_interactive || is_svg_chrome_ancestor(el);
-            if let Some(ordered) = summary_heading_reordered_children(node, tag) {
-                for child in ordered {
-                    collect_plain_text(child, child_pre, child_interactive, out);
-                }
-            } else {
-                for child in node.children() {
-                    collect_plain_text(child, child_pre, child_interactive, out);
-                }
-            }
+            for_each_ordered_child(node, tag, |child| {
+                collect_plain_text(child, child_pre, child_interactive, out);
+            });
 
             if is_cell && !out.is_empty() && !out.ends_with([' ', '\n']) {
                 out.push(' ');
@@ -2209,11 +2124,7 @@ fn parse_meta_refresh_target(content: &str) -> Option<&str> {
     if delay_secs > 5 {
         return None;
     }
-    let after_url = if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case("url=") {
-        rest[4..].trim()
-    } else {
-        return None;
-    };
+    let after_url = strip_prefix_ci(rest, "url=")?.trim();
     let unquoted = after_url
         .strip_prefix('\'')
         .and_then(|s| s.strip_suffix('\''))

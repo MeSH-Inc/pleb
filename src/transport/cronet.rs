@@ -197,13 +197,16 @@ impl Engine {
         disable_redirects: bool,
     ) -> Result<CronetResponse> {
         let deadline = tokio::time::Instant::now() + timeout;
+        let timeout_err = || {
+            anyhow::Error::new(TransportError::new(
+                TransportErrorKind::Timeout,
+                format!("Cronet request timed out after {:?}", timeout),
+            ))
+        };
         for attempt in 0..=1 {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                return Err(anyhow::Error::new(TransportError::new(
-                    TransportErrorKind::Timeout,
-                    format!("Cronet request timed out after {:?}", timeout),
-                )));
+                return Err(timeout_err());
             }
 
             let (tx, rx) = oneshot::channel();
@@ -222,43 +225,34 @@ impl Engine {
                 active_request,
             )?;
 
-            match tokio::time::timeout(remaining, rx).await {
-                Ok(Ok(Ok(resp))) => {
-                    drop(guard);
-                    return Ok(resp);
-                }
-                Ok(Ok(Err(failure))) => {
-                    drop(guard);
+            let outcome = tokio::time::timeout(remaining, rx).await;
+            drop(guard);
+            match outcome {
+                Ok(Ok(Ok(resp))) => return Ok(resp),
+                Ok(Ok(Err(err))) => {
                     let remaining_after =
                         deadline.saturating_duration_since(tokio::time::Instant::now());
-                    if attempt == 0
-                        && failure.retryable
-                        && remaining_after >= Duration::from_millis(250)
-                    {
+                    let retryable = err
+                        .downcast_ref::<TransportError>()
+                        .is_some_and(|te| te.retryable);
+                    if attempt == 0 && retryable && remaining_after >= Duration::from_millis(250) {
                         tracing::debug!(
                             url,
-                            error = %failure.err,
+                            error = %err,
                             "retrying transient Cronet error once"
                         );
                         tokio::time::sleep(Duration::from_millis(50)).await;
                         continue;
                     }
-                    return Err(failure.err);
+                    return Err(err);
                 }
                 Ok(Err(_)) => {
-                    drop(guard);
                     return Err(anyhow::Error::new(TransportError::new(
                         TransportErrorKind::Canceled,
                         "Cronet request canceled",
                     )));
                 }
-                Err(_) => {
-                    drop(guard);
-                    return Err(anyhow::Error::new(TransportError::new(
-                        TransportErrorKind::Timeout,
-                        format!("Cronet request timed out after {:?}", timeout),
-                    )));
-                }
+                Err(_) => return Err(timeout_err()),
             }
         }
         unreachable!("attempt loop always returns within two attempts")
@@ -270,7 +264,7 @@ impl Engine {
         headers: &[(&str, String)],
         max_body_bytes: usize,
         disable_redirects: bool,
-        tx: oneshot::Sender<std::result::Result<CronetResponse, CronetAttemptError>>,
+        tx: oneshot::Sender<Result<CronetResponse>>,
         active_request: Arc<(Mutex<ActiveRequestInner>, Condvar)>,
     ) -> Result<()> {
         let c_url = CString::new(url)?;
@@ -291,10 +285,7 @@ impl Engine {
             initial_url: url::Url::parse(url).ok(),
             status_code: AtomicI32::new(0),
             final_url: Mutex::new(url.to_string()),
-            content_type: Mutex::new(None),
-            link_header: Mutex::new(None),
-            location_header: Mutex::new(None),
-            diagnostics: Mutex::new(super::DiagnosticHeaders::default()),
+            headers: Mutex::new(ParsedCronetHeaders::default()),
             sender: Mutex::new(Some(tx)),
             request: Mutex::new(std::ptr::null_mut()),
             callback: Mutex::new(std::ptr::null_mut()),
@@ -337,31 +328,19 @@ impl Engine {
             ffi::Cronet_UrlRequestParams_Destroy(params);
 
             if result != ffi::RESULT_SUCCESS {
-                let boxed = Box::from_raw(state_ptr as *mut RequestState);
-                ffi::Cronet_UrlRequest_Destroy(request);
-                ffi::Cronet_UrlRequestCallback_Destroy(callback);
-                drop(boxed);
+                abort_unstarted_request(state_ptr, request, callback);
                 bail!("Cronet request init failed: result={}", result);
             }
 
             let state_ref = &*(state_ptr as *const RequestState);
             *lock_unpoisoned(&state_ref.request) = request;
             *lock_unpoisoned(&state_ref.callback) = callback;
-            {
-                let (lock, _) = &*state_ref.active_request;
-                lock_unpoisoned(lock).handle = Some(RequestHandle(request));
-            }
+            lock_unpoisoned(&state_ref.active_request.0).handle = Some(RequestHandle(request));
 
             let start_result = ffi::Cronet_UrlRequest_Start(request);
             if start_result != ffi::RESULT_SUCCESS {
-                {
-                    let (lock, _) = &*state_ref.active_request;
-                    lock_unpoisoned(lock).handle = None;
-                }
-                let boxed = Box::from_raw(state_ptr as *mut RequestState);
-                ffi::Cronet_UrlRequest_Destroy(request);
-                ffi::Cronet_UrlRequestCallback_Destroy(callback);
-                drop(boxed);
+                lock_unpoisoned(&state_ref.active_request.0).handle = None;
+                abort_unstarted_request(state_ptr, request, callback);
                 bail!("Cronet request start failed: result={}", start_result);
             }
 
@@ -398,18 +377,36 @@ impl Drop for Engine {
     }
 }
 
+unsafe fn abort_unstarted_request(
+    state_ptr: *mut c_void,
+    request: ffi::Cronet_UrlRequestPtr,
+    callback: ffi::Cronet_UrlRequestCallbackPtr,
+) {
+    let boxed = Box::from_raw(state_ptr as *mut RequestState);
+    destroy_native_handles(DeferredCleanup { request, callback });
+    drop(boxed);
+}
+
+fn cancel_state_request(state: &RequestState) {
+    let active = Arc::clone(&state.active_request);
+    cancel_active_request(&active);
+}
+
+unsafe fn cstr_to_string(ptr: ffi::Cronet_String) -> Option<String> {
+    (!ptr.is_null()).then(|| CStr::from_ptr(ptr).to_string_lossy().into_owned())
+}
+
+unsafe fn response_info_url(info: ffi::Cronet_UrlResponseInfoPtr) -> Option<String> {
+    (!info.is_null())
+        .then(|| cstr_to_string(ffi::Cronet_UrlResponseInfo_url_get(info)))
+        .flatten()
+        .filter(|s| !s.is_empty())
+}
+
 struct InterceptedRedirect {
     status_code: u16,
     final_url: String,
-    content_type: Option<String>,
-    link_header: Option<String>,
-    location_header: Option<String>,
-    diagnostics: super::DiagnosticHeaders,
-}
-
-struct CronetAttemptError {
-    err: anyhow::Error,
-    retryable: bool,
+    headers: ParsedCronetHeaders,
 }
 
 struct RequestState {
@@ -422,17 +419,15 @@ struct RequestState {
     initial_url: Option<url::Url>,
     status_code: AtomicI32,
     final_url: Mutex<String>,
-    content_type: Mutex<Option<String>>,
-    link_header: Mutex<Option<String>>,
-    location_header: Mutex<Option<String>>,
-    diagnostics: Mutex<super::DiagnosticHeaders>,
-    sender: Mutex<Option<oneshot::Sender<std::result::Result<CronetResponse, CronetAttemptError>>>>,
+    headers: Mutex<ParsedCronetHeaders>,
+    sender: Mutex<Option<oneshot::Sender<Result<CronetResponse>>>>,
     request: Mutex<ffi::Cronet_UrlRequestPtr>,
     callback: Mutex<ffi::Cronet_UrlRequestCallbackPtr>,
     active_request: Arc<(Mutex<ActiveRequestInner>, Condvar)>,
     in_flight: Option<InFlightGuard>,
 }
 
+#[derive(Default)]
 struct ParsedCronetHeaders {
     content_type: Option<String>,
     link_header: Option<String>,
@@ -440,23 +435,30 @@ struct ParsedCronetHeaders {
     diagnostics: super::DiagnosticHeaders,
 }
 
+impl ParsedCronetHeaders {
+    fn into_response(self, status_code: u16, final_url: String, body: Vec<u8>) -> CronetResponse {
+        CronetResponse {
+            status_code,
+            final_url,
+            content_type: self.content_type,
+            link_header: self.link_header,
+            location_header: self.location_header,
+            diagnostics: self.diagnostics,
+            body,
+        }
+    }
+}
+
 unsafe fn parse_cronet_response_headers(
     info: ffi::Cronet_UrlResponseInfoPtr,
     capture_location: bool,
 ) -> ParsedCronetHeaders {
-    let mut content_type: Option<String> = None;
-    let mut link_values: Vec<String> = Vec::new();
-    let mut location_header: Option<String> = None;
-    let mut diagnostics = super::DiagnosticHeaders::default();
+    let mut parsed = ParsedCronetHeaders::default();
     if info.is_null() {
-        return ParsedCronetHeaders {
-            content_type,
-            link_header: None,
-            location_header,
-            diagnostics,
-        };
+        return parsed;
     }
 
+    let mut link_values: Vec<String> = Vec::new();
     let header_count = ffi::Cronet_UrlResponseInfo_all_headers_list_size(info);
     for i in 0..header_count {
         let header = ffi::Cronet_UrlResponseInfo_all_headers_list_at(info, i);
@@ -468,29 +470,25 @@ unsafe fn parse_cronet_response_headers(
         if !name_ptr.is_null() && !value_ptr.is_null() {
             let name = CStr::from_ptr(name_ptr).to_string_lossy();
             let value = CStr::from_ptr(value_ptr).to_string_lossy();
-            diagnostics.capture_header(&name, &value);
-            if name.eq_ignore_ascii_case("content-type") && content_type.is_none() {
-                content_type = Some(value.into_owned());
+            parsed.diagnostics.capture_header(&name, &value);
+            if name.eq_ignore_ascii_case("content-type") && parsed.content_type.is_none() {
+                parsed.content_type = Some(value.into_owned());
             } else if name.eq_ignore_ascii_case("link") {
                 if !value.is_empty() {
                     link_values.push(value.into_owned());
                 }
             } else if capture_location
                 && name.eq_ignore_ascii_case("location")
-                && location_header.is_none()
+                && parsed.location_header.is_none()
                 && !value.is_empty()
             {
-                location_header = Some(value.into_owned());
+                parsed.location_header = Some(value.into_owned());
             }
         }
     }
 
-    ParsedCronetHeaders {
-        content_type,
-        link_header: (!link_values.is_empty()).then(|| link_values.join(", ")),
-        location_header,
-        diagnostics,
-    }
+    parsed.link_header = (!link_values.is_empty()).then(|| link_values.join(", "));
+    parsed
 }
 
 fn get_state(callback: ffi::Cronet_UrlRequestCallbackPtr) -> &'static RequestState {
@@ -500,7 +498,7 @@ fn get_state(callback: ffi::Cronet_UrlRequestCallbackPtr) -> &'static RequestSta
     }
 }
 
-fn complete(state: &RequestState, result: std::result::Result<CronetResponse, CronetAttemptError>) {
+fn complete(state: &RequestState, result: Result<CronetResponse>) {
     if let Some(tx) = lock_unpoisoned(&state.sender).take() {
         let _ = tx.send(result);
     }
@@ -521,52 +519,25 @@ unsafe extern "C" fn on_redirect_received(
     new_location: ffi::Cronet_String,
 ) {
     let state = get_state(callback);
-    let raw_loc = if new_location.is_null() {
-        String::new()
-    } else {
-        CStr::from_ptr(new_location).to_string_lossy().into_owned()
-    };
+    let raw_loc = cstr_to_string(new_location).unwrap_or_default();
 
     if state.disable_redirects {
-        let status_code = if info.is_null() {
-            302
-        } else {
-            let code = ffi::Cronet_UrlResponseInfo_http_status_code_get(info);
-            if (300..400).contains(&code) {
-                code as u16
-            } else {
-                302
-            }
-        };
-        let final_url = if !info.is_null() {
-            let url_ptr = ffi::Cronet_UrlResponseInfo_url_get(info);
-            if !url_ptr.is_null() {
-                let s = CStr::from_ptr(url_ptr).to_string_lossy().into_owned();
-                if !s.is_empty() {
-                    s
-                } else {
-                    lock_unpoisoned(&state.final_url).clone()
-                }
-            } else {
-                lock_unpoisoned(&state.final_url).clone()
-            }
-        } else {
-            lock_unpoisoned(&state.final_url).clone()
-        };
-        let headers = parse_cronet_response_headers(info, true);
-        let location_header = (!raw_loc.is_empty())
+        let status_code = (!info.is_null())
+            .then(|| ffi::Cronet_UrlResponseInfo_http_status_code_get(info))
+            .filter(|code| (300..400).contains(code))
+            .map_or(302, |code| code as u16);
+        let final_url =
+            response_info_url(info).unwrap_or_else(|| lock_unpoisoned(&state.final_url).clone());
+        let mut headers = parse_cronet_response_headers(info, true);
+        headers.location_header = (!raw_loc.is_empty())
             .then_some(raw_loc)
             .or(headers.location_header);
         *lock_unpoisoned(&state.intercepted_redirect) = Some(InterceptedRedirect {
             status_code,
             final_url,
-            content_type: headers.content_type,
-            link_header: headers.link_header,
-            location_header,
-            diagnostics: headers.diagnostics,
+            headers,
         });
-        let active = Arc::clone(&state.active_request);
-        cancel_active_request(&active);
+        cancel_state_request(state);
         return;
     }
 
@@ -586,8 +557,7 @@ unsafe extern "C" fn on_redirect_received(
             .map(|u| u.as_str().to_string())
             .unwrap_or(raw_loc);
         *lock_unpoisoned(&state.blocked_redirect) = Some(target_desc);
-        let active = Arc::clone(&state.active_request);
-        cancel_active_request(&active);
+        cancel_state_request(state);
         return;
     }
     if let Some(target) = resolved {
@@ -605,27 +575,11 @@ unsafe extern "C" fn on_response_started(
     let code = ffi::Cronet_UrlResponseInfo_http_status_code_get(info);
     state.status_code.store(code, Ordering::SeqCst);
 
-    let url_ptr = ffi::Cronet_UrlResponseInfo_url_get(info);
-    if !url_ptr.is_null() {
-        let final_url = CStr::from_ptr(url_ptr).to_string_lossy().into_owned();
-        if !final_url.is_empty() {
-            *lock_unpoisoned(&state.final_url) = final_url;
-        }
+    if let Some(final_url) = response_info_url(info) {
+        *lock_unpoisoned(&state.final_url) = final_url;
     }
-
-    let headers = parse_cronet_response_headers(info, (300..400).contains(&code));
-    if headers.content_type.is_some() {
-        *lock_unpoisoned(&state.content_type) = headers.content_type;
-    }
-    if headers.link_header.is_some() {
-        *lock_unpoisoned(&state.link_header) = headers.link_header;
-    }
-    if headers.location_header.is_some() {
-        *lock_unpoisoned(&state.location_header) = headers.location_header;
-    }
-    if !headers.diagnostics.is_empty() {
-        *lock_unpoisoned(&state.diagnostics) = headers.diagnostics;
-    }
+    *lock_unpoisoned(&state.headers) =
+        parse_cronet_response_headers(info, (300..400).contains(&code));
 
     let buffer = ffi::Cronet_Buffer_Create();
     ffi::Cronet_Buffer_InitWithAlloc(buffer, READ_BUFFER_SIZE);
@@ -657,9 +611,8 @@ unsafe extern "C" fn on_read_completed(
         };
         if exceeded {
             state.overflowed.store(true, Ordering::SeqCst);
-            let active = Arc::clone(&state.active_request);
             ffi::Cronet_Buffer_Destroy(buffer);
-            cancel_active_request(&active);
+            cancel_state_request(state);
             return;
         }
     }
@@ -713,26 +666,11 @@ unsafe extern "C" fn on_succeeded(
     _info: ffi::Cronet_UrlResponseInfoPtr,
 ) {
     let boxed = finish_request(callback);
-    let code = boxed.status_code.load(Ordering::SeqCst);
+    let code = boxed.status_code.load(Ordering::SeqCst) as u16;
     let body = std::mem::take(&mut *lock_unpoisoned(&boxed.body));
     let final_url = std::mem::take(&mut *lock_unpoisoned(&boxed.final_url));
-    let content_type = lock_unpoisoned(&boxed.content_type).take();
-    let link_header = lock_unpoisoned(&boxed.link_header).take();
-    let location_header = lock_unpoisoned(&boxed.location_header).take();
-    let diagnostics = std::mem::take(&mut *lock_unpoisoned(&boxed.diagnostics));
-
-    complete(
-        &boxed,
-        Ok(CronetResponse {
-            status_code: code as u16,
-            final_url,
-            content_type,
-            link_header,
-            location_header,
-            diagnostics,
-            body,
-        }),
-    );
+    let headers = std::mem::take(&mut *lock_unpoisoned(&boxed.headers));
+    complete(&boxed, Ok(headers.into_response(code, final_url, body)));
 }
 
 fn sanitize_cronet_error_detail(raw: &str) -> String {
@@ -741,18 +679,18 @@ fn sanitize_cronet_error_detail(raw: &str) -> String {
     for ch in raw.chars() {
         if ch.is_control() || ch.is_whitespace() {
             if !out.is_empty() && !last_space {
+                if out.len() >= 256 {
+                    break;
+                }
                 out.push(' ');
                 last_space = true;
             }
         } else {
+            if out.len() + ch.len_utf8() > 256 {
+                break;
+            }
             out.push(ch);
             last_space = false;
-        }
-        if out.len() >= 256 {
-            while out.len() > 256 {
-                out.pop();
-            }
-            break;
         }
     }
     out.trim_end().to_string()
@@ -818,9 +756,7 @@ unsafe extern "C" fn on_failed(
         let internal_code = ffi::Cronet_Error_internal_error_code_get(error);
         let quic_code = ffi::Cronet_Error_quic_detailed_error_code_get(error);
         let immediately_retryable = ffi::Cronet_Error_immediately_retryable_get(error);
-        let msg_ptr = ffi::Cronet_Error_message_get(error);
-        let raw_message =
-            (!msg_ptr.is_null()).then(|| CStr::from_ptr(msg_ptr).to_string_lossy().into_owned());
+        let raw_message = cstr_to_string(ffi::Cronet_Error_message_get(error));
         let kind = match code {
             4 | 6 => TransportErrorKind::Timeout,
             _ => TransportErrorKind::Network,
@@ -841,10 +777,9 @@ unsafe extern "C" fn on_failed(
     let boxed = finish_request(callback);
     complete(
         &boxed,
-        Err(CronetAttemptError {
-            err: anyhow::Error::new(TransportError::new(kind, msg).with_retryable(retryable_err)),
-            retryable: retryable_err,
-        }),
+        Err(anyhow::Error::new(
+            TransportError::new(kind, msg).with_retryable(retryable_err),
+        )),
     );
 }
 
@@ -872,38 +807,23 @@ unsafe extern "C" fn on_canceled(
 ) {
     let boxed = finish_request(callback);
     let result = if let Some(redir) = lock_unpoisoned(&boxed.intercepted_redirect).take() {
-        Ok(CronetResponse {
-            status_code: redir.status_code,
-            final_url: redir.final_url,
-            content_type: redir.content_type,
-            link_header: redir.link_header,
-            location_header: redir.location_header,
-            diagnostics: redir.diagnostics,
-            body: Vec::new(),
-        })
+        Ok(redir
+            .headers
+            .into_response(redir.status_code, redir.final_url, Vec::new()))
     } else if let Some(target) = lock_unpoisoned(&boxed.blocked_redirect).take() {
-        Err(CronetAttemptError {
-            err: anyhow::Error::new(TransportError::new(
-                TransportErrorKind::RedirectBlocked,
-                format!("blocked unsafe redirect to {target}"),
-            )),
-            retryable: false,
-        })
+        Err(anyhow::Error::new(TransportError::new(
+            TransportErrorKind::RedirectBlocked,
+            format!("blocked unsafe redirect to {target}"),
+        )))
     } else if boxed.overflowed.load(Ordering::SeqCst) {
-        Err(CronetAttemptError {
-            err: anyhow::Error::new(super::ResponseTooLargeError {
-                limit_bytes: boxed.max_body_bytes,
-            }),
-            retryable: false,
-        })
+        Err(anyhow::Error::new(super::ResponseTooLargeError {
+            limit_bytes: boxed.max_body_bytes,
+        }))
     } else {
-        Err(CronetAttemptError {
-            err: anyhow::Error::new(TransportError::new(
-                TransportErrorKind::Canceled,
-                "cronet request canceled",
-            )),
-            retryable: false,
-        })
+        Err(anyhow::Error::new(TransportError::new(
+            TransportErrorKind::Canceled,
+            "cronet request canceled",
+        )))
     };
     complete(&boxed, result);
 }
@@ -928,6 +848,22 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    async fn write_plain_ok(socket: &mut tokio::net::TcpStream, body: &[u8]) {
+        let hdr = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = socket.write_all(hdr.as_bytes()).await;
+        let _ = socket.write_all(body).await;
+    }
+
+    async fn write_redirect(socket: &mut tokio::net::TcpStream, loc: &str) {
+        let hdr = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let _ = socket.write_all(hdr.as_bytes()).await;
     }
 
     async fn spawn_edge_server() -> String {
@@ -955,57 +891,24 @@ mod tests {
                         .unwrap_or("/");
 
                     match path {
-                        "/large" => {
-                            let body = vec![b'x'; 64 * 1024];
-                            let hdr = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                                body.len()
-                            );
-                            let _ = socket.write_all(hdr.as_bytes()).await;
-                            let _ = socket.write_all(&body).await;
-                        }
-                        "/slow" => {
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                        }
-                        "/ok" => {
-                            let body = b"redirect ok";
-                            let hdr = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                                body.len()
-                            );
-                            let _ = socket.write_all(hdr.as_bytes()).await;
-                            let _ = socket.write_all(body).await;
-                        }
+                        "/large" => write_plain_ok(&mut socket, &vec![b'x'; 64 * 1024]).await,
+                        "/slow" => tokio::time::sleep(Duration::from_secs(5)).await,
+                        "/ok" => write_plain_ok(&mut socket, b"redirect ok").await,
                         "/drop-once" => {
                             if !drop_once_seen.swap(true, Ordering::SeqCst) {
                                 drop(socket);
                                 return;
                             }
-                            let body = b"recovered after drop";
-                            let hdr = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                                body.len()
-                            );
-                            let _ = socket.write_all(hdr.as_bytes()).await;
-                            let _ = socket.write_all(body).await;
+                            write_plain_ok(&mut socket, b"recovered after drop").await;
                         }
-                        "/drop-always" => {
-                            drop(socket);
-                        }
-                        "/redir-ok" => {
-                            let _ = socket
-                                .write_all(b"HTTP/1.1 302 Found\r\nLocation: /ok\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                                .await;
-                        }
+                        "/drop-always" => drop(socket),
+                        "/redir-ok" => write_redirect(&mut socket, "/ok").await,
                         "/redir-imds" => {
-                            let _ = socket
-                                .write_all(b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            write_redirect(&mut socket, "http://169.254.169.254/latest/meta-data/")
                                 .await;
                         }
                         "/redir-localhost" => {
-                            let _ = socket
-                                .write_all(b"HTTP/1.1 302 Found\r\nLocation: http://localhost:1/internal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                                .await;
+                            write_redirect(&mut socket, "http://localhost:1/internal").await;
                         }
                         _ => {
                             let _ = socket
