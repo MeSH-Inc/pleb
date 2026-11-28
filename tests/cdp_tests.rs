@@ -2220,3 +2220,455 @@ async fn passive_attach_classification_site_cache_isolation_and_cli_envelopes() 
     }
     let _ = ResourcePolicy::Manifest;
 }
+
+#[tokio::test]
+async fn cdp_reveal_scroll_xhr_datasets_and_fail_safe_guards() {
+    use pleb::extract::ResourceKind;
+    use pleb::transport::reveal::RevealPolicy;
+
+    let base_html = r#"<!doctype html><html><head><title>App</title></head><body><main><h1>App</h1><p>Initial body copy.</p></main></body></html>"#;
+    let scrolled_html = r#"<!doctype html><html><head><title>App</title></head><body><main><h1>App</h1><p>Initial body copy.</p><p>Lazy scrolled content loaded.</p></main></body></html>"#;
+    let challenge_html = r#"<!doctype html><html><head><title>Just a moment...</title></head><body><div id="cf-wrapper"><p>Checking your browser before accessing</p></div></body></html>"#;
+
+    // 1. --reveal all --scroll 3: omits layout=off, runs Runtime.evaluate, re-reads post-scroll HTML,
+    //    merges revealed panels, and indexes only safe same-origin GET 2xx JSON XHR payloads.
+    let eval_seen = Arc::new(AtomicU64::new(0));
+    let get_doc_calls = Arc::new(AtomicU64::new(0));
+    let eval_seen_c = Arc::clone(&eval_seen);
+    let get_doc_c = Arc::clone(&get_doc_calls);
+    let h1: RpcHandler = Arc::new(move |id, method, session_id, params, _| {
+        let sid = session_id.as_deref();
+        match method {
+            "Target.createTarget" => vec![rpc_ok(id, session_id, json!({ "targetId": "tgt-m8" }))],
+            "Target.attachToTarget" => {
+                vec![rpc_ok(id, session_id, json!({ "sessionId": "sess-m8" }))]
+            }
+            "Target.closeTarget" => vec![rpc_ok(id, session_id, json!({ "success": true }))],
+            "Page.enable" | "Network.enable" | "Fetch.enable" | "WebMCP.enable" => {
+                vec![rpc_ok(id, session_id, json!({}))]
+            }
+            "Page.getFrameTree" => vec![rpc_ok(
+                id,
+                session_id,
+                json!({ "frameTree": { "frame": { "id": "main-frame" } } }),
+            )],
+            "Page.navigate" => vec![
+                rpc_event(
+                    sid,
+                    "Network.requestWillBeSent",
+                    json!({
+                        "requestId": "req-doc", "frameId": "main-frame", "type": "Document",
+                        "request": { "url": "https://app.example.com/dash", "method": "GET" }
+                    }),
+                ),
+                rpc_event(
+                    sid,
+                    "Network.responseReceived",
+                    json!({
+                        "requestId": "req-doc", "frameId": "main-frame", "type": "Document",
+                        "response": { "url": "https://app.example.com/dash", "status": 200, "mimeType": "text/html", "headers": { "Content-Type": "text/html" } }
+                    }),
+                ),
+                // Valid same-origin GET 2xx +json XHR
+                rpc_event(
+                    sid,
+                    "Network.requestWillBeSent",
+                    json!({
+                        "requestId": "xhr-ok", "frameId": "main-frame", "type": "XHR",
+                        "request": { "url": "https://app.example.com/api/v1/orders?limit=50", "method": "GET" }
+                    }),
+                ),
+                rpc_event(
+                    sid,
+                    "Network.responseReceived",
+                    json!({
+                        "requestId": "xhr-ok", "frameId": "main-frame", "type": "XHR",
+                        "response": { "url": "https://app.example.com/api/v1/orders?limit=50", "status": 200, "mimeType": "application/vnd.api+json", "headers": { "Content-Length": "420" } }
+                    }),
+                ),
+                // Ignored POST XHR
+                rpc_event(
+                    sid,
+                    "Network.requestWillBeSent",
+                    json!({
+                        "requestId": "xhr-post", "frameId": "main-frame", "type": "Fetch",
+                        "request": { "url": "https://app.example.com/api/mutate", "method": "POST" }
+                    }),
+                ),
+                rpc_event(
+                    sid,
+                    "Network.responseReceived",
+                    json!({
+                        "requestId": "xhr-post", "frameId": "main-frame", "type": "Fetch",
+                        "response": { "url": "https://app.example.com/api/mutate", "status": 200, "mimeType": "application/json", "headers": { "Content-Length": "200" } }
+                    }),
+                ),
+                // Ignored cross-origin, sensitive query, and telemetry health XHRs
+                rpc_event(
+                    sid,
+                    "Network.requestWillBeSent",
+                    json!({
+                        "requestId": "xhr-ext", "frameId": "main-frame", "type": "XHR",
+                        "request": { "url": "https://other.example.com/data.json", "method": "GET" }
+                    }),
+                ),
+                rpc_event(
+                    sid,
+                    "Network.responseReceived",
+                    json!({
+                        "requestId": "xhr-ext", "frameId": "main-frame", "type": "XHR",
+                        "response": { "url": "https://other.example.com/data.json", "status": 200, "mimeType": "application/json", "headers": { "Content-Length": "200" } }
+                    }),
+                ),
+                rpc_event(
+                    sid,
+                    "Network.requestWillBeSent",
+                    json!({
+                        "requestId": "xhr-tok", "frameId": "main-frame", "type": "XHR",
+                        "request": { "url": "https://app.example.com/api/s.json?token=secret", "method": "GET" }
+                    }),
+                ),
+                rpc_event(
+                    sid,
+                    "Network.responseReceived",
+                    json!({
+                        "requestId": "xhr-tok", "frameId": "main-frame", "type": "XHR",
+                        "response": { "url": "https://app.example.com/api/s.json?token=secret", "status": 200, "mimeType": "application/json", "headers": { "Content-Length": "200" } }
+                    }),
+                ),
+                rpc_event(
+                    sid,
+                    "Network.requestWillBeSent",
+                    json!({
+                        "requestId": "xhr-health", "frameId": "main-frame", "type": "XHR",
+                        "request": { "url": "https://app.example.com/health", "method": "GET" }
+                    }),
+                ),
+                rpc_event(
+                    sid,
+                    "Network.responseReceived",
+                    json!({
+                        "requestId": "xhr-health", "frameId": "main-frame", "type": "XHR",
+                        "response": { "url": "https://app.example.com/health", "status": 200, "mimeType": "application/json", "headers": { "Content-Length": "20" } }
+                    }),
+                ),
+                rpc_ok(
+                    id,
+                    session_id,
+                    json!({ "frameId": "main-frame", "loaderId": "req-doc" }),
+                ),
+                rpc_event(sid, "Page.loadEventFired", json!({ "timestamp": 1.0 })),
+            ],
+            "Kitesurf.getPageState" => vec![rpc_ok(id, session_id, json!({ "seq": 1 }))],
+            "DOM.getDocument" => vec![rpc_ok(
+                id,
+                session_id,
+                json!({ "root": { "nodeId": get_doc_c.fetch_add(1, Ordering::Relaxed) + 1 } }),
+            )],
+            "DOM.getOuterHTML" => {
+                let html = if params["nodeId"].as_i64().unwrap_or(1) > 1 {
+                    scrolled_html
+                } else {
+                    base_html
+                };
+                vec![rpc_ok(id, session_id, json!({ "outerHTML": html }))]
+            }
+            "Runtime.evaluate" => {
+                eval_seen_c.fetch_add(1, Ordering::Relaxed);
+                assert!(params["expression"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("__plebRevealAndScroll"));
+                vec![rpc_ok(
+                    id,
+                    session_id,
+                    json!({
+                        "result": {
+                            "type": "object",
+                            "value": {
+                                "revealed_panels": [{
+                                    "kind": "tab",
+                                    "label": "Rust",
+                                    "section_heading": "Install",
+                                    "heading_level": 3,
+                                    "html": "<div><p>cargo add sdk</p></div>"
+                                }],
+                                "reveal_capped": false,
+                                "scroll_steps_performed": 3,
+                                "navigated": false,
+                                "challenge_detected": false,
+                                "warning": null
+                            }
+                        }
+                    }),
+                )]
+            }
+            _ => vec![rpc_err(id, session_id, -32601, "Method not found")],
+        }
+    });
+    let (ws_url, _p, log1) = spawn_mock_cdp_server(h1).await;
+    let dir1 = TempDir::new();
+    let ctx = RuntimeContext::new(RuntimeConfig {
+        state_dir: dir1.path().to_path_buf(),
+        cdp_url: Some(format!("{ws_url}/devtools/browser")),
+        timeout: Duration::from_secs(10),
+        cdp_timeout: Duration::from_secs(10),
+        ..Default::default()
+    })
+    .unwrap();
+    let out = fetch_target(
+        &ctx,
+        FetchTarget::Navigate("https://app.example.com/dash".to_string()),
+        &FetchOptions {
+            render: RenderMode::Cdp,
+            reveal: RevealPolicy::All,
+            scroll_steps: 3,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(eval_seen.load(Ordering::Relaxed), 1);
+    assert!(log1.lock().unwrap().request_uris[0] == "/devtools/browser");
+    assert!(out.content.contains("Lazy scrolled content loaded."));
+    assert!(out.content.contains("### Tab: Rust"));
+    assert!(out.content.contains("cargo add sdk"));
+    let ds: Vec<_> = out
+        .resources
+        .iter()
+        .filter(|r| r.kind == ResourceKind::Dataset)
+        .collect();
+    assert_eq!(ds.len(), 1, "expected only 1 safe dataset, got {ds:?}");
+    assert_eq!(ds[0].url, "https://app.example.com/api/v1/orders?limit=50");
+    assert_eq!(ds[0].section_heading.as_deref(), Some("Network XHR"));
+
+    // 2. Challenge pre-flight runs BEFORE Runtime.evaluate (0 interactions).
+    let ch_evals = Arc::new(AtomicU64::new(0));
+    let ch_evals_c = Arc::clone(&ch_evals);
+    let h2: RpcHandler = Arc::new(move |id, method, session_id, _, _| {
+        let sid = session_id.as_deref();
+        match method {
+            "Target.createTarget" => vec![rpc_ok(id, session_id, json!({ "targetId": "tgt-ch" }))],
+            "Target.attachToTarget" => {
+                vec![rpc_ok(id, session_id, json!({ "sessionId": "sess-ch" }))]
+            }
+            "Target.closeTarget" => vec![rpc_ok(id, session_id, json!({ "success": true }))],
+            "Page.enable" | "Network.enable" | "Fetch.enable" | "WebMCP.enable" => {
+                vec![rpc_ok(id, session_id, json!({}))]
+            }
+            "Page.getFrameTree" => vec![rpc_ok(
+                id,
+                session_id,
+                json!({ "frameTree": { "frame": { "id": "main-frame" } } }),
+            )],
+            "Page.navigate" => vec![
+                rpc_event(
+                    sid,
+                    "Network.responseReceived",
+                    json!({
+                        "requestId": "req-doc", "frameId": "main-frame", "type": "Document",
+                        "response": { "url": "https://cf.example.com/", "status": 403, "mimeType": "text/html", "headers": { "Content-Type": "text/html" } }
+                    }),
+                ),
+                rpc_ok(
+                    id,
+                    session_id,
+                    json!({ "frameId": "main-frame", "loaderId": "req-doc" }),
+                ),
+                rpc_event(sid, "Page.loadEventFired", json!({ "timestamp": 1.0 })),
+            ],
+            "Kitesurf.getPageState" => vec![rpc_ok(id, session_id, json!({ "seq": 1 }))],
+            "DOM.getDocument" => vec![rpc_ok(id, session_id, json!({ "root": { "nodeId": 1 } }))],
+            "DOM.getOuterHTML" => vec![rpc_ok(
+                id,
+                session_id,
+                json!({ "outerHTML": challenge_html }),
+            )],
+            "Runtime.evaluate" => {
+                ch_evals_c.fetch_add(1, Ordering::Relaxed);
+                vec![rpc_ok(id, session_id, json!({ "result": { "value": {} } }))]
+            }
+            _ => vec![rpc_err(id, session_id, -32601, "Method not found")],
+        }
+    });
+    let (ws_ch, _p, _) = spawn_mock_cdp_server(h2).await;
+    let dir2 = TempDir::new();
+    let ctx_ch = RuntimeContext::new(RuntimeConfig {
+        state_dir: dir2.path().to_path_buf(),
+        cdp_url: Some(format!("{ws_ch}/devtools/browser")),
+        timeout: Duration::from_secs(10),
+        cdp_timeout: Duration::from_secs(10),
+        ..Default::default()
+    })
+    .unwrap();
+    let err_ch = fetch_target(
+        &ctx_ch,
+        FetchTarget::Navigate("https://cf.example.com/".to_string()),
+        &FetchOptions {
+            render: RenderMode::Cdp,
+            reveal: RevealPolicy::All,
+            scroll_steps: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err_ch, FetchError::Challenge { .. }));
+    assert_eq!(err_ch.exit_code(), 2);
+    assert_eq!(ch_evals.load(Ordering::Relaxed), 0);
+
+    // 3. Navigation-abort discards post-nav panels and surfaces advisory warning.
+    let h3: RpcHandler = Arc::new(move |id, method, session_id, _, _| {
+        let sid = session_id.as_deref();
+        match method {
+            "Target.createTarget" => vec![rpc_ok(id, session_id, json!({ "targetId": "tgt-nav" }))],
+            "Target.attachToTarget" => {
+                vec![rpc_ok(id, session_id, json!({ "sessionId": "sess-nav" }))]
+            }
+            "Target.closeTarget" => vec![rpc_ok(id, session_id, json!({ "success": true }))],
+            "Page.enable" | "Network.enable" | "Fetch.enable" | "WebMCP.enable" => {
+                vec![rpc_ok(id, session_id, json!({}))]
+            }
+            "Page.getFrameTree" => vec![rpc_ok(
+                id,
+                session_id,
+                json!({ "frameTree": { "frame": { "id": "main-frame" } } }),
+            )],
+            "Page.navigate" => vec![
+                rpc_event(
+                    sid,
+                    "Network.responseReceived",
+                    json!({
+                        "requestId": "req-doc", "frameId": "main-frame", "type": "Document",
+                        "response": { "url": "https://app.example.com/docs", "status": 200, "mimeType": "text/html", "headers": { "Content-Type": "text/html" } }
+                    }),
+                ),
+                rpc_ok(
+                    id,
+                    session_id,
+                    json!({ "frameId": "main-frame", "loaderId": "req-doc" }),
+                ),
+                rpc_event(sid, "Page.loadEventFired", json!({ "timestamp": 1.0 })),
+            ],
+            "Kitesurf.getPageState" => vec![rpc_ok(id, session_id, json!({ "seq": 1 }))],
+            "DOM.getDocument" => vec![rpc_ok(id, session_id, json!({ "root": { "nodeId": 1 } }))],
+            "DOM.getOuterHTML" => vec![rpc_ok(id, session_id, json!({ "outerHTML": base_html }))],
+            "Runtime.evaluate" => vec![rpc_ok(
+                id,
+                session_id,
+                json!({
+                    "result": {
+                        "type": "object",
+                        "value": {
+                            "revealed_panels": [{ "kind": "tab", "label": "Stale", "html": "<p>DISCARD_ME</p>" }],
+                            "navigated": true,
+                            "challenge_detected": false,
+                            "scroll_steps_performed": 0,
+                            "warning": "aborted --reveal because a tab control triggered page navigation"
+                        }
+                    }
+                }),
+            )],
+            _ => vec![rpc_err(id, session_id, -32601, "Method not found")],
+        }
+    });
+    let (ws_nav, _p, _) = spawn_mock_cdp_server(h3).await;
+    let dir3 = TempDir::new();
+    let ctx_nav = RuntimeContext::new(RuntimeConfig {
+        state_dir: dir3.path().to_path_buf(),
+        cdp_url: Some(format!("{ws_nav}/devtools/browser")),
+        timeout: Duration::from_secs(10),
+        cdp_timeout: Duration::from_secs(10),
+        ..Default::default()
+    })
+    .unwrap();
+    let nav_out = fetch_target(
+        &ctx_nav,
+        FetchTarget::Navigate("https://app.example.com/docs".to_string()),
+        &FetchOptions {
+            render: RenderMode::Cdp,
+            reveal: RevealPolicy::Tabs,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(nav_out.content.contains("Initial body copy."));
+    assert!(!nav_out.content.contains("DISCARD_ME"));
+    assert!(nav_out
+        .warning
+        .as_deref()
+        .is_some_and(|w| w.contains("aborted --reveal")));
+
+    // 4. Runtime.evaluate -32601 -> ProtocolMismatch -> CdpUnavailable.
+    let h4: RpcHandler = Arc::new(move |id, method, session_id, _, _| {
+        let sid = session_id.as_deref();
+        match method {
+            "Target.createTarget" => {
+                vec![rpc_ok(id, session_id, json!({ "targetId": "tgt-32601" }))]
+            }
+            "Target.attachToTarget" => {
+                vec![rpc_ok(id, session_id, json!({ "sessionId": "sess-32601" }))]
+            }
+            "Target.closeTarget" => vec![rpc_ok(id, session_id, json!({ "success": true }))],
+            "Page.enable" | "Network.enable" | "Fetch.enable" | "WebMCP.enable" => {
+                vec![rpc_ok(id, session_id, json!({}))]
+            }
+            "Page.getFrameTree" => vec![rpc_ok(
+                id,
+                session_id,
+                json!({ "frameTree": { "frame": { "id": "main-frame" } } }),
+            )],
+            "Page.navigate" => vec![
+                rpc_event(
+                    sid,
+                    "Network.responseReceived",
+                    json!({
+                        "requestId": "req-doc", "frameId": "main-frame", "type": "Document",
+                        "response": { "url": "https://app.example.com/no-rt", "status": 200, "mimeType": "text/html", "headers": { "Content-Type": "text/html" } }
+                    }),
+                ),
+                rpc_ok(
+                    id,
+                    session_id,
+                    json!({ "frameId": "main-frame", "loaderId": "req-doc" }),
+                ),
+                rpc_event(sid, "Page.loadEventFired", json!({ "timestamp": 1.0 })),
+            ],
+            "Kitesurf.getPageState" => vec![rpc_ok(id, session_id, json!({ "seq": 1 }))],
+            "DOM.getDocument" => vec![rpc_ok(id, session_id, json!({ "root": { "nodeId": 1 } }))],
+            "DOM.getOuterHTML" => vec![rpc_ok(id, session_id, json!({ "outerHTML": base_html }))],
+            _ => vec![rpc_err(
+                id,
+                session_id,
+                -32601,
+                "Runtime.evaluate not found",
+            )],
+        }
+    });
+    let (ws_4, _p, _) = spawn_mock_cdp_server(h4).await;
+    let dir4 = TempDir::new();
+    let ctx_4 = RuntimeContext::new(RuntimeConfig {
+        state_dir: dir4.path().to_path_buf(),
+        cdp_url: Some(format!("{ws_4}/devtools/browser")),
+        timeout: Duration::from_secs(10),
+        cdp_timeout: Duration::from_secs(10),
+        ..Default::default()
+    })
+    .unwrap();
+    let err_32601 = fetch_target(
+        &ctx_4,
+        FetchTarget::Navigate("https://app.example.com/no-rt".to_string()),
+        &FetchOptions {
+            render: RenderMode::Cdp,
+            reveal: RevealPolicy::Tabs,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err_32601, FetchError::CdpUnavailable(_)),
+        "expected CdpUnavailable for -32601, got {err_32601:?}"
+    );
+}

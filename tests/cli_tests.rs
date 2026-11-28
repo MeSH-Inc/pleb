@@ -124,7 +124,7 @@ async fn cli_supports_value_enums_output_file_and_uniform_json_errors() {
     assert_eq!(status_out.status.code(), Some(0));
     let status_json: serde_json::Value = serde_json::from_slice(&status_out.stdout).unwrap();
     assert_eq!(status_json["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(status_json["cef_renderer"]["expected_protocol"], "v5-meta");
+    assert_eq!(status_json["cef_renderer"]["expected_protocol"], "v6-meta");
 
     // 2. daemon status --json and session clear --json work cleanly.
     let daemon_out = Command::new(pleb_bin)
@@ -518,7 +518,7 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
     let val: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(val["daemon"]["running"], false);
     assert_eq!(val["daemon"]["active_requests"], 0);
-    assert_eq!(val["cef_renderer"]["expected_protocol"], "v5-meta");
+    assert_eq!(val["cef_renderer"]["expected_protocol"], "v6-meta");
     assert_eq!(val["cdp_renderer"]["configured"], false);
     assert_eq!(val["cdp_renderer"]["prefer_cdp"], false);
     assert_eq!(val["agent_identity"]["jwk_configured"], false);
@@ -735,9 +735,9 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "README docs should contain verified relative file links (found {relative_file_links})"
     );
 
-    // README-FULL.md must stay in sync with v5-meta, env overrides, batch/search flags, and JSON schemas.
+    // README-FULL.md must stay in sync with v6-meta, env overrides, batch/search flags, and JSON schemas.
     for required in [
-        "v5-meta",
+        "v6-meta",
         "PLEB_CEF_RENDERER",
         "PLEB_NO_HOME_CEF",
         "PLEB_DAEMON_EXECUTABLE",
@@ -819,6 +819,9 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "UiGateDescriptor",
         "ExtractOutput",
         "UI-Gated:",
+        "--reveal",
+        "--scroll",
+        "Network XHR",
     ] {
         assert!(
             readme_full.contains(required),
@@ -828,7 +831,7 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
     for required in [
         "pleb",
         "Memory Sync Hub LLC",
-        "v5-meta",
+        "v6-meta",
         "daemon.sock",
         "corpus_benchmark",
         "Firecrawl",
@@ -864,6 +867,9 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "UiGateDescriptor",
         "ExtractOutput",
         "UI-Gated:",
+        "--reveal",
+        "--scroll",
+        "Network XHR",
     ] {
         assert!(
             llms_full_txt.contains(required),
@@ -878,6 +884,7 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "MESH_WICK_NO_CEF_DAEMON",
         "cef.sock",
         "v4-meta",
+        "v5-meta",
         "MeSH-wick",
         "MeSH-Inc/mesh-wick",
         "MESH_WICK_HOME",
@@ -913,9 +920,9 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
     .unwrap();
     for required in [
         "name: pleb",
-        "v5-meta",
+        "v6-meta",
         "daemon.sock",
-        "protocol_version: 4",
+        "protocol_version: 5",
         "--source",
         "raw_source",
         "markdown_mirror",
@@ -978,6 +985,9 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "UiGateDescriptor",
         "ExtractOutput",
         "UI-Gated:",
+        "--reveal",
+        "--scroll",
+        "Network XHR",
     ] {
         assert!(
             skill_md.contains(required),
@@ -2354,4 +2364,93 @@ async fn cli_section_offset_pagination_and_conflict_validation() {
     assert!(combined.contains("Extra trailing appendix notes."));
 
     let _ = fs::remove_dir_all(&state_dir);
+}
+
+#[tokio::test]
+async fn cli_rejects_invalid_reveal_and_scroll_flag_combinations() {
+    let state_dir = temp_dir();
+    let pleb_bin = env!("CARGO_BIN_EXE_pleb");
+
+    for bad_args in [
+        vec![
+            "--no-daemon",
+            "fetch",
+            "--scroll",
+            "21",
+            "https://example.com",
+        ],
+        vec![
+            "--no-daemon",
+            "fetch",
+            "--render",
+            "cronet",
+            "--reveal",
+            "tabs",
+            "https://example.com",
+        ],
+        vec![
+            "--no-daemon",
+            "fetch",
+            "--render",
+            "cronet",
+            "--scroll",
+            "2",
+            "https://example.com",
+        ],
+        vec![
+            "--no-daemon",
+            "fetch",
+            "--render",
+            "cdp",
+            "--cdp-url",
+            "ws://127.0.0.1:9222/devtools/page/abc",
+            "--no-navigate",
+            "--reveal",
+            "all",
+        ],
+        vec![
+            "--no-daemon",
+            "fetch",
+            "--render",
+            "cdp",
+            "--cdp-url",
+            "ws://127.0.0.1:9222/devtools/page/abc",
+            "--no-navigate",
+            "--scroll",
+            "1",
+        ],
+        vec![
+            "--no-daemon",
+            "fetch",
+            "--stage",
+            "--reveal",
+            "tabs",
+            "https://example.com/a.png",
+        ],
+        vec![
+            "--no-daemon",
+            "fetch",
+            "--format",
+            "raw",
+            "--scroll",
+            "1",
+            "https://example.com",
+        ],
+    ] {
+        let out = Command::new(pleb_bin)
+            .env("PLEB_NO_HOME_CEF", "1")
+            .env("PLEB_NO_KEYCHAIN", "1")
+            .args(["--state-dir"])
+            .arg(&state_dir)
+            .args(&bad_args)
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "expected exit 1 for {bad_args:?}, stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }

@@ -394,6 +394,39 @@ mod tests {
         // Empty payload rejected.
         assert!(stage_artifact(&dir, &url, Some("image/png"), b"", None).is_err());
 
+        // Dataset kind maps +json MIME types to .json and rejects HTML payloads.
+        let json_url = Url::parse("https://cdn.example.com/api/v1/series").unwrap();
+        let staged_ds = stage_artifact(
+            &dir,
+            &json_url,
+            Some("application/vnd.api+json; charset=utf-8"),
+            b"{\"items\":[1,2,3]}",
+            Some(ResourceKind::Dataset),
+        )
+        .unwrap();
+        assert_eq!(
+            staged_ds.path.extension().and_then(|s| s.to_str()),
+            Some("json")
+        );
+        let err_ds_html = stage_artifact(
+            &dir,
+            &json_url,
+            Some("text/html"),
+            b"<html><body>Login</body></html>",
+            Some(ResourceKind::Dataset),
+        )
+        .unwrap_err();
+        assert!(err_ds_html.to_string().contains("HTML"));
+        let err_ds_sniff = stage_artifact(
+            &dir,
+            &json_url,
+            Some("application/json"),
+            b"<!DOCTYPE html><html>error</html>",
+            Some(ResourceKind::Dataset),
+        )
+        .unwrap_err();
+        assert!(err_ds_sniff.to_string().contains("HTML"));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

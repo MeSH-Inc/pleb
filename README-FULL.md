@@ -32,7 +32,7 @@ Key capabilities beyond upstream `wickproject/wick`:
 
 - **Zero telemetry and local-only configuration**: All upstream telemetry pings and remote `site-rules.json` sync calls are removed. Per-site routing rules are bundled statically and optionally overlaid from `<state_dir>/site-rules.json`.
 - **Unified warm transport daemon (`daemon.sock`, protocol `4`)**: Shares persistent Cronet engines and warm CEF renderer processes across invocations, partitioned by proxy configuration, with automatic restart on binary rebuild (`PLEB_BUILD_ID`).
-- **CEF `v5-meta` and external CDP/Kitesurf renderers**: Local CEF reports real HTTP status codes, final redirect URLs, and typed transport error kinds over a framed stdio protocol; `--cdp-url` / `PLEB_CDP_URL` connects over WebSocket (`ws://` loopback or `wss://` with optional Cloudflare Access service tokens) to Chrome DevTools Protocol / Kitesurf for DOM, `--format axtree`, and imperative WebMCP discovery (`--tools manifest`).
+- **CEF `v6-meta` and external CDP/Kitesurf renderers**: Local CEF reports real HTTP status codes, final redirect URLs, bounded pre-capture `--reveal`/`--scroll` panels, passive XHR JSON datasets, and typed transport error kinds over a framed stdio protocol; `--cdp-url` / `PLEB_CDP_URL` connects over WebSocket (`ws://` loopback or `wss://` with optional Cloudflare Access service tokens) to Chrome DevTools Protocol / Kitesurf for DOM, `--format axtree`, `--reveal`, `--scroll`, XHR dataset indexing, and imperative WebMCP discovery (`--tools manifest`).
 - **HTTP Message Signatures (`web-bot-auth`)**: Optional RFC 9421 Ed25519 request signing on outbound HTTPS requests (`pleb auth set web-bot-auth-jwk`, disabled per invocation with `--no-web-bot-auth`).
 - **Structured source negotiation and first-class non-HTML parsing**: Rewrites GitHub, GitLab, and Gist pages to raw source, follows advertised Markdown mirrors, negotiates `text/markdown`, converts RSS/Atom/JSON feeds to Markdown digests, extracts YouTube metadata and captions, and cleans WebVTT/SRT transcripts.
 - **Single-parse `O(N)` DOM extraction and zero-fetch resource indexing**: Prunes chrome, rescues code tables, math, and SVG labels, indexes high-salience linked assets without extra requests, and stages binary artifacts on demand with magic-byte verification.
@@ -76,7 +76,7 @@ Methodology notes:
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **License & telemetry** | MIT; zero telemetry, local-only | AGPL-3.0 OSS / Cloud API | Apache-2.0 OSS / Cloud API | Apache-2.0 OSS / Cloud API | Permissive; local CLI |
 | **Runtime & dependencies** | Single Rust binary (plus optional CEF bundle) | Cloud API, `firecrawl-local` binary, or Docker Compose (Redis, PostgreSQL, browser) | Hosted `r.jina.ai`/`s.jina.ai` (`20 RPM` no-key / paid tokens) or stateless/S3 Docker image | Python + async Playwright Chromium or Crawl4AI Cloud | POSIX CLI tools |
-| **Network & JS stack** | Cronet (`Chromium 154`) or `reqwest` (`rustls`) + optional warm CEF `v5-meta` daemon | Hosted unblocking/actions or Playwright/Fire-engine | Hosted headless browser fleet | Playwright Chromium browser pool | `libcurl` HTTP, no JS execution |
+| **Network & JS stack** | Cronet (`Chromium 154`) or `reqwest` (`rustls`) + optional warm CEF `v6-meta` daemon | Hosted unblocking/actions or Playwright/Fire-engine | Hosted headless browser fleet | Playwright Chromium browser pool | `libcurl` HTTP, no JS execution |
 | **Challenge policy** | Fail fast (exit `2`), no CAPTCHA bypass | Cloud tier provides managed unblocking | Tiered rate limits (paid keys do not bypass access controls) | Community stealth / proxy hooks | Raw `403` HTML response |
 | **Structured source bypass** | GitHub/GitLab/Gist raw, RFC 8288/`<link>` Markdown mirrors, RSS/Atom/JSON, VTT/SRT, YouTube captions | HTML/PDF scraping and LLM `/extract` schemas | HTML, PDF, MS Office, and VLM image captioning | `PruningContentFilterLXML`, BM25/LLM filters | Generic HTML stripping only |
 | **Search & credential store** | Built-in `pleb search` (6 providers + RRF) & `pleb auth` (`env` / Keychain / `0o600` file) | Separate `/search` endpoint in Cloud/v2 API | Separate `s.jina.ai` search (`10,000` fixed tokens per API search) | Search in Crawl4AI Cloud | None |
@@ -129,9 +129,9 @@ cargo build --release
 
 `cargo install --path . --features cronet --locked` builds the `pleb` crate and installs the `pleb` binary onto `PATH`. Because `daemon.sock` checks the compile-time `PLEB_BUILD_ID` on each connection, an older running daemon restarts automatically after reinstall.
 
-### Optional CEF Renderer (`v5-meta`)
+### Optional CEF Renderer (`v6-meta`)
 
-To render JavaScript-heavy pages and automatically escalate blocked (`403`/`503`) or unhydrated SPA responses in `--render auto` mode, build and install the offscreen CEF `v5-meta` renderer:
+To render JavaScript-heavy pages and automatically escalate blocked (`403`/`503`) or unhydrated SPA responses in `--render auto` mode, build and install the offscreen CEF `v6-meta` renderer:
 
 ```bash
 # macOS Apple Silicon (installs ~/.pleb/cef/pleb-renderer.app)
@@ -159,7 +159,7 @@ pleb status
 pleb status --json
 ```
 
-Healthy local installations report `"version"`, `"cef_renderer": { "status": "ready", "expected_protocol": "v5-meta" }` (when CEF is installed), daemon status (`protocol_version: 4` while running, `null` when stopped), active state directory, and configured search providers. `"cronet_enabled"` is `true` for `--features cronet` builds and `false` for pure-Rust `reqwest` (`rustls`) builds.
+Healthy local installations report `"version"`, `"cef_renderer": { "status": "ready", "expected_protocol": "v6-meta" }` (when CEF is installed), daemon status (`protocol_version: 5` while running, `null` when stopped), active state directory, and configured search providers. `"cronet_enabled"` is `true` for `--features cronet` builds and `false` for pure-Rust `reqwest` (`rustls`) builds.
 
 ---
 
@@ -187,9 +187,9 @@ CLI / Library Call
   │     • Select initial transport (Cronet vs. CEF via rules + site-cache.json)
   │
   ├─► Transport Layer (src/transport/ & src/daemon/)
-  │     • Unix-socket daemon (daemon.sock, protocol 4) or --no-daemon in-process
+  │     • Unix-socket daemon (daemon.sock, protocol 5) or --no-daemon in-process
   │     • Primary HTTP: Cronet (Chromium 154) or reqwest fallback
-  │     • Classify response -> auto-escalate blocks / JS shells to CEF v5-meta
+  │     • Classify response -> auto-escalate blocks / JS shells to CEF v6-meta
   │     • Follow advertised Markdown mirrors / optional <path>.md negotiation
   │
   ├─► Extraction & Indexing (src/extract/)
@@ -222,7 +222,7 @@ CLI / Library Call
 | `src/artifacts.rs` | Content-addressed `<state_dir>/artifacts/` store, magic-byte validation, disguised-HTML rejection, and `256 MiB` LRU eviction |
 | `src/search/` | Multi-provider search dispatch, intent routing, Reciprocal Rank Fusion (`mod.rs`), provider HTTP adapters (`providers.rs`), and locked health/cooldown/pacing state (`state.rs`) |
 | `src/auth.rs` | 3-tier credential resolution (`env` -> AES-256-GCM `credentials.enc` vault wrapped by macOS Keychain `vault-key` -> `credentials.json`), secret zeroization, and status reporting |
-| `cef/` | C/Objective-C sources for the `v5-meta` offscreen CEF renderer and helper (`protocol.h`, `browser_environment.h`, `renderer_core.h`, `helper_core.h`, macOS `.m` and Linux `.c` entrypoints) |
+| `cef/` | C/Objective-C/JS sources for the `v6-meta` offscreen CEF renderer and helper (`protocol.h`, `browser_environment.h`, `reveal_script.js`, `reveal_script.h`, `renderer_core.h`, `helper_core.h`, macOS `.m` and Linux `.c` entrypoints) |
 | `data/site-rules.json` | Bundled structural host rewrite and mandatory CEF overrides |
 | `examples/corpus_benchmark.rs` | Offline corpus byte/token reduction and warm release extraction benchmark |
 | `llms.txt`, `llms-full.txt` | Machine-readable LLM discovery index and single-file technical reference |
@@ -244,9 +244,9 @@ Both Cronet (`on_redirect_received`) and `reqwest` (`redirect::Policy`) enforce 
 
 Transport responses also capture bounded, control-byte-sanitized diagnostic headers (`Server`, `CF-Mitigated`, `CF-Ray`, `Retry-After`, `WWW-Authenticate`, `x-amzn-waf-action`, `x-datadome`, `x-sucuri-id`, `x-iinfo`) into `DiagnosticHeaders` so origin vs. edge WAF vs. active bot-challenge responses are cleanly distinguishable across both direct and `daemon.sock` IPC paths.
 
-### Offscreen CEF Renderer (`v5-meta`)
+### Offscreen CEF Renderer (`v6-meta`)
 
-When installed at `<state_dir>/cef/pleb-renderer.app` (macOS arm64) or `<state_dir>/cef/pleb-renderer` (Linux `x86_64` or `aarch64`), or pointed to by `PLEB_CEF_RENDERER`, `pleb` verifies the embedded `PLEB_RENDERER_PROTOCOL=v5-meta` marker before spawning the renderer. The renderer runs offscreen with:
+When installed at `<state_dir>/cef/pleb-renderer.app` (macOS arm64) or `<state_dir>/cef/pleb-renderer` (Linux `x86_64` or `aarch64`), or pointed to by `PLEB_CEF_RENDERER`, `pleb` verifies the embedded `PLEB_RENDERER_PROTOCOL=v6-meta` marker before spawning the renderer. The renderer runs offscreen with:
 
 - Native headless execution without Xvfb on Linux when `DISPLAY` is unset or empty (`--ozone-platform=headless` and `--password-store=basic`; `--use-mock-keychain` on macOS) to avoid X11 and keyring deadlocks.
 - Audio muted (`--mute-audio`) and autoplay suppressed.
@@ -287,7 +287,7 @@ Run `pleb auth init-web-bot-auth --agent https://<your-domain>` to generate an E
 
 ### Unified Transport Daemon (`daemon.sock`)
 
-On Unix systems, `pleb` automatically starts a background transport daemon bound to `<state_dir>/daemon.sock` (protocol version `4`, locked via `daemon.lock`, logging to `daemon.log`). The daemon:
+On Unix systems, `pleb` automatically starts a background transport daemon bound to `<state_dir>/daemon.sock` (protocol version `5`, locked via `daemon.lock`, logging to `daemon.log`). The daemon:
 
 - Reuses Cronet engines and warm CEF renderer processes across invocations.
 - Partitions persistent storage (`data/` and `cef-cache/`) by proxy configuration (`direct` or `proxy-<hash>`).
@@ -425,7 +425,7 @@ Resources: 1 diagram (r_a1b2c3d4) — pass --resources manifest or --stage-resou
 
 ## Resource Indexing and Staging
 
-During its single `O(N)` DOM pass, `pleb fetch` indexes linked non-prose resources (`diagram`, `image`, `transcript`, `document`, `dataset`, `schema`) and assigns deterministic URL-derived IDs (`r_<8hex>`, e.g., `r_a1b2c3d4`) with `section_heading`, `label`, `dimensions`, and `salience` metadata while making zero subresource network requests. Inline content `<svg>` diagrams also rescue readable `<text>` labels directly into Markdown (`[Diagram: ...]`).
+During its single `O(N)` DOM pass, `pleb fetch` indexes linked non-prose resources (`diagram`, `image`, `transcript`, `document`, `dataset`, `schema`) and assigns deterministic URL-derived IDs (`r_<8hex>`, e.g., `r_a1b2c3d4`) with `section_heading`, `label`, `dimensions`, and `salience` metadata while making zero subresource network requests. Inline content `<svg>` diagrams also rescue readable `<text>` labels directly into Markdown (`[Diagram: ...]`), and CEF/CDP browser captures passively index same-origin `GET` `2xx` JSON `XHR`/`Fetch` responses into `ResourceKind::Dataset` under `"Network XHR"` (up to `12` per page).
 
 ### Resource Policies (`--resources`)
 
@@ -551,6 +551,8 @@ pleb search --urls-only "rust async runtime" | pleb fetch -
 | `--format <FMT>` | `markdown` *(default)*, `html`, `text`, `axtree`, `raw` | Aliases: `md`, `txt`, `ax`. `axtree` requires CDP (`--cdp-url`); `raw` rejects `--json`, `--jsonl`, `--metadata-only`, `--stage`, `--no-navigate`, batch mode, and writing to a TTY without `-o`. |
 | `--extract <MODE>` | `clean` *(default)*, `article`, `full` | Extraction scope for HTML, Markdown, feeds, and transcripts. |
 | `--expand <POLICY>` | `none` *(default)*, `tabs`, `all` | In-landmark ARIA disclosure rescue (`tabs` recovers hidden `[role="tabpanel"]` panels; `all` adds uniquely paired `[aria-expanded="false"][aria-controls]` disclosures; up to 32 panels). |
+| `--reveal <POLICY>` | `none` *(default)*, `tabs`, `disclosures`, `all` | Declarative pre-capture DOM reveal inside `<main>`/`[role="main"]` for unmounted tabs/disclosures over CEF `v6-meta` or navigated CDP (implies matching `--expand`; skips nav/forms/auth/destructive labels; aborts cleanly on navigation; rejects `--no-navigate`, `--render cronet`, `--stage`, and `--format raw`). |
+| `--scroll <N>` | `0..=20` *(default `0`)* | Progressive downward viewport scroll steps over CEF `v6-meta` or navigated CDP with quiet-window waits and stagnation early exit (rejects `--no-navigate`, `--render cronet`, `--stage`, and `--format raw`). |
 | `--render <MODE>` | `auto` *(default)*, `cef`, `cdp`, `cronet` | Aliases: `browser`/`render`/`js` (`cef`), `kitesurf`/`remote` (`cdp`), `network`/`fast`/`no-js`/`nojs` (`cronet`). |
 | `--no-navigate` | flag | Document-bound passive snapshot of an already-loaded loopback `ws://127.0.0.1\|localhost\|[::1]/.../devtools/page/<id>` tab (`--render cdp` required; optional positional `[URL]` asserts expected origin; emits `strategy: "cdp_attach"` and `status_code: 0`; never mutates layout, writes `site-cache.json`, or runs `Fetch.enable`/`Page.navigate`). |
 | `--source <MODE>` | `auto` *(default)*, `negotiate`, `none` | Structured source and Markdown mirror policy. |
@@ -581,7 +583,7 @@ In batch mode (`2+` URLs or `-` on `stdin`), default Markdown output emits numbe
 | `exit 2` with `block_reason` in `["cloudflare_challenge", "bot_challenge"]` | Stop retrying in `pleb` (zero evasion scripts). Hand off to a **human** in a visible browser pane. |
 | `exit 2` with `block_reason` in `["login_wall", "cookie_wall"]` | Stop retrying in `pleb`; escalate to an interactive browser session (Playwright / browser subagent). |
 | `UI-Gated: ... in DOM (pass --expand tabs\|all)` | Stay in `pleb`: re-run with `--expand tabs` (or `--expand all`) plus `--focus` or `--section`. |
-| `UI-Gated: ... unmounted` or `visual canvas` / `modal` | Escalate to Playwright / interactive browser subagent to click, scroll, or inspect visually. |
+| `UI-Gated: ... unmounted` or `visual canvas` / `modal` | Re-run with `--reveal tabs\|disclosures\|all` / `--scroll <0..=20>` inside `pleb` for unmounted tabs/disclosures or lazy lists; use Playwright / interactive browser subagent for `visual canvas`, `modal`, or login flows. |
 | Returning from Playwright with dense post-interaction DOM | Pipe `page.content()` to `pleb extract --url <url> --expand tabs --focus "<query>"`, or snapshot the open tab via `pleb fetch --render cdp --cdp-url ws://127.0.0.1:<port>/devtools/page/<id> --no-navigate --focus "<query>"`. |
 
 ### `pleb extract`
@@ -674,7 +676,7 @@ pleb skill install          # Write bundled SKILL.md into local agent skill dire
 | `PLEB_NO_WEB_BOT_AUTH` | Disables RFC 9421 Web Bot Auth signing (`--no-web-bot-auth`). |
 | `PLEB_CDP_URL`, `PLEB_CDP_TIMEOUT`, `PLEB_PREFER_CDP` | Default WebSocket CDP endpoint, render timeout (seconds), and `--render auto` CDP priority. |
 | `PLEB_NO_KEYCHAIN=1` | Disables macOS Keychain reads/writes (`1` or case-insensitive `true`; forces `credentials.json` under `--storage auto`; required for hermetic tests). |
-| `PLEB_CEF_RENDERER` | Explicit path to a `v5-meta` `pleb-renderer` binary (overrides `<state_dir>/cef` discovery). |
+| `PLEB_CEF_RENDERER` | Explicit path to a `v6-meta` `pleb-renderer` binary (overrides `<state_dir>/cef` discovery). |
 | `PLEB_NO_HOME_CEF=1` | Disables fallback discovery of `~/.pleb/cef` (used in hermetic tests). |
 | `PLEB_DAEMON_EXECUTABLE` | Explicit path to the `pleb` executable spawned when auto-starting the background daemon. |
 | `PLEB_CLAUDE_SETTINGS` | Optional override for Claude Code's `settings.json` path edited by `pleb setup --hooks`. |
@@ -838,7 +840,7 @@ cargo clippy --all-targets --features cronet -- -D warnings
 cargo test --features cronet
 cargo test --test corpus_evaluation
 cargo test --features cronet --test unblock_canary_tests -- --ignored --nocapture  # opt-in live 403 canary
-cargo test --test cef_protocol_tests -- --ignored  # opt-in live v5-meta CEF smoke test
+cargo test --test cef_protocol_tests -- --ignored  # opt-in live v6-meta CEF smoke test
 ```
 
 ### Corpus Evaluation and Hermetic Test Isolation
@@ -858,6 +860,7 @@ The milestone specifications in `docs/` record point-in-time design history (ear
 - [docs/05-multi-provider-search-and-auth.md](docs/05-multi-provider-search-and-auth.md) — Historical Milestone 5 design specification.
 - [docs/06-agent-identity-webmcp-and-cdp-renderer.md](docs/06-agent-identity-webmcp-and-cdp-renderer.md) — Historical Milestone 6 design specification.
 - [docs/07-ui-gated-disclosure-and-escalation.md](docs/07-ui-gated-disclosure-and-escalation.md) — Historical Milestone 7 design specification (UI-gated disclosure rescue, `ui_gates`, `pleb extract`, passive `--no-navigate`).
+- [docs/08-declarative-reveal-scroll-and-dataset-indexing.md](docs/08-declarative-reveal-scroll-and-dataset-indexing.md) — Milestone 8 design specification (declarative `--reveal`, bounded `--scroll`, passive XHR `Dataset` indexing, CEF `v6-meta`).
 
 ---
 

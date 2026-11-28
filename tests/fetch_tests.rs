@@ -1067,11 +1067,11 @@ async fn cef_challenge_interstitial_fails_fast_without_retry() {
 
     let script = format!(
         r#"#!/usr/bin/env python3
-# PLEB_RENDERER_PROTOCOL=v5-meta
+# PLEB_RENDERER_PROTOCOL=v6-meta
 import json, sys
 
 count_path = {count_path:?}
-sys.stdout.write(json.dumps({{"ready": True, "protocol": "v5-meta", "error": None}}) + "\n")
+sys.stdout.write(json.dumps({{"ready": True, "protocol": "v6-meta", "error": None}}) + "\n")
 sys.stdout.flush()
 
 for raw in sys.stdin:
@@ -1165,12 +1165,12 @@ async fn auto_mode_fails_fast_on_cronet_challenge_without_escalating_to_cef() {
 
     let script = format!(
         r#"#!/usr/bin/env python3
-# PLEB_RENDERER_PROTOCOL=v5-meta
+# PLEB_RENDERER_PROTOCOL=v6-meta
 import json, sys
 
 with open({count_path:?}, "a") as f:
     f.write("spawned\n")
-sys.stdout.write(json.dumps({{"ready": True, "protocol": "v5-meta", "error": None}}) + "\n")
+sys.stdout.write(json.dumps({{"ready": True, "protocol": "v6-meta", "error": None}}) + "\n")
 sys.stdout.flush()
 "#,
         count_path = count_file
@@ -1222,12 +1222,12 @@ async fn adversarial_cef_transient_empty_render_retries_once_and_succeeds() {
 
     let script = format!(
         r#"#!/usr/bin/env python3
-# PLEB_RENDERER_PROTOCOL=v5-meta
+# PLEB_RENDERER_PROTOCOL=v6-meta
 import json, sys
 
 count_path = {count_path:?}
 attempt = 0
-sys.stdout.write(json.dumps({{"ready": True, "protocol": "v5-meta", "error": None}}) + "\n")
+sys.stdout.write(json.dumps({{"ready": True, "protocol": "v6-meta", "error": None}}) + "\n")
 sys.stdout.flush()
 
 for raw in sys.stdin:

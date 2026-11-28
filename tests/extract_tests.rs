@@ -3694,3 +3694,83 @@ fn canary_fixes_preserve_inverse_false_positives_across_clean_and_full_modes() {
     assert_eq!(meta_h1_doc.content.matches("## Example").count(), 2);
     assert!(meta_h1_doc.content.contains("## Fenced\n## Fenced"));
 }
+
+#[test]
+fn merge_revealed_panels_sanitizes_dedups_merges_resources_and_reconciles_gates() {
+    use pleb::extract::{merge_revealed_panels, ui_gates::UiGateKind, ui_gates::UiGatePresence};
+    use pleb::transport::reveal::{RevealedPanelKind, RevealedPanelSnapshot};
+
+    let url = Url::parse("https://example.com/docs").unwrap();
+    let base_html = r#"<!doctype html><html><head><title>SDK</title></head><body><main>
+      <div role="tablist">
+        <button role="tab" aria-selected="true">Python</button>
+        <button role="tab" aria-selected="false">Go</button>
+      </div>
+      <div role="tabpanel"><p>pip install sdk</p></div>
+      <button aria-expanded="false">Troubleshooting</button>
+    </main></body></html>"#;
+
+    let panels = vec![
+        // Duplicate of already-extracted active tab panel -> omitted
+        RevealedPanelSnapshot {
+            kind: RevealedPanelKind::Tab,
+            label: "Python".into(),
+            section_heading: None,
+            heading_level: 3,
+            html: "<div role=\"tabpanel\"><p>pip install sdk</p></div>".into(),
+        },
+        // Newly mounted panel containing concealed text + legitimate resource link
+        RevealedPanelSnapshot {
+            kind: RevealedPanelKind::Tab,
+            label: "Go".into(),
+            section_heading: None,
+            heading_level: 3,
+            html: "<div><p>go get sdk</p><div style=\"display:none\">SECRET_HIDDEN</div><img src=\"/diagrams/flow.png\" width=\"600\" height=\"300\" alt=\"Flow\"><script>alert(1)</script></div>".into(),
+        },
+        // Expanded disclosure
+        RevealedPanelSnapshot {
+            kind: RevealedPanelKind::Disclosure,
+            label: "Troubleshooting".into(),
+            section_heading: None,
+            heading_level: 3,
+            html: "<div><p>Check timeout settings.</p></div>".into(),
+        },
+    ];
+
+    // 1. Markdown mode: sanitizes hidden DOM, deduplicates, appends Go & Troubleshooting, resolves ui_gates.
+    let mut md_doc = extract_document(
+        base_html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    merge_revealed_panels(&mut md_doc, &panels, true, &url, &ExtractOptions::default());
+    assert!(md_doc.content.contains("### Tab: Go"));
+    assert!(md_doc.content.contains("go get sdk"));
+    assert!(md_doc.content.contains("### Disclosure: Troubleshooting"));
+    assert!(md_doc.content.contains("Check timeout settings."));
+    assert!(!md_doc.content.contains("SECRET_HIDDEN"));
+    assert!(!md_doc.content.contains("alert(1)"));
+    assert_eq!(md_doc.content.matches("pip install sdk").count(), 1);
+    assert!(md_doc
+        .resources
+        .iter()
+        .any(|r| r.url == "https://example.com/diagrams/flow.png"));
+    // Both Python/Go tablist and Troubleshooting disclosure are now resolved -> removed (or none unmounted)!
+    assert!(!md_doc
+        .ui_gates
+        .iter()
+        .any(|g| g.kind == UiGateKind::Tablist && g.presence == UiGatePresence::Unmounted));
+
+    // 2. HTML mode: revealed sections must also run through pruned sanitization (no <script> or display:none leak).
+    let html_opts = ExtractOptions {
+        format: OutputFormat::Html,
+        ..Default::default()
+    };
+    let mut html_doc = extract_document(base_html, &url, Some("text/html"), &html_opts).unwrap();
+    merge_revealed_panels(&mut html_doc, &panels, false, &url, &html_opts);
+    assert!(html_doc.content.contains("go get sdk"));
+    assert!(!html_doc.content.contains("SECRET_HIDDEN"));
+    assert!(!html_doc.content.contains("alert(1)"));
+}

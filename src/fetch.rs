@@ -508,8 +508,8 @@ async fn extract_and_finalize_page(
         || options.extract.focus.is_some()
         || options.extract.section.is_some()
         || options.extract.offset > 0;
-    let has_revealed_panels = !page.capture_meta.revealed_panels.is_empty()
-        || page.capture_meta.reveal_capped;
+    let has_revealed_panels =
+        !page.capture_meta.revealed_panels.is_empty() || page.capture_meta.reveal_capped;
     let effective_expand = options.reveal.implies_expand(options.extract.expand);
     let initial_extract_opts = if is_axtree {
         ExtractOptions {

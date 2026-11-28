@@ -294,7 +294,7 @@ async fn mcp_initialize_list_fetch_block_diagnostics_and_status() {
     )
     .unwrap();
     assert_eq!(st["cronet_enabled"], cfg!(feature = "cronet"));
-    assert_eq!(st["cef_renderer"]["expected_protocol"], "v5-meta");
+    assert_eq!(st["cef_renderer"]["expected_protocol"], "v6-meta");
 
     // 6b. MCP resource cue uses MCP arg names, manifest appends table, and stage_resources stages locally.
     let diag_default = send_rpc(
@@ -1496,4 +1496,95 @@ async fn mcp_fetch_supports_expand_no_navigate_optional_url_and_ui_gated_headers
     drop(writer);
     server_task.await.unwrap();
     let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+#[tokio::test]
+async fn mcp_pleb_fetch_exposes_reveal_and_scroll_and_enforces_validation() {
+    let dir = hermetic_dir("mcp_m8_val");
+    let ctx = Arc::new(
+        RuntimeContext::new(RuntimeConfig {
+            state_dir: dir.clone(),
+            cdp_url: Some("ws://127.0.0.1:9222/devtools/page/abc".to_string()),
+            use_daemon: false,
+            no_web_bot_auth: true,
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    let (mut writer, server_in) = tokio::io::duplex(64 * 1024);
+    let (server_out, client_in) = tokio::io::duplex(64 * 1024);
+    let server_task = tokio::spawn(async move {
+        let _ = serve_io(ctx, BufReader::new(server_in), server_out).await;
+    });
+    let mut reader = BufReader::new(client_in);
+
+    let list_resp = send_rpc(
+        &mut writer,
+        &mut reader,
+        &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} }),
+    )
+    .await;
+    let tools = list_resp["result"]["tools"].as_array().unwrap();
+    let fetch_tool = tools.iter().find(|t| t["name"] == "pleb_fetch").unwrap();
+    let props = &fetch_tool["inputSchema"]["properties"];
+    assert_eq!(
+        props["reveal"]["enum"],
+        json!(["none", "tabs", "disclosures", "all"])
+    );
+    assert_eq!(props["scroll"]["minimum"], json!(0));
+    assert_eq!(props["scroll"]["maximum"], json!(20));
+
+    for (id, bad_args, snippet) in [
+        (
+            2,
+            json!({ "url": "https://example.com", "scroll": 21 }),
+            "between 0 and 20",
+        ),
+        (
+            3,
+            json!({ "no_navigate": true, "render": "cdp", "reveal": "tabs" }),
+            "no_navigate",
+        ),
+        (
+            4,
+            json!({ "url": "https://example.com", "render": "cdp", "no_navigate": true, "scroll": 1 }),
+            "no_navigate",
+        ),
+        (
+            5,
+            json!({ "url": "https://example.com", "render": "cronet", "reveal": "all" }),
+            "browser renderer",
+        ),
+        (
+            6,
+            json!({ "url": "https://example.com", "render": "cronet", "scroll": 2 }),
+            "browser renderer",
+        ),
+    ] {
+        let resp = send_rpc(
+            &mut writer,
+            &mut reader,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": { "name": "pleb_fetch", "arguments": bad_args }
+            }),
+        )
+        .await;
+        assert_eq!(
+            resp["error"]["code"],
+            json!(-32602),
+            "expected -32602 for {bad_args}, got {resp}"
+        );
+        let msg = resp["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            msg.contains(snippet),
+            "expected '{snippet}' in MCP error '{msg}'"
+        );
+    }
+
+    drop(writer);
+    server_task.await.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -7,8 +7,8 @@ use crate::extract::url::{resolve_and_clean_url, ResolvedUrl};
 use crate::extract::{
     resource_identifier, ExpandPolicy, ResourceDescriptor, ResourceKind, ResourceSalience,
 };
-use crate::policy::source::canonical_url_host;
 use crate::policy::is_safe_subresource_url;
+use crate::policy::source::canonical_url_host;
 
 pub const MAX_REVEAL_ACTIONS: usize = 16;
 pub const MAX_REVEAL_PER_GROUP: usize = 8;
@@ -150,8 +150,11 @@ impl BrowserCaptureMetadata {
         let mut total_bytes = 0usize;
         for mut snap in self.revealed_panels.drain(..) {
             if snap.html.len() > MAX_REVEALED_PANEL_HTML_BYTES {
-                snap.html
-                    .truncate(snap.html.floor_char_boundary(MAX_REVEALED_PANEL_HTML_BYTES));
+                let mut end = MAX_REVEALED_PANEL_HTML_BYTES;
+                while end > 0 && !snap.html.is_char_boundary(end) {
+                    end -= 1;
+                }
+                snap.html.truncate(end);
                 self.reveal_capped = true;
             }
             let next_total = total_bytes.saturating_add(snap.html.len());
@@ -238,13 +241,10 @@ pub fn filter_and_index_xhr_datasets(
         if item.byte_count.is_some_and(|b| b <= 2) {
             continue;
         }
-        let mime_clean = item
-            .mime_type
-            .as_deref()
-            .and_then(|m| {
-                let b = m.split(';').next()?.trim().to_ascii_lowercase();
-                is_indexable_json_mime(&b).then_some(b)
-            });
+        let mime_clean = item.mime_type.as_deref().and_then(|m| {
+            let b = m.split(';').next()?.trim().to_ascii_lowercase();
+            is_indexable_json_mime(&b).then_some(b)
+        });
         let Some(mime_hint) = mime_clean else {
             continue;
         };
@@ -252,7 +252,8 @@ pub fn filter_and_index_xhr_datasets(
         let Ok(raw_parsed) = Url::parse(item.url.trim()) else {
             continue;
         };
-        if has_sensitive_query_param(&raw_parsed) || !is_safe_subresource_url(page_url, &raw_parsed) {
+        if has_sensitive_query_param(&raw_parsed) || !is_safe_subresource_url(page_url, &raw_parsed)
+        {
             continue;
         }
         let Some(cand_host) = canonical_url_host(&raw_parsed) else {

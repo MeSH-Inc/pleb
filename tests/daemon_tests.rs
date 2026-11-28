@@ -723,7 +723,7 @@ async fn transport_captures_multiple_link_headers_and_accept_markdown_direct_and
 
 #[tokio::test]
 async fn daemon_restarts_automatically_on_protocol_version_mismatch() {
-    assert_eq!(PROTOCOL_VERSION, 4);
+    assert_eq!(PROTOCOL_VERSION, 5);
     let (base, _, _) = spawn_daemon_test_server().await;
     let dir = TempStateDir::new();
     let sock = socket_path(dir.path());
@@ -783,8 +783,8 @@ async fn daemon_restarts_automatically_on_protocol_version_mismatch() {
     assert_eq!(resp.text(), "alpha");
     let status = daemon_ping(dir.path())
         .await
-        .expect("v4 daemon should be running");
-    assert_eq!(status.protocol_version, 4);
+        .expect("v5 daemon should be running");
+    assert_eq!(status.protocol_version, PROTOCOL_VERSION);
 
     let _ = mock_task.await;
     let _ = daemon_stop(dir.path()).await;
@@ -890,7 +890,7 @@ async fn transport_subresource_headers_and_referer_direct_and_daemon() {
         IMAGE_ACCEPT_HEADER,
     };
 
-    assert_eq!(PROTOCOL_VERSION, 4);
+    assert_eq!(PROTOCOL_VERSION, 5);
     let base = spawn_link_and_accept_server().await;
     let echo_url = format!("{base}/echo-accept");
 
@@ -1006,7 +1006,7 @@ async fn transport_subresource_headers_and_referer_direct_and_daemon() {
         .expect("direct transport should initialize");
     assert_client_subresource_headers(&direct, &base, &echo_url).await;
 
-    // Daemon-backed TransportClient over daemon.sock (PROTOCOL_VERSION == 4)
+    // Daemon-backed TransportClient over daemon.sock (PROTOCOL_VERSION == 5)
     let daemon_dir = TempStateDir::new();
     let daemon_dir_clone = daemon_dir.to_path_buf();
     let handle =
@@ -1210,11 +1210,11 @@ async fn daemon_cancels_inflight_cef_render_on_client_disconnect() {
 
     let script = format!(
         r#"#!/usr/bin/env python3
-# PLEB_RENDERER_PROTOCOL=v5-meta
+# PLEB_RENDERER_PROTOCOL=v6-meta
 import json, sys, time
 
 flag_path = {flag_path:?}
-sys.stdout.write(json.dumps({{"ready": True, "protocol": "v5-meta", "error": None}}) + "\n")
+sys.stdout.write(json.dumps({{"ready": True, "protocol": "v6-meta", "error": None}}) + "\n")
 sys.stdout.flush()
 
 for raw in sys.stdin:
@@ -1367,7 +1367,7 @@ async fn daemon_v4_round_trips_web_bot_auth_and_disable_redirects() {
     let handle =
         tokio::spawn(async move { run_daemon(dir_clone, Duration::from_secs(30), false).await });
     let status = wait_for_ping(dir.path()).await;
-    assert_eq!(status.protocol_version, 4);
+    assert_eq!(status.protocol_version, 5);
 
     let client = TransportClient::new_daemon(
         dir.to_path_buf(),
@@ -1404,6 +1404,107 @@ async fn daemon_v4_round_trips_web_bot_auth_and_disable_redirects() {
     assert_eq!(follow_hits.load(Ordering::SeqCst), 0);
 
     srv.abort();
+    assert!(daemon_stop(dir.path()).await.unwrap());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn daemon_cef_render_roundtrips_reveal_and_capture_metadata() {
+    use pleb::daemon::daemon_cef_render;
+    use pleb::transport::cef::CefRenderOptions;
+    use pleb::transport::reveal::RevealPolicy;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempStateDir::new();
+    let cef_dir = dir.path().join("cef");
+    std::fs::create_dir_all(&cef_dir).unwrap();
+    let renderer_bin = cef_dir.join("pleb-renderer");
+
+    let script = r#"#!/usr/bin/env python3
+# PLEB_RENDERER_PROTOCOL=v6-meta
+import json, sys
+
+sys.stdout.write(json.dumps({"ready": True, "protocol": "v6-meta", "error": None}) + "\n")
+sys.stdout.flush()
+
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        break
+    req = json.loads(line)
+    assert req["reveal"] == "tabs", req
+    assert req["scroll"] == 3, req
+    html = b"<html><body><main><p>Base body</p></main></body></html>"
+    meta = json.dumps({
+        "revealed_panels": [{
+            "kind": "tab",
+            "label": "Go",
+            "section_heading": "SDK",
+            "heading_level": 3,
+            "html": "<div><p>go get sdk</p></div>"
+        }],
+        "datasets": [{
+            "url": "https://example.com/api/items.json",
+            "mime_type": "application/json",
+            "byte_count": 512
+        }],
+        "reveal_capped": True,
+        "scroll_steps_performed": 3,
+        "reveal_warning": "partial reveal"
+    }).encode("utf-8")
+    hdr = {
+        "status_code": 200,
+        "final_url": req["url"],
+        "html_bytes": len(html),
+        "meta_bytes": len(meta),
+        "error": None
+    }
+    sys.stdout.write(json.dumps(hdr) + "\n")
+    sys.stdout.flush()
+    sys.stdout.buffer.write(html)
+    sys.stdout.buffer.write(meta)
+    sys.stdout.buffer.flush()
+"#;
+    std::fs::write(&renderer_bin, script).unwrap();
+    std::fs::set_permissions(&renderer_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let dir_clone = dir.to_path_buf();
+    let handle =
+        tokio::spawn(async move { run_daemon(dir_clone, Duration::from_secs(30), false).await });
+    let status = wait_for_ping(dir.path()).await;
+    assert_eq!(status.protocol_version, 5);
+
+    let res = daemon_cef_render(
+        dir.path(),
+        None,
+        Duration::from_secs(10),
+        Duration::from_secs(30),
+        false,
+        "https://example.com/docs",
+        &CefRenderOptions {
+            wait_for_selector: None,
+            reveal: RevealPolicy::Tabs,
+            scroll_steps: 3,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(res.status_code, 200);
+    assert!(res.html.contains("Base body"));
+    assert_eq!(res.capture_meta.revealed_panels.len(), 1);
+    assert_eq!(res.capture_meta.revealed_panels[0].label, "Go");
+    assert_eq!(res.capture_meta.datasets.len(), 1);
+    assert_eq!(
+        res.capture_meta.datasets[0].url,
+        "https://example.com/api/items.json"
+    );
+    assert!(res.capture_meta.reveal_capped);
+    assert_eq!(res.capture_meta.scroll_steps_performed, 3);
+    assert_eq!(
+        res.capture_meta.reveal_warning.as_deref(),
+        Some("partial reveal")
+    );
+
     assert!(daemon_stop(dir.path()).await.unwrap());
     let _ = handle.await;
 }

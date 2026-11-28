@@ -15,6 +15,7 @@ use pleb::search::{
 use pleb::setup;
 use pleb::transport::cdp;
 use pleb::transport::cef::{self, RendererProbe};
+use pleb::transport::reveal::{RevealPolicy, MAX_SCROLL_STEPS};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read, Write};
@@ -115,6 +116,12 @@ enum Command {
         /// In-landmark ARIA disclosure rescue policy
         #[arg(long, value_enum, default_value_t = ExpandPolicy::None, ignore_case = true)]
         expand: ExpandPolicy,
+        /// Pre-capture DOM reveal policy for unmounted tabs and disclosures
+        #[arg(long, value_enum, default_value_t = RevealPolicy::None, ignore_case = true)]
+        reveal: RevealPolicy,
+        /// Progressive viewport scroll steps before DOM capture (0-20)
+        #[arg(long, default_value_t = 0)]
+        scroll: usize,
         /// Transport mode
         #[arg(long, value_enum, default_value_t = RenderMode::Auto, ignore_case = true)]
         render: RenderMode,
@@ -911,6 +918,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             format,
             extract,
             expand,
+            reveal,
+            scroll,
             render,
             source,
             resources,
@@ -997,6 +1006,27 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 }
             }
 
+            if scroll > MAX_SCROLL_STEPS {
+                return Err(CliError::invalid_input(format!(
+                    "--scroll exceeds maximum {MAX_SCROLL_STEPS} steps"
+                )));
+            }
+            let has_browser_actions = reveal != RevealPolicy::None || scroll > 0;
+            if has_browser_actions && no_navigate {
+                return Err(CliError::invalid_input(
+                    "--no-navigate is passive and cannot be combined with --reveal or --scroll",
+                ));
+            }
+            if has_browser_actions && render == RenderMode::Cronet {
+                return Err(CliError::invalid_input(
+                    "--reveal and --scroll require a browser renderer (--render cef, cdp, or auto)",
+                ));
+            }
+            if has_browser_actions && (stage || format == OutputFormat::Raw) {
+                return Err(CliError::invalid_input(
+                    "--reveal and --scroll cannot be combined with --stage or --format raw",
+                ));
+            }
             if stage && batch_mode {
                 return Err(CliError::invalid_input(
                     "--stage cannot be combined with batch mode",
@@ -1135,6 +1165,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     offset,
                 },
                 render,
+                reveal,
+                scroll_steps: scroll,
                 source,
                 resources,
                 tools,

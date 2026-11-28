@@ -62,36 +62,6 @@ static char* pleb_strdup(const char* s) {
     return copy;
 }
 
-static int pleb_ascii_lower(unsigned char c) {
-    return (c >= 'A' && c <= 'Z') ? (int)(c + ('a' - 'A')) : (int)c;
-}
-
-static int pleb_streq_ascii_ci(const char* a, const char* b) {
-    if (!a || !b) return a == b;
-    while (*a && *b) {
-        if (pleb_ascii_lower((unsigned char)*a) != pleb_ascii_lower((unsigned char)*b)) return 0;
-        a++;
-        b++;
-    }
-    return *a == *b;
-}
-
-static int pleb_contains_ascii_ci(const char* haystack, const char* needle) {
-    if (!haystack || !needle) return 0;
-    if (!needle[0]) return 1;
-    size_t nlen = strlen(needle);
-    for (const char* p = haystack; *p; p++) {
-        size_t i = 0;
-        while (i < nlen && p[i] &&
-               pleb_ascii_lower((unsigned char)p[i]) == pleb_ascii_lower((unsigned char)needle[i])) {
-            i++;
-        }
-        if (i == nlen) return 1;
-        if (!p[i]) break;
-    }
-    return 0;
-}
-
 // Reads one line up to `max_bytes`. Returns 1 if a line was read (or exceeded
 // `max_bytes`, setting *out_too_long = 1 and consuming through '\n'), 0 on EOF.
 static int pleb_read_line(FILE* in, char** out_buf, size_t max_bytes, int* out_too_long) {
@@ -482,64 +452,6 @@ static void pleb_write_ready(FILE* out, int ok, const char* error) {
     }
     fputs("}\n", out);
     fflush(out);
-}
-
-typedef struct {
-    char* data;
-    size_t len;
-    size_t cap;
-} PlebStrBuf;
-
-static int pleb_buf_append(PlebStrBuf* b, const char* s, size_t n) {
-    if (n == 0) return 0;
-    if (b->len + n + 1 > b->cap) {
-        size_t next_cap = b->cap ? b->cap * 2 : 512;
-        while (next_cap < b->len + n + 1) next_cap *= 2;
-        char* grown = (char*)realloc(b->data, next_cap);
-        if (!grown) return -1;
-        b->data = grown;
-        b->cap = next_cap;
-    }
-    memcpy(b->data + b->len, s, n);
-    b->len += n;
-    b->data[b->len] = '\0';
-    return 0;
-}
-
-static int pleb_buf_append_cstr(PlebStrBuf* b, const char* s) {
-    return s ? pleb_buf_append(b, s, strlen(s)) : 0;
-}
-
-static int pleb_buf_append_json_str(PlebStrBuf* b, const char* s) {
-    if (!s) return pleb_buf_append_cstr(b, "null");
-    if (pleb_buf_append(b, "\"", 1) != 0) return -1;
-    for (const unsigned char* p = (const unsigned char*)s; *p; p++) {
-        unsigned char c = *p;
-        char esc[8];
-        const char* rep = NULL;
-        size_t rlen = 0;
-        switch (c) {
-            case '"': rep = "\\\""; rlen = 2; break;
-            case '\\': rep = "\\\\"; rlen = 2; break;
-            case '\b': rep = "\\b"; rlen = 2; break;
-            case '\f': rep = "\\f"; rlen = 2; break;
-            case '\n': rep = "\\n"; rlen = 2; break;
-            case '\r': rep = "\\r"; rlen = 2; break;
-            case '\t': rep = "\\t"; rlen = 2; break;
-            default:
-                if (c < 0x20) {
-                    snprintf(esc, sizeof(esc), "\\u%04x", c);
-                    rep = esc;
-                    rlen = 6;
-                } else {
-                    char ch = (char)c;
-                    if (pleb_buf_append(b, &ch, 1) != 0) return -1;
-                    continue;
-                }
-        }
-        if (pleb_buf_append(b, rep, rlen) != 0) return -1;
-    }
-    return pleb_buf_append(b, "\"", 1);
 }
 
 static void pleb_write_response(

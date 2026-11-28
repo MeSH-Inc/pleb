@@ -12,6 +12,7 @@ use crate::fetch::{self, FetchError, FetchOptions};
 use crate::policy::{RenderMode, ResourcePolicy, SourceMode};
 use crate::search::{self, Freshness, SearchMode, SearchOptions, SearchProvider};
 use crate::transport::cef;
+use crate::transport::reveal::{RevealPolicy, MAX_SCROLL_STEPS};
 
 const MAX_MCP_LINE_BYTES: usize = 4 * 1024 * 1024;
 const SUPPORTED_PROTOCOLS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -226,6 +227,17 @@ fn tool_definitions() -> Value {
                         "enum": ["none", "tabs", "all"],
                         "description": "In-landmark ARIA disclosure rescue policy: none (default), tabs (paired tabpanels), or all (tabpanels plus aria-expanded=false disclosures)"
                     },
+                    "reveal": {
+                        "type": "string",
+                        "enum": ["none", "tabs", "disclosures", "all"],
+                        "description": "Pre-capture DOM reveal policy for unmounted tabs and disclosures inside main content: none (default), tabs, disclosures, or all"
+                    },
+                    "scroll": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 20,
+                        "description": "Bounded progressive downward scroll steps before DOM capture (0-20, default 0)"
+                    },
                     "render": {
                         "type": "string",
                         "enum": ["auto", "cef", "cdp", "cronet"],
@@ -378,6 +390,8 @@ async fn call_fetch(
     let mode = parse_opt_enum::<ExtractMode>(args, "extract")?.unwrap_or(ExtractMode::Clean);
     let expand =
         parse_opt_enum::<crate::extract::ExpandPolicy>(args, "expand")?.unwrap_or_default();
+    let reveal = parse_opt_enum::<RevealPolicy>(args, "reveal")?.unwrap_or_default();
+    let scroll = opt_nonneg_usize(args, "scroll")?.unwrap_or(0);
     let render = parse_opt_enum::<RenderMode>(args, "render")?.unwrap_or(RenderMode::Auto);
     let source = parse_opt_enum::<SourceMode>(args, "source")?.unwrap_or(SourceMode::Auto);
     let resources = parse_opt_enum::<ResourcePolicy>(args, "resources")?.unwrap_or_default();
@@ -394,6 +408,22 @@ async fn call_fetch(
     let wait_for_selector = opt_nonempty_str(args, "wait_for_selector")?;
     let respect_robots = opt_bool(args, "respect_robots")?.unwrap_or(false);
 
+    if scroll > MAX_SCROLL_STEPS {
+        return Err(RpcError::invalid_params(format!(
+            "'scroll' must be between 0 and {MAX_SCROLL_STEPS}"
+        )));
+    }
+    let has_browser_actions = reveal != RevealPolicy::None || scroll > 0;
+    if has_browser_actions && no_navigate {
+        return Err(RpcError::invalid_params(
+            "'no_navigate' is passive and cannot be combined with 'reveal' or 'scroll'",
+        ));
+    }
+    if has_browser_actions && render == RenderMode::Cronet {
+        return Err(RpcError::invalid_params(
+            "'reveal' and 'scroll' require a browser renderer (render='cef', 'cdp', or 'auto')",
+        ));
+    }
     if expand != crate::extract::ExpandPolicy::None && format == OutputFormat::Axtree {
         return Err(RpcError::invalid_params(
             "'expand' cannot be combined with format 'axtree'",
@@ -465,6 +495,8 @@ async fn call_fetch(
             offset,
         },
         render,
+        reveal,
+        scroll_steps: scroll,
         source,
         resources,
         tools,

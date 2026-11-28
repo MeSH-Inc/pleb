@@ -956,10 +956,10 @@ if os.path.exists(sock_path):
     let cef_dir = TempStateDir::new();
     let renderer_bin = cef_dir.path().join("mock-pleb-renderer");
     let renderer_script = r#"#!/usr/bin/env python3
-# PLEB_RENDERER_PROTOCOL=v5-meta
+# PLEB_RENDERER_PROTOCOL=v6-meta
 import json, os, sys
 
-sys.stdout.write(json.dumps({"ready": True, "protocol": "v5-meta", "error": None}) + "\n")
+sys.stdout.write(json.dumps({"ready": True, "protocol": "v6-meta", "error": None}) + "\n")
 sys.stdout.flush()
 
 for raw in sys.stdin:

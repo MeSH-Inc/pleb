@@ -12,7 +12,7 @@ pleb status --json
 pleb skill print
 ```
 
-Healthy Cronet + CEF installations report `"cronet_enabled": true`, `"cef_renderer": { "status": "ready", "expected_protocol": "v5-meta" }`, `"cdp_renderer"`, `"agent_identity"`, and `"state_dir": "<home>/.pleb"`. Standard builds without `--features cronet` report `"cronet_enabled": false` and use `reqwest` (`rustls` with a session cookie jar enabled, surfacing a rebuild hint in `status` and block diagnostics when non-Chrome TLS fingerprints trigger `403`s). The transport daemon (`daemon.sock`) starts lazily on demand and reports `"protocol_version": 4` while running (`null` when stopped).
+Healthy Cronet + CEF installations report `"cronet_enabled": true`, `"cef_renderer": { "status": "ready", "expected_protocol": "v6-meta" }`, `"cdp_renderer"`, `"agent_identity"`, and `"state_dir": "<home>/.pleb"`. Standard builds without `--features cronet` report `"cronet_enabled": false` and use `reqwest` (`rustls` with a session cookie jar enabled, surfacing a rebuild hint in `status` and block diagnostics when non-Chrome TLS fingerprints trigger `403`s). The transport daemon (`daemon.sock`) starts lazily on demand and reports `"protocol_version": 5` while running (`null` when stopped).
 
 ## Behavioral Boundaries
 
@@ -34,7 +34,7 @@ Healthy Cronet + CEF installations report `"cronet_enabled": true`, `"cef_render
    cargo install --path . --features cronet --locked
    ```
    - **Linux note**: Cronet binaries link dynamically against `libcronet.so` with an `$ORIGIN` and repo `lib/linux_<arch>` rpath. If you move or install the binary elsewhere (such as `~/.cargo/bin/pleb`) and remove the checkout, copy `lib/linux_<arch>/libcronet.so` beside the binary or set `LD_LIBRARY_PATH`.
-3. **Optional local offscreen CEF renderer (`v5-meta`, requires a source checkout):**
+3. **Optional local offscreen CEF renderer (`v6-meta`, requires a source checkout):**
    ```bash
    bash scripts/install-cef-mac.sh --force     # macOS arm64 (~/.pleb/cef/pleb-renderer.app)
    bash scripts/install-cef-linux.sh --force   # Linux x86_64/aarch64 (Ozone headless when DISPLAY is unset)
@@ -68,7 +68,7 @@ Notes:
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **License & telemetry** | MIT; zero telemetry, local-only | AGPL-3.0 OSS / Cloud API | Apache-2.0 OSS / Cloud API | Apache-2.0 OSS / Cloud API | Permissive; local |
 | **Runtime footprint** | Single Rust binary (plus optional CEF) | `firecrawl-local` binary, Cloud API, or Docker Compose (Redis, PostgreSQL, browser) | Hosted `r.jina.ai`/`s.jina.ai` or self-hosted stateless/S3 container | Python runtime + Playwright Chromium | Ubiquitous lightweight CLI |
-| **Network & browser stack** | Cronet (`Chromium 154`) or `reqwest` + optional CEF `v5-meta` daemon | Hosted unblocking/actions or self-hosted Playwright/Fire-engine | Hosted headless browser (no-key 20 RPM / free & paid token tiers) | Async Playwright Chromium pool | Default HTTP client (`libcurl`), no JS |
+| **Network & browser stack** | Cronet (`Chromium 154`) or `reqwest` + optional CEF `v6-meta` daemon | Hosted unblocking/actions or self-hosted Playwright/Fire-engine | Hosted headless browser (no-key 20 RPM / free & paid token tiers) | Async Playwright Chromium pool | Default HTTP client (`libcurl`), no JS |
 | **Bot challenge handling** | Fail fast (exit `2`), no CAPTCHA bypass | Cloud tier offers managed unblocking | Respects tier limits; paid tiers increase RPM, not access bypass | Community stealth / proxy hooks | Raw `403` HTML response |
 | **Structured source bypass** | GitHub/GitLab/Gist raw, RFC 8288/`<link>` Markdown mirrors, RSS/Atom/JSON, VTT/SRT, YouTube captions | HTML/PDF scraping and structured `/extract` schemas | HTML, PDF, MS Office, and VLM image captioning | HTML fit-Markdown, BM25/LLM filters | Raw HTML only |
 | **Search + credentials** | Built-in `pleb search` (6 providers + RRF) and `pleb auth` | Separate `/search` endpoint in Cloud/v2 API | Separate `s.jina.ai` search (`10,000` fixed tokens/search on API) | Search integration in Crawl4AI Cloud | None |
@@ -102,6 +102,8 @@ Notes:
   - `--format <markdown|html|text|axtree|raw>` (aliases: `md`, `txt`, `ax`; `axtree` requires CDP)
   - `--extract <clean|article|full>` (default `clean`: prune chrome; `article`: main content; `full`: verbatim body/frontmatter/feeds/transcripts)
   - `--expand <none|tabs|all>` (default `none`: `tabs` recovers hidden in-landmark `[role="tabpanel"]` panels; `all` adds uniquely paired `[aria-expanded="false"][aria-controls]` disclosures up to `32` panels)
+  - `--reveal <none|tabs|disclosures|all>` *(default `none`: declarative pre-capture DOM reveal inside `<main>`/`[role="main"]` over CEF `v6-meta` or navigated CDP, skipping nav/forms/auth/destructive controls and aborting cleanly on navigation; implies corresponding static `--expand`; rejects `--no-navigate`, `--render cronet`, `--stage`, and `--format raw`)*
+  - `--scroll <0..=20>` *(default `0`: bounded progressive downward scroll steps over CEF `v6-meta` or navigated CDP with quiet-window waits and stagnation early exit; passive browser renders also index same-origin `GET` `2xx` JSON `XHR`/`Fetch` responses into `ResourceKind::Dataset` under `"Network XHR"`; rejects `--no-navigate`, `--render cronet`, `--stage`, and `--format raw`)*
   - `--render <auto|cef|cdp|cronet>` (aliases: `browser`/`render`/`js` -> `cef`; `kitesurf`/`remote` -> `cdp`; `network`/`fast`/`no-js`/`nojs` -> `cronet`; unrendered `JavaScriptShell` emits a `Warning:` on `stderr` and `FetchOutput.warning`)
   - `--no-navigate` *(requires `--render cdp` and a loopback `ws://.../devtools/page/<id>` URL; captures the active document without navigation, layout mutation, `Fetch.enable`, or `site-cache.json` writes; sets `strategy: "cdp_attach"` and `status_code: 0`)*
   - `--source <auto|negotiate|none>` (default `auto`: raw forge URLs + RFC 8288/HTML Markdown mirrors; `negotiate` sends `Accept: text/markdown` and probes `<path>.md`)
@@ -141,7 +143,7 @@ Notes:
 | `PLEB_NO_WEB_BOT_AUTH` | Disables Web Bot Auth request signing (`--no-web-bot-auth`). |
 | `PLEB_CDP_URL`, `PLEB_CDP_TIMEOUT`, `PLEB_PREFER_CDP` | Default WebSocket CDP endpoint, timeout seconds, and `--render auto` preference. |
 | `PLEB_NO_KEYCHAIN=1` *(or `true`)* | Disables macOS Keychain reads/writes (uses `<state_dir>/credentials.json` under `--storage auto`). |
-| `PLEB_CEF_RENDERER` | Explicit path to a `v5-meta` `pleb-renderer` binary. |
+| `PLEB_CEF_RENDERER` | Explicit path to a `v6-meta` `pleb-renderer` binary. |
 | `PLEB_NO_HOME_CEF=1` | Disables fallback discovery of `~/.pleb/cef`. |
 | `PLEB_DAEMON_EXECUTABLE` | Explicit `pleb` executable path spawned for `daemon.sock`. |
 | `PLEB_CLAUDE_SETTINGS` | Optional override for Claude Code `settings.json` path edited by `pleb setup --hooks`. |

@@ -2,7 +2,7 @@
 
 > Local, MIT-licensed, zero-telemetry web acquisition CLI and stdio MCP server (`pleb`) by Memory Sync Hub LLC, built to unblock `403`s and empty JS shells in Claude Code and Codex.
 
-`pleb` wires into Claude Code and Codex via `pleb setup` (`pleb mcp`, bundled skill, and `WebFetch` hooks via `--hooks redirect|fallback|none`), fetches over Chromium 154 Cronet (or cookie-jar `reqwest`) with `CEF v5-meta` / WebSocket CDP escalation (`--render cdp`, passive loopback `--no-navigate`), offline HTML extraction (`pleb extract`), in-landmark ARIA expansion (`--expand`), `UI-Gated:` affordance indexing, and optional RFC 9421 signing (`pleb auth init-web-bot-auth`), and fails fast (exit `2`) on active bot challenges without CAPTCHA bypass.
+`pleb` wires into Claude Code and Codex via `pleb setup` (`pleb mcp`, bundled skill, and `WebFetch` hooks via `--hooks redirect|fallback|none`), fetches over Chromium 154 Cronet (or cookie-jar `reqwest`) with `CEF v6-meta` / WebSocket CDP escalation (`--render cdp`, passive loopback `--no-navigate`), declarative pre-capture `--reveal` / `--scroll` + passive `"Network XHR"` JSON dataset indexing, offline HTML extraction (`pleb extract`), in-landmark ARIA expansion (`--expand`), `UI-Gated:` affordance indexing, and optional RFC 9421 signing (`pleb auth init-web-bot-auth`), and fails fast (exit `2`) on active bot challenges without CAPTCHA bypass.
 
 ## Primary Docs
 
@@ -16,7 +16,7 @@
 - [Cargo.toml](Cargo.toml): Crate manifest (`pleb`, default `reqwest` with cookies, optional `--features cronet`)
 - [AGENTS.md](AGENTS.md): Build rules, host binary sync, hermetic test isolation, and standing non-regression gates
 - [data/site-rules.json](data/site-rules.json): Bundled host rewrites and mandatory CEF overrides
-- [scripts/](scripts/): Cronet downloaders, CEF `v5-meta` installers, and skill install helper
+- [scripts/](scripts/): Cronet downloaders, CEF `v6-meta` installers, and skill install helper
 - [LICENSE](LICENSE): MIT license and `wickproject/wick` attribution
 
 ## Optional

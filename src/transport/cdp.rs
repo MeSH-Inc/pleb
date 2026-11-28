@@ -1575,7 +1575,9 @@ impl CdpSession {
                         .unwrap_or("GET")
                         .eq_ignore_ascii_case("GET")
                 {
-                    self.state.xhr_get_requests.insert(params.request_id.clone());
+                    self.state
+                        .xhr_get_requests
+                        .insert(params.request_id.clone());
                 }
                 let matches_main = self.state.main_frame_id.as_deref().is_some_and(|mf| {
                     params.frame_id.as_deref() == Some(mf)
@@ -1622,10 +1624,7 @@ impl CdpSession {
                                     (!params.response.mime_type.trim().is_empty())
                                         .then(|| params.response.mime_type.trim().to_string())
                                 });
-                        if mime_type
-                            .as_deref()
-                            .is_some_and(is_indexable_json_mime)
-                        {
+                        if mime_type.as_deref().is_some_and(is_indexable_json_mime) {
                             let byte_count =
                                 header_case_insensitive(&params.response.headers, "content-length")
                                     .and_then(|v| v.trim().parse::<usize>().ok())
@@ -2000,9 +1999,8 @@ impl CdpSession {
                                     }
                                 }
                                 Err(err) => {
-                                    capture_meta.reveal_warning = Some(format!(
-                                        "invalid reveal script payload: {err}"
-                                    ));
+                                    capture_meta.reveal_warning =
+                                        Some(format!("invalid reveal script payload: {err}"));
                                 }
                             }
                         }

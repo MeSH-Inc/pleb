@@ -1,6 +1,6 @@
 # pleb
 
-`pleb`, developed by Memory Sync Hub LLC, is a local, zero-telemetry web fetcher (CLI + stdio MCP server + Claude Code hooks) that unblocks `403 Forbidden` responses and empty JavaScript shells encountered by built-in cloud agent fetchers. Forked from [wickproject/wick](https://github.com/wickproject/wick), it fetches from your host IP over Chrome's network stack (Cronet TLS/HTTP2/QUIC), escalates blocks and unhydrated SPAs to offscreen Chromium (`CEF v5-meta`) or WebSocket CDP/Kitesurf, signs public requests via RFC 9421 Web Bot Auth, and extracts compact Markdown.
+`pleb`, developed by Memory Sync Hub LLC, is a local, zero-telemetry web fetcher (CLI + stdio MCP server + Claude Code hooks) that unblocks `403 Forbidden` responses and empty JavaScript shells encountered by built-in cloud agent fetchers. Forked from [wickproject/wick](https://github.com/wickproject/wick), it fetches from your host IP over Chrome's network stack (Cronet TLS/HTTP2/QUIC), escalates blocks and unhydrated SPAs to offscreen Chromium (`CEF v6-meta`) or WebSocket CDP/Kitesurf, signs public requests via RFC 9421 Web Bot Auth, and extracts compact Markdown.
 
 ## Install and Harness Setup
 
@@ -12,7 +12,7 @@ cargo install --path . --features cronet --locked
 # Or install from crates.io (pure-Rust reqwest/rustls with session cookies; no Chrome TLS)
 cargo install pleb
 
-# Optional: local offscreen CEF v5-meta renderer for automatic 403/SPA escalation
+# Optional: local offscreen CEF v6-meta renderer for automatic 403/SPA escalation
 bash scripts/install-cef-mac.sh --force   # or bash scripts/install-cef-linux.sh --force
 
 # Register `pleb mcp`, bundled SKILL.md, and Claude Code WebFetch hook (PreToolUse redirect by default)
@@ -56,7 +56,7 @@ Across all `43` extractable fixtures in [examples/corpus_benchmark.rs](examples/
 
 - **Agent reference**: [skills/pleb/SKILL.md](skills/pleb/SKILL.md) (embedded in `pleb skill print`), [llms.txt](llms.txt), and [llms-full.txt](llms-full.txt)
 - **Full human & integrator manual**: [README-FULL.md](README-FULL.md)
-  - [Transport and Rendering](README-FULL.md#transport-and-rendering) — Cronet, CEF `v5-meta`, remote CDP/Kitesurf, Web Bot Auth, and `daemon.sock`
+  - [Transport and Rendering](README-FULL.md#transport-and-rendering) — Cronet, CEF `v6-meta`, remote CDP/Kitesurf, Web Bot Auth, and `daemon.sock`
   - [Extraction and Source Negotiation](README-FULL.md#extraction-and-source-negotiation) — 5-stage cleanup, Markdown mirrors, RSS/Atom, transcripts, and YouTube
   - [Resource Indexing and Staging](README-FULL.md#resource-indexing-and-staging) — zero-fetch `resources` cues and selective artifact staging
   - [Search and Credentials](README-FULL.md#search-and-credentials) — multi-provider RRF search and `pleb auth` vault

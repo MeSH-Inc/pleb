@@ -1,3 +1,6 @@
+use crate::transport::reveal::{
+    BrowserCaptureMetadata, RevealPolicy, MAX_SCROLL_STEPS, MAX_TOTAL_REVEAL_META_BYTES,
+};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -6,9 +9,6 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use crate::transport::reveal::{
-    BrowserCaptureMetadata, RevealPolicy, MAX_SCROLL_STEPS, MAX_TOTAL_REVEAL_META_BYTES,
-};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
 pub const EXPECTED_PROTOCOL: &str = "v6-meta";

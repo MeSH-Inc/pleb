@@ -67,14 +67,14 @@ async fn v4_meta_mock_renderer_handles_metadata_selectors_and_errors() {
 
     let script = format!(
         r#"#!/usr/bin/env python3
-# PLEB_RENDERER_PROTOCOL=v5-meta
+# PLEB_RENDERER_PROTOCOL=v6-meta
 import json, sys
 
 args_log = {log_path:?}
 with open(args_log, "a") as f:
     f.write("ARGS=" + json.dumps(sys.argv[1:]) + "\n")
 
-sys.stdout.write(json.dumps({{"ready": True, "protocol": "v5-meta", "error": None}}) + "\n")
+sys.stdout.write(json.dumps({{"ready": True, "protocol": "v6-meta", "error": None}}) + "\n")
 sys.stdout.flush()
 
 for raw in sys.stdin:
@@ -275,7 +275,7 @@ async fn outdated_v3_renderer_fails_loudly_with_rebuild_hint() {
     assert!(err.is::<CefProtocolError>());
     let msg = err.to_string();
     assert!(msg.contains("v3-cf-aware"));
-    assert!(msg.contains("v5-meta"));
+    assert!(msg.contains("v6-meta"));
     assert!(msg.contains("install-cef-"));
 }
 
@@ -295,7 +295,7 @@ fn renderer_override_and_no_home_cef_isolation() {
     let custom_bin = custom_dir.path().join("custom-renderer");
     write_executable(
         &custom_bin,
-        "#!/bin/sh\n# PLEB_RENDERER_PROTOCOL=v5-meta\nexit 0\n",
+        "#!/bin/sh\n# PLEB_RENDERER_PROTOCOL=v6-meta\nexit 0\n",
     );
 
     let renderer = CefRenderer::new_direct(empty_state.to_path_buf(), None, false)
@@ -325,7 +325,7 @@ int main(void) {
     assert(strstr(req.wait_for_selector, "[data-x='a\\b']") != NULL);
     assert(strstr(req.wait_for_selector, "\xF0\x9F\xA6\x80") != NULL);
 
-    char* js = pleb_build_poller_js(req.wait_for_selector, "MARK", "SERR", 5000);
+    char* js = pleb_build_poller_js(req.wait_for_selector, "MARK", "SERR", "META", "PRE", "none", 0, 5000, 5000);
     assert(js != NULL);
     assert(strstr(js, "\\'a\\\\b\\'") != NULL);
     assert(strstr(js, "try{el=document.querySelector(sel);}") != NULL);
@@ -340,7 +340,7 @@ int main(void) {
 
     // Timeout clamping leaves headroom below caller deadline.
     int total = 0, post = 0, js_cap = 0;
-    pleb_clamp_timeouts(5000, 1, &total, &post, &js_cap);
+    pleb_clamp_timeouts(5000, 1, 0, &total, &post, &js_cap);
     assert(total == 3500);
     assert(post == 3500);
     assert(js_cap == 3500);
@@ -358,8 +358,8 @@ int main(void) {
     FILE* tmp = tmpfile();
     assert(tmp != NULL);
     pleb_write_ready(tmp, 1, NULL);
-    pleb_write_response(tmp, 200, "https://example.com/a\"b", "<b>hi</b>", 9, NULL, NULL);
-    pleb_write_response(tmp, 0, "https://example.com/err", NULL, 0, "load error -105", "load_error");
+    pleb_write_response(tmp, 200, "https://example.com/a\"b", "<b>hi</b>", 9, NULL, 0, NULL, NULL);
+    pleb_write_response(tmp, 0, "https://example.com/err", NULL, 0, NULL, 0, "load error -105", "load_error");
     rewind(tmp);
 
     char* rline = NULL;
@@ -419,7 +419,7 @@ fn adversarial_explicit_missing_renderer_override_does_not_fallback_to_state_dir
     let state_renderer = cef_dir.join("pleb-renderer");
     fs::write(
         &state_renderer,
-        b"#!/bin/sh\n# PLEB_RENDERER_PROTOCOL=v5-meta\n",
+        b"#!/bin/sh\n# PLEB_RENDERER_PROTOCOL=v6-meta\n",
     )
     .unwrap();
 
@@ -460,7 +460,7 @@ fn v5_poller_js_short_page_settles_fast_and_waits_for_empty_spa_root() {
 #include "protocol.h"
 
 int main(void) {
-    char* js = pleb_build_poller_js(NULL, "MARK:", "SERR:", 4000);
+    char* js = pleb_build_poller_js(NULL, "MARK:", "SERR:", "META:", "PRE:", "none", 0, 4000, 4000);
     if (!js) return 1;
     fputs(js, stdout);
     free(js);
@@ -733,7 +733,7 @@ fn chromium_cronet_cef_version_and_keyring_parity() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[ignore = "requires installed v5-meta CEF renderer; run explicitly via --ignored"]
+#[ignore = "requires installed v6-meta CEF renderer; run explicitly via --ignored"]
 async fn live_cef_renderer_cold_start_static_and_spa_hydration() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -746,7 +746,7 @@ async fn live_cef_renderer_cold_start_static_and_spa_hydration() {
             find_renderer_in(&home.join(".pleb"))
         })
         .expect(
-            "installed v5-meta CEF renderer not found; build with `bash scripts/install-cef-mac.sh --force` or set PLEB_CEF_RENDERER",
+            "installed v6-meta CEF renderer not found; build with `bash scripts/install-cef-mac.sh --force` or set PLEB_CEF_RENDERER",
         );
     assert_eq!(
         probe_renderer_binary(&renderer_path),
@@ -834,4 +834,281 @@ async fn live_cef_renderer_cold_start_static_and_spa_hydration() {
 
     drop(renderer);
     server.abort();
+}
+
+#[test]
+fn v6_meta_c_protocol_parses_reveal_scroll_and_writes_meta_bytes() {
+    let c_harness = r#"
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+#include "protocol.h"
+
+int main(void) {
+    assert(strcmp(PLEB_RENDERER_PROTOCOL_VERSION, "v6-meta") == 0);
+
+    PlebRenderRequest req = {0};
+    char err[256] = {0};
+    assert(pleb_parse_request_line(
+        "{\"url\":\"https://example.com\",\"reveal\":\"disclosures\",\"scroll\":12,\"timeout_ms\":5000}",
+        &req, err, sizeof(err)) == 0);
+    assert(strcmp(req.reveal, "disclosures") == 0);
+    assert(req.scroll == 12);
+    pleb_render_request_free(&req);
+
+    // Invalid reveal value rejected.
+    assert(pleb_parse_request_line(
+        "{\"url\":\"https://example.com\",\"reveal\":\"bogus\"}",
+        &req, err, sizeof(err)) != 0);
+    // Scroll out of 0..=20 range rejected.
+    assert(pleb_parse_request_line(
+        "{\"url\":\"https://example.com\",\"scroll\":21}",
+        &req, err, sizeof(err)) != 0);
+    assert(pleb_parse_request_line(
+        "{\"url\":\"https://example.com\",\"scroll\":-1}",
+        &req, err, sizeof(err)) != 0);
+
+    // Meta payload serialization writes both html_bytes and meta_bytes.
+    FILE* tmp = tmpfile();
+    assert(tmp != NULL);
+    const char* html = "<html>ok</html>";
+    const char* meta = "{\"scroll_steps_performed\":2}";
+    pleb_write_response(tmp, 200, "https://example.com", html, strlen(html), meta, strlen(meta), NULL, NULL);
+    rewind(tmp);
+    char hdr[512] = {0};
+    assert(fgets(hdr, sizeof(hdr), tmp) != NULL);
+    assert(strstr(hdr, "\"html_bytes\":15") != NULL);
+    assert(strstr(hdr, "\"meta_bytes\":28") != NULL);
+    char payload[128] = {0};
+    size_t n = fread(payload, 1, strlen(html) + strlen(meta), tmp);
+    assert(n == strlen(html) + strlen(meta));
+    assert(memcmp(payload, html, strlen(html)) == 0);
+    assert(memcmp(payload + strlen(html), meta, strlen(meta)) == 0);
+    fclose(tmp);
+    return 0;
+}
+"#;
+    let dir = TempStateDir::new();
+    let src = dir.path().join("test_v6_meta.c");
+    let bin = dir.path().join("test_v6_meta");
+    fs::write(&src, c_harness).unwrap();
+    let cef_inc = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cef");
+    let compile = std::process::Command::new("cc")
+        .arg("-std=c99")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-Wno-unused-function")
+        .arg("-Werror")
+        .arg(format!("-I{}", cef_inc.display()))
+        .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .output()
+        .expect("cc compiler must be available");
+    assert!(
+        compile.status.success(),
+        "C compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = std::process::Command::new(&bin).output().unwrap();
+    assert!(
+        run.status.success(),
+        "C harness failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
+fn reveal_script_js_and_header_stay_in_exact_parity() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let raw_js = fs::read_to_string(root.join("cef/reveal_script.js")).unwrap();
+    let header = fs::read_to_string(root.join("cef/reveal_script.h")).unwrap();
+    let mut reconstructed = String::new();
+    let mut in_array = false;
+    for line in header.lines() {
+        let trimmed = line.trim();
+        if trimmed == "static const char PLEB_REVEAL_SCRIPT_JS[] =" {
+            in_array = true;
+            continue;
+        }
+        if in_array {
+            if trimmed == ";" {
+                break;
+            }
+            let decoded: String = serde_json::from_str(trimmed).expect("valid JSON string literal");
+            reconstructed.push_str(&decoded);
+        }
+    }
+    assert_eq!(
+        reconstructed, raw_js,
+        "cef/reveal_script.h must match cef/reveal_script.js byte-for-byte"
+    );
+}
+
+#[test]
+fn node_vm_harness_verifies_reveal_scroll_security_and_nav_guards() {
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script_js = fs::read_to_string(root.join("cef/reveal_script.js")).unwrap();
+    let dir = TempStateDir::new();
+    let test_js = r#"
+const vm = require('vm');
+const revealSrc = __SCRIPT_JSON__;
+
+function runReveal(setupFn, cfg) {
+    const sandbox = vm.createContext({
+        Date, Math, Number, String, Array, JSON, Promise, Set,
+        setTimeout, clearTimeout,
+        requestAnimationFrame: (cb) => setTimeout(cb, 5),
+        MutationObserver: class { observe() {} disconnect() {} },
+        window: { __plebInflight: 0, scrollY: 0, innerHeight: 800, scrollTo: (_x, y) => { sandbox.window.scrollY = y; } },
+        location: { origin: 'https://app.example.com', pathname: '/docs' },
+        document: {
+            body: { innerText: '' },
+            documentElement: { scrollHeight: 800, clientHeight: 800, scrollTop: 0 },
+            scrollingElement: { scrollHeight: 800, clientHeight: 800, scrollTop: 0 },
+            querySelector: () => null,
+            querySelectorAll: () => [],
+            getElementById: () => null,
+        },
+        getComputedStyle: () => ({ display: 'block', visibility: 'visible', opacity: '1', overflowY: 'visible', height: '40px' }),
+    });
+    setupFn(sandbox);
+    vm.runInContext(revealSrc, sandbox);
+    return sandbox.__plebRevealAndScroll(cfg);
+}
+
+(async () => {
+    // 1. Challenge gate aborts with zero clicks/scrolls.
+    let challengeClicks = 0;
+    const chRes = await runReveal((sb) => {
+        sb.document.body.innerText = 'Checking your browser before accessing...';
+        sb.document.querySelectorAll = (sel) => sel.includes('tab') ? [{ click: () => { challengeClicks++; } }] : [];
+    }, { mode: 'all', scrollSteps: 3, budgetMs: 2000 });
+    if (!chRes.challenge_detected || challengeClicks !== 0 || chRes.scroll_steps_performed !== 0) {
+        throw new Error('challenge case failed: ' + JSON.stringify(chRes));
+    }
+
+    // 2. Destructive label & omitted-type <button> inside <form> are skipped, while safe tab & disclosure open.
+    const clicked = [];
+    const mkBtn = (label, attrs, closestFn, clickFn) => {
+        const obj = {
+            nodeType: 1,
+            tagName: 'BUTTON',
+            attrs: Object.assign({}, attrs),
+            childNodes: [{ nodeType: 3, nodeValue: label }],
+            getAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attrs, k) ? this.attrs[k] : null; },
+            hasAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attrs, k) && this.attrs[k] !== undefined; },
+            closest(sel) { return closestFn(sel, obj); },
+            getBoundingClientRect() { return { width: 80, height: 24 }; },
+            click() { clickFn(obj); },
+        };
+        return obj;
+    };
+    const pPy = {
+        nodeType: 1, tagName: 'DIV', id: 'p-py',
+        outerHTML: '<div><p>pip install sdk</p></div>', textContent: 'pip install sdk',
+        attrs: {},
+        getAttribute(k) { return this.attrs[k] ?? null; },
+        hasAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attrs, k) && this.attrs[k] !== undefined; },
+        getBoundingClientRect() { return { width: 400, height: 100 }; },
+    };
+    const pGo = {
+        nodeType: 1, tagName: 'DIV', id: 'p-go',
+        outerHTML: '<div><p>go get sdk</p></div>', textContent: 'go get sdk',
+        attrs: {},
+        getAttribute(k) { return this.attrs[k] ?? null; },
+        hasAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attrs, k) && this.attrs[k] !== undefined; },
+        getBoundingClientRect() { return { width: 400, height: 100 }; },
+    };
+    let activePanel = 'py';
+    let activeTab, safeTab;
+    activeTab = mkBtn('Python', { role: 'tab', 'aria-selected': 'true', 'aria-controls': 'p-py' },
+        (sel, self) => (sel === 'main' ? self : null),
+        () => { clicked.push('restore-Python'); activePanel = 'py'; activeTab.attrs['aria-selected'] = 'true'; safeTab.attrs['aria-selected'] = 'false'; });
+    safeTab = mkBtn('Go', { role: 'tab', 'aria-selected': 'false', 'aria-controls': 'p-go' },
+        (sel, self) => (sel === 'main' ? self : null),
+        () => { clicked.push('Go'); activePanel = 'go'; activeTab.attrs['aria-selected'] = 'false'; safeTab.attrs['aria-selected'] = 'true'; });
+    const formSubmitBtn = mkBtn('More', { 'aria-expanded': 'false' },
+        (sel, self) => ((sel === 'form' || sel === 'main') ? self : null),
+        () => { clicked.push('FORM_SUBMIT_SHOULD_NOT_RUN'); });
+    const deleteBtn = mkBtn('Delete Account', { 'aria-expanded': 'false', type: 'button' },
+        (sel, self) => (sel === 'main' ? self : null),
+        () => { clicked.push('DELETE_SHOULD_NOT_RUN'); });
+    const tablistEl = {
+        nodeType: 1,
+        querySelectorAll: () => [activeTab, safeTab],
+        closest: () => null,
+        getAttribute: () => null,
+        hasAttribute: () => false,
+        getBoundingClientRect: () => ({ width: 300, height: 40 }),
+    };
+    const res = await runReveal((sb) => {
+        sb.document.querySelectorAll = (sel) => {
+            if (sel.includes('main')) return [{ nodeType: 1, contains: () => true, getBoundingClientRect: () => ({ width: 800, height: 900 }) }];
+            if (sel === '[role="tablist"]') return [tablistEl];
+            if (sel === '[aria-expanded="false"]') return [formSubmitBtn, deleteBtn];
+            if (sel === '[id="p-py"]') return activePanel === 'py' ? [pPy] : [];
+            if (sel === '[id="p-go"]') return activePanel === 'go' ? [pGo] : [];
+            return [];
+        };
+        sb.document.getElementById = (id) => {
+            if (id === 'p-py' && activePanel === 'py') return pPy;
+            if (id === 'p-go' && activePanel === 'go') return pGo;
+            return null;
+        };
+    }, { mode: 'all', scrollSteps: 0, budgetMs: 3000 });
+    if (clicked.includes('FORM_SUBMIT_SHOULD_NOT_RUN') || clicked.includes('DELETE_SHOULD_NOT_RUN')) {
+        throw new Error('unsafe control clicked: ' + JSON.stringify(clicked));
+    }
+    if (res.revealed_panels.length < 2 || !res.revealed_panels.some(p => p.label === 'Go')) {
+        throw new Error('tab panels not captured: ' + JSON.stringify(res));
+    }
+
+    // 3. Path mutation aborts cleanly with warning.
+    const navTab = mkBtn('Pricing', { role: 'tab', 'aria-selected': 'false' },
+        (sel, self) => (sel === 'main' ? self : null),
+        () => {});
+    const navTablist = {
+        nodeType: 1,
+        querySelectorAll: () => [navTab],
+        closest: () => null,
+        getAttribute: () => null,
+        hasAttribute: () => false,
+        getBoundingClientRect: () => ({ width: 200, height: 40 }),
+    };
+    const navRes = await runReveal((sb) => {
+        navTab.click = () => { sb.location.pathname = '/pricing'; };
+        sb.document.querySelectorAll = (sel) => {
+            if (sel.includes('main')) return [{ nodeType: 1, contains: () => true }];
+            if (sel === '[role="tablist"]') return [navTablist];
+            return [];
+        };
+    }, { mode: 'tabs', scrollSteps: 0, budgetMs: 2000 });
+    if (!navRes.navigated || !navRes.warning) {
+        throw new Error('navigation abort failed: ' + JSON.stringify(navRes));
+    }
+})().catch((e) => {
+    console.error(e);
+    process.exit(1);
+});
+"#.replace("__SCRIPT_JSON__", &serde_json::to_string(&script_js).unwrap());
+    let harness_path = dir.path().join("verify_reveal.js");
+    fs::write(&harness_path, test_js).unwrap();
+    let out = std::process::Command::new("node")
+        .arg(&harness_path)
+        .output()
+        .expect("failed to execute node");
+    assert!(
+        out.status.success(),
+        "Node reveal_script.js test failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
