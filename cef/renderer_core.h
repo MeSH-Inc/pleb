@@ -369,6 +369,36 @@ static cef_return_value_t CEF_CALLBACK on_before_resource_load(
     return RV_CONTINUE;
 }
 
+static int pleb_ascii_lower(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') ? (int)(c + ('a' - 'A')) : (int)c;
+}
+
+static int pleb_streq_ascii_ci(const char* a, const char* b) {
+    if (!a || !b) return a == b;
+    while (*a && *b) {
+        if (pleb_ascii_lower((unsigned char)*a) != pleb_ascii_lower((unsigned char)*b)) return 0;
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
+static int pleb_contains_ascii_ci(const char* haystack, const char* needle) {
+    if (!haystack || !needle) return 0;
+    if (!needle[0]) return 1;
+    size_t nlen = strlen(needle);
+    for (const char* p = haystack; *p; p++) {
+        size_t i = 0;
+        while (i < nlen && p[i] &&
+               pleb_ascii_lower((unsigned char)p[i]) == pleb_ascii_lower((unsigned char)needle[i])) {
+            i++;
+        }
+        if (i == nlen) return 1;
+        if (!p[i]) break;
+    }
+    return 0;
+}
+
 static void CEF_CALLBACK on_resource_load_complete(
     cef_resource_request_handler_t* self,
     cef_browser_t* browser,
@@ -617,36 +647,6 @@ static char* copy_main_frame_url(void) {
     }
     frame->base.release(&frame->base);
     return result;
-}
-
-static int pleb_ascii_lower(unsigned char c) {
-    return (c >= 'A' && c <= 'Z') ? (int)(c + ('a' - 'A')) : (int)c;
-}
-
-static int pleb_streq_ascii_ci(const char* a, const char* b) {
-    if (!a || !b) return a == b;
-    while (*a && *b) {
-        if (pleb_ascii_lower((unsigned char)*a) != pleb_ascii_lower((unsigned char)*b)) return 0;
-        a++;
-        b++;
-    }
-    return *a == *b;
-}
-
-static int pleb_contains_ascii_ci(const char* haystack, const char* needle) {
-    if (!haystack || !needle) return 0;
-    if (!needle[0]) return 1;
-    size_t nlen = strlen(needle);
-    for (const char* p = haystack; *p; p++) {
-        size_t i = 0;
-        while (i < nlen && p[i] &&
-               pleb_ascii_lower((unsigned char)p[i]) == pleb_ascii_lower((unsigned char)needle[i])) {
-            i++;
-        }
-        if (i == nlen) return 1;
-        if (!p[i]) break;
-    }
-    return 0;
 }
 
 typedef struct {
