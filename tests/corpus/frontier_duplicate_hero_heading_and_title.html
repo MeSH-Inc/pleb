@@ -1,0 +1,14 @@
+<!-- pleb-fixture: {"tier":"ratchet","url":"https://docs.example.io/concepts/pods/","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"Pods | Kubernetes","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["# Pods","Pods are the smallest deployable units of computing.","## Lifecycle","Each pod runs one or more containers."],"forbidden_substrings":["# Pods | Kubernetes","# Pods # Pods"],"minimum_output_bytes":90,"maximum_output_bytes":350,"expected_structure":{"minimum_headings":2}}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><title>Pods | Kubernetes</title></head>
+<body>
+  <header><section class="hero"><h1>Pods</h1></section></header>
+  <main>
+    <h1>Pods</h1>
+    <p>Pods are the smallest deployable units of computing.</p>
+    <h2>Lifecycle</h2>
+    <p>Each pod runs one or more containers.</p>
+  </main>
+</body>
+</html>

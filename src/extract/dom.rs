@@ -113,7 +113,9 @@ static A_HREF_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("a[href
 static BUTTON_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("button").unwrap());
 static STYLE_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("[style]").unwrap());
 static IMG_DIM_SEL: LazyLock<Selector> =
-    LazyLock::new(|| Selector::parse("img[width], img[height], img[role]").unwrap());
+    LazyLock::new(|| Selector::parse("img[width], img[height], img[role], button img").unwrap());
+static ARIA_COLLAPSED_CTRL_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("[aria-expanded=\"false\"][aria-controls]").unwrap());
 static CHECKBOX_POPUP_SEL: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("input[type=\"checkbox\"][aria-haspopup=\"true\"]").unwrap());
 pub(crate) static WEBMCP_FORM_SEL: LazyLock<Selector> =
@@ -540,12 +542,34 @@ fn prune_dom(doc: &mut Html, mode: ExtractMode) -> HashMap<NodeId, NodeMetrics> 
             }
         }
 
+        let doc_has_landmark =
+            doc.select(&MAIN_SEL).next().is_some() || doc.select(&ARTICLE_SEL).next().is_some();
+        let collapsed_ids: HashSet<&str> = doc
+            .select(&ARIA_COLLAPSED_CTRL_SEL)
+            .filter(|ctrl| {
+                doc_has_landmark
+                    || ctrl.ancestors().any(|a| {
+                        matches!(
+                            a.value(),
+                            Node::Element(e) if matches!(e.name(), "header" | "nav" | "aside" | "footer")
+                        )
+                    })
+            })
+            .filter_map(|ctrl| ctrl.value().attr("aria-controls"))
+            .flat_map(str::split_whitespace)
+            .collect();
+
         for el in doc.select(&ATTR_SEL) {
             let val = el.value();
             if matches!(val.name(), "html" | "body") || is_landmark_element(val) {
                 continue;
             }
-            if is_boilerplate_attr(val.attr("id"), val.attr("class"))
+            let is_collapsed_panel = !collapsed_ids.is_empty()
+                && val.attr("id").is_some_and(|id| collapsed_ids.contains(id))
+                && !el
+                    .ancestors()
+                    .any(|a| matches!(a.value(), Node::Element(e) if is_landmark_element(e)));
+            if (is_boilerplate_attr(val.attr("id"), val.attr("class")) || is_collapsed_panel)
                 && find_tex_annotation(*el).is_none()
                 && !contains_heading_or_landmark(*el)
             {
@@ -563,16 +587,25 @@ fn prune_dom(doc: &mut Html, mode: ExtractMode) -> HashMap<NodeId, NodeMetrics> 
         }
         for el in doc.select(&IMG_DIM_SEL) {
             let val = el.value();
-            let tiny = ["width", "height"].iter().any(|a| {
-                val.attr(a)
-                    .and_then(parse_html_dimension)
-                    .is_some_and(|n| n <= 1)
-            });
+            let has_max_dim = |limit: u32| {
+                ["width", "height"].iter().any(|a| {
+                    val.attr(a)
+                        .and_then(parse_html_dimension)
+                        .is_some_and(|n| n <= limit)
+                })
+            };
+            let tiny = has_max_dim(1);
+            let empty_alt = val.attr("alt").is_some_and(|a| a.trim().is_empty());
             let decorative_empty = val
                 .attr("role")
                 .is_some_and(|r| eq_any_ci(r.trim(), &["presentation", "none"]))
                 && val.attr("alt").is_none_or(|a| a.trim().is_empty());
-            if tiny || decorative_empty {
+            let small_icon = empty_alt
+                && (has_max_dim(32)
+                    || el
+                        .ancestors()
+                        .any(|a| matches!(a.value(), Node::Element(e) if e.name() == "button")));
+            if tiny || decorative_empty || small_icon {
                 to_detach.push(el.id());
             }
         }
@@ -1200,6 +1233,10 @@ fn serialize_pruned_html(node: NodeRef<'_, Node>, in_interactive: bool, out: &mu
                     }
                     return;
                 }
+                if is_nested_layout_table(node) {
+                    emit_unwrapped_layout_table(node, in_interactive, out);
+                    return;
+                }
             }
 
             out.push('<');
@@ -1825,6 +1862,69 @@ fn try_extract_equation_layout_table(
     }
 
     (!equations.is_empty()).then_some(equations)
+}
+
+fn is_nested_layout_table(table: NodeRef<'_, Node>) -> bool {
+    let mut has_nested_table = false;
+    for section in table.children() {
+        let Some(tag) = section.value().as_element().map(|e| e.name()) else {
+            continue;
+        };
+        if matches!(tag, "thead" | "caption" | "tfoot") {
+            return false;
+        }
+        let rows: Box<dyn Iterator<Item = NodeRef<'_, Node>>> = match tag {
+            "tbody" => Box::new(section.children()),
+            "tr" => Box::new(std::iter::once(section)),
+            _ => continue,
+        };
+        for row in rows {
+            if !matches!(row.value(), Node::Element(e) if e.name() == "tr") {
+                continue;
+            }
+            for cell in row.children() {
+                let Some(ctag) = cell.value().as_element().map(|e| e.name()) else {
+                    continue;
+                };
+                if ctag == "th" {
+                    return false;
+                }
+                if ctag == "td"
+                    && cell
+                        .descendants()
+                        .skip(1)
+                        .any(|d| matches!(d.value(), Node::Element(e) if e.name() == "table"))
+                {
+                    has_nested_table = true;
+                }
+            }
+        }
+    }
+    has_nested_table
+}
+
+fn emit_unwrapped_layout_table(node: NodeRef<'_, Node>, in_interactive: bool, out: &mut String) {
+    for child in node.children() {
+        let Some(tag) = child.value().as_element().map(|e| e.name()) else {
+            continue;
+        };
+        match tag {
+            "tbody" | "tr" => emit_unwrapped_layout_table(child, in_interactive, out),
+            "td" => {
+                let mut inner = String::new();
+                for cell_child in child.children() {
+                    serialize_pruned_html(cell_child, in_interactive, &mut inner);
+                }
+                if !inner.trim().is_empty() {
+                    out.push_str("<div>");
+                    out.push_str(&inner);
+                    out.push_str("</div>");
+                }
+            }
+            "colgroup" | "col" => {}
+            _ => serialize_pruned_html(child, in_interactive, out),
+        }
+    }
 }
 
 fn collect_td_math_cell(node: NodeRef<'_, Node>, out: &mut Vec<String>) -> bool {

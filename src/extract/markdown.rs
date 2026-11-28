@@ -418,12 +418,14 @@ pub fn compact_markdown(md: &str) -> String {
     let mut fence = FenceTracker::default();
     let mut blank_run = 0usize;
     let mut last_was_hr = false;
+    let mut last_heading: Option<String> = None;
 
     for raw_line in md.lines() {
         let step = fence.step(raw_line);
         if !matches!(step, FenceLine::Outside) {
             last_was_hr = false;
             blank_run = 0;
+            last_heading = None;
             let kept = if matches!(step, FenceLine::Opening) {
                 raw_line.trim_end()
             } else {
@@ -451,11 +453,25 @@ pub fn compact_markdown(md: &str) -> String {
             }
             last_was_hr = true;
             blank_run = 0;
+            last_heading = None;
             out_lines.push(trimmed_end.to_string());
             continue;
         }
         last_was_hr = false;
         blank_run = 0;
+
+        if split_atx_heading(trimmed_end).is_some() {
+            let trimmed_h = trimmed_end.trim();
+            if last_heading
+                .as_deref()
+                .is_some_and(|prev| prev.eq_ignore_ascii_case(trimmed_h))
+            {
+                continue;
+            }
+            last_heading = Some(trimmed_h.to_string());
+        } else {
+            last_heading = None;
+        }
 
         let deduped = dedup_adjacent_empty_alt_images(trimmed_end);
         out_lines.push(compact_table_row(&deduped).unwrap_or_else(|| deduped.into_owned()));

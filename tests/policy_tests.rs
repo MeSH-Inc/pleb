@@ -755,3 +755,75 @@ fn classify_response_with_headers_distinguishes_waf_challenges_cookie_walls_and_
         }
     );
 }
+
+#[test]
+fn classify_response_with_headers_maps_403_login_redirect_to_login_wall_with_inverse_guards() {
+    let mut cf_headers = DiagnosticHeaders::default();
+    cf_headers.capture_header("Server", "cloudflare");
+    let mut parsed = None;
+
+    // HTTP 403 redirected from non-auth URL to /login classifies as LoginWall even behind edge WAF headers.
+    assert_eq!(
+        classify_response_with_headers(
+            403,
+            true,
+            Some("https://old.example.com/r/rust/"),
+            Some("https://old.example.com/login/?reason=lor2"),
+            "<html><body><p>Please sign in.</p></body></html>",
+            &cf_headers,
+            &mut parsed
+        ),
+        ResponseClassification::Blocked {
+            status: 403,
+            reason: BlockReason::LoginWall,
+        }
+    );
+
+    // Direct 403 on /login (no redirect) stays EdgeWafBlock / OriginForbidden.
+    assert_eq!(
+        classify_response_with_headers(
+            403,
+            true,
+            Some("https://old.example.com/login"),
+            Some("https://old.example.com/login"),
+            "Forbidden",
+            &cf_headers,
+            &mut parsed
+        ),
+        ResponseClassification::Blocked {
+            status: 403,
+            reason: BlockReason::EdgeWafBlock,
+        }
+    );
+
+    // Challenge signals on 403 /login still classify as Challenge.
+    assert!(matches!(
+        classify_response_with_headers(
+            403,
+            true,
+            Some("https://old.example.com/r/rust/"),
+            Some("https://old.example.com/login"),
+            "Just a moment... challenges.cloudflare.com",
+            &cf_headers,
+            &mut parsed
+        ),
+        ResponseClassification::Challenge { status: 403, .. }
+    ));
+
+    // HTTP 503 redirected to /login remains OriginForbidden / EdgeWafBlock.
+    assert_eq!(
+        classify_response_with_headers(
+            503,
+            true,
+            Some("https://old.example.com/r/rust/"),
+            Some("https://old.example.com/login"),
+            "Service Unavailable",
+            &DiagnosticHeaders::default(),
+            &mut parsed
+        ),
+        ResponseClassification::Blocked {
+            status: 503,
+            reason: BlockReason::OriginForbidden,
+        }
+    );
+}

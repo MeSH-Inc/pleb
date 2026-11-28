@@ -620,21 +620,41 @@ pub(crate) fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
     end
 }
 
-pub(crate) fn starts_with_title_heading(md: &str, title: &str) -> bool {
-    let first_line = md.lines().next().unwrap_or("").trim();
-    let Some(heading) = first_line.strip_prefix("# ").map(str::trim) else {
-        return false;
-    };
+fn heading_matches_title(heading: &str, title: &str) -> bool {
     let title_trimmed = title.trim();
     if heading.eq_ignore_ascii_case(title_trimmed) {
         return true;
     }
     for sep in [" | ", " - ", " — ", " – ", " :: ", " · ", " • "] {
-        if let Some((prefix, _)) = title_trimmed.split_once(sep) {
-            let p = prefix.trim();
-            if !p.is_empty() && heading.eq_ignore_ascii_case(p) {
-                return true;
-            }
+        if title_trimmed.contains(sep)
+            && title_trimmed
+                .split(sep)
+                .map(str::trim)
+                .any(|seg| !seg.is_empty() && heading.eq_ignore_ascii_case(seg))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn starts_with_title_heading(md: &str, title: &str) -> bool {
+    let mut fence = markdown::FenceTracker::default();
+    let mut checked = 0usize;
+    for raw_line in md.lines() {
+        if !matches!(fence.step(raw_line), markdown::FenceLine::Outside) {
+            return false;
+        }
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some((level, _, heading)) = markdown::split_atx_heading(trimmed) {
+            return level == 1 && heading_matches_title(heading, title);
+        }
+        checked += 1;
+        if checked >= 6 || trimmed.len() > 200 {
+            return false;
         }
     }
     false

@@ -131,7 +131,9 @@ pub fn classify_response_with_headers(
         if let Some(reason) = detect_challenge_lower(&lower) {
             return ResponseClassification::Challenge { status, reason };
         }
-        let reason = if headers.is_edge_waf() {
+        let reason = if status == 403 && is_login_redirect(requested_url, final_url) {
+            BlockReason::LoginWall
+        } else if headers.is_edge_waf() {
             BlockReason::EdgeWafBlock
         } else {
             BlockReason::OriginForbidden

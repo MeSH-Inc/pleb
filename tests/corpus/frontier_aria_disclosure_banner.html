@@ -1,0 +1,23 @@
+<!-- pleb-fixture: {"tier":"ratchet","url":"https://agency.example.gov/edgar/about","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"SEC.gov | About EDGAR","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["# About EDGAR","EDGAR is the primary filing system.","Inside-main FAQ content must remain visible."],"forbidden_substrings":["Official websites use .gov","Secure .gov websites use HTTPS","# SEC.gov | About EDGAR"],"minimum_output_bytes":80,"maximum_output_bytes":400,"expected_structure":{"minimum_headings":1}}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><title>SEC.gov | About EDGAR</title></head>
+<body>
+  <section class="usa-banner">
+    <header class="usa-banner__header">
+      <p>An official website of the United States government</p>
+      <button aria-expanded="false" aria-controls="gov-banner">Here's how you know</button>
+    </header>
+    <div id="gov-banner">
+      <p><strong>Official websites use .gov</strong> A .gov website belongs to an official government organization.</p>
+      <p><strong>Secure .gov websites use HTTPS</strong> Share sensitive information only on official websites.</p>
+    </div>
+  </section>
+  <main>
+    <h1>About EDGAR</h1>
+    <p>EDGAR is the primary filing system.</p>
+    <button aria-expanded="false" aria-controls="faq-1">FAQ</button>
+    <div id="faq-1"><p>Inside-main FAQ content must remain visible.</p></div>
+  </main>
+</body>
+</html>

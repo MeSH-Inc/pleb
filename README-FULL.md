@@ -260,9 +260,10 @@ In `--render auto` mode (default):
 
 1. `pleb` checks bundled and local `site-rules.json` (by default `x.com`/`twitter.com` route to CEF waiting for `article`, and custom overlays can configure `rewrite_host` rules), then consults `<state_dir>/site-cache.json`.
 2. Unless a rule or cached strategy selects CEF first, `pleb` fetches via Cronet/`reqwest` and classifies the response:
+   - Retryable network resets (`TransportErrorKind::Network` with `retryable=true`, such as HTTP/2 protocol errors or transient drops after Cronet's internal retry) perform a bounded 1x HTTP/1.1 (`reqwest`) fallback within remaining timeout (`escalated: true`) and escalate to CEF/CDP if available when both network paths drop or `reqwest` hits a TLS-fingerprinted `403`/`503`.
    - `406 Not Acceptable` when sending `Accept: text/markdown` -> automatically retries once with standard HTML `Accept` headers.
    - `429 Too Many Requests` with integer `Retry-After <= 5s` -> performs one bounded retry within remaining timeout; persistent `429`s classify as `Blocked` (`block_reason: "rate_limited"`, exit code `2`).
-   - `403`/`503` without an active bot challenge -> `Blocked` (`block_reason: "edge_waf_block"` or `"origin_forbidden"`, escalating to CEF/CDP if available).
+   - `403`/`503` without an active bot challenge -> `Blocked` (`block_reason: "login_wall"` when `403` redirected to an authentication path, `"edge_waf_block"`, or `"origin_forbidden"`, escalating to CEF/CDP if available).
    - `403`/`503` (including `CF-Mitigated: challenge` or `x-amzn-waf-action: challenge`/`captcha` headers) or `200` interstitial matching an active bot challenge -> `Challenge` (`block_reason: "cloudflare_challenge"` or `"bot_challenge"`, failing fast with exit code `2` and no duplicate CEF retry).
    - `200` HTML with low prose volume matching an unhydrated SPA/JS shell -> `JavaScriptShell` (escalates to CEF/CDP if available).
    - `200` HTML with low prose volume redirected to an authentication path or containing a password form -> `Blocked` (`block_reason: "login_wall"`, exit code `2`); cookie consent gates classify as `Blocked` (`block_reason: "cookie_wall"`, exit code `2`).
@@ -712,7 +713,7 @@ All `--json` and `--jsonl` payloads serialize directly from `pleb`'s Rust output
 | `strategy` | `string` | Acquisition strategy (`cronet`, `reqwest`, `cef`, `cdp`, `raw_source`, `markdown_mirror`, `markdown_negotiated`) |
 | `content_outcome` | `string` | Machine-readable completeness classification (`complete` or `incomplete_shell`) |
 | `acquired_sha256` | `string` | Lowercase SHA-256 hex digest of the acquired source body prior to extraction/truncation |
-| `escalated` | `boolean` | `true` when transport escalated from primary HTTP to CEF or CDP |
+| `escalated` | `boolean` | `true` when transport fell back to HTTP/1.1 or escalated from primary HTTP to CEF or CDP |
 | `truncated` | `boolean` | `true` when `--max-bytes` truncated output |
 | `next_offset` | `number` | Next continuation byte offset for `--offset` when `--max-bytes` stops before the end of the extracted document (**omitted** when complete or absent) |
 | `timing_ms` | `number` | End-to-end fetch duration in milliseconds |

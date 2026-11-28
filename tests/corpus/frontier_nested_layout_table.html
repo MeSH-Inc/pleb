@@ -1,0 +1,25 @@
+<!-- pleb-fixture: {"tier":"ratchet","url":"https://news.example.org/","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"Tech Links","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["First Story Title","Second Story Title","| Metric | Value |","| Latency | 12ms |"],"expected_links":["https://a.example/1","https://b.example/2"],"forbidden_substrings":["&#124;"],"minimum_output_bytes":120,"maximum_output_bytes":800,"expected_structure":{"minimum_tables":1,"minimum_links":2}}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><title>Tech Links</title></head>
+<body>
+  <table id="shell">
+    <tr>
+      <td>
+        <table>
+          <tr><td>1.</td><td><a href="https://a.example/1">First Story Title</a></td></tr>
+          <tr><td>2.</td><td><a href="https://b.example/2">Second Story Title</a></td></tr>
+        </table>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <table>
+          <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+          <tbody><tr><td>Latency</td><td>12ms</td></tr></tbody>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

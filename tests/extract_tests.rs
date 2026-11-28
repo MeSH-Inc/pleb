@@ -3560,3 +3560,137 @@ echo still here
         .contains("```bash\n#\n##\necho still here\n```"));
     assert!(!heading_doc.content.contains("\n\n\n"));
 }
+
+#[test]
+fn canary_fixes_preserve_inverse_false_positives_across_clean_and_full_modes() {
+    let url = Url::parse("https://docs.example.com/guide").unwrap();
+
+    // 1. Collapsed ARIA disclosure panels: prune outside landmarks (or in chrome header),
+    //    preserve inside <main>, expanded panels, landmark-less bare FAQs, <main id=...>, and Full mode.
+    let aria_html = r#"<!doctype html>
+<html><head><title>Guide | Docs</title></head><body>
+  <section class="banner">
+    <header><button aria-expanded="false" aria-controls="banner-panel">Toggle</button></header>
+    <div id="banner-panel"><p>Chrome disclosure boilerplate.</p></div>
+  </section>
+  <button aria-expanded="true" aria-controls="open-panel">Open</button>
+  <div id="open-panel"><p>Expanded outside panel stays.</p></div>
+  <button aria-expanded="false" aria-controls="main-landmark">Main Toggle</button>
+  <main id="main-landmark">
+    <h1>Guide</h1>
+    <button aria-expanded="false" aria-controls="faq-in-main">FAQ</button>
+    <div id="faq-in-main"><p>Accordion inside main stays.</p></div>
+  </main>
+</body></html>"#;
+    let aria_clean = extract_document(
+        aria_html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert!(!aria_clean
+        .content
+        .contains("Chrome disclosure boilerplate."));
+    assert!(aria_clean.content.contains("Expanded outside panel stays."));
+    assert!(aria_clean.content.contains("Accordion inside main stays."));
+
+    let bare_faq_html = r#"<!doctype html><html><head><title>FAQ</title></head><body>
+      <button aria-expanded="false" aria-controls="a1">Question 1</button>
+      <div id="a1"><p>Bare page FAQ answer stays.</p></div>
+    </body></html>"#;
+    let bare_faq_doc = extract_document(
+        bare_faq_html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert!(bare_faq_doc.content.contains("Bare page FAQ answer stays."));
+
+    let aria_full = extract_document(
+        aria_html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions {
+            mode: ExtractMode::Full,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(aria_full.content.contains("Chrome disclosure boilerplate."));
+
+    // 2. Empty-alt small/button UI icons are pruned while unsized <img>, large <img>, meaningful alt, and Full stay.
+    let icons_html = r#"<!doctype html><html><head><title>Icons</title></head><body><main>
+      <h1>Icons</h1>
+      <button><img alt="" src="/btn.svg"></button>
+      <p><img width="24" height="24" alt="" src="/small.svg"> <img alt="" src="/unsized.png"> <img width="24" height="24" alt="Alert" src="/alert.svg"> <img width="800" height="400" alt="" src="/hero.png"></p>
+    </main></body></html>"#;
+    let icons_clean = extract_document(
+        icons_html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert!(!icons_clean.content.contains("/btn.svg"));
+    assert!(!icons_clean.content.contains("/small.svg"));
+    assert!(icons_clean.content.contains("/unsized.png"));
+    assert!(icons_clean.content.contains("/alert.svg"));
+    assert!(icons_clean.content.contains("/hero.png"));
+
+    let icons_full = extract_document(
+        icons_html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions {
+            mode: ExtractMode::Full,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(icons_full.content.contains("/btn.svg"));
+    assert!(icons_full.content.contains("/small.svg"));
+
+    // 3. Nested layout tables unwrap while standalone headerless tables and outer tables with <thead>/<th> stay tables.
+    let tables_html = r#"<!doctype html><html><head><title>Tables</title></head><body><main>
+      <h1>Tables</h1>
+      <table><tr><td>Key</td><td>Val</td></tr><tr><td>Foo</td><td>Bar</td></tr></table>
+      <table><thead><tr><th>Outer</th><th>Nested</th></tr></thead><tbody><tr><td>A</td><td><table><tr><td>X</td><td>Y</td></tr></table></td></tr></tbody></table>
+    </main></body></html>"#;
+    let tables_clean = extract_document(
+        tables_html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert!(tables_clean.content.contains("| Key | Val |"));
+    assert!(tables_clean.content.contains("| Outer | Nested |"));
+
+    // 4. Title suffix + leading metadata H1 dedup and consecutive duplicate heading suppression preserve non-adjacent/fenced headings.
+    let meta_h1_html = r#"<!doctype html><html><head><title>Cloudflare | Deep Dive</title></head><body><main>
+      <p>February 12, 2026</p>
+      <p>5 min read</p>
+      <h1>Deep Dive</h1>
+      <h1>Deep Dive</h1>
+      <p>First body paragraph.</p>
+      <h2>Example</h2>
+      <p>First example.</p>
+      <h2>Example</h2>
+      <p>Second example separated by prose.</p>
+      <pre><code>## Fenced
+## Fenced</code></pre>
+    </main></body></html>"#;
+    let meta_h1_doc = extract_document(
+        meta_h1_html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert!(!meta_h1_doc.content.contains("# Cloudflare | Deep Dive"));
+    assert_eq!(meta_h1_doc.content.matches("# Deep Dive").count(), 1);
+    assert_eq!(meta_h1_doc.content.matches("## Example").count(), 2);
+    assert!(meta_h1_doc.content.contains("## Fenced\n## Fenced"));
+}
