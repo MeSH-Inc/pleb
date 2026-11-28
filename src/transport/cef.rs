@@ -6,6 +6,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use crate::transport::reveal::{BrowserCaptureMetadata, RevealPolicy};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
 pub const EXPECTED_PROTOCOL: &str = "v5-meta";
@@ -74,6 +75,8 @@ impl RendererProbe {
 #[derive(Debug, Clone, Default)]
 pub struct CefRenderOptions {
     pub wait_for_selector: Option<String>,
+    pub reveal: RevealPolicy,
+    pub scroll_steps: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +84,7 @@ pub struct CefRenderResult {
     pub html: String,
     pub final_url: String,
     pub status_code: u16,
+    pub capture_meta: BrowserCaptureMetadata,
 }
 
 #[derive(Serialize)]
@@ -604,6 +608,7 @@ fn perform_render(
         html: String::from_utf8_lossy(&html_buf).into_owned(),
         final_url,
         status_code: header.status_code,
+        capture_meta: BrowserCaptureMetadata::default(),
     }))
 }
 

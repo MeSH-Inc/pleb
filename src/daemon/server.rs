@@ -516,6 +516,8 @@ async fn handle_connection(
             wait_for_selector,
             proxy,
             timeout_ms,
+            reveal,
+            scroll_steps,
             expected_protocol_version,
             expected_build_id,
         } => {
@@ -570,7 +572,11 @@ async fn handle_connection(
                 return Ok(());
             }
 
-            let opts = CefRenderOptions { wait_for_selector };
+            let opts = CefRenderOptions {
+                wait_for_selector,
+                reveal,
+                scroll_steps,
+            };
             let render_fut = renderer_guard.render(&url, &opts, remaining);
             tokio::select! {
                 biased;

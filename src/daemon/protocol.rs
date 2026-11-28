@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::transport::{DiagnosticHeaders, SubresourceDest, TransportErrorKind, WebBotAuthHeaders};
+use crate::transport::{
+    DiagnosticHeaders, RevealPolicy, SubresourceDest, TransportErrorKind, WebBotAuthHeaders,
+};
 
 pub const PROTOCOL_VERSION: u32 = 4;
 pub const BUILD_ID: &str = env!("PLEB_BUILD_ID");
@@ -78,6 +80,10 @@ pub enum DaemonRequest {
         wait_for_selector: Option<String>,
         proxy: Option<String>,
         timeout_ms: u64,
+        #[serde(default)]
+        reveal: RevealPolicy,
+        #[serde(default)]
+        scroll_steps: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expected_protocol_version: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,6 +121,8 @@ pub struct DaemonResponseHeader {
     #[serde(default)]
     pub body_bytes: usize,
     #[serde(default)]
+    pub meta_bytes: usize,
+    #[serde(default)]
     pub error: Option<String>,
     #[serde(default)]
     pub error_kind: Option<TransportErrorKind>,
@@ -141,6 +149,7 @@ impl DaemonResponseHeader {
             location_header: None,
             diagnostics: DiagnosticHeaders::default(),
             body_bytes: 0,
+            meta_bytes: 0,
             error: None,
             error_kind: None,
             error_retryable: false,

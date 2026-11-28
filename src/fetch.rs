@@ -143,6 +143,8 @@ pub struct FetchOptions {
     pub wait_for_selector: Option<String>,
     pub respect_robots: bool,
     pub apply_rewrites: bool,
+    pub reveal: crate::transport::RevealPolicy,
+    pub scroll_steps: usize,
 }
 
 impl Default for FetchOptions {
@@ -158,6 +160,8 @@ impl Default for FetchOptions {
             wait_for_selector: None,
             respect_robots: false,
             apply_rewrites: true,
+            reveal: crate::transport::RevealPolicy::None,
+            scroll_steps: 0,
         }
     }
 }
@@ -258,6 +262,8 @@ struct AcquiredPage {
     parsed: Option<ParsedHtml>,
     axtree_text: Option<String>,
     imperative_tools: Vec<crate::extract::WebMcpToolDescriptor>,
+    #[allow(dead_code)]
+    capture_meta: crate::transport::BrowserCaptureMetadata,
 }
 
 /// Target for `fetch_target`: either a normal URL navigation or a passive loopback CDP attach.
@@ -374,6 +380,7 @@ async fn fetch_attached_cdp(
         capture_axtree: is_axtree,
         max_response_bytes,
         allow_local_targets: true,
+        ..Default::default()
     };
     let res = cdp
         .render_attached(expected_origin, &opts, ctx.config.cdp_timeout)
@@ -1689,6 +1696,7 @@ async fn acquire_page(
                 parsed,
                 axtree_text: None,
                 imperative_tools: Vec::new(),
+                capture_meta: Default::default(),
             }
         };
 
@@ -1821,6 +1829,7 @@ async fn acquire_page(
                 parsed: parsed_html,
                 axtree_text: None,
                 imperative_tools: Vec::new(),
+                capture_meta: Default::default(),
             })
         }
         ResponseClassification::Blocked { status, reason } => {
@@ -2057,6 +2066,7 @@ async fn acquire_via_cdp(
         capture_axtree,
         max_response_bytes: max_bytes,
         allow_local_targets: false,
+        ..Default::default()
     };
     let res = cdp
         .render(url, &opts, ctx.config.cdp_timeout)
@@ -2117,6 +2127,7 @@ fn classify_rendered_result(
                 parsed: parsed_html,
                 axtree_text,
                 imperative_tools,
+                capture_meta: Default::default(),
             })
         }
         ResponseClassification::JavaScriptShell { reason } => Ok(AcquiredPage {
@@ -2135,6 +2146,7 @@ fn classify_rendered_result(
             parsed: parsed_html,
             axtree_text,
             imperative_tools,
+            capture_meta: Default::default(),
         }),
         ResponseClassification::Blocked { status, reason } => Err(FetchError::Blocked {
             url: final_url,
@@ -2230,6 +2242,7 @@ fn classify_cdp_attach_result(
             parsed: parsed_html,
             axtree_text: res.axtree_text,
             imperative_tools: res.imperative_tools,
+            capture_meta: Default::default(),
         }),
         ResponseClassification::JavaScriptShell { reason } => Ok(AcquiredPage {
             body: res.html,
@@ -2246,6 +2259,7 @@ fn classify_cdp_attach_result(
             parsed: parsed_html,
             axtree_text: res.axtree_text,
             imperative_tools: res.imperative_tools,
+            capture_meta: Default::default(),
         }),
         ResponseClassification::Blocked { reason, .. } => Err(FetchError::Blocked {
             url: res.final_url,
@@ -2368,6 +2382,7 @@ async fn render_cef_checked(
     let deadline = Instant::now() + timeout;
     let opts = CefRenderOptions {
         wait_for_selector: wait_for_selector.map(|s| s.to_string()),
+        ..Default::default()
     };
 
     let first_attempt = cef.render(url, &opts, timeout).await;

@@ -4,7 +4,13 @@ pub mod cef;
 pub mod cronet;
 #[cfg(feature = "cronet")]
 pub mod cronet_ffi;
+pub mod reveal;
 pub mod web_bot_auth;
+
+pub use reveal::{
+    BrowserCaptureMetadata, CapturedDataset, RevealPolicy, RevealedPanelKind,
+    RevealedPanelSnapshot,
+};
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};

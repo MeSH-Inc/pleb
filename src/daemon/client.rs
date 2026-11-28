@@ -16,7 +16,8 @@ use super::server::stop_legacy_cef_daemon;
 use crate::context::ensure_private_dir;
 use crate::transport::cef::{CefProtocolError, CefRenderOptions, CefRenderResult, CefTimeoutError};
 use crate::transport::{
-    HttpResponse, RequestHeaderOptions, ResponseTooLargeError, TransportError, TransportErrorKind,
+    BrowserCaptureMetadata, HttpResponse, RequestHeaderOptions, ResponseTooLargeError,
+    TransportError, TransportErrorKind,
 };
 
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(3);
@@ -219,6 +220,8 @@ pub async fn daemon_cef_render_with_executable(
         wait_for_selector: opts.wait_for_selector.clone(),
         proxy: proxy.map(str::to_string),
         timeout_ms: timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+        reveal: opts.reveal,
+        scroll_steps: opts.scroll_steps,
         expected_protocol_version: Some(PROTOCOL_VERSION),
         expected_build_id: Some(BUILD_ID.to_string()),
     };
@@ -239,6 +242,7 @@ pub async fn daemon_cef_render_with_executable(
             html,
             final_url: hdr.final_url.unwrap_or_else(|| url.to_string()),
             status_code: hdr.status_code.unwrap_or(200),
+            capture_meta: BrowserCaptureMetadata::default(),
         })
     } else {
         Err(map_daemon_error(&hdr, "daemon CEF render failed"))

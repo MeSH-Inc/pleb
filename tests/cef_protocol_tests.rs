@@ -134,6 +134,7 @@ for raw in sys.stdin:
         .with_cache_dir(custom_cache.clone());
     let opts = CefRenderOptions {
         wait_for_selector: Some("[data-testid='tweet']".to_string()),
+        ..Default::default()
     };
 
     let short = renderer
@@ -820,6 +821,7 @@ async fn live_cef_renderer_cold_start_static_and_spa_hydration() {
             &spa_url,
             &CefRenderOptions {
                 wait_for_selector: Some("article[data-ready=\"1\"]".to_string()),
+                ..Default::default()
             },
             Duration::from_secs(15),
         )

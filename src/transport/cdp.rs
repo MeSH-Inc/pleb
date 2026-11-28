@@ -36,12 +36,16 @@ const PAGE_STATE_FALLBACK_SETTLE: Duration = Duration::from_millis(250);
 const CDP_ERR_METHOD_NOT_FOUND: i64 = -32601;
 const CDP_ERR_SERVER_ERROR: i64 = -32000;
 
+use crate::transport::reveal::{BrowserCaptureMetadata, RevealPolicy};
+
 #[derive(Debug, Clone, Default)]
 pub struct CdpRenderOptions {
     pub wait_for_selector: Option<String>,
     pub capture_axtree: bool,
     pub max_response_bytes: usize,
     pub allow_local_targets: bool,
+    pub reveal: RevealPolicy,
+    pub scroll_steps: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +57,7 @@ pub struct CdpRenderResult {
     pub link_header: Option<String>,
     pub axtree_text: Option<String>,
     pub imperative_tools: Vec<WebMcpToolDescriptor>,
+    pub capture_meta: BrowserCaptureMetadata,
 }
 
 #[derive(Clone)]
@@ -1801,6 +1806,7 @@ impl CdpSession {
             link_header: self.state.link_header.clone(),
             axtree_text,
             imperative_tools,
+            capture_meta: BrowserCaptureMetadata::default(),
         })
     }
 
@@ -2757,6 +2763,7 @@ impl PassiveAttachSession {
                 link_header: None,
                 axtree_text: None,
                 imperative_tools,
+                capture_meta: BrowserCaptureMetadata::default(),
             });
         }
 
@@ -2787,6 +2794,7 @@ impl PassiveAttachSession {
             link_header: None,
             axtree_text,
             imperative_tools,
+            capture_meta: BrowserCaptureMetadata::default(),
         })
     }
 
