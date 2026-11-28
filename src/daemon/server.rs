@@ -586,13 +586,30 @@ async fn handle_connection(
                 res = render_fut => {
                     match res {
                         Ok(result) => {
-                            let bytes = result.html.as_bytes();
+                            let html_bytes = result.html.as_bytes();
+                            let meta_vec = match serde_json::to_vec(&result.capture_meta) {
+                                Ok(v) => v,
+                                Err(err) => {
+                                    let hdr = DaemonResponseHeader::err(
+                                        format!("failed to serialize CEF capture metadata: {err}"),
+                                        Some(TransportErrorKind::ProtocolMismatch),
+                                        None,
+                                    );
+                                    let _ = write_frame(&mut write_half, &hdr, &[]).await;
+                                    return Ok(());
+                                }
+                            };
+                            let mut combined =
+                                Vec::with_capacity(html_bytes.len() + meta_vec.len());
+                            combined.extend_from_slice(html_bytes);
+                            combined.extend_from_slice(&meta_vec);
                             let mut hdr = DaemonResponseHeader::ok_empty();
                             hdr.status_code = Some(result.status_code);
                             hdr.final_url = Some(result.final_url);
                             hdr.content_type = Some("text/html".to_string());
-                            hdr.body_bytes = bytes.len();
-                            let _ = write_frame(&mut write_half, &hdr, bytes).await;
+                            hdr.meta_bytes = meta_vec.len();
+                            hdr.body_bytes = combined.len();
+                            let _ = write_frame(&mut write_half, &hdr, &combined).await;
                         }
                         Err(err) => {
                             let kind =

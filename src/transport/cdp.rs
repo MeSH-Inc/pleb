@@ -29,8 +29,7 @@ use crate::policy::{
 };
 use crate::transport::reveal::{
     build_cdp_reveal_eval_js, is_indexable_json_mime, BrowserCaptureMetadata, CapturedDataset,
-    RevealPolicy, RevealedPanelSnapshot, MAX_RAW_CAPTURED_DATASETS, MAX_REVEALED_PANEL_HTML_BYTES,
-    MAX_TOTAL_REVEAL_META_BYTES,
+    RevealPolicy, RevealedPanelSnapshot, MAX_RAW_CAPTURED_DATASETS,
 };
 use crate::transport::DiagnosticHeaders;
 
@@ -1983,24 +1982,9 @@ impl CdpSession {
                                         }
                                         outer_html = post_html;
                                     } else {
-                                        let mut total_meta_bytes = 0usize;
-                                        for mut snap in outcome.revealed_panels {
-                                            if snap.html.len() > MAX_REVEALED_PANEL_HTML_BYTES {
-                                                snap.html.truncate(snap.html.floor_char_boundary(
-                                                    MAX_REVEALED_PANEL_HTML_BYTES,
-                                                ));
-                                                capture_meta.reveal_capped = true;
-                                            }
-                                            let next_total =
-                                                total_meta_bytes.saturating_add(snap.html.len());
-                                            if next_total > MAX_TOTAL_REVEAL_META_BYTES {
-                                                capture_meta.reveal_capped = true;
-                                                break;
-                                            }
-                                            total_meta_bytes = next_total;
-                                            capture_meta.revealed_panels.push(snap);
-                                        }
+                                        capture_meta.revealed_panels = outcome.revealed_panels;
                                         capture_meta.reveal_capped |= outcome.reveal_capped;
+                                        capture_meta.enforce_bounds();
                                         capture_meta.scroll_steps_performed =
                                             outcome.scroll_steps_performed;
                                         capture_meta.reveal_warning = outcome.warning;

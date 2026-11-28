@@ -7,9 +7,12 @@
 #include <string.h>
 
 #include "browser_environment.h"
+#include "reveal_script.h"
 
-#define PLEB_RENDERER_PROTOCOL_VERSION "v5-meta"
+#define PLEB_RENDERER_PROTOCOL_VERSION "v6-meta"
 #define PLEB_MAX_REQUEST_LINE_BYTES (64 * 1024)
+#define PLEB_MAX_SCROLL_STEPS 20
+#define PLEB_MAX_REVEAL_META_BYTES (4 * 1024 * 1024)
 
 __attribute__((used)) static const char PLEB_RENDERER_PROTOCOL[] =
     "PLEB_RENDERER_PROTOCOL=" PLEB_RENDERER_PROTOCOL_VERSION;
@@ -18,15 +21,20 @@ typedef struct {
     char* url;
     char* wait_for_selector;
     int timeout_ms;
+    char* reveal;
+    int scroll;
 } PlebRenderRequest;
 
 static void pleb_render_request_free(PlebRenderRequest* req) {
     if (!req) return;
     free(req->url);
     free(req->wait_for_selector);
+    free(req->reveal);
     req->url = NULL;
     req->wait_for_selector = NULL;
+    req->reveal = NULL;
     req->timeout_ms = 0;
+    req->scroll = 0;
 }
 
 static char* pleb_asprintf(const char* fmt, ...) {
@@ -44,6 +52,44 @@ static char* pleb_asprintf(const char* fmt, ...) {
     vsnprintf(buf, (size_t)needed + 1, fmt, ap2);
     va_end(ap2);
     return buf;
+}
+
+static char* pleb_strdup(const char* s) {
+    if (!s) return NULL;
+    size_t len = strlen(s);
+    char* copy = (char*)malloc(len + 1);
+    if (copy) memcpy(copy, s, len + 1);
+    return copy;
+}
+
+static int pleb_ascii_lower(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') ? (int)(c + ('a' - 'A')) : (int)c;
+}
+
+static int pleb_streq_ascii_ci(const char* a, const char* b) {
+    if (!a || !b) return a == b;
+    while (*a && *b) {
+        if (pleb_ascii_lower((unsigned char)*a) != pleb_ascii_lower((unsigned char)*b)) return 0;
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
+static int pleb_contains_ascii_ci(const char* haystack, const char* needle) {
+    if (!haystack || !needle) return 0;
+    if (!needle[0]) return 1;
+    size_t nlen = strlen(needle);
+    for (const char* p = haystack; *p; p++) {
+        size_t i = 0;
+        while (i < nlen && p[i] &&
+               pleb_ascii_lower((unsigned char)p[i]) == pleb_ascii_lower((unsigned char)needle[i])) {
+            i++;
+        }
+        if (i == nlen) return 1;
+        if (!p[i]) break;
+    }
+    return 0;
 }
 
 // Reads one line up to `max_bytes`. Returns 1 if a line was read (or exceeded
@@ -318,6 +364,40 @@ static int pleb_parse_request_line(
             if (val > 600000) val = 600000;
             out->timeout_ms = (int)val;
             p = endptr;
+        } else if (strcmp(key, "reveal") == 0) {
+            if (strncmp(p, "null", 4) == 0) {
+                p += 4;
+                free(out->reveal);
+                out->reveal = NULL;
+            } else {
+                char* val = NULL;
+                if (pleb_parse_json_string(&p, &val, err_buf, err_cap) != 0) {
+                    free(key);
+                    pleb_render_request_free(out);
+                    return -1;
+                }
+                if (strcmp(val, "none") != 0 && strcmp(val, "tabs") != 0
+                    && strcmp(val, "disclosures") != 0 && strcmp(val, "all") != 0) {
+                    free(val);
+                    free(key);
+                    pleb_render_request_free(out);
+                    snprintf(err_buf, err_cap, "reveal must be one of none, tabs, disclosures, all");
+                    return -1;
+                }
+                free(out->reveal);
+                out->reveal = val;
+            }
+        } else if (strcmp(key, "scroll") == 0) {
+            char* endptr = NULL;
+            long val = strtol(p, &endptr, 10);
+            if (endptr == p || val < 0 || val > PLEB_MAX_SCROLL_STEPS) {
+                free(key);
+                pleb_render_request_free(out);
+                snprintf(err_buf, err_cap, "scroll must be an integer between 0 and %d", PLEB_MAX_SCROLL_STEPS);
+                return -1;
+            }
+            out->scroll = (int)val;
+            p = endptr;
         } else {
             snprintf(err_buf, err_cap, "unknown request field '%s'", key);
             free(key);
@@ -350,6 +430,15 @@ static int pleb_parse_request_line(
         pleb_render_request_free(out);
         snprintf(err_buf, err_cap, "request field 'url' must be a non-empty string");
         return -1;
+    }
+
+    if (!out->reveal) {
+        out->reveal = pleb_strdup("none");
+        if (!out->reveal) {
+            pleb_render_request_free(out);
+            snprintf(err_buf, err_cap, "out of memory");
+            return -1;
+        }
     }
 
     return 0;
@@ -395,24 +484,90 @@ static void pleb_write_ready(FILE* out, int ok, const char* error) {
     fflush(out);
 }
 
+typedef struct {
+    char* data;
+    size_t len;
+    size_t cap;
+} PlebStrBuf;
+
+static int pleb_buf_append(PlebStrBuf* b, const char* s, size_t n) {
+    if (n == 0) return 0;
+    if (b->len + n + 1 > b->cap) {
+        size_t next_cap = b->cap ? b->cap * 2 : 512;
+        while (next_cap < b->len + n + 1) next_cap *= 2;
+        char* grown = (char*)realloc(b->data, next_cap);
+        if (!grown) return -1;
+        b->data = grown;
+        b->cap = next_cap;
+    }
+    memcpy(b->data + b->len, s, n);
+    b->len += n;
+    b->data[b->len] = '\0';
+    return 0;
+}
+
+static int pleb_buf_append_cstr(PlebStrBuf* b, const char* s) {
+    return s ? pleb_buf_append(b, s, strlen(s)) : 0;
+}
+
+static int pleb_buf_append_json_str(PlebStrBuf* b, const char* s) {
+    if (!s) return pleb_buf_append_cstr(b, "null");
+    if (pleb_buf_append(b, "\"", 1) != 0) return -1;
+    for (const unsigned char* p = (const unsigned char*)s; *p; p++) {
+        unsigned char c = *p;
+        char esc[8];
+        const char* rep = NULL;
+        size_t rlen = 0;
+        switch (c) {
+            case '"': rep = "\\\""; rlen = 2; break;
+            case '\\': rep = "\\\\"; rlen = 2; break;
+            case '\b': rep = "\\b"; rlen = 2; break;
+            case '\f': rep = "\\f"; rlen = 2; break;
+            case '\n': rep = "\\n"; rlen = 2; break;
+            case '\r': rep = "\\r"; rlen = 2; break;
+            case '\t': rep = "\\t"; rlen = 2; break;
+            default:
+                if (c < 0x20) {
+                    snprintf(esc, sizeof(esc), "\\u%04x", c);
+                    rep = esc;
+                    rlen = 6;
+                } else {
+                    char ch = (char)c;
+                    if (pleb_buf_append(b, &ch, 1) != 0) return -1;
+                    continue;
+                }
+        }
+        if (pleb_buf_append(b, rep, rlen) != 0) return -1;
+    }
+    return pleb_buf_append(b, "\"", 1);
+}
+
 static void pleb_write_response(
     FILE* out,
     int status_code,
     const char* final_url,
     const char* html,
     size_t html_len,
+    const char* meta_json,
+    size_t meta_len,
     const char* error,
     const char* error_kind
 ) {
+    int has_err = (error && error[0]) ? 1 : 0;
     fprintf(out, "{\"status_code\":%d,\"final_url\":", status_code);
     pleb_write_json_escaped(out, final_url ? final_url : "");
-    fprintf(out, ",\"html_bytes\":%zu,\"error\":", (error && error[0]) ? (size_t)0 : html_len);
-    pleb_write_json_escaped(out, (error && error[0]) ? error : NULL);
+    fprintf(out, ",\"html_bytes\":%zu,\"meta_bytes\":%zu,\"error\":",
+            has_err ? (size_t)0 : html_len,
+            (has_err || !meta_json) ? (size_t)0 : meta_len);
+    pleb_write_json_escaped(out, has_err ? error : NULL);
     fputs(",\"error_kind\":", out);
     pleb_write_json_escaped(out, (error_kind && error_kind[0]) ? error_kind : NULL);
     fputs("}\n", out);
-    if ((!error || !error[0]) && html && html_len > 0) {
+    if (!has_err && html && html_len > 0) {
         fwrite(html, 1, html_len, out);
+    }
+    if (!has_err && meta_json && meta_len > 0) {
+        fwrite(meta_json, 1, meta_len, out);
     }
     fflush(out);
 }
@@ -420,12 +575,14 @@ static void pleb_write_response(
 static void pleb_clamp_timeouts(
     int timeout_ms,
     int has_selector,
+    int has_reveal,
     int* total_cap,
     int* post_load_cap,
     int* js_cap
 ) {
-    int default_total = has_selector ? 60000 : 45000;
-    int default_post = has_selector ? 30000 : 12000;
+    int needs_extended = has_selector || has_reveal;
+    int default_total = needs_extended ? 60000 : 45000;
+    int default_post = needs_extended ? 30000 : 12000;
     int default_js = has_selector ? 20000 : 8000;
 
     int budget = (timeout_ms > 2000) ? (timeout_ms - 1500) : ((timeout_ms * 3) / 4);
@@ -444,7 +601,12 @@ static char* pleb_build_poller_js(
     const char* selector_or_null,
     const char* marker,
     const char* sel_err_prefix,
-    int js_cap_ms
+    const char* meta_marker,
+    const char* pre_reveal_marker,
+    const char* reveal_mode_or_null,
+    int scroll_steps,
+    int js_cap_ms,
+    int reveal_budget_ms
 ) {
     char* escaped_sel = NULL;
     const char* sel_expr = "null";
@@ -458,12 +620,24 @@ static char* pleb_build_poller_js(
         sel_expr = quoted_sel;
     }
 
+    const char* eff_reveal = (reveal_mode_or_null && reveal_mode_or_null[0])
+        ? reveal_mode_or_null : "none";
+    int clamped_scroll = (scroll_steps < 0) ? 0
+        : (scroll_steps > PLEB_MAX_SCROLL_STEPS ? PLEB_MAX_SCROLL_STEPS : scroll_steps);
+    int has_reveal = (strcmp(eff_reveal, "none") != 0 || clamped_scroll > 0) ? 1 : 0;
+    const char* reveal_lib = has_reveal ? PLEB_REVEAL_SCRIPT_JS : "";
+    int r_budget = (reveal_budget_ms < 200) ? 200
+        : (reveal_budget_ms > 15000 ? 15000 : reveal_budget_ms);
+
     char* js = pleb_asprintf(
         "(function(){"
         "if(window.__plebPollerActive)return;"
         "window.__plebPollerActive=true;"
+        "%s\n"
         "var sel=%s;"
-        "var start=Date.now(),lastMut=start,selMatchedAt=0,done=false,scheduled=false;"
+        "var revealMode='%s',scrollSteps=%d,hasReveal=%d,revealBudgetMs=%d;"
+        "var metaMarker='%s',preRevealMarker='%s';"
+        "var start=Date.now(),lastMut=start,selMatchedAt=0,done=false,scheduled=false,revealStarted=false;"
         "var QUIET_MS=180;"
         "var obs=null,iv=null;"
         "var cleanup=function(){"
@@ -471,11 +645,58 @@ static char* pleb_build_poller_js(
         "  if(obs){try{obs.disconnect();}catch(_){}obs=null;}"
         "  window.__plebPollerActive=false;"
         "};"
+        "var checkChallenge=function(blt){"
+        "  if(blt.length<4000&&(blt.indexOf('performing security verification')>=0||blt.indexOf('checking your browser')>=0||blt.indexOf('verify you are human')>=0||blt.indexOf('just a moment')>=0))return true;"
+        "  if(document.querySelector&&document.querySelector('#cf-wrapper, iframe[src*=\"challenges.cloudflare.com\"], iframe[src*=\"turnstile\"], iframe[src*=\"hcaptcha\"], iframe[src*=\"recaptcha\"]'))return true;"
+        "  return false;"
+        "};"
         "var dump=function(){"
         "  if(done)return;"
         "  done=true;"
         "  cleanup();"
-        "  console.log('%s'+(document.documentElement?document.documentElement.outerHTML:''));"
+        "  var curHtml=(document.documentElement?document.documentElement.outerHTML:'');"
+        "  var body=document.body;"
+        "  var bt=body&&body.innerText?body.innerText:'';"
+        "  if(!hasReveal||checkChallenge(bt.toLowerCase())){"
+        "    console.log('%s'+curHtml);"
+        "    return;"
+        "  }"
+        "  if(revealStarted)return;"
+        "  revealStarted=true;"
+        "  if(preRevealMarker){console.log(preRevealMarker+curHtml);}"
+        "  __plebRevealAndScroll({"
+        "    mode:revealMode,"
+        "    scrollSteps:scrollSteps,"
+        "    maxActions:16,"
+        "    maxPerGroup:8,"
+        "    maxPanelBytes:262144,"
+        "    maxTotalBytes:2097152,"
+        "    budgetMs:revealBudgetMs"
+        "  }).then(function(res){"
+        "    res=res||{};"
+        "    var outHtml=(res.navigated)?curHtml:(document.documentElement?document.documentElement.outerHTML:'');"
+        "    var panels=(res.navigated||res.challenge_detected)?[]:(res.revealed_panels||[]);"
+        "    var warn=res.warning||(res.navigated?'aborted --reveal because a control triggered page navigation':null);"
+        "    if(metaMarker){"
+        "      console.log(metaMarker+JSON.stringify({"
+        "        revealed_panels:panels,"
+        "        reveal_capped:!!res.reveal_capped,"
+        "        scroll_steps_performed:res.scroll_steps_performed||0,"
+        "        reveal_warning:warn"
+        "      }));"
+        "    }"
+        "    console.log('%s'+outHtml);"
+        "  }).catch(function(e){"
+        "    if(metaMarker){"
+        "      console.log(metaMarker+JSON.stringify({"
+        "        revealed_panels:[],"
+        "        reveal_capped:false,"
+        "        scroll_steps_performed:0,"
+        "        reveal_warning:'reveal script exception: '+(e&&e.message?e.message:String(e))"
+        "      }));"
+        "    }"
+        "    console.log('%s'+curHtml);"
+        "  });"
         "};"
         "var finishAfterRaf=function(){"
         "  if(done||scheduled)return;"
@@ -501,10 +722,7 @@ static char* pleb_build_poller_js(
         "  var body=document.body;"
         "  var bt=body&&body.innerText?body.innerText:'';"
         "  var blt=bt.toLowerCase();"
-        "  var isChallenge=blt.length<4000&&"
-        "                  (blt.indexOf('performing security verification')>=0||"
-        "                   blt.indexOf('checking your browser')>=0);"
-        "  if(isChallenge){dump();return;}"
+        "  if(checkChallenge(blt)){dump();return;}"
         "  if(now-start>=%d){dump();return;}"
         "  if(sel){"
         "    var el=null;"
@@ -532,7 +750,16 @@ static char* pleb_build_poller_js(
         "};"
         "iv=setInterval(check,40);"
         "})();",
+        reveal_lib,
         sel_expr,
+        eff_reveal,
+        clamped_scroll,
+        has_reveal,
+        r_budget,
+        meta_marker ? meta_marker : "",
+        pre_reveal_marker ? pre_reveal_marker : "",
+        marker,
+        marker,
         marker,
         js_cap_ms,
         sel_err_prefix

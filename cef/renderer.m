@@ -1,4 +1,4 @@
-// pleb-renderer (macOS): CEF offscreen renderer with v5-meta stdin/stdout JSON+bytes framing.
+// pleb-renderer (macOS): CEF offscreen renderer with v6-meta stdin/stdout JSON+bytes framing.
 
 #include <libgen.h>
 #include <mach-o/dyld.h>

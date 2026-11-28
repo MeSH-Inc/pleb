@@ -2842,7 +2842,7 @@ mod tests {
             "https://example.com",
             anyhow::Error::new(TransportError::new(
                 TransportErrorKind::ProtocolMismatch,
-                "expected v5-meta",
+                "expected v6-meta",
             )),
             1024,
         );

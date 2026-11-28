@@ -6,10 +6,12 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use crate::transport::reveal::{BrowserCaptureMetadata, RevealPolicy};
+use crate::transport::reveal::{
+    BrowserCaptureMetadata, RevealPolicy, MAX_SCROLL_STEPS, MAX_TOTAL_REVEAL_META_BYTES,
+};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
-pub const EXPECTED_PROTOCOL: &str = "v5-meta";
+pub const EXPECTED_PROTOCOL: &str = "v6-meta";
 const PROTOCOL_MARKER_PREFIX: &[u8] = b"PLEB_RENDERER_PROTOCOL=";
 const STDERR_TAIL_MAX_BYTES: usize = 64 * 1024;
 const MAX_HTML_BYTES: usize = 64 * 1024 * 1024;
@@ -92,6 +94,8 @@ struct RendererRequest<'a> {
     url: &'a str,
     wait_for_selector: Option<&'a str>,
     timeout_ms: u64,
+    reveal: RevealPolicy,
+    scroll: usize,
 }
 
 #[derive(Deserialize)]
@@ -110,6 +114,8 @@ struct RendererResponseHeader {
     final_url: String,
     #[serde(default)]
     html_bytes: usize,
+    #[serde(default)]
+    meta_bytes: usize,
     #[serde(default)]
     error: Option<String>,
     #[serde(default)]
@@ -282,6 +288,8 @@ impl CefRenderer {
         let mut kill_guard = KillOnDrop(Some(child));
         let clean_url = url.to_string();
         let clean_selector = opts.wait_for_selector.clone();
+        let reveal = opts.reveal;
+        let scroll_steps = opts.scroll_steps.min(MAX_SCROLL_STEPS);
         let timeout_ms = remaining.as_millis().min(u128::from(u64::MAX)) as u64;
         let url_for_err = clean_url.clone();
 
@@ -295,6 +303,8 @@ impl CefRenderer {
                     &clean_url,
                     clean_selector.as_deref(),
                     timeout_ms,
+                    reveal,
+                    scroll_steps,
                 );
                 let _ = tx.send((stdin, stdout, res));
             })
@@ -550,11 +560,15 @@ fn perform_render(
     url: &str,
     wait_for_selector: Option<&str>,
     timeout_ms: u64,
+    reveal: RevealPolicy,
+    scroll: usize,
 ) -> Result<Result<CefRenderResult>> {
     let req = RendererRequest {
         url,
         wait_for_selector: wait_for_selector.filter(|s| !s.trim().is_empty()),
         timeout_ms: timeout_ms.max(1),
+        reveal,
+        scroll,
     };
     let encoded = serde_json::to_string(&req)?;
     writeln!(stdin, "{}", encoded)?;
@@ -576,10 +590,22 @@ fn perform_render(
             header.html_bytes
         );
     }
+    if header.meta_bytes > MAX_TOTAL_REVEAL_META_BYTES {
+        bail!(
+            "pleb-renderer capture metadata exceeded {} byte limit ({} bytes)",
+            MAX_TOTAL_REVEAL_META_BYTES,
+            header.meta_bytes
+        );
+    }
 
     let mut html_buf = vec![0u8; header.html_bytes];
     if header.html_bytes > 0 {
         stdout.read_exact(&mut html_buf)?;
+    }
+
+    let mut meta_buf = vec![0u8; header.meta_bytes];
+    if header.meta_bytes > 0 {
+        stdout.read_exact(&mut meta_buf)?;
     }
 
     if let Some(err_msg) = header.error {
@@ -598,6 +624,19 @@ fn perform_render(
         }));
     }
 
+    let mut capture_meta: BrowserCaptureMetadata = if meta_buf.is_empty() {
+        BrowserCaptureMetadata::default()
+    } else {
+        serde_json::from_slice(&meta_buf).map_err(|e| {
+            anyhow::anyhow!(
+                "bad CEF capture metadata JSON ({} bytes): {}",
+                meta_buf.len(),
+                e
+            )
+        })?
+    };
+    capture_meta.enforce_bounds();
+
     let final_url = if header.final_url.is_empty() {
         url.to_string()
     } else {
@@ -608,7 +647,7 @@ fn perform_render(
         html: String::from_utf8_lossy(&html_buf).into_owned(),
         final_url,
         status_code: header.status_code,
-        capture_meta: BrowserCaptureMetadata::default(),
+        capture_meta,
     }))
 }
 

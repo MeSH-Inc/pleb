@@ -237,12 +237,35 @@ pub async fn daemon_cef_render_with_executable(
     .await?;
 
     if hdr.ok {
-        let html = String::from_utf8_lossy(&body).into_owned();
+        if hdr.meta_bytes > body.len()
+            || hdr.meta_bytes > crate::transport::reveal::MAX_TOTAL_REVEAL_META_BYTES
+        {
+            return Err(anyhow::Error::new(TransportError::new(
+                TransportErrorKind::ProtocolMismatch,
+                format!(
+                    "daemon CEF response had invalid meta_bytes ({} > body {})",
+                    hdr.meta_bytes,
+                    body.len()
+                ),
+            )));
+        }
+        let split = body.len() - hdr.meta_bytes;
+        let html = String::from_utf8_lossy(&body[..split]).into_owned();
+        let capture_meta = if hdr.meta_bytes == 0 {
+            BrowserCaptureMetadata::default()
+        } else {
+            serde_json::from_slice(&body[split..]).map_err(|e| {
+                TransportError::new(
+                    TransportErrorKind::ProtocolMismatch,
+                    format!("daemon CEF capture metadata invalid JSON: {e}"),
+                )
+            })?
+        };
         Ok(CefRenderResult {
             html,
             final_url: hdr.final_url.unwrap_or_else(|| url.to_string()),
             status_code: hdr.status_code.unwrap_or(200),
-            capture_meta: BrowserCaptureMetadata::default(),
+            capture_meta,
         })
     } else {
         Err(map_daemon_error(&hdr, "daemon CEF render failed"))

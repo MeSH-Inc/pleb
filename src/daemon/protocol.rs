@@ -7,7 +7,7 @@ use crate::transport::{
     DiagnosticHeaders, RevealPolicy, SubresourceDest, TransportErrorKind, WebBotAuthHeaders,
 };
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const BUILD_ID: &str = env!("PLEB_BUILD_ID");
 pub const SOCKET_NAME: &str = "daemon.sock";
 pub const LOCK_NAME: &str = "daemon.lock";

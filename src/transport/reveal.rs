@@ -143,6 +143,29 @@ pub struct BrowserCaptureMetadata {
     pub reveal_warning: Option<String>,
 }
 
+impl BrowserCaptureMetadata {
+    /// Enforce per-panel and total byte caps on captured panel snapshots.
+    pub fn enforce_bounds(&mut self) {
+        let mut kept = Vec::with_capacity(self.revealed_panels.len());
+        let mut total_bytes = 0usize;
+        for mut snap in self.revealed_panels.drain(..) {
+            if snap.html.len() > MAX_REVEALED_PANEL_HTML_BYTES {
+                snap.html
+                    .truncate(snap.html.floor_char_boundary(MAX_REVEALED_PANEL_HTML_BYTES));
+                self.reveal_capped = true;
+            }
+            let next_total = total_bytes.saturating_add(snap.html.len());
+            if next_total > MAX_TOTAL_REVEAL_META_BYTES {
+                self.reveal_capped = true;
+                break;
+            }
+            total_bytes = next_total;
+            kept.push(snap);
+        }
+        self.revealed_panels = kept;
+    }
+}
+
 /// Returns `true` when `mime` represents an indexable JSON data payload (excluding error/manifest stubs).
 pub fn is_indexable_json_mime(mime: &str) -> bool {
     let base = mime

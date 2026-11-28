@@ -1,4 +1,4 @@
-// pleb-renderer (Linux): CEF offscreen renderer with v5-meta stdin/stdout JSON+bytes framing.
+// pleb-renderer (Linux): CEF offscreen renderer with v6-meta stdin/stdout JSON+bytes framing.
 
 #include <libgen.h>
 #include <limits.h>

@@ -1,6 +1,7 @@
 #ifndef PLEB_RENDERER_CORE_H
 #define PLEB_RENDERER_CORE_H
 
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,8 +37,61 @@ static volatile int g_inflight_subresources = 0;
 static char* g_html = NULL;
 static size_t g_html_len = 0;
 static char* g_selector_error = NULL;
+static char* g_reveal_meta = NULL;
+static size_t g_reveal_meta_len = 0;
+static char* g_pre_reveal_html = NULL;
+static size_t g_pre_reveal_html_len = 0;
+static char* g_pre_reveal_url = NULL;
+static int g_reveal_started = 0;
 static char g_marker[32];
 static char g_sel_err_prefix[48];
+static char g_meta_marker[48];
+static char g_pre_reveal_marker[48];
+
+#define PLEB_MAX_CAPTURED_DATASETS 32
+typedef struct {
+    char* url;
+    char* mime_type;
+    size_t byte_count;
+    int has_byte_count;
+} PlebCapturedDataset;
+
+static pthread_mutex_t g_dataset_mutex = PTHREAD_MUTEX_INITIALIZER;
+static PlebCapturedDataset g_datasets[PLEB_MAX_CAPTURED_DATASETS];
+static size_t g_dataset_count = 0;
+
+static void pleb_clear_datasets(void) {
+    pthread_mutex_lock(&g_dataset_mutex);
+    for (size_t i = 0; i < g_dataset_count; i++) {
+        free(g_datasets[i].url);
+        free(g_datasets[i].mime_type);
+        g_datasets[i].url = NULL;
+        g_datasets[i].mime_type = NULL;
+        g_datasets[i].byte_count = 0;
+        g_datasets[i].has_byte_count = 0;
+    }
+    g_dataset_count = 0;
+    pthread_mutex_unlock(&g_dataset_mutex);
+}
+
+static char* pleb_cef_string_to_cstr(cef_string_userfree_t s) {
+    if (!s) return NULL;
+    char* out = NULL;
+    if (s->str && s->length > 0) {
+        cef_string_utf8_t utf8 = {};
+        cef_string_utf16_to_utf8(s->str, s->length, &utf8);
+        if (utf8.str && utf8.length > 0) {
+            out = (char*)malloc(utf8.length + 1);
+            if (out) {
+                memcpy(out, utf8.str, utf8.length);
+                out[utf8.length] = '\0';
+            }
+        }
+        cef_string_utf8_clear(&utf8);
+    }
+    cef_string_userfree_free(s);
+    return out;
+}
 
 static int pleb_is_tracked_subresource(cef_resource_type_t rt) {
     return rt == RT_XHR || rt == RT_SCRIPT || rt == RT_SUB_RESOURCE;
@@ -56,13 +110,13 @@ static void pleb_inflight_dec_clamped(void) {
 static void pleb_init_markers(void) {
     static unsigned long fallback_seq = 0;
     FILE* f = fopen("/dev/urandom", "r");
-    unsigned char buf[24];
+    unsigned char buf[48];
     if (f && fread(buf, 1, sizeof(buf), f) == sizeof(buf)) {
         for (int i = 0; i < 12; i++) {
             snprintf(g_marker + i * 2, 3, "%02x", buf[i]);
-        }
-        for (int i = 0; i < 12; i++) {
             snprintf(g_sel_err_prefix + i * 2, 3, "%02x", buf[12 + i]);
+            snprintf(g_meta_marker + i * 2, 3, "%02x", buf[24 + i]);
+            snprintf(g_pre_reveal_marker + i * 2, 3, "%02x", buf[36 + i]);
         }
         fclose(f);
     } else {
@@ -71,6 +125,10 @@ static void pleb_init_markers(void) {
         snprintf(g_marker, sizeof(g_marker), "_m%d_%ld_%lu_",
                  getpid(), (long)time(NULL), fallback_seq);
         snprintf(g_sel_err_prefix, sizeof(g_sel_err_prefix), "_e%d_%ld_%lu_",
+                 getpid(), (long)time(NULL), fallback_seq);
+        snprintf(g_meta_marker, sizeof(g_meta_marker), "_j%d_%ld_%lu_",
+                 getpid(), (long)time(NULL), fallback_seq);
+        snprintf(g_pre_reveal_marker, sizeof(g_pre_reveal_marker), "_p%d_%ld_%lu_",
                  getpid(), (long)time(NULL), fallback_seq);
     }
 }
@@ -101,6 +159,8 @@ static void execute_js_on_main_frame(const char* js) {
     frame->base.release(&frame->base);
 }
 
+static char* copy_main_frame_url(void);
+
 // ── Display handler — captures DOM dump and selector errors ───
 
 static int CEF_CALLBACK on_console_message(
@@ -124,6 +184,46 @@ static int CEF_CALLBACK on_console_message(
             g_selector_error[msg_len] = '\0';
         }
         g_source_done = 1;
+        cef_string_utf8_clear(&utf8);
+        return 1;
+    }
+
+    size_t prlen = strlen(g_pre_reveal_marker);
+    if (utf8.length >= prlen && strncmp(utf8.str, g_pre_reveal_marker, prlen) == 0) {
+        const char* html = utf8.str + prlen;
+        size_t html_len = utf8.length - prlen;
+        free(g_pre_reveal_html);
+        g_pre_reveal_html = NULL;
+        g_pre_reveal_html_len = 0;
+        if (html_len > 0) {
+            g_pre_reveal_html = (char*)malloc(html_len);
+            if (g_pre_reveal_html) {
+                memcpy(g_pre_reveal_html, html, html_len);
+                g_pre_reveal_html_len = html_len;
+            }
+        }
+        free(g_pre_reveal_url);
+        g_pre_reveal_url = copy_main_frame_url();
+        g_reveal_started = 1;
+        cef_string_utf8_clear(&utf8);
+        return 1;
+    }
+
+    size_t jlen = strlen(g_meta_marker);
+    if (utf8.length >= jlen && strncmp(utf8.str, g_meta_marker, jlen) == 0) {
+        const char* meta = utf8.str + jlen;
+        size_t meta_len = utf8.length - jlen;
+        if (meta_len <= PLEB_MAX_REVEAL_META_BYTES) {
+            free(g_reveal_meta);
+            g_reveal_meta = (char*)malloc(meta_len + 1);
+            if (g_reveal_meta) {
+                memcpy(g_reveal_meta, meta, meta_len);
+                g_reveal_meta[meta_len] = '\0';
+                g_reveal_meta_len = meta_len;
+            } else {
+                g_reveal_meta_len = 0;
+            }
+        }
         cef_string_utf8_clear(&utf8);
         return 1;
     }
@@ -277,11 +377,57 @@ static void CEF_CALLBACK on_resource_load_complete(
     cef_response_t* response,
     cef_urlrequest_status_t status,
     int64_t received_content_length) {
-    (void)self; (void)browser; (void)frame; (void)response;
-    (void)status; (void)received_content_length;
-    if (request && pleb_is_tracked_subresource(request->get_resource_type(request))) {
+    (void)self; (void)browser; (void)frame;
+    if (!request) return;
+    cef_resource_type_t rt = request->get_resource_type(request);
+    if (pleb_is_tracked_subresource(rt)) {
         pleb_inflight_dec_clamped();
     }
+    if (rt != RT_XHR || status != UR_SUCCESS || !response) return;
+
+    int http_status = response->get_status(response);
+    if (http_status < 200 || http_status >= 300) return;
+
+    char* method = pleb_cef_string_to_cstr(request->get_method(request));
+    int is_get = (!method || pleb_streq_ascii_ci(method, "GET"));
+    free(method);
+    if (!is_get) return;
+
+    char* mime = pleb_cef_string_to_cstr(response->get_mime_type(response));
+    int looks_json = pleb_contains_ascii_ci(mime, "json");
+    if (!looks_json) {
+        free(mime);
+        return;
+    }
+
+    char* url = response->get_url ? pleb_cef_string_to_cstr(response->get_url(response)) : NULL;
+    if (!url || !url[0]) {
+        free(url);
+        url = pleb_cef_string_to_cstr(request->get_url(request));
+    }
+    if (!url || !url[0]) {
+        free(url);
+        free(mime);
+        return;
+    }
+
+    pthread_mutex_lock(&g_dataset_mutex);
+    if (g_dataset_count < PLEB_MAX_CAPTURED_DATASETS) {
+        g_datasets[g_dataset_count].url = url;
+        g_datasets[g_dataset_count].mime_type = mime;
+        if (received_content_length > 0) {
+            g_datasets[g_dataset_count].byte_count = (size_t)received_content_length;
+            g_datasets[g_dataset_count].has_byte_count = 1;
+        } else {
+            g_datasets[g_dataset_count].byte_count = 0;
+            g_datasets[g_dataset_count].has_byte_count = 0;
+        }
+        g_dataset_count++;
+    } else {
+        free(url);
+        free(mime);
+    }
+    pthread_mutex_unlock(&g_dataset_mutex);
 }
 
 static cef_resource_request_handler_t g_resource_request_handler;
@@ -430,7 +576,7 @@ static void pleb_init_cef_app(void) {
     g_app.get_browser_process_handler = get_browser_process_handler;
 }
 
-// ── Render a URL with v5-meta response ────────────────────────
+// ── Render a URL with v6-meta response ────────────────────────
 
 static void force_dump_dom(void) {
     char* dump_js = pleb_asprintf(
@@ -473,7 +619,91 @@ static char* copy_main_frame_url(void) {
     return result;
 }
 
-static void render_url_v5(const PlebRenderRequest* req) {
+static char* pleb_build_combined_meta_json(size_t* out_len) {
+    *out_len = 0;
+    pthread_mutex_lock(&g_dataset_mutex);
+    size_t ds_count = g_dataset_count;
+    int has_reveal_meta = (g_reveal_meta && g_reveal_meta_len >= 2
+        && g_reveal_meta[0] == '{' && g_reveal_meta[g_reveal_meta_len - 1] == '}');
+    if (!has_reveal_meta && ds_count == 0) {
+        pthread_mutex_unlock(&g_dataset_mutex);
+        return NULL;
+    }
+
+    PlebStrBuf sb = {NULL, 0, 0};
+    if (has_reveal_meta) {
+        if (pleb_buf_append(&sb, g_reveal_meta, g_reveal_meta_len - 1) != 0) {
+            pthread_mutex_unlock(&g_dataset_mutex);
+            free(sb.data);
+            return NULL;
+        }
+    } else {
+        if (pleb_buf_append_cstr(&sb, "{") != 0) {
+            pthread_mutex_unlock(&g_dataset_mutex);
+            free(sb.data);
+            return NULL;
+        }
+    }
+
+    if (ds_count > 0) {
+        if (has_reveal_meta) {
+            if (pleb_buf_append_cstr(&sb, ",") != 0) {
+                pthread_mutex_unlock(&g_dataset_mutex);
+                free(sb.data);
+                return NULL;
+            }
+        }
+        if (pleb_buf_append_cstr(&sb, "\"datasets\":[") != 0) {
+            pthread_mutex_unlock(&g_dataset_mutex);
+            free(sb.data);
+            return NULL;
+        }
+        for (size_t i = 0; i < ds_count; i++) {
+            if (i > 0 && pleb_buf_append_cstr(&sb, ",") != 0) {
+                pthread_mutex_unlock(&g_dataset_mutex);
+                free(sb.data);
+                return NULL;
+            }
+            if (pleb_buf_append_cstr(&sb, "{\"url\":") != 0
+                || pleb_buf_append_json_str(&sb, g_datasets[i].url) != 0
+                || pleb_buf_append_cstr(&sb, ",\"mime_type\":") != 0
+                || pleb_buf_append_json_str(&sb, g_datasets[i].mime_type) != 0) {
+                pthread_mutex_unlock(&g_dataset_mutex);
+                free(sb.data);
+                return NULL;
+            }
+            if (g_datasets[i].has_byte_count) {
+                char num_buf[48];
+                snprintf(num_buf, sizeof(num_buf), ",\"byte_count\":%zu", g_datasets[i].byte_count);
+                if (pleb_buf_append_cstr(&sb, num_buf) != 0) {
+                    pthread_mutex_unlock(&g_dataset_mutex);
+                    free(sb.data);
+                    return NULL;
+                }
+            }
+            if (pleb_buf_append_cstr(&sb, "}") != 0) {
+                pthread_mutex_unlock(&g_dataset_mutex);
+                free(sb.data);
+                return NULL;
+            }
+        }
+        if (pleb_buf_append_cstr(&sb, "]") != 0) {
+            pthread_mutex_unlock(&g_dataset_mutex);
+            free(sb.data);
+            return NULL;
+        }
+    }
+    pthread_mutex_unlock(&g_dataset_mutex);
+
+    if (pleb_buf_append_cstr(&sb, "}") != 0 || sb.len > PLEB_MAX_REVEAL_META_BYTES) {
+        free(sb.data);
+        return NULL;
+    }
+    *out_len = sb.len;
+    return sb.data;
+}
+
+static void render_url_v6(const PlebRenderRequest* req) {
     pleb_init_markers();
 
     g_load_done = 0;
@@ -481,16 +711,26 @@ static void render_url_v5(const PlebRenderRequest* req) {
     g_status_code = 0;
     g_committed_main_frame = 0;
     g_load_error = 0;
+    g_reveal_started = 0;
     __atomic_store_n(&g_inflight_subresources, 0, __ATOMIC_RELEASE);
     free(g_html);
     g_html = NULL;
     g_html_len = 0;
     free(g_selector_error);
     g_selector_error = NULL;
+    free(g_reveal_meta);
+    g_reveal_meta = NULL;
+    g_reveal_meta_len = 0;
+    free(g_pre_reveal_html);
+    g_pre_reveal_html = NULL;
+    g_pre_reveal_html_len = 0;
+    free(g_pre_reveal_url);
+    g_pre_reveal_url = NULL;
+    pleb_clear_datasets();
 
     cef_frame_t* frame = g_browser->get_main_frame(g_browser);
     if (!frame) {
-        pleb_write_response(stdout, 0, req->url, NULL, 0, "main frame unavailable", "network");
+        pleb_write_response(stdout, 0, req->url, NULL, 0, NULL, 0, "main frame unavailable", "network");
         return;
     }
 
@@ -501,8 +741,9 @@ static void render_url_v5(const PlebRenderRequest* req) {
     frame->base.release(&frame->base);
 
     int has_selector = (req->wait_for_selector && req->wait_for_selector[0]) ? 1 : 0;
+    int has_reveal = ((req->reveal && strcmp(req->reveal, "none") != 0) || req->scroll > 0) ? 1 : 0;
     int total_cap = 0, post_load_cap = 0, js_cap = 0;
-    pleb_clamp_timeouts(req->timeout_ms, has_selector, &total_cap, &post_load_cap, &js_cap);
+    pleb_clamp_timeouts(req->timeout_ms, has_selector, has_reveal, &total_cap, &post_load_cap, &js_cap);
 
     int post_load_ms = 0;
     const int tick_ms = 25;
@@ -511,6 +752,7 @@ static void render_url_v5(const PlebRenderRequest* req) {
     int last_pushed_inflight = -1;
     int total_ms = 0;
     int timed_out_uncommitted = 0;
+    char* saved_final_url = NULL;
 
     while (!g_source_done) {
         cef_do_message_loop_work();
@@ -518,6 +760,24 @@ static void render_url_v5(const PlebRenderRequest* req) {
         total_ms += tick_ms;
 
         if (g_nav_count != last_nav) {
+            if (g_reveal_started) {
+                saved_final_url = g_pre_reveal_url ? g_pre_reveal_url : copy_main_frame_url();
+                g_pre_reveal_url = NULL;
+                if (g_browser && g_browser->stop_load) {
+                    g_browser->stop_load(g_browser);
+                }
+                free(g_html);
+                g_html = g_pre_reveal_html;
+                g_html_len = g_pre_reveal_html_len;
+                g_pre_reveal_html = NULL;
+                g_pre_reveal_html_len = 0;
+                free(g_reveal_meta);
+                g_reveal_meta = pleb_strdup("{\"revealed_panels\":[],\"reveal_warning\":\"aborted --reveal because a control triggered page navigation\"}");
+                g_reveal_meta_len = g_reveal_meta ? strlen(g_reveal_meta) : 0;
+                g_source_done = 1;
+                g_load_error = 0;
+                break;
+            }
             last_nav = g_nav_count;
             post_load_ms = 0;
             poll_injected = 0;
@@ -545,11 +805,17 @@ static void render_url_v5(const PlebRenderRequest* req) {
             }
 
             if (!poll_injected && g_browser) {
+                int reveal_budget = (post_load_cap > js_cap) ? (post_load_cap - js_cap) : (post_load_cap / 2);
                 char* poller_js = pleb_build_poller_js(
                     req->wait_for_selector,
                     g_marker,
                     g_sel_err_prefix,
-                    js_cap
+                    g_meta_marker,
+                    g_pre_reveal_marker,
+                    req->reveal,
+                    req->scroll,
+                    js_cap,
+                    reveal_budget
                 );
                 if (poller_js) {
                     execute_js_on_main_frame(poller_js);
@@ -570,31 +836,37 @@ static void render_url_v5(const PlebRenderRequest* req) {
     }
 
     if (g_load_error != 0) {
+        free(saved_final_url);
         char err_msg[96];
         snprintf(err_msg, sizeof(err_msg), "load error %d", g_load_error);
-        pleb_write_response(stdout, 0, req->url, NULL, 0, err_msg, "load_error");
+        pleb_write_response(stdout, 0, req->url, NULL, 0, NULL, 0, err_msg, "load_error");
         return;
     }
 
     if (g_selector_error && g_selector_error[0]) {
+        free(saved_final_url);
         char* err_msg = pleb_asprintf("invalid selector: %s", g_selector_error);
-        pleb_write_response(stdout, g_status_code, req->url, NULL, 0,
+        pleb_write_response(stdout, g_status_code, req->url, NULL, 0, NULL, 0,
                             err_msg ? err_msg : "invalid selector", "invalid_selector");
         free(err_msg);
         return;
     }
 
     if (timed_out_uncommitted || !g_source_done) {
+        free(saved_final_url);
         const char* msg = timed_out_uncommitted
             ? "timed out before main frame commit"
             : "timed out capturing rendered DOM";
-        pleb_write_response(stdout, g_status_code, req->url, NULL, 0, msg, "timeout");
+        pleb_write_response(stdout, g_status_code, req->url, NULL, 0, NULL, 0, msg, "timeout");
         return;
     }
 
-    char* final_url = copy_main_frame_url();
+    char* final_url = saved_final_url ? saved_final_url : copy_main_frame_url();
     const char* out_url = (final_url && final_url[0]) ? final_url : req->url;
-    pleb_write_response(stdout, g_status_code, out_url, g_html, g_html_len, NULL, NULL);
+    size_t meta_len = 0;
+    char* meta_json = pleb_build_combined_meta_json(&meta_len);
+    pleb_write_response(stdout, g_status_code, out_url, g_html, g_html_len, meta_json, meta_len, NULL, NULL);
+    free(meta_json);
     free(final_url);
 }
 
@@ -626,7 +898,8 @@ static void pleb_run_request_loop(void) {
     int too_long = 0;
     while (pleb_read_line(stdin, &line, PLEB_MAX_REQUEST_LINE_BYTES, &too_long)) {
         if (too_long) {
-            pleb_write_response(stdout, 0, "", NULL, 0, "request line exceeds 64 KiB limit",
+            pleb_write_response(stdout, 0, "", NULL, 0, NULL, 0,
+                                "request line exceeds 64 KiB limit",
                                 "protocol_mismatch");
             continue;
         }
@@ -639,7 +912,7 @@ static void pleb_run_request_loop(void) {
         PlebRenderRequest req = {};
         char err_buf[256] = {};
         if (pleb_parse_request_line(line, &req, err_buf, sizeof(err_buf)) != 0) {
-            pleb_write_response(stdout, 0, "", NULL, 0, err_buf, "protocol_mismatch");
+            pleb_write_response(stdout, 0, "", NULL, 0, NULL, 0, err_buf, "protocol_mismatch");
             free(line);
             line = NULL;
             continue;
@@ -647,7 +920,7 @@ static void pleb_run_request_loop(void) {
         free(line);
         line = NULL;
 
-        render_url_v5(&req);
+        render_url_v6(&req);
         pleb_render_request_free(&req);
     }
 
@@ -655,6 +928,13 @@ static void pleb_run_request_loop(void) {
     g_html = NULL;
     free(g_selector_error);
     g_selector_error = NULL;
+    free(g_reveal_meta);
+    g_reveal_meta = NULL;
+    free(g_pre_reveal_html);
+    g_pre_reveal_html = NULL;
+    free(g_pre_reveal_url);
+    g_pre_reveal_url = NULL;
+    pleb_clear_datasets();
 }
 
 #endif

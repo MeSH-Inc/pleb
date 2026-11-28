@@ -317,7 +317,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "pleb_status",
-            "description": "Inspect local pleb transport readiness (Cronet TLS, CEF v5-meta renderer, CDP endpoint, and state dir).",
+            "description": "Inspect local pleb transport readiness (Cronet TLS, CEF v6-meta renderer, CDP endpoint, and state dir).",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
