@@ -1206,3 +1206,274 @@ async fn mcp_fetch_supports_section_offset_and_flag_parity() {
     server_task.await.unwrap();
     let _ = std::fs::remove_dir_all(&state_dir);
 }
+
+#[tokio::test]
+async fn mcp_fetch_supports_expand_no_navigate_optional_url_and_ui_gated_headers() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let html = concat!(
+        "<!doctype html><html><head><title>MCP Attach</title></head><body><main>",
+        "<h1>MCP Attach</h1><p>Active visible content.</p>",
+        "<div role=\"tablist\">",
+        "<button role=\"tab\" aria-controls=\"m-js\" aria-selected=\"true\">JS</button>",
+        "<button role=\"tab\" aria-controls=\"m-rs\" aria-selected=\"false\">Rust</button>",
+        "</div>",
+        "<div id=\"m-js\" role=\"tabpanel\"><p>npm install sdk</p></div>",
+        "<div id=\"m-rs\" role=\"tabpanel\" hidden><p>cargo add sdk</p>",
+        "<span style=\"opacity:0\">LEAK_MCP_HIDDEN</span></div>",
+        "</main></body></html>"
+    )
+    .to_string();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_port = listener.local_addr().unwrap().port();
+    let html_bg = html.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let html = html_bg.clone();
+            tokio::spawn(async move {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                while let Some(Ok(msg)) = ws.next().await {
+                    let Message::Text(txt) = msg else {
+                        if matches!(msg, Message::Close(_)) {
+                            let _ = ws.send(Message::Close(None)).await;
+                            break;
+                        }
+                        continue;
+                    };
+                    let val: Value = serde_json::from_str(&txt).unwrap();
+                    let id = val["id"].as_i64().unwrap();
+                    let method = val["method"].as_str().unwrap_or("");
+                    let result = match method {
+                        "Page.enable" | "DOM.enable" | "WebMCP.enable" => json!({}),
+                        "Page.getFrameTree" => json!({
+                            "frameTree": {
+                                "frame": {
+                                    "id": "mf-mcp",
+                                    "loaderId": "ldr-mcp",
+                                    "url": "https://portal.example.com/app",
+                                    "securityOrigin": "https://portal.example.com",
+                                    "mimeType": "text/html"
+                                }
+                            }
+                        }),
+                        "DOM.getDocument" => json!({ "root": { "nodeId": 1 } }),
+                        "DOM.getOuterHTML" => json!({ "outerHTML": html }),
+                        _ => {
+                            let err = json!({
+                                "id": id,
+                                "error": { "code": -32601, "message": "Method not found" }
+                            });
+                            let _ = ws.send(Message::Text(err.to_string().into())).await;
+                            continue;
+                        }
+                    };
+                    let reply = json!({ "id": id, "result": result });
+                    if ws.send(Message::Text(reply.to_string().into())).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    let state_dir = hermetic_dir("mcp-m7");
+    let ctx = Arc::new(
+        RuntimeContext::new(RuntimeConfig {
+            state_dir: state_dir.clone(),
+            cdp_url: Some(format!("ws://127.0.0.1:{ws_port}/devtools/page/mcp-1")),
+            timeout: Duration::from_secs(5),
+            cef_timeout: Duration::from_secs(5),
+            use_daemon: false,
+            no_web_bot_auth: true,
+            cef_renderer_executable: Some(state_dir.join("missing-cef")),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+
+    let (client_out, server_in) = tokio::io::duplex(64 * 1024);
+    let (server_out, client_in) = tokio::io::duplex(64 * 1024);
+    let ctx_server = Arc::clone(&ctx);
+    let server_task = tokio::spawn(async move {
+        serve_io(ctx_server, BufReader::new(server_in), server_out)
+            .await
+            .unwrap();
+    });
+    let mut writer = client_out;
+    let mut reader = BufReader::new(client_in);
+
+    let _ = send_rpc(
+        &mut writer,
+        &mut reader,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-03-26" }
+        }),
+    )
+    .await;
+
+    // 1. tools/list schema checks (`expand`, `no_navigate`, optional `url`).
+    let list_resp = send_rpc(
+        &mut writer,
+        &mut reader,
+        &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+    )
+    .await;
+    let fetch_schema = &list_resp["result"]["tools"][0]["inputSchema"];
+    assert_eq!(
+        fetch_schema["properties"]["expand"]["enum"],
+        json!(["none", "tabs", "all"])
+    );
+    assert_eq!(fetch_schema["properties"]["no_navigate"]["type"], "boolean");
+    let req = fetch_schema["required"].as_array().unwrap();
+    assert!(
+        !req.iter().any(|v| v == "url"),
+        "url should be optional in pleb_fetch schema, got {req:?}"
+    );
+
+    // 2. Rejections returning JSON-RPC -32602.
+    for (idx, bad_args) in [
+        json!({ "url": "" }),
+        json!({ "url": "", "no_navigate": true, "render": "cdp" }),
+        json!({ "no_navigate": true, "render": "cronet" }),
+        json!({ "no_navigate": true, "render": "cdp", "resources": "transcripts" }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let err = send_rpc(
+            &mut writer,
+            &mut reader,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 300 + idx,
+                "method": "tools/call",
+                "params": { "name": "pleb_fetch", "arguments": bad_args }
+            }),
+        )
+        .await;
+        assert_eq!(err["error"]["code"], -32602, "expected -32602: {err:?}");
+    }
+
+    // 3. Also reject non-page browser CDP URL when no_navigate is true.
+    let bad_cdp_dir = hermetic_dir("mcp-bad-cdp");
+    let bad_ctx = Arc::new(
+        RuntimeContext::new(RuntimeConfig {
+            state_dir: bad_cdp_dir.clone(),
+            cdp_url: Some(format!("ws://127.0.0.1:{ws_port}/devtools/browser")),
+            timeout: Duration::from_secs(5),
+            cef_timeout: Duration::from_secs(5),
+            use_daemon: false,
+            no_web_bot_auth: true,
+            cef_renderer_executable: Some(bad_cdp_dir.join("missing-cef")),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    {
+        let (c_out, s_in) = tokio::io::duplex(16 * 1024);
+        let (s_out, c_in) = tokio::io::duplex(16 * 1024);
+        let t = tokio::spawn(async move {
+            serve_io(bad_ctx, BufReader::new(s_in), s_out).await.unwrap();
+        });
+        let mut bw = c_out;
+        let mut br = BufReader::new(c_in);
+        let _ = send_rpc(
+            &mut bw,
+            &mut br,
+            &json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-03-26" } }),
+        )
+        .await;
+        let browser_err = send_rpc(
+            &mut bw,
+            &mut br,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "pleb_fetch",
+                    "arguments": { "no_navigate": true, "render": "cdp" }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(browser_err["error"]["code"], -32602, "got {browser_err:?}");
+        drop(bw);
+        t.await.unwrap();
+        let _ = std::fs::remove_dir_all(&bad_cdp_dir);
+    }
+
+    // 4. Successful passive no_navigate attach (no url) emits UI-Gated header.
+    let attach_none = send_rpc(
+        &mut writer,
+        &mut reader,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "pleb_fetch",
+                "arguments": { "no_navigate": true, "render": "cdp" }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(attach_none["result"]["isError"], false);
+    let attach_text = attach_none["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(attach_text.contains("UI-Gated: 1 tab in DOM (pass --expand tabs) | untrusted labels: \"Rust\""), "text={attach_text}");
+    assert!(attach_text.contains("npm install sdk"));
+    assert!(!attach_text.contains("cargo add sdk"));
+    assert!(!attach_text.contains("LEAK_MCP_HIDDEN"));
+
+    // 5. expand="tabs" recovers hidden Rust tabpanel while suppressing concealed LEAK_MCP_HIDDEN.
+    let attach_tabs = send_rpc(
+        &mut writer,
+        &mut reader,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "pleb_fetch",
+                "arguments": { "no_navigate": true, "render": "cdp", "expand": "tabs" }
+            }
+        }),
+    )
+    .await;
+    let tabs_text = attach_tabs["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(tabs_text.contains("## Tab: Rust"), "tabs={tabs_text}");
+    assert!(tabs_text.contains("cargo add sdk"));
+    assert!(!tabs_text.contains("LEAK_MCP_HIDDEN"));
+
+    // 6. metadata_only=true retains UI-Gated header without leaking body or concealed text.
+    let attach_meta = send_rpc(
+        &mut writer,
+        &mut reader,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/call",
+            "params": {
+                "name": "pleb_fetch",
+                "arguments": { "no_navigate": true, "render": "cdp", "metadata_only": true }
+            }
+        }),
+    )
+    .await;
+    let meta_text = attach_meta["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(meta_text.contains("UI-Gated: 1 tab in DOM (pass --expand tabs) | untrusted labels: \"Rust\""), "meta={meta_text}");
+    assert!(!meta_text.contains("npm install sdk"));
+    assert!(!meta_text.contains("cargo add sdk"));
+    assert!(!meta_text.contains("LEAK_MCP_HIDDEN"));
+
+    drop(writer);
+    server_task.await.unwrap();
+    let _ = std::fs::remove_dir_all(&state_dir);
+}

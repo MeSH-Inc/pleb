@@ -1,0 +1,26 @@
+<!-- pleb-fixture: {"tier":"ratchet","url":"https://docs.example.com/react-tabs","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"Mixed and Unmounted Tabs","variants":[{"name":"expand_none","format":"markdown","mode":"clean","expand":"none","expected_substrings":["Mixed Example","console.log(1)","Unmounted React Example","export const ok = true;"],"expected_ui_gate_count":2,"expected_ui_gates":[{"kind":"tablist","presence":"mixed","in_dom_labels":["Rust"],"unmounted_labels":["Go"],"active_label":"JavaScript"},{"kind":"tablist","presence":"unmounted","unmounted_labels":["Python","Ruby"],"active_label":"TypeScript"}]},{"name":"expand_tabs","format":"markdown","mode":"clean","expand":"tabs","expected_substrings":["Mixed Example","console.log(1)","### Tab: Rust","go test","Unmounted React Example","export const ok = true;"],"expected_ui_gate_count":2,"expected_ui_gates":[{"kind":"tablist","presence":"unmounted","unmounted_labels":["Go"],"active_label":"JavaScript"},{"kind":"tablist","presence":"unmounted","unmounted_labels":["Python","Ruby"],"active_label":"TypeScript"}]}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><title>Mixed and Unmounted Tabs</title></head>
+<body>
+  <main>
+    <h1>Mixed and Unmounted Tabs</h1>
+    <h2>Mixed Example</h2>
+    <div role="tablist">
+      <button role="tab" aria-controls="m-js" aria-selected="true">JavaScript</button>
+      <button role="tab" aria-controls="m-rs" aria-selected="false">Rust</button>
+      <button role="tab" aria-controls="m-go" aria-selected="false">Go</button>
+    </div>
+    <div id="m-js" role="tabpanel"><pre><code>console.log(1)</code></pre></div>
+    <div id="m-rs" role="tabpanel" hidden><code>go test</code></div>
+
+    <h2>Unmounted React Example</h2>
+    <div role="tablist">
+      <button role="tab" aria-controls="r-ts" aria-selected="true">TypeScript</button>
+      <button role="tab" aria-controls="r-py" aria-selected="false">Python</button>
+      <button role="tab" aria-controls="r-rb" aria-selected="false">Ruby</button>
+    </div>
+    <div id="r-ts" role="tabpanel"><pre><code>export const ok = true;</code></pre></div>
+  </main>
+</body>
+</html>

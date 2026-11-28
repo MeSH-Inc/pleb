@@ -30,7 +30,11 @@ pleb status
 
 # Fetch as clean Markdown (auto-escalates 403/JS shells to CEF/CDP when available)
 pleb fetch https://example.com
-pleb fetch --focus "rate limit retry" https://docs.example.com/api
+pleb fetch --expand tabs --focus "rate limit retry" https://docs.example.com/api
+
+# Extract offline HTML from Playwright or stdin, or passively snapshot an open loopback CDP tab
+node dump-page.mjs | pleb extract --url https://docs.example.com/api --expand tabs --focus "rate limits"
+pleb fetch --render cdp --cdp-url ws://127.0.0.1:9222/devtools/page/<id> --no-navigate
 
 # Search across providers (or DuckDuckGo) and pipe URLs into concurrent batch fetch
 pleb search --urls-only -n 5 "rust async runtime" | pleb fetch - --jsonl --concurrency 4

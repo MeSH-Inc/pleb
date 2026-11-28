@@ -606,7 +606,6 @@ pub(crate) fn plan_disclosures_and_gates(
         let mut group_capped = false;
 
         for (tab, label) in &eligible_tabs {
-            let is_active = tab.aria_selected == Some(true) || !any_selected;
             let resolved_panel = resolve_tab_panel(
                 doc,
                 tab.node_id,
@@ -616,7 +615,7 @@ pub(crate) fn plan_disclosures_and_gates(
                 &claimed_panels,
             );
 
-            if is_active && tab.aria_selected == Some(true) {
+            if tab.aria_selected == Some(true) {
                 if let Some(p_id) = resolved_panel {
                     if let Some(p_meta) = state.nodes.get(&p_id) {
                         if p_meta.visibility == ElementVisibility::Visible
@@ -641,7 +640,7 @@ pub(crate) fn plan_disclosures_and_gates(
                             continue;
                         }
                     }
-                } else {
+                } else if tab.aria_selected != Some(false) {
                     continue;
                 }
             }
@@ -1574,4 +1573,41 @@ fn is_pagination_label(label: &str) -> bool {
             false
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::extract::{extract_document_parsed, ExtractMode, ExtractOptions};
+    use url::Url;
+
+    #[test]
+    fn explicit_false_tab_with_duplicate_id_is_unmounted_while_unattributed_tab_is_ignored() {
+        let html = r#"
+            <html><body><main>
+              <div role="tablist">
+                <button role="tab" aria-controls="ok-panel" aria-selected="false">Rust</button>
+                <button role="tab" aria-controls="dup" aria-selected="false">DupTab</button>
+                <button role="tab" aria-controls="missing">NoAttrTab</button>
+              </div>
+              <div id="ok-panel" role="tabpanel" hidden><p>Rust body</p></div>
+              <div id="dup" role="tabpanel" hidden><p>A</p></div>
+              <div id="dup" role="tabpanel" hidden><p>B</p></div>
+            </main></body></html>
+        "#;
+        let url = Url::parse("https://example.com/tabs").unwrap();
+        let opts = ExtractOptions {
+            format: OutputFormat::Markdown,
+            mode: ExtractMode::Clean,
+            expand: ExpandPolicy::None,
+            ..Default::default()
+        };
+        let doc = extract_document_parsed(html, None, &url, Some("text/html"), &opts).unwrap();
+        assert_eq!(doc.ui_gates.len(), 1);
+        let gate = &doc.ui_gates[0];
+        assert_eq!(gate.kind, UiGateKind::Tablist);
+        assert_eq!(gate.presence, UiGatePresence::Mixed);
+        assert_eq!(gate.in_dom_labels, vec!["Rust"]);
+        assert_eq!(gate.unmounted_labels, vec!["DupTab"]);
+    }
 }

@@ -1,6 +1,9 @@
-use pleb::extract::webmcp::{MAX_ENUM_VALUES, MAX_SCHEMA_BYTES, MAX_SCHEMA_PROPERTIES};
+use pleb::extract::webmcp::{
+    format_webmcp_manifest_markdown, MAX_ENUM_VALUES, MAX_SCHEMA_BYTES, MAX_SCHEMA_PROPERTIES,
+};
 use pleb::extract::{
-    decode_text_bytes, detect_binary_content, extract_document_parsed, is_html_content_type,
+    decode_text_bytes, detect_binary_content, extract_document_parsed,
+    format_resource_manifest_markdown, format_ui_gates_cue, is_html_content_type, ExpandPolicy,
     ExtractMode, ExtractOptions, OutputFormat, ParsedHtml, ResourceKind,
 };
 use pleb::policy::{classify_response_with_context, is_safe_redirect_url, ResponseClassification};
@@ -11,6 +14,7 @@ use std::path::{Path, PathBuf};
 use url::Url;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FixtureSpec {
     tier: String,
     url: String,
@@ -31,12 +35,16 @@ struct FixtureSpec {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct VariantSpec {
     name: String,
     #[serde(default = "default_format")]
     format: String,
     #[serde(default = "default_mode")]
     mode: String,
+    expand: Option<String>,
+    section: Option<String>,
+    focus: Option<String>,
     #[serde(default = "default_true")]
     include_images: bool,
     #[serde(default = "default_true")]
@@ -58,6 +66,8 @@ struct VariantSpec {
     #[serde(default)]
     forbidden_substrings: Vec<String>,
     #[serde(default)]
+    forbidden_all_outputs_substrings: Vec<String>,
+    #[serde(default)]
     expected_resource_urls: Vec<String>,
     #[serde(default)]
     expected_resource_kinds: Vec<String>,
@@ -69,18 +79,37 @@ struct VariantSpec {
     forbidden_tool_names: Vec<String>,
     #[serde(default)]
     expected_tool_count: Option<usize>,
+    #[serde(default)]
+    expected_ui_gates: Vec<ExpectedUiGate>,
+    #[serde(default)]
+    expected_ui_gate_count: Option<usize>,
     minimum_output_bytes: Option<usize>,
     maximum_output_bytes: Option<usize>,
     expected_structure: Option<ExpectedStructure>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExpectedUiGate {
+    kind: String,
+    presence: String,
+    #[serde(default)]
+    in_dom_labels: Vec<String>,
+    #[serde(default)]
+    unmounted_labels: Vec<String>,
+    capped: Option<bool>,
+    active_label: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExpectedCodeBlock {
     language: Option<String>,
     snippet: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExpectedStructure {
     #[serde(default)]
     minimum_headings: usize,
@@ -440,12 +469,21 @@ fn evaluate_fixture(path: &Path) -> (String, FixtureSpec, FixtureOutcome) {
             "full" => ExtractMode::Full,
             _ => ExtractMode::Clean,
         };
+        let expand = match v.expand.as_deref().unwrap_or("none") {
+            "none" => ExpandPolicy::None,
+            "tabs" => ExpandPolicy::Tabs,
+            "all" => ExpandPolicy::All,
+            other => panic!("unknown expand policy in {}: {other}", path.display()),
+        };
         let opts = ExtractOptions {
             format,
             mode,
+            expand,
             include_images: v.include_images,
             include_links: v.include_links,
             max_bytes: v.max_bytes,
+            focus: v.focus.clone(),
+            section: v.section.clone(),
             ..Default::default()
         };
         let doc = extract_document_parsed(
@@ -566,6 +604,72 @@ fn evaluate_fixture(path: &Path) -> (String, FixtureSpec, FixtureOutcome) {
                     .push(format!("{}: forbidden substring {:?}", v.name, forb));
             } else {
                 out.forbidden_clean += 1;
+            }
+        }
+
+        if !v.forbidden_all_outputs_substrings.is_empty() {
+            let allow_expand_hint = matches!(mode, ExtractMode::Clean | ExtractMode::Article)
+                && matches!(format, OutputFormat::Markdown | OutputFormat::Text);
+            let combined_outputs = format!(
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                doc.content,
+                doc.title.as_deref().unwrap_or(""),
+                serde_json::to_string(&doc.resources).unwrap_or_default(),
+                serde_json::to_string(&doc.tools).unwrap_or_default(),
+                serde_json::to_string(&doc.ui_gates).unwrap_or_default(),
+                format_resource_manifest_markdown(&doc.resources),
+                format_webmcp_manifest_markdown(&doc.tools),
+                format_ui_gates_cue(&doc.ui_gates, allow_expand_hint).unwrap_or_default(),
+            )
+            .to_ascii_lowercase();
+            for forb in &v.forbidden_all_outputs_substrings {
+                out.forbidden_total += 1;
+                if combined_outputs.contains(&forb.to_ascii_lowercase()) {
+                    out.failures.push(format!(
+                        "{}: leaked {:?} across outputs/metadata/cues",
+                        v.name, forb
+                    ));
+                } else {
+                    out.forbidden_clean += 1;
+                }
+            }
+        }
+
+        if let Some(exp_gate_count) = v.expected_ui_gate_count {
+            out.expected_total += 1;
+            if doc.ui_gates.len() == exp_gate_count {
+                out.expected_hits += 1;
+            } else {
+                out.failures.push(format!(
+                    "{}: ui_gate count {} != {exp_gate_count} (found {:?})",
+                    v.name,
+                    doc.ui_gates.len(),
+                    doc.ui_gates
+                ));
+            }
+        }
+        for exp_gate in &v.expected_ui_gates {
+            out.expected_total += 1;
+            let matched = doc.ui_gates.iter().any(|g| {
+                g.kind.as_str() == exp_gate.kind
+                    && g.presence.as_str() == exp_gate.presence
+                    && g.in_dom_labels == exp_gate.in_dom_labels
+                    && g.unmounted_labels == exp_gate.unmounted_labels
+                    && exp_gate.capped.is_none_or(|c| g.capped == c)
+                    && exp_gate
+                        .active_label
+                        .as_deref()
+                        .is_none_or(|a| g.active_label.as_deref() == Some(a))
+                    && g.untrusted_content
+                    && g.identifier.starts_with("g_")
+            });
+            if matched {
+                out.expected_hits += 1;
+            } else {
+                out.failures.push(format!(
+                    "{}: missing expected ui_gate {exp_gate:?} (found {:?})",
+                    v.name, doc.ui_gates
+                ));
             }
         }
 

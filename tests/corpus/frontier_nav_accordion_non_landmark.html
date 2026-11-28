@@ -1,0 +1,17 @@
+<!-- pleb-fixture: {"tier":"ratchet","url":"https://docs.example.com/nav-accordion","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"Clean Main Prose","variants":[{"name":"expand_all","format":"markdown","mode":"clean","expand":"all","expected_substrings":["Core documentation paragraph inside main landmark."],"forbidden_substrings":["Hidden nav product dropdown links"],"expected_ui_gate_count":0}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><title>Clean Main Prose</title></head>
+<body>
+  <nav>
+    <button type="button" aria-expanded="false" aria-controls="nav-drop">Products</button>
+    <div id="nav-drop" hidden><a href="/a">Hidden nav product dropdown links</a></div>
+  </nav>
+  <main>
+    <h1>Clean Main Prose</h1>
+    <p>Core documentation paragraph inside main landmark.</p>
+    <button type="button" disabled>Load more</button>
+    <form action="/more"><button type="submit">Show more</button></form>
+  </main>
+</body>
+</html>

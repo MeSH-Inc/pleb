@@ -1,0 +1,31 @@
+<!-- pleb-fixture: {"tier":"ratchet","url":"https://docs.example.com/security/tabs","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"Security Tabs","variants":[{"name":"expand_none","format":"markdown","mode":"clean","expand":"none","expected_substrings":["Visible intro.","Guide","Safe UTF-8 trailing style text."],"forbidden_all_outputs_substrings":["LEAK_HIDDEN_CTRL","LEAK_LABEL_OPACITY","LEAK_HEADING","LEAK_MIXED_STYLE","LEAK_NESTED_SPAN","LEAK_TEX_ADJACENT","leak_cls","leak_inert","leak_inside_panel","LEAK_DUP_ID"],"expected_ui_gate_count":1,"expected_ui_gates":[{"kind":"tablist","presence":"mixed","in_dom_labels":["Rust"],"unmounted_labels":["MixedStyle","DupTab"]}]},{"name":"expand_tabs","format":"markdown","mode":"clean","expand":"tabs","expected_substrings":["Visible intro.","Guide","### Tab: Rust","cargo build --release","x^2","Safe UTF-8 trailing style text."],"forbidden_all_outputs_substrings":["LEAK_HIDDEN_CTRL","LEAK_LABEL_OPACITY","LEAK_HEADING","LEAK_MIXED_STYLE","LEAK_NESTED_SPAN","LEAK_TEX_ADJACENT","leak_cls","leak_inert","leak_inside_panel","LEAK_DUP_ID"],"expected_tool_count":0,"expected_ui_gate_count":1,"expected_ui_gates":[{"kind":"tablist","presence":"unmounted","unmounted_labels":["MixedStyle","DupTab"]}]},{"name":"expand_all","format":"markdown","mode":"clean","expand":"all","expected_substrings":["Visible intro.","Guide","### Tab: Rust","cargo build --release","x^2","Safe UTF-8 trailing style text."],"forbidden_all_outputs_substrings":["LEAK_HIDDEN_CTRL","LEAK_LABEL_OPACITY","LEAK_HEADING","LEAK_MIXED_STYLE","LEAK_NESTED_SPAN","LEAK_TEX_ADJACENT","leak_cls","leak_inert","leak_inside_panel","LEAK_DUP_ID"],"expected_tool_count":0}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><title>Security Tabs</title></head>
+<body>
+  <main>
+    <h1>Security Tabs</h1>
+    <p>Visible intro.</p>
+    <h2>Guide<span style="font-size:0">LEAK_HEADING</span></h2>
+    <div role="tablist">
+      <button role="tab" id="tab-bad-ctrl" style="opacity:0" aria-controls="e1" aria-selected="false">FakeCtrl</button>
+      <button role="tab" id="tab-ok" aria-controls="ok-panel" aria-selected="false">Rust<span style="opacity:0">LEAK_LABEL_OPACITY</span></button>
+      <button role="tab" id="tab-mix" aria-controls="mix-panel" aria-selected="false">MixedStyle</button>
+      <button role="tab" id="tab-dup" aria-controls="dup" aria-selected="false">DupTab</button>
+    </div>
+    <div id="e1" role="tabpanel" hidden><p>LEAK_HIDDEN_CTRL</p></div>
+    <div id="ok-panel" role="tabpanel" hidden>
+      <pre><code class="language-bash">cargo build --release</code></pre>
+      <span style="opacity:0">LEAK_NESTED_SPAN</span>
+      <div style="display:none">LEAK_TEX_ADJACENT <math><annotation encoding="application/x-tex">x^2</annotation></math></div>
+      <form toolname="leak_inside_panel" tooldescription="Hidden tool"><input name="k"></form>
+    </div>
+    <div id="mix-panel" role="tabpanel" style="display: none; opacity: 0"><p>LEAK_MIXED_STYLE</p></div>
+    <div id="dup" role="tabpanel" hidden><p>LEAK_DUP_ID first</p></div>
+    <div id="dup" role="tabpanel" hidden><p>LEAK_DUP_ID second</p></div>
+    <div style="left: -1000é"><p>Safe UTF-8 trailing style text.</p></div>
+    <form class="hidden" toolname="leak_cls" tooldescription="Class hidden tool"><input name="x"></form>
+    <form inert toolname="leak_inert" tooldescription="Inert tool"><input name="y"></form>
+  </main>
+</body>
+</html>

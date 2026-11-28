@@ -535,8 +535,9 @@ Fetch one or more `http`/`https` URLs, or pass `-` to read newline-separated URL
 
 ```bash
 pleb fetch https://example.com
-pleb fetch --extract article --no-images https://example.com/post
+pleb fetch --extract article --expand tabs --no-images https://example.com/post
 pleb fetch --render cef --wait-for-selector "article" https://x.com/user
+pleb fetch --render cdp --cdp-url ws://127.0.0.1:9222/devtools/page/<id> --no-navigate
 pleb fetch --format text https://news.ycombinator.com
 pleb fetch --format raw --output doc.pdf https://example.com/doc.pdf
 pleb fetch --stage --referer https://example.com/guide https://example.com/arch.png
@@ -547,9 +548,11 @@ pleb search --urls-only "rust async runtime" | pleb fetch -
 
 | Flag | Values / Default | Notes |
 | :--- | :--- | :--- |
-| `--format <FMT>` | `markdown` *(default)*, `html`, `text`, `axtree`, `raw` | Aliases: `md`, `txt`, `ax`. `axtree` requires CDP (`--cdp-url`); `raw` rejects `--json`, `--jsonl`, `--metadata-only`, `--stage`, batch mode, and writing to a TTY without `-o`. |
+| `--format <FMT>` | `markdown` *(default)*, `html`, `text`, `axtree`, `raw` | Aliases: `md`, `txt`, `ax`. `axtree` requires CDP (`--cdp-url`); `raw` rejects `--json`, `--jsonl`, `--metadata-only`, `--stage`, `--no-navigate`, batch mode, and writing to a TTY without `-o`. |
 | `--extract <MODE>` | `clean` *(default)*, `article`, `full` | Extraction scope for HTML, Markdown, feeds, and transcripts. |
+| `--expand <POLICY>` | `none` *(default)*, `tabs`, `all` | In-landmark ARIA disclosure rescue (`tabs` recovers hidden `[role="tabpanel"]` panels; `all` adds uniquely paired `[aria-expanded="false"][aria-controls]` disclosures; up to 32 panels). |
 | `--render <MODE>` | `auto` *(default)*, `cef`, `cdp`, `cronet` | Aliases: `browser`/`render`/`js` (`cef`), `kitesurf`/`remote` (`cdp`), `network`/`fast`/`no-js`/`nojs` (`cronet`). |
+| `--no-navigate` | flag | Document-bound passive snapshot of an already-loaded loopback `ws://127.0.0.1\|localhost\|[::1]/.../devtools/page/<id>` tab (`--render cdp` required; optional positional `[URL]` asserts expected origin; emits `strategy: "cdp_attach"` and `status_code: 0`; never mutates layout, writes `site-cache.json`, or runs `Fetch.enable`/`Page.navigate`). |
 | `--source <MODE>` | `auto` *(default)*, `negotiate`, `none` | Structured source and Markdown mirror policy. |
 | `--resources <POLICY>` | `none` *(default)*, `manifest`, `transcripts`, `diagrams`, `all` | Linked resource enrichment policy. |
 | `--tools <POLICY>` | `none` *(default)*, `manifest` | WebMCP tool indexing policy (`manifest` appends `## Page Tools (WebMCP)`). |
@@ -566,10 +569,31 @@ pleb search --urls-only "rust async runtime" | pleb fetch -
 | `--offset <BYTES>` | `usize` *(default `0`)* | Start byte offset within extracted content for fence-safe continuation (typically from a prior `Next-Offset` / `next_offset`; rejects `--focus`, `--stage`, and `--format raw`). |
 | `--concurrency <N>` | `1..=16` *(default `4`)* | Batch mode concurrency (hard cap of `2` concurrent fetches per host). |
 | `--jsonl` | flag | Stream one JSON result object per completed URL (conflicts with `--json`). |
-| `--metadata-only` | flag | Omit `content` while retaining metadata, `warning`, `resources`, and `tools` (requires `--json` or `--jsonl`; conflicts with `-o`). |
+| `--metadata-only` | flag | Omit `content` while retaining metadata, `warning`, `resources`, `tools`, and `ui_gates` (requires `--json` or `--jsonl`; conflicts with `-o`). |
 | `-o`, `--output <PATH>` | file path | Write output to a file on single-URL fetch (created only after success). |
 
-In batch mode (`2+` URLs or `-` on `stdin`), default Markdown output emits numbered `## [i/N]` sections, `--json` emits an input-ordered JSON array, and `--jsonl` streams completion-ordered JSON lines.
+In batch mode (`2+` URLs or `-` on `stdin`), default Markdown output emits numbered `## [i/N]` sections, `--json` emits an input-ordered JSON array, and `--jsonl` streams completion-ordered JSON lines. On non-JSON fetches, `pleb` prints `UI-Gated: ... | untrusted labels: ...` on `stderr` whenever unrendered tabs, disclosures, pagination buttons, modals, or `<canvas>` elements are detected in the baseline landmark.
+
+#### Deterministic Escalation Matrix
+
+| Signal from `pleb fetch` | Next Step |
+| :--- | :--- |
+| `exit 2` with `block_reason` in `["cloudflare_challenge", "bot_challenge"]` | Stop retrying in `pleb` (zero evasion scripts). Hand off to a **human** in a visible browser pane. |
+| `exit 2` with `block_reason` in `["login_wall", "cookie_wall"]` | Stop retrying in `pleb`; escalate to an interactive browser session (Playwright / browser subagent). |
+| `UI-Gated: ... in DOM (pass --expand tabs\|all)` | Stay in `pleb`: re-run with `--expand tabs` (or `--expand all`) plus `--focus` or `--section`. |
+| `UI-Gated: ... unmounted` or `visual canvas` / `modal` | Escalate to Playwright / interactive browser subagent to click, scroll, or inspect visually. |
+| Returning from Playwright with dense post-interaction DOM | Pipe `page.content()` to `pleb extract --url <url> --expand tabs --focus "<query>"`, or snapshot the open tab via `pleb fetch --render cdp --cdp-url ws://127.0.0.1:<port>/devtools/page/<id> --no-navigate --focus "<query>"`. |
+
+### `pleb extract`
+
+Extract clean Markdown, plain text, or sanitized HTML offline from `stdin` (`-`, default) or a local file (`<INPUT>`) without initializing `~/.pleb`, touching Keychain, or spawning `daemon.sock`.
+
+```bash
+node dump-page.mjs | pleb extract --url https://docs.example.com/api --expand tabs --focus "rate limits"
+pleb extract ./snapshot.html --url https://docs.example.com/api --json
+```
+
+Accepts `--url <URL>` (required `http://`/`https://` origin metadata, never fetched), `--content-type <MIME>` (default `"text/html; charset=utf-8"`), `--format <markdown|text|html>`, `--extract <clean|article|full>`, `--expand <none|tabs|all>`, `--resources <none|manifest>`, `--tools <none|manifest>`, `--no-images`, `--no-links`, `--focus <QUERY>`, `--section <SELECTOR>`, `--offset <BYTES>`, `--max-bytes <N>`, `--max-input-bytes <N>` (default `16 MiB`; `--max-response-bytes` is rejected), `--metadata-only` (requires `--json`), and `-o`/`--output <PATH>` (atomic write only after success). Rejects binary inputs and magic headers with exit `5` (`unsupported_content_type`) while allowing valid UTF-16 BOM / UTF-16 HTML.
 
 ### `pleb search`
 
@@ -705,12 +729,12 @@ All `--json` and `--jsonl` payloads serialize directly from `pleb`'s Rust output
 | `url` | `string` | Requested URL |
 | `final_url` | `string` | Post-rewrite / post-redirect final URL |
 | `representation_url` | `string` | Exact representation URL when distinct from `final_url` (e.g., an advertised Markdown mirror; **omitted** when identical) |
-| `status_code` | `number` | Observed HTTP status code (`u16`) |
+| `status_code` | `number` | Observed HTTP status code (`u16`; `0` on `cdp_attach` where `pleb` attached to an already-loaded tab) |
 | `content_type` | `string \| null` | Response `Content-Type` header if present |
 | `title` | `string \| null` | Extracted document title if present |
 | `content` | `string` | Extracted Markdown, text, HTML, or accessibility tree (`axtree`) (**omitted** with `--metadata-only`) |
 | `content_bytes` | `number` | Byte length of `content` (still populated with `--metadata-only`) |
-| `strategy` | `string` | Acquisition strategy (`cronet`, `reqwest`, `cef`, `cdp`, `raw_source`, `markdown_mirror`, `markdown_negotiated`) |
+| `strategy` | `string` | Acquisition strategy (`cronet`, `reqwest`, `cef`, `cdp`, `cdp_attach`, `raw_source`, `markdown_mirror`, `markdown_negotiated`) |
 | `content_outcome` | `string` | Machine-readable completeness classification (`complete` or `incomplete_shell`) |
 | `acquired_sha256` | `string` | Lowercase SHA-256 hex digest of the acquired source body prior to extraction/truncation |
 | `escalated` | `boolean` | `true` when transport fell back to HTTP/1.1 or escalated from primary HTTP to CEF or CDP |
@@ -720,13 +744,38 @@ All `--json` and `--jsonl` payloads serialize directly from `pleb`'s Rust output
 | `warning` | `string` | Advisory warning when an unrendered or post-render `JavaScriptShell` returns partial HTML, a requested `--stage-resources` selector is absent, or a requested `--section` / `--offset` does not match (**omitted** when absent) |
 | `resources` | `ResourceDescriptor[]` | Indexed linked resources (**omitted** when empty) |
 | `tools` | `WebMcpToolDescriptor[]` | Indexed WebMCP page tools (**omitted** when empty; `untrusted_content: true`) |
+| `ui_gates` | `UiGateDescriptor[]` | Detected baseline UI-gated controls (**omitted** when empty; `untrusted_content: true`) |
 
 ### `BatchItemResult` (`pleb fetch --jsonl` and multi-URL `pleb fetch --json`)
 
 Multi-URL and `stdin` (`-`) fetches emit an array (`--json`) or newline-delimited stream (`--jsonl`) of untagged `BatchItemResult` objects discriminated by `ok`:
 
-- **Success (`ok: true`)**: `url`, `ok`, `final_url`, `representation_url` (omitted when identical to `final_url`), `status_code`, `content_type`, `title`, `strategy`, `content_outcome`, `acquired_sha256`, `escalated`, `truncated`, `timing_ms`, `content_bytes`, plus `next_offset` (omitted when absent), `warning` (omitted when absent), `content` (omitted with `--metadata-only`), `resources` (omitted when empty), and `tools` (omitted when empty).
+- **Success (`ok: true`)**: `url`, `ok`, `final_url`, `representation_url` (omitted when identical to `final_url`), `status_code`, `content_type`, `title`, `strategy`, `content_outcome`, `acquired_sha256`, `escalated`, `truncated`, `timing_ms`, `content_bytes`, plus `next_offset` (omitted when absent), `warning` (omitted when absent), `content` (omitted with `--metadata-only`), `resources` (omitted when empty), `tools` (omitted when empty), and `ui_gates` (omitted when empty).
 - **Failure (`ok: false`)**: `url`, `ok`, `error`, `kind`, `block_reason` (optional `BlockReason`), `exit_code`.
+
+### `ExtractOutput` (`pleb extract --json`)
+
+| Field | Type | Notes |
+| :--- | :--- | :--- |
+| `url`, `content_type` | `string` | Validated origin URL metadata (`--url`) and resolved input MIME |
+| `title` | `string \| null` | Extracted document title if present |
+| `content` | `string` | Extracted content (**omitted** with `--metadata-only`) |
+| `content_bytes` | `number` | Byte length of `content` |
+| `acquired_sha256` | `string` | Lowercase SHA-256 hex digest of raw input bytes prior to charset decode |
+| `truncated`, `next_offset?`, `timing_ms`, `warning?` | — | Same truncation/projection semantics as `FetchOutput` |
+| `resources`, `tools`, `ui_gates` | arrays | Indexed resources, declarative WebMCP tools, and UI gates (**omitted** when empty) |
+
+### `UiGateDescriptor` (entries in `ui_gates`)
+
+| Field | Type | Notes |
+| :--- | :--- | :--- |
+| `identifier` | `string` | Deterministic SHA-256 ID (`g_<8hex>`) |
+| `kind` | `string` | `tablist`, `disclosure`, `pagination`, `modal_overlay`, or `visual_canvas` |
+| `presence` | `string` | `in_dom`, `unmounted`, `mixed`, or `opaque` |
+| `section_heading` | `string` | Nearest ancestor/preceding heading (**omitted** when absent) |
+| `in_dom_labels`, `unmounted_labels` | `string[]` | Capped (`16`) preview labels for in-DOM vs unmounted controls (**omitted** when empty) |
+| `gated_count`, `capped?`, `active_label?` | — | Total gated items represented, 32-panel expansion cap indicator, and active tab label |
+| `untrusted_content` | `boolean` | Always `true` (page-authored labels/headings are untrusted data) |
 
 ### `StagedAssetOutput` (`pleb fetch --stage --json`)
 
@@ -808,6 +857,7 @@ The milestone specifications in `docs/` record point-in-time design history (ear
 - [docs/04-resource-indexing-and-staging.md](docs/04-resource-indexing-and-staging.md) — Historical Milestone 4 design specification.
 - [docs/05-multi-provider-search-and-auth.md](docs/05-multi-provider-search-and-auth.md) — Historical Milestone 5 design specification.
 - [docs/06-agent-identity-webmcp-and-cdp-renderer.md](docs/06-agent-identity-webmcp-and-cdp-renderer.md) — Historical Milestone 6 design specification.
+- [docs/07-ui-gated-disclosure-and-escalation.md](docs/07-ui-gated-disclosure-and-escalation.md) — Historical Milestone 7 design specification (UI-gated disclosure rescue, `ui_gates`, `pleb extract`, passive `--no-navigate`).
 
 ---
 

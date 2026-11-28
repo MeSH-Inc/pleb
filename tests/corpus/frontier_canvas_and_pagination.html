@@ -1,0 +1,16 @@
+<!-- pleb-fixture: {"tier":"ratchet","url":"https://metrics.example.com/latency","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"Latency Dashboard","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["Percentiles","P99 latency summary."],"expected_ui_gate_count":2,"expected_ui_gates":[{"kind":"pagination","presence":"unmounted","unmounted_labels":["Load more"]},{"kind":"visual_canvas","presence":"opaque","unmounted_labels":["Latency percentiles"]}]}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><title>Latency Dashboard</title></head>
+<body>
+  <main>
+    <h1>Latency Dashboard</h1>
+    <section>
+      <h2>Percentiles</h2>
+      <p>P99 latency summary.</p>
+      <canvas width="640" height="360" aria-label="Latency percentiles"></canvas>
+      <button type="button">Load more</button>
+    </section>
+  </main>
+</body>
+</html>

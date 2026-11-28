@@ -810,6 +810,15 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "PLEB_CLAUDE_SETTINGS",
         "init-web-bot-auth",
         "block_reason",
+        "--expand",
+        "pleb extract",
+        "--max-input-bytes",
+        "--no-navigate",
+        "cdp_attach",
+        "ui_gates",
+        "UiGateDescriptor",
+        "ExtractOutput",
+        "UI-Gated:",
     ] {
         assert!(
             readme_full.contains(required),
@@ -846,6 +855,15 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "PLEB_CLAUDE_SETTINGS",
         "init-web-bot-auth",
         "block_reason",
+        "--expand",
+        "pleb extract",
+        "--max-input-bytes",
+        "--no-navigate",
+        "cdp_attach",
+        "ui_gates",
+        "UiGateDescriptor",
+        "ExtractOutput",
+        "UI-Gated:",
     ] {
         assert!(
             llms_full_txt.contains(required),
@@ -951,6 +969,15 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "PLEB_CLAUDE_SETTINGS",
         "init-web-bot-auth",
         "block_reason",
+        "--expand",
+        "pleb extract",
+        "--max-input-bytes",
+        "--no-navigate",
+        "cdp_attach",
+        "ui_gates",
+        "UiGateDescriptor",
+        "ExtractOutput",
+        "UI-Gated:",
     ] {
         assert!(
             skill_md.contains(required),

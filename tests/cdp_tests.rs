@@ -1,9 +1,11 @@
 use futures_util::{SinkExt, StreamExt};
 use pleb::auth::{set_credential, CredentialProvider, CredentialStorage};
-use pleb::policy::RenderMode;
+use pleb::context::{RuntimeConfig, RuntimeContext};
+use pleb::fetch::{fetch_target, FetchError, FetchOptions, FetchTarget};
+use pleb::policy::{BlockReason, RenderMode, ResourcePolicy};
 use pleb::transport::cdp::{
-    sanitize_cdp_url_for_display, validate_cdp_url, CdpRenderOptions, CdpRenderer,
-    MAX_UNSOLICITED_EVENTS,
+    sanitize_cdp_url_for_display, validate_cdp_url, validate_loopback_page_cdp_url,
+    CdpRenderOptions, CdpRenderer, MAX_UNSOLICITED_EVENTS,
 };
 use pleb::transport::{transport_error_kind, ResponseTooLargeError, TransportErrorKind};
 use serde_json::{json, Value};
@@ -1263,3 +1265,870 @@ async fn cdp_proxy_non_101_sanitization_access_credentials_and_url_validation() 
     // Ensure unused RenderMode import isn't flagged if omitted.
     let _ = RenderMode::Cdp;
 }
+
+#[tokio::test]
+async fn passive_attach_enforces_outbound_rpc_allowlist_and_ignores_fetch_pause_events() {
+    let dir = TempDir::new();
+    let html = concat!(
+        "<!doctype html><html><head><title>Attached Doc</title></head>",
+        "<body><main><h1>Attached</h1><p>Logged in dashboard content.</p>",
+        "<div role=\"tablist\">",
+        "<button role=\"tab\" aria-controls=\"p1\" aria-selected=\"true\">One</button>",
+        "<button role=\"tab\" aria-controls=\"p2\" aria-selected=\"false\">Two</button>",
+        "</div>",
+        "<div id=\"p1\" role=\"tabpanel\"><p>Visible one.</p></div>",
+        "<div id=\"p2\" role=\"tabpanel\" hidden><p>Hidden two.</p></div>",
+        "</main></body></html>"
+    )
+    .to_string();
+
+    let handler: RpcHandler = Arc::new(move |id, method, session_id, _params, _log| {
+        let html = html.clone();
+        match method {
+            "Page.enable" | "DOM.enable" | "WebMCP.enable" => {
+                vec![
+                    rpc_event(
+                        session_id.as_deref(),
+                        "Fetch.requestPaused",
+                        json!({ "requestId": "req-unsolicited", "request": { "url": "https://portal.example.com/" } }),
+                    ),
+                    rpc_ok(id, session_id, json!({})),
+                ]
+            }
+            "Page.getFrameTree" => vec![rpc_ok(
+                id,
+                session_id,
+                json!({
+                    "frameTree": {
+                        "frame": {
+                            "id": "main-frame-1",
+                            "loaderId": "loader-alpha",
+                            "url": "https://portal.example.com/app",
+                            "urlFragment": "#panel",
+                            "securityOrigin": "https://portal.example.com",
+                            "mimeType": "text/html"
+                        }
+                    }
+                }),
+            )],
+            "DOM.getDocument" => vec![rpc_ok(id, session_id, json!({ "root": { "nodeId": 7 } }))],
+            "DOM.getOuterHTML" => vec![rpc_ok(id, session_id, json!({ "outerHTML": html }))],
+            "DOM.querySelector" => vec![rpc_ok(id, session_id, json!({ "nodeId": 42 }))],
+            _ => vec![rpc_err(id, session_id, -32601, "Method not found")],
+        }
+    });
+
+    let (base_ws, _port, log) = spawn_mock_cdp_server(handler).await;
+    let renderer = CdpRenderer::new(
+        format!("{base_ws}/devtools/page/tab-123"),
+        dir.path().to_path_buf(),
+        None,
+    );
+    let res = renderer
+        .render_attached(
+            Some("https://portal.example.com/"),
+            &CdpRenderOptions {
+                wait_for_selector: Some("main".to_string()),
+                ..Default::default()
+            },
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.final_url, "https://portal.example.com/app#panel");
+    assert!(res.html.contains("Logged in dashboard content."));
+    wait_for_close_frame(&log).await;
+
+    let guard = log.lock().unwrap();
+    assert_eq!(guard.request_uris, vec!["/devtools/page/tab-123"]);
+    let methods: Vec<&str> = guard.rpcs.iter().map(|r| r.method.as_str()).collect();
+    for required in [
+        "Page.enable",
+        "Page.getFrameTree",
+        "DOM.getDocument",
+        "DOM.getOuterHTML",
+    ] {
+        assert!(
+            methods.contains(&required),
+            "missing required passive method {required} in {methods:?}"
+        );
+    }
+    for forbidden in [
+        "Fetch.enable",
+        "Fetch.continueRequest",
+        "Fetch.failRequest",
+        "Network.enable",
+        "Page.navigate",
+        "Kitesurf.setLayoutMode",
+        "Target.createTarget",
+        "Target.attachToTarget",
+        "Target.closeTarget",
+        "Browser.close",
+    ] {
+        assert!(
+            !methods.contains(&forbidden),
+            "forbidden method {forbidden} sent during passive attach: {methods:?}"
+        );
+    }
+    assert!(guard.received_close_frame);
+
+    // Abrupt WebSocket EOF mid-attach fails cleanly with zero forbidden RPCs.
+    let drop_handler: RpcHandler = Arc::new(|id, method, session_id, _params, _log| match method {
+        "Page.enable" | "DOM.enable" | "WebMCP.enable" => vec![rpc_ok(id, session_id, json!({}))],
+        "Page.getFrameTree" => vec![rpc_ok(
+            id,
+            session_id,
+            json!({
+                "frameTree": {
+                    "frame": {
+                        "id": "main-frame-1",
+                        "loaderId": "loader-alpha",
+                        "url": "https://portal.example.com/app",
+                        "securityOrigin": "https://portal.example.com"
+                    }
+                }
+            }),
+        )],
+        "DOM.getDocument" => vec![Message::Close(None)],
+        _ => vec![],
+    });
+    let (drop_ws, _p, drop_log) = spawn_mock_cdp_server(drop_handler).await;
+    let drop_err = CdpRenderer::new(
+        format!("{drop_ws}/devtools/page/drop-1"),
+        dir.path().to_path_buf(),
+        None,
+    )
+    .render_attached(None, &CdpRenderOptions::default(), Duration::from_secs(5))
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            transport_error_kind(&drop_err),
+            Some(TransportErrorKind::Network | TransportErrorKind::LoadError)
+        ),
+        "unexpected drop err: {drop_err}"
+    );
+    let drop_methods: Vec<String> = drop_log
+        .lock()
+        .unwrap()
+        .rpcs
+        .iter()
+        .map(|r| r.method.clone())
+        .collect();
+    assert!(!drop_methods.iter().any(|m| m.starts_with("Target.") || m.starts_with("Fetch.") || m == "Browser.close"));
+}
+
+#[tokio::test]
+async fn passive_attach_aborts_on_all_three_toctou_document_swaps() {
+    let dir = TempDir::new();
+
+    // Case A: `Page.frameNavigated` arrives during `--wait-for-selector` polling.
+    let selector_polls = Arc::new(AtomicU64::new(0));
+    let polls_a = Arc::clone(&selector_polls);
+    let handler_a: RpcHandler = Arc::new(move |id, method, session_id, _params, _log| match method {
+        "Page.enable" | "DOM.enable" | "WebMCP.enable" => vec![rpc_ok(id, session_id, json!({}))],
+        "Page.getFrameTree" => vec![rpc_ok(
+            id,
+            session_id,
+            json!({
+                "frameTree": {
+                    "frame": {
+                        "id": "main-a",
+                        "loaderId": "ldr-a1",
+                        "url": "https://portal.example.com/step1",
+                        "securityOrigin": "https://portal.example.com"
+                    }
+                }
+            }),
+        )],
+        "DOM.getDocument" => vec![rpc_ok(id, session_id, json!({ "root": { "nodeId": 1 } }))],
+        "DOM.getOuterHTML" => {
+            vec![rpc_ok(id, session_id, json!({ "outerHTML": "<html><body>Initial</body></html>" }))]
+        }
+        "DOM.querySelector" => {
+            if polls_a.fetch_add(1, Ordering::Relaxed) == 0 {
+                vec![
+                    rpc_event(
+                        session_id.as_deref(),
+                        "Page.frameNavigated",
+                        json!({
+                            "frame": {
+                                "id": "main-a",
+                                "loaderId": "ldr-a2",
+                                "url": "https://portal.example.com/step2"
+                            }
+                        }),
+                    ),
+                    rpc_ok(id, session_id, json!({ "nodeId": 0 })),
+                ]
+            } else {
+                vec![rpc_ok(id, session_id, json!({ "nodeId": 22 }))]
+            }
+        }
+        _ => vec![rpc_err(id, session_id, -32601, "Method not found")],
+    });
+    let (ws_a, _p, _l) = spawn_mock_cdp_server(handler_a).await;
+    let err_a = CdpRenderer::new(
+        format!("{ws_a}/devtools/page/a"),
+        dir.path().to_path_buf(),
+        None,
+    )
+    .render_attached(
+        Some("https://portal.example.com/step1"),
+        &CdpRenderOptions {
+            wait_for_selector: Some(".ready".to_string()),
+            ..Default::default()
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(transport_error_kind(&err_a), Some(TransportErrorKind::LoadError));
+
+    // Case B: `loaderId` swaps between `DOM.getOuterHTML` and `Accessibility.getFullAXTree`.
+    let tree_calls_b = Arc::new(AtomicU64::new(0));
+    let tree_b = Arc::clone(&tree_calls_b);
+    let handler_b: RpcHandler = Arc::new(move |id, method, session_id, _params, _log| match method {
+        "Page.enable" | "DOM.enable" | "WebMCP.enable" => vec![rpc_ok(id, session_id, json!({}))],
+        "Page.getFrameTree" => {
+            let n = tree_b.fetch_add(1, Ordering::Relaxed);
+            let loader = if n < 2 { "ldr-b1" } else { "ldr-b2" };
+            vec![rpc_ok(
+                id,
+                session_id,
+                json!({
+                    "frameTree": {
+                        "frame": {
+                            "id": "main-b",
+                            "loaderId": loader,
+                            "url": "https://portal.example.com/doc",
+                            "securityOrigin": "https://portal.example.com"
+                        }
+                    }
+                }),
+            )]
+        }
+        "DOM.getDocument" => vec![rpc_ok(id, session_id, json!({ "root": { "nodeId": 1 } }))],
+        "DOM.getOuterHTML" => {
+            vec![rpc_ok(id, session_id, json!({ "outerHTML": "<html><body>Snap B</body></html>" }))]
+        }
+        "Accessibility.getFullAXTree" => vec![rpc_ok(
+            id,
+            session_id,
+            json!({
+                "nodes": [
+                    { "nodeId": "1", "role": { "value": "RootWebArea" }, "name": { "value": "Doc" }, "childIds": [] }
+                ]
+            }),
+        )],
+        _ => vec![rpc_err(id, session_id, -32601, "Method not found")],
+    });
+    let (ws_b, _p, _l) = spawn_mock_cdp_server(handler_b).await;
+    let err_b = CdpRenderer::new(
+        format!("{ws_b}/devtools/page/b"),
+        dir.path().to_path_buf(),
+        None,
+    )
+    .render_attached(
+        Some("https://portal.example.com/doc"),
+        &CdpRenderOptions {
+            capture_axtree: true,
+            ..Default::default()
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(transport_error_kind(&err_b), Some(TransportErrorKind::LoadError));
+
+    // Case C: Tab navigates away and back to the exact same URL (new `loaderId`) before final `Page.getFrameTree`.
+    let tree_calls_c = Arc::new(AtomicU64::new(0));
+    let tree_c = Arc::clone(&tree_calls_c);
+    let handler_c: RpcHandler = Arc::new(move |id, method, session_id, _params, _log| match method {
+        "Page.enable" | "DOM.enable" | "WebMCP.enable" => vec![rpc_ok(id, session_id, json!({}))],
+        "Page.getFrameTree" => {
+            let n = tree_calls_c_step(&tree_c);
+            let loader = if n == 0 || n == 1 { "ldr-c1" } else { "ldr-c-reloaded" };
+            vec![rpc_ok(
+                id,
+                session_id,
+                json!({
+                    "frameTree": {
+                        "frame": {
+                            "id": "main-c",
+                            "loaderId": loader,
+                            "url": "https://portal.example.com/same",
+                            "securityOrigin": "https://portal.example.com"
+                        }
+                    }
+                }),
+            )]
+        }
+        "DOM.getDocument" => vec![rpc_ok(id, session_id, json!({ "root": { "nodeId": 1 } }))],
+        "DOM.getOuterHTML" => {
+            vec![rpc_ok(id, session_id, json!({ "outerHTML": "<html><body>Round trip</body></html>" }))]
+        }
+        _ => vec![rpc_err(id, session_id, -32601, "Method not found")],
+    });
+    let (ws_c, _p, _l) = spawn_mock_cdp_server(handler_c).await;
+    let err_c = CdpRenderer::new(
+        format!("{ws_c}/devtools/page/c"),
+        dir.path().to_path_buf(),
+        None,
+    )
+    .render_attached(
+        Some("https://portal.example.com/same"),
+        &CdpRenderOptions::default(),
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(transport_error_kind(&err_c), Some(TransportErrorKind::LoadError));
+}
+
+fn tree_calls_c_step(counter: &Arc<AtomicU64>) -> u64 {
+    counter.fetch_add(1, Ordering::Relaxed)
+}
+
+#[tokio::test]
+async fn passive_attach_guards_endpoints_frame_binding_axtree_size_and_child_webmcp() {
+    let dir = TempDir::new();
+
+    // 1. Endpoint URL validations reject non-page/remote/ambiguous CDP endpoints.
+    for bad in [
+        "ws://127.0.0.1:9222/devtools/browser",
+        "ws://127.0.0.1:9222/devtools/page/",
+        "ws://127.0.0.1:9222/devtools/page/a/b",
+        "wss://cdp.example.com/devtools/page/abc",
+        "http://127.0.0.1:9222/devtools/page/abc",
+    ] {
+        assert!(
+            validate_loopback_page_cdp_url(bad).is_err(),
+            "expected validate_loopback_page_cdp_url to reject {bad}"
+        );
+    }
+    assert!(validate_loopback_page_cdp_url("ws://127.0.0.1:9222/devtools/page/TAB-42").is_ok());
+
+    // 2. Frame binding failures and child-frame WebMCP filtering.
+    let frame_override = Arc::new(Mutex::new(json!({
+        "id": "main-1",
+        "loaderId": "ldr-1",
+        "url": "https://portal.example.com/app",
+        "securityOrigin": "https://portal.example.com"
+    })));
+    let ax_nodes = Arc::new(Mutex::new(json!([
+        { "nodeId": "1", "role": { "value": "RootWebArea" }, "name": { "value": "OK" }, "childIds": [] }
+    ])));
+
+    let f_bg = Arc::clone(&frame_override);
+    let ax_bg = Arc::clone(&ax_nodes);
+    let handler: RpcHandler = Arc::new(move |id, method, session_id, _params, _log| match method {
+        "Page.enable" | "DOM.enable" => vec![rpc_ok(id, session_id, json!({}))],
+        "WebMCP.enable" => vec![
+            rpc_event(
+                session_id.as_deref(),
+                "WebMCP.toolsAdded",
+                json!({
+                    "tools": [
+                        {
+                            "name": "evil_child_tool",
+                            "description": "from iframe",
+                            "frameId": "child-iframe-99"
+                        },
+                        {
+                            "name": "main_safe_tool",
+                            "description": "main tool",
+                            "frameId": "main-1"
+                        }
+                    ]
+                }),
+            ),
+            rpc_ok(id, session_id, json!({})),
+        ],
+        "Page.getFrameTree" => {
+            let f = f_bg.lock().unwrap().clone();
+            vec![rpc_ok(id, session_id, json!({ "frameTree": { "frame": f } }))]
+        }
+        "DOM.getDocument" => vec![rpc_ok(id, session_id, json!({ "root": { "nodeId": 1 } }))],
+        "DOM.getOuterHTML" => {
+            vec![rpc_ok(id, session_id, json!({ "outerHTML": "<html><body><main><p>Bound OK</p></main></body></html>" }))]
+        }
+        "Accessibility.getFullAXTree" => {
+            let nodes = ax_bg.lock().unwrap().clone();
+            vec![rpc_ok(id, session_id, json!({ "nodes": nodes }))]
+        }
+        _ => vec![rpc_err(id, session_id, -32601, "Method not found")],
+    });
+
+    let (base_ws, _port, log) = spawn_mock_cdp_server(handler).await;
+    let renderer = CdpRenderer::new(
+        format!("{base_ws}/devtools/page/main-1"),
+        dir.path().to_path_buf(),
+        None,
+    );
+
+    // Child-frame WebMCP is ignored while main-frame tool is kept; `frameId` is sent on AXTree.
+    let ok = renderer
+        .render_attached(
+            Some("https://portal.example.com/"),
+            &CdpRenderOptions {
+                capture_axtree: true,
+                ..Default::default()
+            },
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok.imperative_tools.len(), 1);
+    assert_eq!(ok.imperative_tools[0].name, "main_safe_tool");
+    assert!(ok.axtree_text.as_deref().is_some_and(|t| t.contains("RootWebArea")));
+    {
+        let guard = log.lock().unwrap();
+        let ax_rpc = guard
+            .rpcs
+            .iter()
+            .find(|r| r.method == "Accessibility.getFullAXTree")
+            .expect("AXTree RPC");
+        assert_eq!(ax_rpc.params["frameId"], "main-1");
+    }
+
+    // Oversized successful AXTree reply triggers `ResponseTooLarge`.
+    let huge_label = "x".repeat(4096);
+    *ax_nodes.lock().unwrap() = json!([
+        { "nodeId": "1", "role": { "value": "StaticText" }, "name": { "value": huge_label }, "childIds": [] }
+    ]);
+    let ax_over = renderer
+        .render_attached(
+            Some("https://portal.example.com/"),
+            &CdpRenderOptions {
+                capture_axtree: true,
+                max_response_bytes: 512,
+                ..Default::default()
+            },
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+    assert!(ax_over.is::<ResponseTooLargeError>());
+    *ax_nodes.lock().unwrap() = json!([
+        { "nodeId": "1", "role": { "value": "RootWebArea" }, "name": { "value": "OK" }, "childIds": [] }
+    ]);
+
+    // Missing loaderId -> ProtocolMismatch.
+    *frame_override.lock().unwrap() = json!({
+        "id": "main-1",
+        "loaderId": "",
+        "url": "https://portal.example.com/app",
+        "securityOrigin": "https://portal.example.com"
+    });
+    let no_ldr = renderer
+        .render_attached(None, &CdpRenderOptions::default(), Duration::from_secs(5))
+        .await
+        .unwrap_err();
+    assert_eq!(transport_error_kind(&no_ldr), Some(TransportErrorKind::ProtocolMismatch));
+
+    // Non-empty unreachableUrl -> LoadError.
+    *frame_override.lock().unwrap() = json!({
+        "id": "main-1",
+        "loaderId": "ldr-1",
+        "url": "chrome-error://chromewebdata/",
+        "unreachableUrl": "https://portal.example.com/app"
+    });
+    let unreach = renderer
+        .render_attached(None, &CdpRenderOptions::default(), Duration::from_secs(5))
+        .await
+        .unwrap_err();
+    assert_eq!(transport_error_kind(&unreach), Some(TransportErrorKind::LoadError));
+
+    // Non-HTTP URLs (`chrome://settings`, `about:blank`) rejected.
+    for non_http in ["chrome://settings", "about:blank"] {
+        *frame_override.lock().unwrap() = json!({
+            "id": "main-1",
+            "loaderId": "ldr-1",
+            "url": non_http
+        });
+        let err = renderer
+            .render_attached(None, &CdpRenderOptions::default(), Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            transport_error_kind(&err),
+            Some(TransportErrorKind::LoadError),
+            "expected LoadError for {non_http}, got {err}"
+        );
+    }
+
+    // Mismatched expected origin -> RedirectBlocked.
+    *frame_override.lock().unwrap() = json!({
+        "id": "main-1",
+        "loaderId": "ldr-1",
+        "url": "https://other.example.com/app",
+        "securityOrigin": "https://other.example.com"
+    });
+    let origin_err = renderer
+        .render_attached(
+            Some("https://portal.example.com/app"),
+            &CdpRenderOptions::default(),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(transport_error_kind(&origin_err), Some(TransportErrorKind::RedirectBlocked));
+
+    // Opaque `"null"` securityOrigin -> RedirectBlocked.
+    *frame_override.lock().unwrap() = json!({
+        "id": "main-1",
+        "loaderId": "ldr-1",
+        "url": "https://portal.example.com/sandbox",
+        "securityOrigin": "null"
+    });
+    let opaque_err = renderer
+        .render_attached(
+            Some("https://portal.example.com/"),
+            &CdpRenderOptions::default(),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(transport_error_kind(&opaque_err), Some(TransportErrorKind::RedirectBlocked));
+}
+
+#[tokio::test]
+async fn passive_attach_classification_site_cache_isolation_and_cli_envelopes() {
+    let dir = TempDir::new();
+    let site_cache_path = dir.path().join("site-cache.json");
+    let initial_cache_bytes =
+        br#"{"https://portal.example.com":{"prefer_cef":true,"updated_at_epoch_s":1700000000}}"#;
+    std::fs::write(&site_cache_path, initial_cache_bytes).unwrap();
+
+    let mode = Arc::new(Mutex::new("ok"));
+    let frame_url = Arc::new(Mutex::new("https://portal.example.com/dashboard"));
+    let query_calls = Arc::new(AtomicU64::new(0));
+
+    let mode_bg = Arc::clone(&mode);
+    let url_bg = Arc::clone(&frame_url);
+    let qc_bg = Arc::clone(&query_calls);
+    let handler: RpcHandler = Arc::new(move |id, method, session_id, _params, _log| match method {
+        "Page.enable" | "DOM.enable" | "WebMCP.enable" => vec![rpc_ok(id, session_id, json!({}))],
+        "Page.getFrameTree" => {
+            let url = *url_bg.lock().unwrap();
+            let origin = if url.starts_with("https://other.") {
+                "https://other.example.com"
+            } else {
+                "https://portal.example.com"
+            };
+            vec![rpc_ok(
+                id,
+                session_id,
+                json!({
+                    "frameTree": {
+                        "frame": {
+                            "id": "main-cls",
+                            "loaderId": "ldr-cls",
+                            "url": url,
+                            "securityOrigin": origin,
+                            "mimeType": "text/html"
+                        }
+                    }
+                }),
+            )]
+        }
+        "DOM.getDocument" => vec![rpc_ok(id, session_id, json!({ "root": { "nodeId": 1 } }))],
+        "DOM.getOuterHTML" => {
+            let m = *mode_bg.lock().unwrap();
+            let html = match m {
+                "cloudflare" => "<html><head><title>Just a moment...</title></head><body><div id=\"cf-wrapper\">Checking your browser before accessing... Enable JavaScript and cookies to continue</div><script src=\"/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1\"></script></body></html>",
+                "login" => "<html><head><title>Sign In</title></head><body><main><form action=\"/login\"><label>Email<input type=\"email\"></label><label>Password<input type=\"password\"></label><button type=\"submit\">Sign in</button></form></main></body></html>",
+                _ => "<html><head><title>Portal</title></head><body><main><h1>Portal</h1><p>Loaded portal metrics report.</p><div role=\"tablist\"><button role=\"tab\" aria-controls=\"t1\" aria-selected=\"true\">Overview</button><button role=\"tab\" aria-controls=\"t2\" aria-selected=\"false\">Audit</button></div><div id=\"t1\" role=\"tabpanel\"><p>Overview body.</p></div><div id=\"t2\" role=\"tabpanel\" hidden><p>Audit log rows.</p></div></main></body></html>",
+            };
+            vec![rpc_ok(id, session_id, json!({ "outerHTML": html }))]
+        }
+        "DOM.querySelector" => {
+            qc_bg.fetch_add(1, Ordering::Relaxed);
+            vec![rpc_ok(id, session_id, json!({ "nodeId": 0 }))]
+        }
+        _ => vec![rpc_err(id, session_id, -32601, "Method not found")],
+    });
+
+    let (base_ws, _port, _log) = spawn_mock_cdp_server(handler).await;
+    let cdp_page_url = format!("{base_ws}/devtools/page/cls-1");
+
+    let ctx = RuntimeContext::new(RuntimeConfig {
+        state_dir: dir.path().to_path_buf(),
+        cdp_url: Some(cdp_page_url.clone()),
+        timeout: Duration::from_secs(5),
+        cef_timeout: Duration::from_secs(5),
+        use_daemon: false,
+        no_web_bot_auth: true,
+        cef_renderer_executable: Some(dir.path().join("missing-cef")),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let attach_opts = FetchOptions {
+        render: RenderMode::Cdp,
+        ..Default::default()
+    };
+
+    // 1. Success attaches with `strategy = "cdp_attach"`, `status_code = 0`, `escalated = false`, and UI gates.
+    let ok = fetch_target(
+        &ctx,
+        FetchTarget::AttachCdp {
+            expected_origin: None,
+        },
+        &attach_opts,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ok.strategy, "cdp_attach");
+    assert_eq!(ok.status_code, 0);
+    assert!(!ok.escalated);
+    assert_eq!(ok.url, "https://portal.example.com/dashboard");
+    assert_eq!(ok.ui_gates.len(), 1);
+    assert_eq!(std::fs::read(&site_cache_path).unwrap(), initial_cache_bytes);
+
+    // 2. Challenge interstitial fails fast BEFORE any `--wait-for-selector` polling expires!
+    *mode.lock().unwrap() = "cloudflare";
+    let t0 = std::time::Instant::now();
+    let ch_err = fetch_target(
+        &ctx,
+        FetchTarget::AttachCdp {
+            expected_origin: Some("https://portal.example.com/".to_string()),
+        },
+        &FetchOptions {
+            render: RenderMode::Cdp,
+            wait_for_selector: Some(".never-appears".to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(t0.elapsed() < Duration::from_secs(2), "challenge waited on selector timeout");
+    assert_eq!(query_calls.load(Ordering::Relaxed), 0);
+    assert!(
+        matches!(ch_err, FetchError::Challenge { status: 0, .. }),
+        "expected Challenge(status=0), got {ch_err:?}"
+    );
+    assert_eq!(std::fs::read(&site_cache_path).unwrap(), initial_cache_bytes);
+
+    // 3. Login wall classifies cleanly as LoginWall without touching site-cache.
+    *mode.lock().unwrap() = "login";
+    *frame_url.lock().unwrap() = "https://portal.example.com/login";
+    let login_err = fetch_target(
+        &ctx,
+        FetchTarget::AttachCdp {
+            expected_origin: None,
+        },
+        &attach_opts,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            login_err,
+            FetchError::Blocked {
+                status: 0,
+                reason: BlockReason::LoginWall,
+                ..
+            }
+        ),
+        "expected Blocked LoginWall, got {login_err:?}"
+    );
+    assert_eq!(std::fs::read(&site_cache_path).unwrap(), initial_cache_bytes);
+
+    // 4. Selector timeout and origin mismatch both leave site-cache untouched.
+    *mode.lock().unwrap() = "ok";
+    *frame_url.lock().unwrap() = "https://portal.example.com/dashboard";
+    let timeout_dir = TempDir::new();
+    let timeout_cache_path = timeout_dir.path().join("site-cache.json");
+    std::fs::write(&timeout_cache_path, initial_cache_bytes).unwrap();
+    let timeout_ctx = RuntimeContext::new(RuntimeConfig {
+        state_dir: timeout_dir.path().to_path_buf(),
+        cdp_url: Some(cdp_page_url.clone()),
+        timeout: Duration::from_millis(120),
+        cef_timeout: Duration::from_millis(120),
+        use_daemon: false,
+        no_web_bot_auth: true,
+        cef_renderer_executable: Some(timeout_dir.path().join("missing-cef")),
+        ..Default::default()
+    })
+    .unwrap();
+    let timeout_err = fetch_target(
+        &timeout_ctx,
+        FetchTarget::AttachCdp {
+            expected_origin: None,
+        },
+        &FetchOptions {
+            render: RenderMode::Cdp,
+            wait_for_selector: Some(".never-appears".to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(timeout_err, FetchError::Timeout { .. }), "got {timeout_err:?}");
+    assert_eq!(std::fs::read(&timeout_cache_path).unwrap(), initial_cache_bytes);
+    assert_eq!(std::fs::read(&site_cache_path).unwrap(), initial_cache_bytes);
+
+    *frame_url.lock().unwrap() = "https://other.example.com/dashboard";
+    let mismatch = fetch_target(
+        &ctx,
+        FetchTarget::AttachCdp {
+            expected_origin: Some("https://portal.example.com/".to_string()),
+        },
+        &attach_opts,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(mismatch, FetchError::Transport(_)), "got {mismatch:?}");
+    assert_eq!(std::fs::read(&site_cache_path).unwrap(), initial_cache_bytes);
+
+    // 5. CLI integration: single-item `--json`, `--jsonl`, `--metadata-only`, and invalid flag rejections.
+    *frame_url.lock().unwrap() = "https://portal.example.com/dashboard";
+    let pleb_bin = env!("CARGO_BIN_EXE_pleb");
+
+    let cli_json = tokio::process::Command::new(pleb_bin)
+        .env("PLEB_NO_HOME_CEF", "1")
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .args(["--state-dir"])
+        .arg(dir.path())
+        .args([
+            "--no-daemon",
+            "--json",
+            "fetch",
+            "--render",
+            "cdp",
+            "--cdp-url",
+            &cdp_page_url,
+            "--no-navigate",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(
+        cli_json.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&cli_json.stderr)
+    );
+    let parsed_json: Value = serde_json::from_slice(&cli_json.stdout).unwrap();
+    assert_eq!(parsed_json["strategy"], "cdp_attach");
+    assert_eq!(parsed_json["status_code"], 0);
+    assert_eq!(parsed_json["ui_gates"][0]["kind"], "tablist");
+
+    let cli_jsonl = tokio::process::Command::new(pleb_bin)
+        .env("PLEB_NO_HOME_CEF", "1")
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .args(["--state-dir"])
+        .arg(dir.path())
+        .args([
+            "--no-daemon",
+            "fetch",
+            "--render",
+            "cdp",
+            "--cdp-url",
+            &cdp_page_url,
+            "--no-navigate",
+            "--jsonl",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(cli_jsonl.status.code(), Some(0));
+    let jsonl_str = String::from_utf8(cli_jsonl.stdout).unwrap();
+    assert_eq!(jsonl_str.lines().count(), 1);
+    let parsed_jsonl: Value = serde_json::from_str(jsonl_str.trim()).unwrap();
+    assert_eq!(parsed_jsonl["strategy"], "cdp_attach");
+    assert_eq!(parsed_jsonl["status_code"], 0);
+
+    let cli_meta = tokio::process::Command::new(pleb_bin)
+        .env("PLEB_NO_HOME_CEF", "1")
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .args(["--state-dir"])
+        .arg(dir.path())
+        .args([
+            "--no-daemon",
+            "--json",
+            "fetch",
+            "--render",
+            "cdp",
+            "--cdp-url",
+            &cdp_page_url,
+            "--no-navigate",
+            "--metadata-only",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(cli_meta.status.code(), Some(0));
+    let parsed_meta: Value = serde_json::from_slice(&cli_meta.stdout).unwrap();
+    assert!(parsed_meta.get("content").is_none());
+    assert_eq!(parsed_meta["strategy"], "cdp_attach");
+    assert_eq!(parsed_meta["status_code"], 0);
+    assert_eq!(parsed_meta["ui_gates"][0]["kind"], "tablist");
+
+    for bad_args in [
+        vec!["--no-daemon", "fetch", "--no-navigate"],
+        vec![
+            "--no-daemon",
+            "--proxy",
+            "http://127.0.0.1:8888",
+            "fetch",
+            "--render",
+            "cdp",
+            "--cdp-url",
+            &cdp_page_url,
+            "--no-navigate",
+        ],
+        vec![
+            "--no-daemon",
+            "fetch",
+            "--render",
+            "cdp",
+            "--cdp-url",
+            &cdp_page_url,
+            "--no-navigate",
+            "--resources",
+            "transcripts",
+        ],
+        vec![
+            "--no-daemon",
+            "fetch",
+            "--render",
+            "cdp",
+            "--cdp-url",
+            &cdp_page_url,
+            "--no-navigate",
+            "https://portal.example.com/a",
+            "https://portal.example.com/b",
+        ],
+        vec![
+            "--no-daemon",
+            "fetch",
+            "--render",
+            "cdp",
+            "--cdp-url",
+            &cdp_page_url,
+            "--no-navigate",
+            "-",
+        ],
+    ] {
+        let out = tokio::process::Command::new(pleb_bin)
+            .env("PLEB_NO_HOME_CEF", "1")
+            .env("PLEB_NO_KEYCHAIN", "1")
+            .args(["--state-dir"])
+            .arg(dir.path())
+            .args(&bad_args)
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "expected exit 1 for {bad_args:?}, stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let _ = ResourcePolicy::Manifest;
+}
+

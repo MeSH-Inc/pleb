@@ -1,0 +1,21 @@
+<!-- pleb-fixture: {"tier":"ratchet","url":"https://docs.example.com/sdk/tabs","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"SDK Quickstart","variants":[{"name":"default_none","format":"markdown","mode":"clean","expand":"none","expected_substrings":["Install","npm install example-sdk"],"forbidden_substrings":["cargo add example-sdk","go get example.com/sdk","curl https://api.example.com"],"expected_ui_gate_count":1,"expected_ui_gates":[{"kind":"tablist","presence":"in_dom","in_dom_labels":["Rust","Go","curl"],"active_label":"JavaScript"}]},{"name":"expand_tabs","format":"markdown","mode":"clean","expand":"tabs","expected_substrings":["### Tab: JavaScript","npm install example-sdk","### Tab: Rust","Async Rust client crate:","cargo add example-sdk","### Tab: Go","go get example.com/sdk","### Tab: curl","curl https://api.example.com"],"forbidden_substrings":["\\[Tab:"],"expected_ui_gate_count":0},{"name":"section_rust","format":"markdown","mode":"clean","expand":"tabs","section":"Tab: Rust","expected_substrings":["### Tab: Rust","Async Rust client crate:","cargo add example-sdk"],"forbidden_substrings":["npm install example-sdk","go get example.com/sdk","curl https://api.example.com"],"expected_ui_gate_count":0},{"name":"focus_rust_budget","format":"markdown","mode":"clean","expand":"tabs","focus":"cargo async","max_bytes":220,"expected_substrings":["### Tab: Rust","cargo add example-sdk"],"forbidden_substrings":["go get example.com/sdk"]}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><title>SDK Quickstart</title></head>
+<body>
+  <main>
+    <h1>SDK Quickstart</h1>
+    <h2>Install</h2>
+    <div role="tablist">
+      <button role="tab" id="t-js" aria-controls="p-js" aria-selected="true">JavaScript</button>
+      <button role="tab" id="t-rs" aria-controls="p-rs" aria-selected="false">Rust</button>
+      <button role="tab" id="t-go" aria-controls="p-go" aria-selected="false">Go</button>
+      <button role="tab" id="t-curl" aria-controls="p-curl" aria-selected="false">curl</button>
+    </div>
+    <div id="p-js" role="tabpanel" aria-labelledby="t-js"><pre><code class="language-bash">npm install example-sdk</code></pre></div>
+    <div id="p-rs" role="tabpanel" aria-labelledby="t-rs" hidden><p>Async Rust client crate:</p><pre><code class="language-bash">cargo add example-sdk</code></pre></div>
+    <div id="p-go" role="tabpanel" aria-labelledby="t-go" style="display: none"><pre><code class="language-bash">go get example.com/sdk</code></pre></div>
+    <div id="p-curl" role="tabpanel" aria-labelledby="t-curl" class="hidden"><pre><code class="language-bash">curl https://api.example.com</code></pre></div>
+  </main>
+</body>
+</html>

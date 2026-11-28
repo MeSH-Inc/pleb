@@ -1,0 +1,24 @@
+<!-- pleb-fixture: {"tier":"ratchet","url":"https://blog.example.com/article-vs-tabs","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"Primary Article","variants":[{"name":"article_expand_tabs","format":"markdown","mode":"article","expand":"tabs","expected_substrings":["This is the primary winning article with clear visible prose that easily exceeds the hundred byte baseline threshold and dominates the page."],"forbidden_substrings":["Secondary article hidden rust code","Secondary article hidden go code"],"expected_ui_gate_count":0}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><title>Primary Article</title></head>
+<body>
+  <article id="winner">
+    <h1>Primary Article</h1>
+    <p>This is the primary winning article with clear visible prose that easily exceeds the hundred byte baseline threshold and dominates the page.</p>
+  </article>
+  <article id="loser">
+    <p>Short intro.</p>
+    <div role="tablist">
+      <button role="tab" aria-controls="l-rs" aria-selected="false">Rust</button>
+      <button role="tab" aria-controls="l-go" aria-selected="false">Go</button>
+    </div>
+    <div id="l-rs" role="tabpanel" hidden>
+      <p>Secondary article hidden rust code with hundreds of bytes of padding text designed to test whether hidden expansion flips baseline article root selection across siblings.</p>
+    </div>
+    <div id="l-go" role="tabpanel" hidden>
+      <p>Secondary article hidden go code with hundreds of bytes of padding text designed to test whether hidden expansion flips baseline article root selection across siblings.</p>
+    </div>
+  </article>
+</body>
+</html>
