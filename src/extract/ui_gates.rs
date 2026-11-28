@@ -151,6 +151,10 @@ fn plural(n: usize, singular: &str, plural: &str) -> String {
     }
 }
 
+pub(crate) fn sanitize_cue_label_pub(raw: &str) -> Option<String> {
+    sanitize_cue_label(raw)
+}
+
 fn sanitize_cue_label(raw: &str) -> Option<String> {
     let mut out = String::with_capacity(raw.len().min(MAX_UI_GATE_LABEL_BYTES));
     let mut pending_space = false;
@@ -1076,6 +1080,82 @@ pub(crate) fn finalize_ui_gates(
     }
 
     out
+}
+
+/// Remove revealed tab/disclosure labels from indexed `ui_gates`, drop resolved gates,
+/// and propagate `reveal_capped` onto remaining gates of the same kind.
+pub fn reconcile_revealed_gates(
+    ui_gates: &mut Vec<UiGateDescriptor>,
+    revealed: &[(UiGateKind, String)],
+    reveal_capped: bool,
+) {
+    if revealed.is_empty() && !reveal_capped {
+        return;
+    }
+    let normalized_revealed: Vec<(UiGateKind, String)> = revealed
+        .iter()
+        .filter_map(|(kind, label)| {
+            let norm = sanitize_cue_label(label)?.to_ascii_lowercase();
+            Some((*kind, norm))
+        })
+        .collect();
+
+    let mut occurrences: HashMap<(UiGateKind, Option<String>), usize> = HashMap::new();
+    let mut updated = Vec::with_capacity(ui_gates.len());
+
+    for mut gate in ui_gates.drain(..) {
+        if reveal_capped && matches!(gate.kind, UiGateKind::Tablist | UiGateKind::Disclosure) {
+            gate.capped = true;
+        }
+        let is_revealed = |label: &str| -> bool {
+            let Some(clean) = sanitize_cue_label(label) else {
+                return false;
+            };
+            let needle = clean.to_ascii_lowercase();
+            normalized_revealed
+                .iter()
+                .any(|(k, l)| *k == gate.kind && l == &needle)
+        };
+
+        let before_total = gate.in_dom_labels.len() + gate.unmounted_labels.len();
+        gate.in_dom_labels.retain(|l| !is_revealed(l));
+        gate.unmounted_labels.retain(|l| !is_revealed(l));
+        let after_total = gate.in_dom_labels.len() + gate.unmounted_labels.len();
+        let removed = before_total.saturating_sub(after_total);
+        gate.gated_count = gate.gated_count.saturating_sub(removed);
+
+        if gate.gated_count == 0 {
+            continue;
+        }
+
+        let has_in_dom = !gate.in_dom_labels.is_empty();
+        let has_unmounted = !gate.unmounted_labels.is_empty();
+        gate.presence = match (gate.presence, has_in_dom, has_unmounted) {
+            (UiGatePresence::Opaque, _, _) => UiGatePresence::Opaque,
+            (_, true, true) => UiGatePresence::Mixed,
+            (_, true, false) => UiGatePresence::InDom,
+            (_, false, _) => UiGatePresence::Unmounted,
+        };
+
+        let occ_entry = occurrences
+            .entry((gate.kind, gate.section_heading.clone()))
+            .or_insert(0);
+        let occ_idx = *occ_entry;
+        *occ_entry += 1;
+        gate.identifier = ui_gate_identifier(
+            gate.kind,
+            gate.presence,
+            gate.section_heading.as_deref(),
+            gate.active_label.as_deref(),
+            &gate.in_dom_labels,
+            &gate.unmounted_labels,
+            gate.capped,
+            occ_idx,
+        );
+        updated.push(gate);
+    }
+
+    *ui_gates = updated;
 }
 
 fn analyze_tree<'a>(

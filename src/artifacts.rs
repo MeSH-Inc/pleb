@@ -40,6 +40,7 @@ pub fn stage_artifact(
         url_ext.as_deref(),
         Some("png" | "jpg" | "jpeg" | "webp" | "gif" | "pdf")
     );
+    let expects_dataset = expected_kind == Some(ResourceKind::Dataset);
     let mime_is_html = matches!(
         declared_mime.as_deref(),
         Some("text/html" | "application/xhtml+xml")
@@ -48,13 +49,14 @@ pub fn stage_artifact(
         .as_deref()
         .is_some_and(|m| m.starts_with("image/") || m == "application/pdf");
 
-    if expects_binary && mime_is_html {
+    if (expects_binary || expects_dataset) && mime_is_html {
         bail!(
-            "refusing to stage HTML response ({}) as binary artifact for {source_url}",
-            declared_mime.as_deref().unwrap_or("text/html")
+            "refusing to stage HTML response ({}) as {} artifact for {source_url}",
+            declared_mime.as_deref().unwrap_or("text/html"),
+            if expects_dataset { "dataset" } else { "binary" }
         );
     }
-    if (expects_binary || mime_claims_binary) && looks_like_html(bytes) {
+    if (expects_binary || mime_claims_binary || expects_dataset) && looks_like_html(bytes) {
         bail!("refusing to stage disguised HTML payload for {source_url}");
     }
 
@@ -259,6 +261,7 @@ fn mime_to_ext(mime: &str) -> Option<&'static str> {
         "text/html" | "application/xhtml+xml" => Some("html"),
         "application/xml" | "text/xml" => Some("xml"),
         "application/sql" | "text/sql" => Some("sql"),
+        m if m.starts_with("application/") && m.ends_with("+json") => Some("json"),
         _ => None,
     }
 }

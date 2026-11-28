@@ -21,8 +21,8 @@ pub use resources::{
     ResourceSalience,
 };
 pub use ui_gates::{
-    format_ui_gates_cue, format_ui_gates_cue_with_hint, ui_gate_identifier, UiGateDescriptor,
-    UiGateKind, UiGatePresence,
+    format_ui_gates_cue, format_ui_gates_cue_with_hint, reconcile_revealed_gates,
+    ui_gate_identifier, UiGateDescriptor, UiGateKind, UiGatePresence,
 };
 pub use webmcp::{
     format_webmcp_cue, format_webmcp_cue_with_hint, format_webmcp_manifest_markdown,
@@ -377,6 +377,126 @@ fn extract_document_parsed_inner(
         tools,
         ui_gates,
     })
+}
+
+/// Extract and merge browser-revealed tab/disclosure panel snapshots through the standard
+/// Rust `ElementVisibility` sanitizer, deduplicate against already extracted content, merge
+/// newly discovered resources, and reconcile `doc.ui_gates`.
+pub fn merge_revealed_panels(
+    doc: &mut ExtractedDocument,
+    panels: &[crate::transport::RevealedPanelSnapshot],
+    reveal_capped: bool,
+    base_url: &::url::Url,
+    extract_opts: &ExtractOptions,
+) {
+    if panels.is_empty() && !reveal_capped {
+        return;
+    }
+    let format = match extract_opts.format {
+        OutputFormat::Html | OutputFormat::Text | OutputFormat::Markdown => extract_opts.format,
+        OutputFormat::Raw | OutputFormat::Axtree => return,
+    };
+    let panel_opts = ExtractOptions {
+        format,
+        mode: ExtractMode::Clean,
+        expand: ExpandPolicy::None,
+        include_images: extract_opts.include_images,
+        include_links: extract_opts.include_links,
+        max_bytes: None,
+        focus: None,
+        section: None,
+        offset: 0,
+    };
+
+    let norm_ws = |s: &str| -> String { s.split_whitespace().collect::<Vec<_>>().join(" ") };
+    let base_norm = norm_ws(&doc.content);
+    let mut seen_bodies: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_res_ids: std::collections::HashSet<String> =
+        doc.resources.iter().map(|r| r.identifier.clone()).collect();
+    let mut revealed_gate_labels: Vec<(UiGateKind, String)> = Vec::new();
+    let mut appended = String::new();
+
+    for snap in panels {
+        let Some(clean_label) = ui_gates::sanitize_cue_label_pub(&snap.label) else {
+            continue;
+        };
+        let gate_kind = match snap.kind {
+            crate::transport::RevealedPanelKind::Tab => UiGateKind::Tablist,
+            crate::transport::RevealedPanelKind::Disclosure => UiGateKind::Disclosure,
+        };
+        revealed_gate_labels.push((gate_kind, clean_label.clone()));
+
+        let wrapped = format!(
+            "<!doctype html><html><body><main>{}</main></body></html>",
+            snap.html
+        );
+        let Ok(mut panel_doc) = extract_document_parsed(
+            &wrapped,
+            None,
+            base_url,
+            Some("text/html; charset=utf-8"),
+            &panel_opts,
+        ) else {
+            continue;
+        };
+        for res in panel_doc.resources.drain(..) {
+            if seen_res_ids.insert(res.identifier.clone()) {
+                doc.resources.push(res);
+            }
+        }
+        let body = panel_doc.content.trim();
+        if body.is_empty() {
+            continue;
+        }
+        let body_norm = norm_ws(body);
+        if body_norm.is_empty()
+            || (body_norm.len() >= 12 && base_norm.contains(&body_norm))
+            || !seen_bodies.insert(body_norm)
+        {
+            continue;
+        }
+
+        let kind_prefix = match snap.kind {
+            crate::transport::RevealedPanelKind::Tab => "Tab",
+            crate::transport::RevealedPanelKind::Disclosure => "Disclosure",
+        };
+        let heading = format!("{kind_prefix}: {clean_label}");
+        let level = usize::from(snap.heading_level.clamp(2, 6));
+        match format {
+            OutputFormat::Markdown => {
+                let hashes = "#".repeat(level);
+                appended.push_str(&format!("\n\n{hashes} {heading}\n\n{body}"));
+            }
+            OutputFormat::Text => {
+                appended.push_str(&format!("\n\n[{heading}]\n\n{body}"));
+            }
+            OutputFormat::Html => {
+                let (pruned, _, _) = dom::ParsedHtml::parse(&wrapped).into_pruned_html_with_gates(
+                    ExtractMode::Clean,
+                    ExpandPolicy::None,
+                    Some(base_url),
+                );
+                let escaped_h = heading
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;");
+                appended.push_str(&format!(
+                    "\n<section data-pleb-revealed=\"true\"><h{level}>{escaped_h}</h{level}>\n{pruned}\n</section>"
+                ));
+            }
+            OutputFormat::Raw | OutputFormat::Axtree => unreachable!(),
+        }
+    }
+
+    if !appended.is_empty() {
+        let trimmed = appended.trim();
+        if !doc.content.trim().is_empty() {
+            doc.content.push_str("\n\n");
+        }
+        doc.content.push_str(trimmed);
+    }
+
+    reconcile_revealed_gates(&mut doc.ui_gates, &revealed_gate_labels, reveal_capped);
 }
 
 /// Finalize an extracted document by appending optional resource/tool manifests before running

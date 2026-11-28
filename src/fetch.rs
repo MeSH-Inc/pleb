@@ -262,7 +262,6 @@ struct AcquiredPage {
     parsed: Option<ParsedHtml>,
     axtree_text: Option<String>,
     imperative_tools: Vec<crate::extract::WebMcpToolDescriptor>,
-    #[allow(dead_code)]
     capture_meta: crate::transport::BrowserCaptureMetadata,
 }
 
@@ -336,6 +335,11 @@ async fn fetch_attached_cdp(
     is_axtree: bool,
     start: Instant,
 ) -> std::result::Result<FetchOutput, FetchError> {
+    if options.reveal != crate::transport::RevealPolicy::None || options.scroll_steps > 0 {
+        return Err(FetchError::CdpUnavailable(
+            "--no-navigate is passive and cannot be combined with --reveal or --scroll".to_string(),
+        ));
+    }
     if options.render != RenderMode::Cdp {
         return Err(FetchError::CdpUnavailable(
             "--no-navigate requires --render cdp".to_string(),
@@ -401,8 +405,40 @@ async fn fetch_navigated(
     is_axtree: bool,
     start: Instant,
 ) -> std::result::Result<FetchOutput, FetchError> {
+    let has_browser_actions =
+        options.reveal != crate::transport::RevealPolicy::None || options.scroll_steps > 0;
+    if options.scroll_steps > crate::transport::reveal::MAX_SCROLL_STEPS {
+        return Err(FetchError::Transport(anyhow::anyhow!(
+            "--scroll exceeds maximum {} steps",
+            crate::transport::reveal::MAX_SCROLL_STEPS
+        )));
+    }
     let effective_render = if is_axtree && options.render == RenderMode::Auto {
         RenderMode::Cdp
+    } else if has_browser_actions {
+        match options.render {
+            RenderMode::Cronet => {
+                return Err(FetchError::CefUnavailable(
+                    "--reveal and --scroll require a browser renderer (--render cef, cdp, or auto)"
+                        .to_string(),
+                ));
+            }
+            RenderMode::Auto => {
+                let cef_available = ctx.cef.is_available();
+                let cdp_available = ctx.cdp_renderer().is_some();
+                if (ctx.config.prefer_cdp && cdp_available) || (!cef_available && cdp_available) {
+                    RenderMode::Cdp
+                } else if cef_available {
+                    RenderMode::Cef
+                } else {
+                    return Err(FetchError::CefUnavailable(format!(
+                        "--reveal/--scroll requested but no browser renderer (CEF or CDP) is available; install CEF ({}) or pass --cdp-url",
+                        crate::transport::cef::rebuild_command_hint()
+                    )));
+                }
+            }
+            explicit => explicit,
+        }
     } else {
         options.render
     };
@@ -411,6 +447,7 @@ async fn fetch_navigated(
         resolve_and_check_robots(ctx, url, options.apply_rewrites, options.respect_robots).await?;
 
     let effective_source_mode = if options.source == SourceMode::None
+        || has_browser_actions
         || matches!(
             options.extract.format,
             OutputFormat::Html | OutputFormat::Raw | OutputFormat::Axtree
@@ -440,6 +477,8 @@ async fn fetch_navigated(
         options.wait_for_selector.as_deref(),
         options.respect_robots,
         is_axtree,
+        options.reveal,
+        options.scroll_steps,
     )
     .await?;
 
@@ -469,17 +508,22 @@ async fn extract_and_finalize_page(
         || options.extract.focus.is_some()
         || options.extract.section.is_some()
         || options.extract.offset > 0;
+    let has_revealed_panels = !page.capture_meta.revealed_panels.is_empty()
+        || page.capture_meta.reveal_capped;
+    let effective_expand = options.reveal.implies_expand(options.extract.expand);
     let initial_extract_opts = if is_axtree {
         ExtractOptions {
             format: OutputFormat::Html,
+            expand: effective_expand,
             max_bytes: None,
             focus: None,
             section: None,
             offset: 0,
             ..options.extract.clone()
         }
-    } else if needs_enrichment && has_slice_or_projection {
+    } else if (needs_enrichment || has_revealed_panels) && has_slice_or_projection {
         ExtractOptions {
+            expand: effective_expand,
             max_bytes: None,
             focus: None,
             section: None,
@@ -487,7 +531,10 @@ async fn extract_and_finalize_page(
             ..options.extract.clone()
         }
     } else {
-        options.extract.clone()
+        ExtractOptions {
+            expand: effective_expand,
+            ..options.extract.clone()
+        }
     };
     let mut extracted = extract::extract_document_parsed(
         &page.body,
@@ -502,7 +549,25 @@ async fn extract_and_finalize_page(
             FetchError::CdpUnavailable("CDP render did not capture accessibility tree".to_string())
         })?;
         extracted.truncated = false;
+    } else if has_revealed_panels {
+        let panel_opts = ExtractOptions {
+            expand: effective_expand,
+            ..options.extract.clone()
+        };
+        extract::merge_revealed_panels(
+            &mut extracted,
+            &page.capture_meta.revealed_panels,
+            page.capture_meta.reveal_capped,
+            extract_url,
+            &panel_opts,
+        );
     }
+
+    crate::transport::reveal::filter_and_index_xhr_datasets(
+        &final_url_parsed,
+        &page.capture_meta.datasets,
+        &mut extracted.resources,
+    );
 
     if !page.imperative_tools.is_empty() {
         let imperative: Vec<_> = page
@@ -514,6 +579,7 @@ async fn extract_and_finalize_page(
     }
 
     let mut warning = page.warning;
+    merge_warning(&mut warning, page.capture_meta.reveal_warning);
     merge_warning(&mut warning, extracted.warning.take());
     if needs_enrichment {
         let missing_resources = enrich_document_resources(
@@ -536,7 +602,7 @@ async fn extract_and_finalize_page(
     let append_tools_manifest = options.tools == ToolPolicy::Manifest;
     // `enrich_document_resources` already appends the resource manifest when `ResourcePolicy::Manifest`,
     // so only pass `append_tools_manifest` + final projection/slice here.
-    if (needs_enrichment && has_slice_or_projection)
+    if ((needs_enrichment || has_revealed_panels) && has_slice_or_projection)
         || (is_axtree && has_slice_or_projection)
         || append_tools_manifest
     {
@@ -597,6 +663,8 @@ pub async fn fetch_html(
         None,
         respect_robots,
         false,
+        crate::transport::RevealPolicy::None,
+        0,
     )
     .await?;
     let acquired_sha256 = sha256_hex(page.body.as_bytes());
@@ -1345,6 +1413,7 @@ async fn try_fetch_markdown_mirror(
     Ok(None)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn acquire_page(
     ctx: &RuntimeContext,
     parsed: &url::Url,
@@ -1353,6 +1422,8 @@ async fn acquire_page(
     wait_for_selector: Option<&str>,
     respect_robots: bool,
     capture_axtree: bool,
+    reveal: crate::transport::RevealPolicy,
+    scroll_steps: usize,
 ) -> std::result::Result<AcquiredPage, FetchError> {
     let start = Instant::now();
     let url_str = parsed.as_str();
@@ -1411,6 +1482,8 @@ async fn acquire_page(
             url_str,
             effective_selector,
             capture_axtree,
+            reveal,
+            scroll_steps,
             start,
             false,
         )
@@ -1438,6 +1511,8 @@ async fn acquire_page(
             &ctx.cef,
             url_str,
             effective_selector,
+            reveal,
+            scroll_steps,
             ctx.config.cef_timeout,
         )
         .await
@@ -2003,7 +2078,16 @@ async fn try_cef_escalation(
     url: &str,
     wait_for_selector: Option<&str>,
 ) -> RendererEscalation {
-    match render_cef_checked(&ctx.cef, url, wait_for_selector, ctx.config.cef_timeout).await {
+    match render_cef_checked(
+        &ctx.cef,
+        url,
+        wait_for_selector,
+        crate::transport::RevealPolicy::None,
+        0,
+        ctx.config.cef_timeout,
+    )
+    .await
+    {
         Ok(cef_res) => RendererEscalation::Completed(Box::new(classify_cef_result(
             ctx, host, url, start, cef_res, true,
         ))),
@@ -2029,6 +2113,8 @@ async fn try_cdp_escalation(
         url,
         wait_for_selector,
         capture_axtree,
+        crate::transport::RevealPolicy::None,
+        0,
         start,
         true,
     )
@@ -2054,6 +2140,8 @@ async fn acquire_via_cdp(
     url: &str,
     wait_for_selector: Option<&str>,
     capture_axtree: bool,
+    reveal: crate::transport::RevealPolicy,
+    scroll_steps: usize,
     start: Instant,
     escalated: bool,
 ) -> std::result::Result<AcquiredPage, FetchError> {
@@ -2066,7 +2154,8 @@ async fn acquire_via_cdp(
         capture_axtree,
         max_response_bytes: max_bytes,
         allow_local_targets: false,
-        ..Default::default()
+        reveal,
+        scroll_steps,
     };
     let res = cdp
         .render(url, &opts, ctx.config.cdp_timeout)
@@ -2091,6 +2180,7 @@ fn classify_rendered_result(
     content_type: Option<String>,
     axtree_text: Option<String>,
     imperative_tools: Vec<crate::extract::WebMcpToolDescriptor>,
+    capture_meta: crate::transport::BrowserCaptureMetadata,
     escalated: bool,
 ) -> std::result::Result<AcquiredPage, FetchError> {
     if status_code == 0 {
@@ -2127,7 +2217,7 @@ fn classify_rendered_result(
                 parsed: parsed_html,
                 axtree_text,
                 imperative_tools,
-                capture_meta: Default::default(),
+                capture_meta,
             })
         }
         ResponseClassification::JavaScriptShell { reason } => Ok(AcquiredPage {
@@ -2146,7 +2236,7 @@ fn classify_rendered_result(
             parsed: parsed_html,
             axtree_text,
             imperative_tools,
-            capture_meta: Default::default(),
+            capture_meta,
         }),
         ResponseClassification::Blocked { status, reason } => Err(FetchError::Blocked {
             url: final_url,
@@ -2317,6 +2407,7 @@ fn classify_cdp_result(
         content_type,
         res.axtree_text,
         res.imperative_tools,
+        res.capture_meta,
         escalated,
     )
 }
@@ -2369,6 +2460,7 @@ fn classify_cef_result(
         Some("text/html".to_string()),
         None,
         Vec::new(),
+        res.capture_meta,
         escalated,
     )
 }
@@ -2377,12 +2469,15 @@ async fn render_cef_checked(
     cef: &CefRenderer,
     url: &str,
     wait_for_selector: Option<&str>,
+    reveal: crate::transport::RevealPolicy,
+    scroll_steps: usize,
     timeout: Duration,
 ) -> std::result::Result<CefRenderResult, FetchError> {
     let deadline = Instant::now() + timeout;
     let opts = CefRenderOptions {
         wait_for_selector: wait_for_selector.map(|s| s.to_string()),
-        ..Default::default()
+        reveal,
+        scroll_steps,
     };
 
     let first_attempt = cef.render(url, &opts, timeout).await;

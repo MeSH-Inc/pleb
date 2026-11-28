@@ -599,6 +599,27 @@ fn extract_node_clean_text(node: NodeRef<'_, Node>) -> Option<String> {
     clean_optional_text(&raw)
 }
 
+pub(crate) fn clean_optional_text_pub(raw: &str) -> Option<String> {
+    clean_optional_text(raw)
+}
+
+pub(crate) fn sanitize_dataset_stem(url: &Url) -> String {
+    let seg = url
+        .path_segments()
+        .and_then(|mut s| s.rfind(|seg| !seg.is_empty()))
+        .unwrap_or("dataset");
+    let clean: String = seg
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+        .take(40)
+        .collect();
+    if clean.is_empty() {
+        "dataset".to_string()
+    } else {
+        clean
+    }
+}
+
 fn clean_optional_text(raw: &str) -> Option<String> {
     let collapsed = collapse_inline_whitespace(raw);
     let trimmed = collapsed.trim();
