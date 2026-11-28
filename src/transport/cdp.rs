@@ -665,6 +665,101 @@ fn parse_event_params<T: for<'de> Deserialize<'de>>(raw: &str) -> Option<T> {
         .and_then(|ev| ev.params)
 }
 
+fn ingest_webmcp_tools_added(
+    raw: &str,
+    main_frame_id: Option<&str>,
+    cdp_tools: &mut Vec<WebMcpToolDescriptor>,
+) {
+    let Some(main_fid) = main_frame_id else {
+        return;
+    };
+    let Some(params) = parse_event_params::<WebMcpToolsAddedParams>(raw) else {
+        return;
+    };
+    for tool in params.tools {
+        if tool.frame_id.as_deref() != Some(main_fid) {
+            continue;
+        }
+        let source = if tool.backend_node_id.is_some_and(|id| id > 0) {
+            WebMcpToolSource::Declarative
+        } else {
+            WebMcpToolSource::Imperative
+        };
+        let annotations = WebMcpToolAnnotations {
+            read_only: tool.annotations.as_ref().and_then(|a| a.read_only),
+            autosubmit: tool.annotations.as_ref().and_then(|a| a.autosubmit),
+            untrusted_content: Some(true),
+        };
+        let descriptor = WebMcpToolDescriptor {
+            name: tool.name,
+            description: tool.description,
+            title: tool.title,
+            source,
+            input_schema: tool.input_schema,
+            annotations: Some(annotations),
+            action_url: None,
+            method: None,
+        };
+        if let Some(clean) = sanitize_webmcp_tool(descriptor) {
+            if let Some(existing) = cdp_tools.iter_mut().find(|t| t.name == clean.name) {
+                *existing = clean;
+            } else {
+                cdp_tools.push(clean);
+            }
+        }
+    }
+}
+
+fn remove_webmcp_tools(
+    raw: &str,
+    main_frame_id: Option<&str>,
+    cdp_tools: &mut Vec<WebMcpToolDescriptor>,
+) {
+    let Some(main_fid) = main_frame_id else {
+        return;
+    };
+    let Some(params) = parse_event_params::<WebMcpToolsRemovedParams>(raw) else {
+        return;
+    };
+    for removed in params.tools {
+        if removed.frame_id.as_deref() == Some(main_fid) {
+            cdp_tools.retain(|t| t.name != removed.name);
+        }
+    }
+}
+
+fn format_bounded_axtree_outcome(
+    outcome: RpcCallOutcome<serde_json::Value>,
+    max_bytes: usize,
+) -> Result<String> {
+    match outcome {
+        RpcCallOutcome::Ok(val) => {
+            let raw_json = serde_json::to_string(&val).map_err(|e| {
+                cdp_err(
+                    TransportErrorKind::ProtocolMismatch,
+                    format!("failed to serialize Accessibility.getFullAXTree payload: {e}"),
+                )
+            })?;
+            if raw_json.len() > max_bytes {
+                return Err(anyhow::Error::new(ResponseTooLargeError {
+                    limit_bytes: max_bytes,
+                }));
+            }
+            crate::extract::axtree::format_axtree_from_cdp_json(&raw_json)
+        }
+        RpcCallOutcome::RpcErr(err) if err.code == CDP_ERR_SERVER_ERROR => {
+            Err(anyhow::Error::new(ResponseTooLargeError {
+                limit_bytes: max_bytes,
+            }))
+        }
+        RpcCallOutcome::RpcErr(err) => Err(rpc_failure_err(
+            "Accessibility.getFullAXTree",
+            &err,
+            TransportErrorKind::LoadError,
+        )),
+    }
+}
+
 fn map_connect_io_or_transport(err: anyhow::Error, _url: &str) -> anyhow::Error {
     if err.is::<TransportError>() {
         return err;
@@ -1526,62 +1621,18 @@ impl CdpSession {
                 }
             }
             "WebMCP.toolsAdded" => {
-                let Some(params) = parse_event_params::<WebMcpToolsAddedParams>(raw) else {
-                    return Ok(());
-                };
-                let Some(main_fid) = self.state.main_frame_id.as_deref() else {
-                    return Ok(());
-                };
-                for tool in params.tools {
-                    if tool.frame_id.as_deref() != Some(main_fid) {
-                        continue;
-                    }
-                    let source = if tool.backend_node_id.is_some_and(|id| id > 0) {
-                        WebMcpToolSource::Declarative
-                    } else {
-                        WebMcpToolSource::Imperative
-                    };
-                    let annotations = WebMcpToolAnnotations {
-                        read_only: tool.annotations.as_ref().and_then(|a| a.read_only),
-                        autosubmit: tool.annotations.as_ref().and_then(|a| a.autosubmit),
-                        untrusted_content: Some(true),
-                    };
-                    let descriptor = WebMcpToolDescriptor {
-                        name: tool.name,
-                        description: tool.description,
-                        title: tool.title,
-                        source,
-                        input_schema: tool.input_schema,
-                        annotations: Some(annotations),
-                        action_url: None,
-                        method: None,
-                    };
-                    if let Some(clean) = sanitize_webmcp_tool(descriptor) {
-                        if let Some(existing) = self
-                            .state
-                            .cdp_tools
-                            .iter_mut()
-                            .find(|t| t.name == clean.name)
-                        {
-                            *existing = clean;
-                        } else {
-                            self.state.cdp_tools.push(clean);
-                        }
-                    }
-                }
+                ingest_webmcp_tools_added(
+                    raw,
+                    self.state.main_frame_id.as_deref(),
+                    &mut self.state.cdp_tools,
+                );
             }
             "WebMCP.toolsRemoved" => {
-                let Some(params) = parse_event_params::<WebMcpToolsRemovedParams>(raw) else {
-                    return Ok(());
-                };
-                let Some(main_fid) = self.state.main_frame_id.as_deref() else {
-                    return Ok(());
-                };
-                for removed in params.tools {
-                    if removed.frame_id.as_deref() == Some(main_fid) {
-                        self.state.cdp_tools.retain(|t| t.name != removed.name);
-                    }
-                }
+                remove_webmcp_tools(
+                    raw,
+                    self.state.main_frame_id.as_deref(),
+                    &mut self.state.cdp_tools,
+                );
             }
             _ => {}
         }
@@ -1949,39 +2000,14 @@ impl CdpSession {
     }
 
     async fn read_axtree(&mut self, max_bytes: usize) -> Result<String> {
-        match self
+        let outcome = self
             .call_typed::<_, serde_json::Value>(
                 "Accessibility.getFullAXTree",
                 serde_json::json!({}),
                 true,
             )
-            .await?
-        {
-            RpcCallOutcome::Ok(val) => {
-                let raw_json = serde_json::to_string(&val).map_err(|e| {
-                    cdp_err(
-                        TransportErrorKind::ProtocolMismatch,
-                        format!("failed to serialize Accessibility.getFullAXTree payload: {e}"),
-                    )
-                })?;
-                if raw_json.len() > max_bytes {
-                    return Err(anyhow::Error::new(ResponseTooLargeError {
-                        limit_bytes: max_bytes,
-                    }));
-                }
-                crate::extract::axtree::format_axtree_from_cdp_json(&raw_json)
-            }
-            RpcCallOutcome::RpcErr(err) if err.code == CDP_ERR_SERVER_ERROR => {
-                Err(anyhow::Error::new(ResponseTooLargeError {
-                    limit_bytes: max_bytes,
-                }))
-            }
-            RpcCallOutcome::RpcErr(err) => Err(rpc_failure_err(
-                "Accessibility.getFullAXTree",
-                &err,
-                TransportErrorKind::LoadError,
-            )),
-        }
+            .await?;
+        format_bounded_axtree_outcome(outcome, max_bytes)
     }
 
     async fn teardown(&mut self) {
@@ -2377,59 +2403,12 @@ impl PassiveAttachSession {
                 }
             }
             "WebMCP.toolsAdded" => {
-                let Some(main_fid) = self.binding.as_ref().map(|b| b.frame_id.as_str()) else {
-                    return;
-                };
-                let Some(params) = parse_event_params::<WebMcpToolsAddedParams>(raw) else {
-                    return;
-                };
-                for tool in params.tools {
-                    if tool.frame_id.as_deref() != Some(main_fid) {
-                        continue;
-                    }
-                    let source = if tool.backend_node_id.is_some_and(|id| id > 0) {
-                        WebMcpToolSource::Declarative
-                    } else {
-                        WebMcpToolSource::Imperative
-                    };
-                    let annotations = WebMcpToolAnnotations {
-                        read_only: tool.annotations.as_ref().and_then(|a| a.read_only),
-                        autosubmit: tool.annotations.as_ref().and_then(|a| a.autosubmit),
-                        untrusted_content: Some(true),
-                    };
-                    let descriptor = WebMcpToolDescriptor {
-                        name: tool.name,
-                        description: tool.description,
-                        title: tool.title,
-                        source,
-                        input_schema: tool.input_schema,
-                        annotations: Some(annotations),
-                        action_url: None,
-                        method: None,
-                    };
-                    if let Some(clean) = sanitize_webmcp_tool(descriptor) {
-                        if let Some(existing) =
-                            self.cdp_tools.iter_mut().find(|t| t.name == clean.name)
-                        {
-                            *existing = clean;
-                        } else {
-                            self.cdp_tools.push(clean);
-                        }
-                    }
-                }
+                let main_fid = self.binding.as_ref().map(|b| b.frame_id.as_str());
+                ingest_webmcp_tools_added(raw, main_fid, &mut self.cdp_tools);
             }
             "WebMCP.toolsRemoved" => {
-                let Some(main_fid) = self.binding.as_ref().map(|b| b.frame_id.as_str()) else {
-                    return;
-                };
-                let Some(params) = parse_event_params::<WebMcpToolsRemovedParams>(raw) else {
-                    return;
-                };
-                for removed in params.tools {
-                    if removed.frame_id.as_deref() == Some(main_fid) {
-                        self.cdp_tools.retain(|t| t.name != removed.name);
-                    }
-                }
+                let main_fid = self.binding.as_ref().map(|b| b.frame_id.as_str());
+                remove_webmcp_tools(raw, main_fid, &mut self.cdp_tools);
             }
             _ => {}
         }
@@ -2706,39 +2685,14 @@ impl PassiveAttachSession {
     }
 
     async fn read_axtree(&mut self, frame_id: &str, max_bytes: usize) -> Result<String> {
-        match self
+        let outcome = self
             .call_typed::<_, serde_json::Value>(
                 "Accessibility.getFullAXTree",
                 serde_json::json!({ "frameId": frame_id }),
             )
-            .await?
-        {
-            RpcCallOutcome::Ok(val) => {
-                self.check_not_invalidated()?;
-                let raw_json = serde_json::to_string(&val).map_err(|e| {
-                    cdp_err(
-                        TransportErrorKind::ProtocolMismatch,
-                        format!("failed to serialize Accessibility.getFullAXTree payload: {e}"),
-                    )
-                })?;
-                if raw_json.len() > max_bytes {
-                    return Err(anyhow::Error::new(ResponseTooLargeError {
-                        limit_bytes: max_bytes,
-                    }));
-                }
-                crate::extract::axtree::format_axtree_from_cdp_json(&raw_json)
-            }
-            RpcCallOutcome::RpcErr(err) if err.code == CDP_ERR_SERVER_ERROR => {
-                Err(anyhow::Error::new(ResponseTooLargeError {
-                    limit_bytes: max_bytes,
-                }))
-            }
-            RpcCallOutcome::RpcErr(err) => Err(rpc_failure_err(
-                "Accessibility.getFullAXTree",
-                &err,
-                TransportErrorKind::LoadError,
-            )),
-        }
+            .await?;
+        self.check_not_invalidated()?;
+        format_bounded_axtree_outcome(outcome, max_bytes)
     }
 
     async fn execute(&mut self, options: &CdpRenderOptions) -> Result<CdpRenderResult> {

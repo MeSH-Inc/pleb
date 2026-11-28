@@ -569,14 +569,12 @@ pub(crate) fn plan_disclosures_and_gates(
             let Some(t_meta) = state.nodes.get(&tab.node_id) else {
                 continue;
             };
-            if !node_inside(t_meta, baseline_root_id, &state.nodes)
-                || t_meta.in_boilerplate_ancestor
-                || t_meta.has_boilerplate_attr
-                || t_meta.ancestor_hard_excluded
-                || !t_meta.ancestor_hidden_chain.is_empty()
-                || t_meta.visibility != ElementVisibility::Visible
-                || (doc_has_landmark && t_meta.enclosing_landmark.is_none())
-            {
+            if !is_visible_in_landmark_control(
+                t_meta,
+                baseline_root_id,
+                doc_has_landmark,
+                &state.nodes,
+            ) {
                 continue;
             }
             let Some(node) = doc.tree.get(tab.node_id) else {
@@ -741,13 +739,7 @@ pub(crate) fn plan_disclosures_and_gates(
         let Some(c_meta) = state.nodes.get(&disc.node_id) else {
             continue;
         };
-        if !node_inside(c_meta, baseline_root_id, &state.nodes)
-            || c_meta.in_boilerplate_ancestor
-            || c_meta.has_boilerplate_attr
-            || c_meta.ancestor_hard_excluded
-            || !c_meta.ancestor_hidden_chain.is_empty()
-            || c_meta.visibility != ElementVisibility::Visible
-            || (doc_has_landmark && c_meta.enclosing_landmark.is_none())
+        if !is_visible_in_landmark_control(c_meta, baseline_root_id, doc_has_landmark, &state.nodes)
         {
             continue;
         }
@@ -867,14 +859,7 @@ pub(crate) fn plan_disclosures_and_gates(
         let Some(meta) = state.nodes.get(&pag.node_id) else {
             continue;
         };
-        if !node_inside(meta, baseline_root_id, &state.nodes)
-            || meta.in_boilerplate_ancestor
-            || meta.has_boilerplate_attr
-            || meta.ancestor_hard_excluded
-            || !meta.ancestor_hidden_chain.is_empty()
-            || meta.visibility != ElementVisibility::Visible
-            || (doc_has_landmark && meta.enclosing_landmark.is_none())
-        {
+        if !is_visible_in_landmark_control(meta, baseline_root_id, doc_has_landmark, &state.nodes) {
             continue;
         }
         let Some(node) = doc.tree.get(pag.node_id) else {
@@ -941,13 +926,7 @@ pub(crate) fn plan_disclosures_and_gates(
         let Some(c_meta) = state.nodes.get(&canvas.node_id) else {
             continue;
         };
-        if !node_inside(c_meta, baseline_root_id, &state.nodes)
-            || c_meta.in_boilerplate_ancestor
-            || c_meta.has_boilerplate_attr
-            || c_meta.ancestor_hard_excluded
-            || !c_meta.ancestor_hidden_chain.is_empty()
-            || c_meta.visibility != ElementVisibility::Visible
-            || (doc_has_landmark && c_meta.enclosing_landmark.is_none())
+        if !is_visible_in_landmark_control(c_meta, baseline_root_id, doc_has_landmark, &state.nodes)
         {
             continue;
         }
@@ -1402,6 +1381,21 @@ fn node_inside(
         return false;
     };
     node_meta.enter >= root_meta.enter && node_meta.exit <= root_meta.exit
+}
+
+fn is_visible_in_landmark_control(
+    meta: &NodeAnalysis,
+    baseline_root_id: NodeId,
+    doc_has_landmark: bool,
+    nodes: &HashMap<NodeId, NodeAnalysis>,
+) -> bool {
+    node_inside(meta, baseline_root_id, nodes)
+        && !meta.in_boilerplate_ancestor
+        && !meta.has_boilerplate_attr
+        && !meta.ancestor_hard_excluded
+        && meta.ancestor_hidden_chain.is_empty()
+        && meta.visibility == ElementVisibility::Visible
+        && (!doc_has_landmark || meta.enclosing_landmark.is_some())
 }
 
 fn resolve_tab_panel(
