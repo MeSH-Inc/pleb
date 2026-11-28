@@ -330,15 +330,21 @@ fn extract_document_parsed_inner(
     let effective_base = doc.effective_base_url(page_url);
     let tools = doc.extract_webmcp_tools(page_url);
 
-    let (raw_content, resources) = match options.format {
-        OutputFormat::Html => (
-            body.to_string(),
-            doc.extract_resources(options.mode, &effective_base),
-        ),
-        OutputFormat::Text => doc.into_plain_text_and_resources(options.mode, &effective_base),
+    let (raw_content, resources, ui_gates) = match options.format {
+        OutputFormat::Html => {
+            let (resources, ui_gates) =
+                doc.extract_resources_and_gates(options.mode, OutputFormat::Html, &effective_base);
+            (body.to_string(), resources, ui_gates)
+        }
+        OutputFormat::Text => {
+            doc.into_plain_text_with_gates(options.mode, options.expand, Some(&effective_base))
+        }
         OutputFormat::Markdown => {
-            let (pruned, resources) =
-                doc.into_pruned_html_and_resources(options.mode, &effective_base);
+            let (pruned, resources, ui_gates) = doc.into_pruned_html_with_gates(
+                options.mode,
+                options.expand,
+                Some(&effective_base),
+            );
             let md = markdown::html_to_compact_markdown(
                 &pruned,
                 &effective_base,
@@ -356,7 +362,7 @@ fn extract_document_parsed_inner(
                 }
                 _ => trimmed_md.to_string(),
             };
-            (raw_content, resources)
+            (raw_content, resources, ui_gates)
         }
         OutputFormat::Raw | OutputFormat::Axtree => unreachable!(),
     };
@@ -369,7 +375,7 @@ fn extract_document_parsed_inner(
         warning: None,
         resources,
         tools,
-        ui_gates: Vec::new(),
+        ui_gates,
     })
 }
 

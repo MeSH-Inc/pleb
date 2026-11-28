@@ -4,7 +4,7 @@ use pleb::context::{clear_state_dir, default_state_dir, RuntimeConfig, RuntimeCo
 use pleb::crawl;
 #[cfg(unix)]
 use pleb::daemon;
-use pleb::extract::{format_page_section, ExtractMode, OutputFormat};
+use pleb::extract::{format_page_section, ExpandPolicy, ExtractMode, OutputFormat};
 use pleb::fetch::{
     self, BatchFetchOptions, BatchItemResult, FetchError, FetchOptions, FetchOutput,
 };
@@ -110,6 +110,9 @@ enum Command {
         /// Content extraction scope
         #[arg(long, value_enum, default_value_t = ExtractMode::Clean, ignore_case = true)]
         extract: ExtractMode,
+        /// In-landmark ARIA disclosure rescue policy
+        #[arg(long, value_enum, default_value_t = ExpandPolicy::None, ignore_case = true)]
+        expand: ExpandPolicy,
         /// Transport mode
         #[arg(long, value_enum, default_value_t = RenderMode::Auto, ignore_case = true)]
         render: RenderMode,
@@ -168,6 +171,60 @@ enum Command {
         #[arg(long)]
         metadata_only: bool,
         /// Write output to file path instead of stdout (created only after fetch succeeds)
+        #[arg(short = 'o', long, conflicts_with = "metadata_only")]
+        output: Option<PathBuf>,
+    },
+    /// Extract clean Markdown, text, or HTML offline from stdin or a local file
+    Extract {
+        /// Input file path, or '-' to read from stdin
+        #[arg(value_name = "INPUT")]
+        input: Option<PathBuf>,
+        /// Origin URL used for link resolution, base href fallback, and metadata
+        #[arg(long)]
+        url: String,
+        /// MIME Content-Type of the input payload
+        #[arg(long, default_value = "text/html; charset=utf-8")]
+        content_type: String,
+        /// Output format (markdown, text, or html)
+        #[arg(long, value_enum, default_value_t = OutputFormat::Markdown, ignore_case = true)]
+        format: OutputFormat,
+        /// Content extraction scope
+        #[arg(long, value_enum, default_value_t = ExtractMode::Clean, ignore_case = true)]
+        extract: ExtractMode,
+        /// In-landmark ARIA disclosure rescue policy
+        #[arg(long, value_enum, default_value_t = ExpandPolicy::None, ignore_case = true)]
+        expand: ExpandPolicy,
+        /// Linked resource indexing policy (none or manifest)
+        #[arg(long, value_enum, default_value_t = ResourcePolicy::None, ignore_case = true)]
+        resources: ResourcePolicy,
+        /// WebMCP tool indexing policy
+        #[arg(long, value_enum, default_value_t = ToolPolicy::None, ignore_case = true)]
+        tools: ToolPolicy,
+        /// Strip image references from markdown output
+        #[arg(long)]
+        no_images: bool,
+        /// Unwrap hyperlink URLs in markdown output
+        #[arg(long)]
+        no_links: bool,
+        /// Truncate extracted content to at most N bytes
+        #[arg(long)]
+        max_bytes: Option<usize>,
+        /// Project long markdown/text output onto query-relevant sections (BM25 + bounded collapsed-section map; default 16000-byte budget or --max-bytes)
+        #[arg(long)]
+        focus: Option<String>,
+        /// Extract exact Markdown section(s) matching a heading selector (exact, prefix, or substring match; includes subsections)
+        #[arg(long)]
+        section: Option<String>,
+        /// Start byte offset within the extracted content for fence-safe sequential continuation
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Maximum raw input bytes to read before rejecting (default: 16 MiB)
+        #[arg(long, default_value_t = pleb::transport::DEFAULT_DOCUMENT_MAX_RESPONSE_BYTES)]
+        max_input_bytes: usize,
+        /// With --json, omit the content field and emit metadata only
+        #[arg(long)]
+        metadata_only: bool,
+        /// Write output to file path instead of stdout (atomically written only after extraction succeeds)
         #[arg(short = 'o', long, conflicts_with = "metadata_only")]
         output: Option<PathBuf>,
     },
@@ -463,6 +520,29 @@ impl<'a> From<&'a FetchOutput> for FetchMetadataOutput<'a> {
             ui_gates: res.ui_gates.clone(),
         }
     }
+}
+
+#[derive(Serialize)]
+struct ExtractOutput<'a> {
+    url: &'a str,
+    content_type: &'a str,
+    title: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<&'a str>,
+    content_bytes: usize,
+    acquired_sha256: &'a str,
+    truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_offset: Option<usize>,
+    timing_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    warning: Option<&'a str>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    resources: &'a [pleb::extract::ResourceDescriptor],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    tools: &'a [pleb::extract::WebMcpToolDescriptor],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    ui_gates: &'a [pleb::extract::UiGateDescriptor],
 }
 
 #[derive(Default, Serialize)]
@@ -827,6 +907,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             urls,
             format,
             extract,
+            expand,
             render,
             source,
             resources,
@@ -876,6 +957,13 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     "--tools manifest cannot be combined with --stage or --format raw",
                 ));
             }
+            if expand != ExpandPolicy::None
+                && (stage || matches!(format, OutputFormat::Raw | OutputFormat::Axtree))
+            {
+                return Err(CliError::invalid_input(
+                    "--expand cannot be combined with --stage, --format raw, or --format axtree",
+                ));
+            }
             if format == OutputFormat::Axtree {
                 if stage {
                     return Err(CliError::invalid_input(
@@ -898,39 +986,9 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     "--format raw cannot be combined with batch mode, --json, --jsonl, or --metadata-only",
                 ));
             }
-            let focus = focus
-                .map(|q| q.trim().to_string())
-                .filter(|q| !q.is_empty());
-            let section = section
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            if focus.is_some()
-                && (stage || !matches!(format, OutputFormat::Markdown | OutputFormat::Text))
-            {
-                return Err(CliError::invalid_input(
-                    "--focus is only supported with --format markdown or --format text (cannot be combined with --stage, --format html, --format raw, or --format axtree)",
-                ));
-            }
-            if section.is_some() && focus.is_some() {
-                return Err(CliError::invalid_input(
-                    "--section cannot be combined with --focus",
-                ));
-            }
-            if offset > 0 && focus.is_some() {
-                return Err(CliError::invalid_input(
-                    "--offset cannot be combined with --focus",
-                ));
-            }
-            if section.is_some() && (stage || format != OutputFormat::Markdown) {
-                return Err(CliError::invalid_input(
-                    "--section is only supported with --format markdown (cannot be combined with --stage, --format text, --format html, --format raw, or --format axtree)",
-                ));
-            }
-            if offset > 0 && (stage || format == OutputFormat::Raw) {
-                return Err(CliError::invalid_input(
-                    "--offset cannot be combined with --stage or --format raw",
-                ));
-            }
+            let focus = normalize_optional_query(focus);
+            let section = normalize_optional_query(section);
+            validate_projection_flags(format, &focus, &section, offset, stage)?;
             if batch_mode && output.is_some() {
                 return Err(CliError::invalid_input(
                     "--output cannot be combined with batch mode",
@@ -1013,7 +1071,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 extract: pleb::extract::ExtractOptions {
                     format,
                     mode: extract,
-                    expand: pleb::extract::ExpandPolicy::None,
+                    expand,
                     include_images: !no_images,
                     include_links: !no_links,
                     max_bytes,
@@ -1073,6 +1131,17 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                             {
                                 eprintln!("{cue}");
                             }
+                        }
+                        let allow_expand_hint =
+                            matches!(opts.extract.mode, ExtractMode::Clean | ExtractMode::Article)
+                                && matches!(
+                                    opts.extract.format,
+                                    OutputFormat::Markdown | OutputFormat::Text
+                                );
+                        if let Some(cue) =
+                            pleb::extract::format_ui_gates_cue(&res.ui_gates, allow_expand_hint)
+                        {
+                            eprintln!("{cue}");
                         }
                         if let Some(staged) = fetch::format_staged_resources_line(&res.resources) {
                             eprintln!("{staged}");
@@ -1157,6 +1226,193 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             }
 
             Ok(ExitCode::from(exit_code))
+        }
+        Command::Extract {
+            input,
+            url,
+            content_type,
+            format,
+            extract,
+            expand,
+            resources,
+            tools,
+            no_images,
+            no_links,
+            max_bytes,
+            focus,
+            section,
+            offset,
+            max_input_bytes,
+            metadata_only,
+            output,
+        } => {
+            if config.max_response_bytes.is_some() {
+                return Err(CliError::invalid_input(
+                    "use --max-input-bytes with 'pleb extract' instead of --max-response-bytes",
+                ));
+            }
+            if metadata_only && !json {
+                return Err(CliError::invalid_input("--metadata-only requires --json"));
+            }
+            if matches!(format, OutputFormat::Raw | OutputFormat::Axtree) {
+                return Err(CliError::invalid_input(
+                    "offline extract supports only --format markdown, text, or html",
+                ));
+            }
+            if !matches!(resources, ResourcePolicy::None | ResourcePolicy::Manifest) {
+                return Err(CliError::invalid_input(
+                    "offline extract supports only --resources none or manifest",
+                ));
+            }
+            if max_input_bytes == 0 || max_input_bytes.checked_add(1).is_none() {
+                return Err(CliError::invalid_input(
+                    "--max-input-bytes must be a positive integer below usize::MAX",
+                ));
+            }
+            let focus = normalize_optional_query(focus);
+            let section = normalize_optional_query(section);
+            validate_projection_flags(format, &focus, &section, offset, false)?;
+
+            let parsed_url = fetch::parse_http_url(&url).map_err(CliError::from_fetch)?;
+            let read_limit = max_input_bytes.checked_add(1).expect("checked above");
+            let raw_bytes = match input.as_deref() {
+                None => read_bounded_stdin(read_limit)?,
+                Some(p) if p == std::path::Path::new("-") => read_bounded_stdin(read_limit)?,
+                Some(path) => {
+                    let file =
+                        std::fs::File::open(path).map_err(|e| CliError::runtime("io_error", e))?;
+                    let mut buf = Vec::new();
+                    file.take(read_limit as u64)
+                        .read_to_end(&mut buf)
+                        .map_err(|e| CliError::runtime("io_error", e))?;
+                    buf
+                }
+            };
+            if raw_bytes.len() > max_input_bytes {
+                return Err(CliError::runtime(
+                    "response_too_large",
+                    format!("input exceeded {max_input_bytes} byte limit"),
+                ));
+            }
+
+            if let Some(detected_mime) = pleb::extract::detect_binary_content_with_magic_sniff(
+                Some(&content_type),
+                &raw_bytes,
+                true,
+            ) {
+                return Err(CliError {
+                    message: format!(
+                        "unsupported binary content ({}) in offline extract ({} bytes)",
+                        detected_mime.as_deref().unwrap_or("binary"),
+                        raw_bytes.len()
+                    ),
+                    kind: "unsupported_content_type",
+                    block_reason: None,
+                    exit_code: 5,
+                });
+            }
+
+            let start = std::time::Instant::now();
+            let acquired_sha256 = fetch::sha256_hex(&raw_bytes);
+            let extract_opts = pleb::extract::ExtractOptions {
+                format,
+                mode: extract,
+                expand,
+                include_images: !no_images,
+                include_links: !no_links,
+                max_bytes,
+                focus,
+                section,
+                offset,
+            };
+            let initial_opts = pleb::extract::ExtractOptions {
+                max_bytes: None,
+                focus: None,
+                section: None,
+                offset: 0,
+                ..extract_opts.clone()
+            };
+            let mut doc = pleb::extract::extract_document_bytes(
+                &raw_bytes,
+                &parsed_url,
+                Some(&content_type),
+                &initial_opts,
+            )
+            .map_err(|e| CliError::runtime("extract_error", e))?;
+
+            pleb::extract::finalize_extracted_document(
+                &mut doc,
+                &extract_opts,
+                resources == ResourcePolicy::Manifest,
+                tools == ToolPolicy::Manifest,
+            );
+            let timing_ms = start.elapsed().as_millis() as u64;
+            let content_bytes = doc.content.len();
+
+            if json {
+                let payload = ExtractOutput {
+                    url: parsed_url.as_str(),
+                    content_type: &content_type,
+                    title: doc.title.as_deref(),
+                    content: (!metadata_only).then_some(doc.content.as_str()),
+                    content_bytes,
+                    acquired_sha256: &acquired_sha256,
+                    truncated: doc.truncated,
+                    next_offset: doc.next_offset,
+                    timing_ms,
+                    warning: doc.warning.as_deref(),
+                    resources: &doc.resources,
+                    tools: &doc.tools,
+                    ui_gates: &doc.ui_gates,
+                };
+                let encoded = serde_json::to_string(&payload)
+                    .map_err(|e| CliError::runtime("serialization_error", e))?;
+                if let Some(ref path) = output {
+                    write_file_atomic(path, format!("{encoded}\n").as_bytes())
+                        .map_err(|e| CliError::runtime("io_error", e))?;
+                } else {
+                    println!("{encoded}");
+                }
+            } else {
+                if !quiet {
+                    if let Some(ref title) = doc.title {
+                        eprintln!("Title: {title}");
+                    }
+                    if resources == ResourcePolicy::None {
+                        if let Some(cue) = fetch::format_resource_cue(&doc.resources) {
+                            eprintln!("{cue}");
+                        }
+                    }
+                    if tools == ToolPolicy::None {
+                        if let Some(cue) = pleb::extract::webmcp::format_webmcp_cue(&doc.tools) {
+                            eprintln!("{cue}");
+                        }
+                    }
+                    let allow_expand_hint =
+                        matches!(extract, ExtractMode::Clean | ExtractMode::Article)
+                            && matches!(format, OutputFormat::Markdown | OutputFormat::Text);
+                    if let Some(cue) =
+                        pleb::extract::format_ui_gates_cue(&doc.ui_gates, allow_expand_hint)
+                    {
+                        eprintln!("{cue}");
+                    }
+                    if let Some(ref warning) = doc.warning {
+                        eprintln!("Warning: {warning}");
+                    }
+                    if let Some(next_offset) = doc.next_offset {
+                        eprintln!("Next-Offset: {next_offset}");
+                    }
+                    eprintln!("Bytes: {content_bytes} | Time: {timing_ms}ms\n");
+                }
+                if let Some(ref path) = output {
+                    write_file_atomic(path, doc.content.as_bytes())
+                        .map_err(|e| CliError::runtime("io_error", e))?;
+                } else {
+                    print!("{}", doc.content);
+                }
+            }
+
+            Ok(ExitCode::SUCCESS)
         }
         Command::Search {
             query,
@@ -1904,20 +2160,92 @@ fn resolve_skill_install_targets(dir: Option<PathBuf>) -> Result<Vec<PathBuf>, C
     ])
 }
 
-fn write_skill_file_atomic(skill_path: &std::path::Path, content: &str) -> std::io::Result<()> {
-    let parent = skill_path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "skill path missing parent directory",
-        )
-    })?;
-    let tmp_path = parent.join(format!(".SKILL.md.tmp.{}", std::process::id()));
-    std::fs::write(&tmp_path, content.as_bytes())?;
-    if let Err(err) = std::fs::rename(&tmp_path, skill_path) {
+fn normalize_optional_query(val: Option<String>) -> Option<String> {
+    val.map(|q| q.trim().to_string()).filter(|q| !q.is_empty())
+}
+
+fn validate_projection_flags(
+    format: OutputFormat,
+    focus: &Option<String>,
+    section: &Option<String>,
+    offset: usize,
+    stage: bool,
+) -> Result<(), CliError> {
+    if focus.is_some() && (stage || !matches!(format, OutputFormat::Markdown | OutputFormat::Text))
+    {
+        return Err(CliError::invalid_input(
+            "--focus is only supported with --format markdown or --format text (cannot be combined with --stage, --format html, --format raw, or --format axtree)",
+        ));
+    }
+    if section.is_some() && focus.is_some() {
+        return Err(CliError::invalid_input(
+            "--section cannot be combined with --focus",
+        ));
+    }
+    if offset > 0 && focus.is_some() {
+        return Err(CliError::invalid_input(
+            "--offset cannot be combined with --focus",
+        ));
+    }
+    if section.is_some() && (stage || format != OutputFormat::Markdown) {
+        return Err(CliError::invalid_input(
+            "--section is only supported with --format markdown (cannot be combined with --stage, --format text, --format html, --format raw, or --format axtree)",
+        ));
+    }
+    if offset > 0 && (stage || format == OutputFormat::Raw) {
+        return Err(CliError::invalid_input(
+            "--offset cannot be combined with --stage or --format raw",
+        ));
+    }
+    Ok(())
+}
+
+fn read_bounded_stdin(read_limit: usize) -> Result<Vec<u8>, CliError> {
+    if std::io::stdin().is_terminal() {
+        return Err(CliError::invalid_input(
+            "no input provided on stdin; pipe content or pass a file path",
+        ));
+    }
+    let mut buf = Vec::new();
+    std::io::stdin()
+        .lock()
+        .take(read_limit as u64)
+        .read_to_end(&mut buf)
+        .map_err(|e| CliError::runtime("io_error", e))?;
+    Ok(buf)
+}
+
+fn write_file_atomic(dest: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let parent = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("output");
+    let tmp_path = parent.join(format!(".{file_name}.tmp.{}.{seq}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)?;
+    if let Err(err) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    drop(file);
+    if let Err(err) = std::fs::rename(&tmp_path, dest) {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(err);
     }
     Ok(())
+}
+
+fn write_skill_file_atomic(skill_path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    write_file_atomic(skill_path, content.as_bytes())
 }
 
 fn install_bundled_skill(

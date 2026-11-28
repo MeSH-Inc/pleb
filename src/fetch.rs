@@ -441,23 +441,22 @@ pub async fn fetch_target(
             );
             merge_warning(&mut warning, Some(drift_warning));
         }
-        if options.tools == ToolPolicy::Manifest && !extracted.tools.is_empty() {
-            let manifest = extract::webmcp::format_webmcp_manifest_markdown(&extracted.tools);
-            if !manifest.trim().is_empty() {
-                if !extracted.content.trim().is_empty() {
-                    extracted.content.push_str("\n\n");
-                }
-                extracted.content.push_str(manifest.trim());
-            }
-        }
     }
 
-    if (needs_enrichment && has_slice_or_projection) || (is_axtree && has_slice_or_projection) {
-        let proj = extract::apply_projection_or_slice(&extracted.content, &options.extract);
-        extracted.content = proj.content;
-        extracted.truncated |= proj.truncated;
-        extracted.next_offset = proj.next_offset;
-        merge_warning(&mut warning, proj.warning);
+    let append_tools_manifest = options.tools == ToolPolicy::Manifest;
+    // `enrich_document_resources` already appends the resource manifest when `ResourcePolicy::Manifest`,
+    // so only pass `append_tools_manifest` + final projection/slice here.
+    if (needs_enrichment && has_slice_or_projection)
+        || (is_axtree && has_slice_or_projection)
+        || append_tools_manifest
+    {
+        extract::finalize_extracted_document(
+            &mut extracted,
+            &options.extract,
+            false,
+            append_tools_manifest,
+        );
+        merge_warning(&mut warning, extracted.warning.take());
     }
 
     let content_bytes = extracted.content.len();

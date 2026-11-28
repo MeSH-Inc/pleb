@@ -221,6 +221,11 @@ fn tool_definitions() -> Value {
                         "enum": ["clean", "article", "full"],
                         "description": "Extraction scope: clean strips chrome across page (default); article focuses primary <article>/<main>; full preserves verbatim body"
                     },
+                    "expand": {
+                        "type": "string",
+                        "enum": ["none", "tabs", "all"],
+                        "description": "In-landmark ARIA disclosure rescue policy: none (default), tabs (paired tabpanels), or all (tabpanels plus aria-expanded=false disclosures)"
+                    },
                     "render": {
                         "type": "string",
                         "enum": ["auto", "cef", "cdp", "cronet"],
@@ -344,6 +349,8 @@ async fn call_fetch(
         ));
     }
     let mode = parse_opt_enum::<ExtractMode>(args, "extract")?.unwrap_or(ExtractMode::Clean);
+    let expand =
+        parse_opt_enum::<crate::extract::ExpandPolicy>(args, "expand")?.unwrap_or_default();
     let render = parse_opt_enum::<RenderMode>(args, "render")?.unwrap_or(RenderMode::Auto);
     let source = parse_opt_enum::<SourceMode>(args, "source")?.unwrap_or(SourceMode::Auto);
     let resources = parse_opt_enum::<ResourcePolicy>(args, "resources")?.unwrap_or_default();
@@ -360,6 +367,11 @@ async fn call_fetch(
     let wait_for_selector = opt_nonempty_str(args, "wait_for_selector")?;
     let respect_robots = opt_bool(args, "respect_robots")?.unwrap_or(false);
 
+    if expand != crate::extract::ExpandPolicy::None && format == OutputFormat::Axtree {
+        return Err(RpcError::invalid_params(
+            "'expand' cannot be combined with format 'axtree'",
+        ));
+    }
     if focus.is_some() && !matches!(format, OutputFormat::Markdown | OutputFormat::Text) {
         return Err(RpcError::invalid_params(
             "'focus' is only supported with format 'markdown' or 'text'",
@@ -387,13 +399,13 @@ async fn call_fetch(
         extract: ExtractOptions {
             format,
             mode,
+            expand,
             include_images: !no_images,
             include_links: !no_links,
             max_bytes,
             focus,
             section,
             offset,
-            ..Default::default()
         },
         render,
         source,
@@ -432,6 +444,16 @@ async fn call_fetch(
                 ) {
                     lines.push(cue);
                 }
+            }
+            let allow_expand_hint = matches!(mode, ExtractMode::Clean | ExtractMode::Article)
+                && matches!(format, OutputFormat::Markdown | OutputFormat::Text);
+            if let Some(cue) = crate::extract::format_ui_gates_cue_with_hint(
+                &res.ui_gates,
+                allow_expand_hint,
+                None,
+                "escalate to browser or attach via no_navigate=true",
+            ) {
+                lines.push(cue);
             }
             if let Some(staged) = fetch::format_staged_resources_line(&res.resources) {
                 lines.push(staged);

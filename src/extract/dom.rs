@@ -5,8 +5,9 @@ use std::sync::{LazyLock, OnceLock};
 use url::Url;
 
 use super::resources::{index_resources_in_subtree, ResourceDescriptor};
+use super::ui_gates::{finalize_ui_gates, plan_disclosures_and_gates, UiGateDescriptor};
 use super::url::{normalize_crawl_url, resolve_and_clean_url, ResolvedUrl};
-use super::ExtractMode;
+use super::{ExpandPolicy, ExtractMode, OutputFormat};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DomTextMetrics {
@@ -112,6 +113,7 @@ static BLOCK_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("section
 static A_HREF_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("a[href]").unwrap());
 static BUTTON_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("button").unwrap());
 static STYLE_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("[style]").unwrap());
+static INERT_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("[inert]").unwrap());
 static IMG_DIM_SEL: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("img[width], img[height], img[role], button img").unwrap());
 static ARIA_COLLAPSED_CTRL_SEL: LazyLock<Selector> =
@@ -120,6 +122,33 @@ static CHECKBOX_POPUP_SEL: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("input[type=\"checkbox\"][aria-haspopup=\"true\"]").unwrap());
 pub(crate) static WEBMCP_FORM_SEL: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("form[toolname][tooldescription]").unwrap());
+
+/// Unified structural visibility classification shared across pruning, disclosure rescue,
+/// UI-gate indexing, and WebMCP discovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ElementVisibility {
+    /// No structural hiding or hard exclusion signal on this element.
+    Visible,
+    /// Hidden solely by a recoverable disclosure mechanism (`[hidden]`, `[aria-hidden="true"]`,
+    /// inline `display: none` / `visibility: hidden`, or `hidden`/`d-none`/`is-hidden` classes).
+    StructuralDisclosureHidden,
+    /// Disqualified from rescue, control eligibility, visible text, and WebMCP discovery.
+    HardExcluded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RescuedPanelKind {
+    Tab,
+    Disclosure,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RescuedPanelMeta {
+    pub(crate) kind: RescuedPanelKind,
+    pub(crate) label: String,
+    pub(crate) was_hidden: bool,
+    pub(crate) heading_level: u8,
+}
 
 /// HTML document parsed once via `scraper` (`atomic` tendrils) for metrics,
 /// link discovery, and pruned extraction.
@@ -285,64 +314,144 @@ impl ParsedHtml {
         links
     }
 
-    fn prune_and_render(
-        &mut self,
+    fn prune_and_render_with_gates(
+        mut self,
         mode: ExtractMode,
+        expand: ExpandPolicy,
+        format: OutputFormat,
         resources_base: Option<&Url>,
-        render: impl FnOnce(NodeRef<'_, Node>, &mut String),
-    ) -> (String, Vec<ResourceDescriptor>) {
-        let metrics = prune_dom(&mut self.doc, mode);
-        let root_id = select_root_id(&self.doc, mode, &metrics);
+        render: impl FnOnce(
+            NodeRef<'_, Node>,
+            &HashMap<NodeId, RescuedPanelMeta>,
+            &HashSet<NodeId>,
+            &mut String,
+        ),
+    ) -> (String, Vec<ResourceDescriptor>, Vec<UiGateDescriptor>) {
+        let mut plan = plan_disclosures_and_gates(&self.doc, mode, expand, format);
+        let rescued_ids: HashSet<NodeId> = plan.rescued_panels.keys().copied().collect();
+        let mut math_only_nodes = HashSet::new();
+        let metrics = prune_dom(&mut self.doc, mode, &rescued_ids, &mut math_only_nodes);
+
+        let root_id = if let Some(baseline_root) = plan.baseline_root_id {
+            if self.doc.tree.get(baseline_root).is_some() {
+                baseline_root
+            } else {
+                select_root_id(&self.doc, mode, &metrics)
+            }
+        } else {
+            select_root_id(&self.doc, mode, &metrics)
+        };
+
+        let surviving_rescued: HashSet<NodeId> =
+            plan.rescued_panels
+                .keys()
+                .copied()
+                .filter(|id| {
+                    self.doc.tree.get(*id).is_some_and(|n| {
+                        n.id() == root_id || n.ancestors().any(|a| a.id() == root_id)
+                    })
+                })
+                .collect();
+        plan.rescued_panels
+            .retain(|id, _| surviving_rescued.contains(id));
+
+        let ui_gates = finalize_ui_gates(&plan.pending_gates, &surviving_rescued);
+
         let mut out = String::new();
         let mut resources = Vec::new();
         if let Some(root) = self.doc.tree.get(root_id) {
             if let Some(base) = resources_base {
                 resources = index_resources_in_subtree(&self.doc, root, base);
             }
-            render(root, &mut out);
+            render(root, &plan.rescued_panels, &math_only_nodes, &mut out);
         }
-        (out, resources)
+        (out, resources, ui_gates)
     }
 
-    pub fn into_pruned_html(mut self, mode: ExtractMode) -> String {
-        self.prune_and_render(mode, None, |r, o| serialize_pruned_html(r, false, o))
+    pub fn into_pruned_html(self, mode: ExtractMode) -> String {
+        self.into_pruned_html_with_gates(mode, ExpandPolicy::None, None)
             .0
     }
 
     pub fn into_pruned_html_and_resources(
-        mut self,
+        self,
         mode: ExtractMode,
         base_url: &Url,
     ) -> (String, Vec<ResourceDescriptor>) {
-        self.prune_and_render(mode, Some(base_url), |r, o| {
-            serialize_pruned_html(r, false, o)
-        })
+        let (html, resources, _) =
+            self.into_pruned_html_with_gates(mode, ExpandPolicy::None, Some(base_url));
+        (html, resources)
     }
 
-    pub fn into_plain_text(mut self, mode: ExtractMode) -> String {
-        let raw = self
-            .prune_and_render(mode, None, |r, o| collect_plain_text(r, false, false, o))
-            .0;
-        normalize_plain_text(&raw)
+    pub(crate) fn into_pruned_html_with_gates(
+        self,
+        mode: ExtractMode,
+        expand: ExpandPolicy,
+        base_url: Option<&Url>,
+    ) -> (String, Vec<ResourceDescriptor>, Vec<UiGateDescriptor>) {
+        self.prune_and_render_with_gates(
+            mode,
+            expand,
+            OutputFormat::Markdown,
+            base_url,
+            |r, rescued, math_only, o| {
+                serialize_pruned_html(r, false, false, rescued, math_only, o)
+            },
+        )
+    }
+
+    pub fn into_plain_text(self, mode: ExtractMode) -> String {
+        self.into_plain_text_with_gates(mode, ExpandPolicy::None, None)
+            .0
     }
 
     pub fn into_plain_text_and_resources(
-        mut self,
+        self,
         mode: ExtractMode,
         base_url: &Url,
     ) -> (String, Vec<ResourceDescriptor>) {
-        let (raw, resources) = self.prune_and_render(mode, Some(base_url), |r, o| {
-            collect_plain_text(r, false, false, o)
-        });
-        (normalize_plain_text(&raw), resources)
+        let (text, resources, _) =
+            self.into_plain_text_with_gates(mode, ExpandPolicy::None, Some(base_url));
+        (text, resources)
     }
 
-    pub fn extract_resources(
-        mut self,
+    pub(crate) fn into_plain_text_with_gates(
+        self,
         mode: ExtractMode,
+        expand: ExpandPolicy,
+        base_url: Option<&Url>,
+    ) -> (String, Vec<ResourceDescriptor>, Vec<UiGateDescriptor>) {
+        let (raw, resources, ui_gates) = self.prune_and_render_with_gates(
+            mode,
+            expand,
+            OutputFormat::Text,
+            base_url,
+            |r, rescued, math_only, o| {
+                collect_plain_text(r, false, false, false, rescued, math_only, o)
+            },
+        );
+        (normalize_plain_text(&raw), resources, ui_gates)
+    }
+
+    pub fn extract_resources(self, mode: ExtractMode, base_url: &Url) -> Vec<ResourceDescriptor> {
+        self.extract_resources_and_gates(mode, OutputFormat::Html, base_url)
+            .0
+    }
+
+    pub(crate) fn extract_resources_and_gates(
+        self,
+        mode: ExtractMode,
+        format: OutputFormat,
         base_url: &Url,
-    ) -> Vec<ResourceDescriptor> {
-        self.prune_and_render(mode, Some(base_url), |_, _| {}).1
+    ) -> (Vec<ResourceDescriptor>, Vec<UiGateDescriptor>) {
+        let (_, resources, ui_gates) = self.prune_and_render_with_gates(
+            mode,
+            ExpandPolicy::None,
+            format,
+            Some(base_url),
+            |_, _, _, _| {},
+        );
+        (resources, ui_gates)
     }
 }
 
@@ -372,26 +481,43 @@ fn is_spa_root(el: &scraper::node::Element) -> bool {
     matches!(el.attr("id"), Some("root" | "app" | "__next" | "__nuxt"))
 }
 
-fn is_landmark_element(el: &scraper::node::Element) -> bool {
+pub(crate) fn is_landmark_element(el: &scraper::node::Element) -> bool {
     matches!(el.name(), "main" | "article")
         || el
             .attr("role")
             .is_some_and(|r| r.eq_ignore_ascii_case("main"))
 }
 
-fn is_inert_tag(tag: &str) -> bool {
+pub(crate) fn is_inert_tag(tag: &str) -> bool {
     matches!(tag, "script" | "style" | "noscript" | "template")
 }
 
-fn is_heading_tag(tag: &str) -> bool {
+pub(crate) fn is_heading_tag(tag: &str) -> bool {
     matches!(tag, "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
 }
 
-fn body_or_root_id(doc: &Html) -> NodeId {
+pub(crate) fn body_or_root_id(doc: &Html) -> NodeId {
     doc.select(&BODY_SEL)
         .next()
         .map(|el| el.id())
         .unwrap_or_else(|| doc.root_element().id())
+}
+
+pub(crate) fn is_math_container(el: &scraper::node::Element) -> bool {
+    el.name() == "math"
+        || el.attr("class").is_some_and(|c| {
+            c.split_whitespace()
+                .any(|t| eq_any_ci(t, &["katex", "katex-mathml", "mjx-container", "MathJax"]))
+        })
+}
+
+pub(crate) fn has_h1_descendant(node: NodeRef<'_, Node>) -> bool {
+    node.descendants()
+        .any(|d| matches!(d.value(), Node::Element(e) if e.name() == "h1"))
+}
+
+pub(crate) fn doc_has_content_landmark(doc: &Html) -> bool {
+    doc.select(&MAIN_SEL).next().is_some() || doc.select(&ARTICLE_SEL).next().is_some()
 }
 
 fn collect_doc_metrics(
@@ -406,7 +532,7 @@ fn collect_doc_metrics(
     (map, visits)
 }
 
-fn is_protected_container(el: &scraper::node::Element) -> bool {
+pub(crate) fn is_protected_container(el: &scraper::node::Element) -> bool {
     is_landmark_element(el) || el.name() == "table"
 }
 
@@ -418,7 +544,7 @@ struct TextMetricsScan {
 }
 
 impl NodeMetrics {
-    fn accumulate(&mut self, child: Self) {
+    pub(crate) fn accumulate(&mut self, child: Self) {
         self.prose_bytes += child.prose_bytes;
         self.link_text_bytes += child.link_text_bytes;
         self.link_count += child.link_count;
@@ -516,7 +642,12 @@ fn walk_node_metrics(
     }
 }
 
-fn prune_dom(doc: &mut Html, mode: ExtractMode) -> HashMap<NodeId, NodeMetrics> {
+fn prune_dom(
+    doc: &mut Html,
+    mode: ExtractMode,
+    rescued_ids: &HashSet<NodeId>,
+    math_only_nodes: &mut HashSet<NodeId>,
+) -> HashMap<NodeId, NodeMetrics> {
     let mut to_detach: Vec<NodeId> = Vec::new();
 
     collect_selector_ids(doc, &ALWAYS_STRIP_SEL, &mut to_detach);
@@ -526,12 +657,24 @@ fn prune_dom(doc: &mut Html, mode: ExtractMode) -> HashMap<NodeId, NodeMetrics> 
         collect_selector_ids(doc, &BOILERPLATE_TAG_SEL, &mut to_detach);
         collect_selector_ids(doc, &WEBMCP_FORM_SEL, &mut to_detach);
 
+        for el in doc.select(&INERT_SEL) {
+            if !matches!(el.value().name(), "html" | "body") {
+                to_detach.push(el.id());
+            }
+        }
+
         for el in doc.select(&ARIA_BOILERPLATE_SEL) {
             let name = el.value().name();
             if matches!(name, "html" | "body") {
                 continue;
             }
-            if find_tex_annotation(*el).is_none() {
+            if rescued_ids.contains(&el.id()) {
+                continue;
+            }
+            let vis = classify_element_visibility(el.value());
+            if vis != ElementVisibility::HardExcluded && find_tex_annotation(*el).is_some() {
+                math_only_nodes.insert(el.id());
+            } else {
                 to_detach.push(el.id());
             }
         }
@@ -542,8 +685,7 @@ fn prune_dom(doc: &mut Html, mode: ExtractMode) -> HashMap<NodeId, NodeMetrics> 
             }
         }
 
-        let doc_has_landmark =
-            doc.select(&MAIN_SEL).next().is_some() || doc.select(&ARTICLE_SEL).next().is_some();
+        let doc_has_landmark = doc_has_content_landmark(doc);
         let collapsed_ids: HashSet<&str> = doc
             .select(&ARIA_COLLAPSED_CTRL_SEL)
             .filter(|ctrl| {
@@ -564,25 +706,64 @@ fn prune_dom(doc: &mut Html, mode: ExtractMode) -> HashMap<NodeId, NodeMetrics> 
             if matches!(val.name(), "html" | "body") || is_landmark_element(val) {
                 continue;
             }
+            if rescued_ids.contains(&el.id()) {
+                continue;
+            }
+            let has_sr = val
+                .attr("class")
+                .is_some_and(|c| has_sr_only_class(&c.to_ascii_lowercase()));
+            if has_sr {
+                if is_math_container(val) && find_tex_annotation(*el).is_some() {
+                    math_only_nodes.insert(el.id());
+                } else {
+                    to_detach.push(el.id());
+                }
+                continue;
+            }
+            let has_bp_pattern = has_boilerplate_pattern_attr(val.attr("id"), val.attr("class"));
+            let has_disc_hidden = val
+                .attr("class")
+                .is_some_and(|c| has_disclosure_hidden_class(&c.to_ascii_lowercase()));
             let is_collapsed_panel = !collapsed_ids.is_empty()
                 && val.attr("id").is_some_and(|id| collapsed_ids.contains(id))
                 && !el
                     .ancestors()
                     .any(|a| matches!(a.value(), Node::Element(e) if is_landmark_element(e)));
-            if (is_boilerplate_attr(val.attr("id"), val.attr("class")) || is_collapsed_panel)
-                && find_tex_annotation(*el).is_none()
+            if (has_bp_pattern || has_disc_hidden || is_collapsed_panel)
                 && !contains_heading_or_landmark(*el)
             {
-                to_detach.push(el.id());
+                if !has_bp_pattern && find_tex_annotation(*el).is_some() {
+                    math_only_nodes.insert(el.id());
+                } else {
+                    to_detach.push(el.id());
+                }
             }
         }
 
         for el in doc.select(&STYLE_SEL) {
-            if !matches!(el.value().name(), "html" | "body")
-                && el.value().attr("style").is_some_and(is_inline_hidden_style)
-                && find_tex_annotation(*el).is_none()
-            {
-                to_detach.push(el.id());
+            let val = el.value();
+            if matches!(val.name(), "html" | "body") || rescued_ids.contains(&el.id()) {
+                continue;
+            }
+            let Some(style) = val.attr("style") else {
+                continue;
+            };
+            match classify_inline_style(style) {
+                ElementVisibility::Visible => {}
+                ElementVisibility::HardExcluded => {
+                    if is_math_container(val) && find_tex_annotation(*el).is_some() {
+                        math_only_nodes.insert(el.id());
+                    } else {
+                        to_detach.push(el.id());
+                    }
+                }
+                ElementVisibility::StructuralDisclosureHidden => {
+                    if find_tex_annotation(*el).is_some() {
+                        math_only_nodes.insert(el.id());
+                    } else {
+                        to_detach.push(el.id());
+                    }
+                }
             }
         }
         for el in doc.select(&IMG_DIM_SEL) {
@@ -720,14 +901,39 @@ fn collect_link_density_prune_ids(
     }
 }
 
-pub(crate) fn is_element_hidden_or_inert(el: &scraper::node::Element) -> bool {
-    is_inert_tag(el.name())
+pub(crate) fn classify_element_visibility(el: &scraper::node::Element) -> ElementVisibility {
+    if is_inert_tag(el.name())
         || (el.name() == "dialog" && el.attr("open").is_none())
-        || el.attr("hidden").is_some()
+        || el.attr("inert").is_some()
+        || el
+            .attr("style")
+            .is_some_and(|s| classify_inline_style(s) == ElementVisibility::HardExcluded)
+        || el
+            .attr("class")
+            .is_some_and(|c| has_sr_only_class(&c.to_ascii_lowercase()))
+    {
+        return ElementVisibility::HardExcluded;
+    }
+
+    if el.attr("hidden").is_some()
         || el
             .attr("aria-hidden")
             .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
-        || el.attr("style").is_some_and(is_inline_hidden_style)
+        || el.attr("style").is_some_and(|s| {
+            classify_inline_style(s) == ElementVisibility::StructuralDisclosureHidden
+        })
+        || el
+            .attr("class")
+            .is_some_and(|c| has_disclosure_hidden_class(&c.to_ascii_lowercase()))
+    {
+        return ElementVisibility::StructuralDisclosureHidden;
+    }
+
+    ElementVisibility::Visible
+}
+
+pub(crate) fn is_element_hidden_or_inert(el: &scraper::node::Element) -> bool {
+    classify_element_visibility(el) != ElementVisibility::Visible
 }
 
 pub(crate) fn is_hidden_or_inert(node: NodeRef<'_, Node>) -> bool {
@@ -754,18 +960,21 @@ fn parse_css_zero(val: &str) -> bool {
 }
 
 fn is_offscreen_px(val: &str) -> bool {
-    let t = val.trim();
+    let t = val.trim().as_bytes();
     t.len() > 2
-        && t[t.len() - 2..].eq_ignore_ascii_case("px")
-        && t[..t.len() - 2]
-            .trim()
-            .parse::<f32>()
-            .is_ok_and(|n| n <= -1000.0)
+        && t[t.len() - 2..].eq_ignore_ascii_case(b"px")
+        && std::str::from_utf8(&t[..t.len() - 2])
+            .ok()
+            .map(str::trim)
+            .and_then(|s| s.parse::<f32>().ok())
+            .is_some_and(|n| n <= -1000.0)
 }
 
-pub(crate) fn is_inline_hidden_style(style: &str) -> bool {
+pub(crate) fn classify_inline_style(style: &str) -> ElementVisibility {
     let (mut overflow_hidden, mut zero_box, mut positioned, mut offscreen) =
         (false, false, false, false);
+    let mut saw_structural = false;
+
     for decl in style.split(';') {
         let Some((prop, raw)) = decl.split_once(':') else {
             continue;
@@ -792,9 +1001,7 @@ pub(crate) fn is_inline_hidden_style(style: &str) -> bool {
                         })
                         && n == 4
                 });
-        if (prop.eq_ignore_ascii_case("display") && val.eq_ignore_ascii_case("none"))
-            || (prop.eq_ignore_ascii_case("visibility") && eq_any_ci(val, &["hidden", "collapse"]))
-            || (eq_any_ci(prop, &["opacity", "font-size"]) && parse_css_zero(val))
+        if (eq_any_ci(prop, &["opacity", "font-size"]) && parse_css_zero(val))
             || (prop.eq_ignore_ascii_case("text-indent") && is_offscreen_px(val))
             || zero_clip
             || (prop.eq_ignore_ascii_case("clip-path")
@@ -802,7 +1009,12 @@ pub(crate) fn is_inline_hidden_style(style: &str) -> bool {
                     .iter()
                     .any(|p| strip_prefix_ci(val, p).is_some()))
         {
-            return true;
+            return ElementVisibility::HardExcluded;
+        }
+        if (prop.eq_ignore_ascii_case("display") && val.eq_ignore_ascii_case("none"))
+            || (prop.eq_ignore_ascii_case("visibility") && eq_any_ci(val, &["hidden", "collapse"]))
+        {
+            saw_structural = true;
         }
         overflow_hidden |= eq_any_ci(prop, &["overflow", "overflow-x", "overflow-y"])
             && val.eq_ignore_ascii_case("hidden");
@@ -812,7 +1024,86 @@ pub(crate) fn is_inline_hidden_style(style: &str) -> bool {
             prop.eq_ignore_ascii_case("position") && eq_any_ci(val, &["absolute", "fixed"]);
         offscreen |= eq_any_ci(prop, &["left", "top"]) && is_offscreen_px(val);
     }
-    (overflow_hidden && zero_box) || (positioned && offscreen)
+
+    if (overflow_hidden && zero_box) || (positioned && offscreen) {
+        ElementVisibility::HardExcluded
+    } else if saw_structural {
+        ElementVisibility::StructuralDisclosureHidden
+    } else {
+        ElementVisibility::Visible
+    }
+}
+
+/// Extract sanitized visible text within `node` up to `max_bytes`, skipping all non-visible
+/// subtrees and halting traversal as soon as `max_bytes` is reached.
+pub(crate) fn extract_bounded_visible_text(
+    node: NodeRef<'_, Node>,
+    max_bytes: usize,
+) -> Option<String> {
+    let mut out = String::with_capacity(max_bytes.min(128));
+    let mut pending_space = false;
+    walk_bounded_visible_text(node, max_bytes, &mut out, &mut pending_space);
+    let trimmed = out.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn walk_bounded_visible_text(
+    node: NodeRef<'_, Node>,
+    max_bytes: usize,
+    out: &mut String,
+    pending_space: &mut bool,
+) {
+    if out.len() >= max_bytes {
+        return;
+    }
+    match node.value() {
+        Node::Text(text) => {
+            for ch in text.chars() {
+                if super::webmcp::is_stripped_control(ch) {
+                    if matches!(ch, '\t' | '\n' | '\r') && !out.is_empty() {
+                        *pending_space = true;
+                    }
+                    continue;
+                }
+                if ch.is_whitespace() {
+                    if !out.is_empty() {
+                        *pending_space = true;
+                    }
+                    continue;
+                }
+                if *pending_space {
+                    if out.len() + 1 > max_bytes {
+                        return;
+                    }
+                    out.push(' ');
+                    *pending_space = false;
+                }
+                if out.len() + ch.len_utf8() > max_bytes {
+                    return;
+                }
+                out.push(ch);
+            }
+        }
+        Node::Element(el) => {
+            if classify_element_visibility(el) != ElementVisibility::Visible {
+                return;
+            }
+            for child in node.children() {
+                walk_bounded_visible_text(child, max_bytes, out, pending_space);
+                if out.len() >= max_bytes {
+                    return;
+                }
+            }
+        }
+        _ => {
+            for child in node.children() {
+                walk_bounded_visible_text(child, max_bytes, out, pending_space);
+                if out.len() >= max_bytes {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 fn collapse_non_empty(raw: &str) -> Option<String> {
@@ -951,7 +1242,7 @@ fn collect_selector_ids(doc: &Html, selector: &Selector, out: &mut Vec<NodeId>) 
     }
 }
 
-fn contains_heading_or_landmark(node: NodeRef<'_, Node>) -> bool {
+pub(crate) fn contains_heading_or_landmark(node: NodeRef<'_, Node>) -> bool {
     node.descendants().any(
         |d| matches!(d.value(), Node::Element(e) if e.name() == "h1" || is_landmark_element(e)),
     )
@@ -963,25 +1254,25 @@ fn has_boilerplate_pattern(lower: &str) -> bool {
         .any(|pat| contains_word_prefix(lower, pat))
 }
 
-fn is_boilerplate_attr(id: Option<&str>, class: Option<&str>) -> bool {
+pub(crate) fn has_boilerplate_pattern_attr(id: Option<&str>, class: Option<&str>) -> bool {
     id.is_some_and(|v| has_boilerplate_pattern(&v.to_ascii_lowercase()))
-        || class.is_some_and(|v| {
-            let lower = v.to_ascii_lowercase();
-            has_boilerplate_pattern(&lower) || has_hidden_or_sr_class(&lower)
-        })
+        || class.is_some_and(|v| has_boilerplate_pattern(&v.to_ascii_lowercase()))
 }
 
-fn has_hidden_or_sr_class(lower: &str) -> bool {
+pub(crate) fn has_sr_only_class(lower: &str) -> bool {
+    lower
+        .split_whitespace()
+        .any(|t| matches!(t, "sr-only" | "visually-hidden" | "screen-reader-text"))
+}
+
+pub(crate) fn has_disclosure_hidden_class(lower: &str) -> bool {
     let has_tok = |target: &str| lower.split_whitespace().any(|t| t == target);
     let has_prefix = |prefixes: &[&str]| {
         lower
             .split_whitespace()
             .any(|t| prefixes.iter().any(|p| t.starts_with(p)))
     };
-    has_tok("sr-only")
-        || has_tok("visually-hidden")
-        || has_tok("screen-reader-text")
-        || (has_tok("hidden") && !has_prefix(&["xs:", "sm:", "md:", "lg:", "xl:", "2xl:"]))
+    (has_tok("hidden") && !has_prefix(&["xs:", "sm:", "md:", "lg:", "xl:", "2xl:"]))
         || (has_tok("d-none") && !has_prefix(&["d-sm-", "d-md-", "d-lg-", "d-xl-", "d-xxl-"]))
         || (has_tok("is-hidden")
             && !lower.split_whitespace().any(|t| {
@@ -1007,7 +1298,11 @@ fn contains_word_prefix(haystack: &str, needle: &str) -> bool {
     false
 }
 
-fn select_root_id(doc: &Html, mode: ExtractMode, metrics: &HashMap<NodeId, NodeMetrics>) -> NodeId {
+pub(crate) fn select_root_id(
+    doc: &Html,
+    mode: ExtractMode,
+    metrics: &HashMap<NodeId, NodeMetrics>,
+) -> NodeId {
     let body_id = body_or_root_id(doc);
 
     if mode != ExtractMode::Article {
@@ -1156,7 +1451,81 @@ fn emit_math_tag(tex: &str, display: bool, out: &mut String) {
     });
 }
 
-fn serialize_pruned_html(node: NodeRef<'_, Node>, in_interactive: bool, out: &mut String) {
+fn should_emit_rescued_heading(node: NodeRef<'_, Node>, meta: &RescuedPanelMeta) -> bool {
+    if meta.was_hidden {
+        return true;
+    }
+    let Some(first_el) = node.children().find(|c| c.value().is_element()) else {
+        return true;
+    };
+    let Some(el) = first_el.value().as_element() else {
+        return true;
+    };
+    if !is_heading_tag(el.name()) {
+        return true;
+    }
+    !extract_bounded_visible_text(first_el, 128).is_some_and(|text| {
+        text.to_ascii_lowercase()
+            .contains(&meta.label.to_ascii_lowercase())
+    })
+}
+
+fn serialize_pruned_html(
+    node: NodeRef<'_, Node>,
+    in_interactive: bool,
+    in_math_only: bool,
+    rescued: &HashMap<NodeId, RescuedPanelMeta>,
+    math_only_nodes: &HashSet<NodeId>,
+    out: &mut String,
+) {
+    if in_math_only {
+        match node.value() {
+            Node::Text(_) => return,
+            Node::Element(el) => {
+                if is_inert_tag(el.name()) || el.name() == "track" {
+                    return;
+                }
+                if el.name() == "math" {
+                    if let Some(tex) = find_tex_annotation(node) {
+                        emit_math_tag(&tex, is_display_math(node, el), out);
+                    }
+                    return;
+                }
+                for child in node.children() {
+                    serialize_pruned_html(
+                        child,
+                        in_interactive,
+                        true,
+                        rescued,
+                        math_only_nodes,
+                        out,
+                    );
+                }
+                return;
+            }
+            _ => {
+                for child in node.children() {
+                    serialize_pruned_html(
+                        child,
+                        in_interactive,
+                        true,
+                        rescued,
+                        math_only_nodes,
+                        out,
+                    );
+                }
+                return;
+            }
+        }
+    }
+
+    if math_only_nodes.contains(&node.id()) {
+        for child in node.children() {
+            serialize_pruned_html(child, in_interactive, true, rescued, math_only_nodes, out);
+        }
+        return;
+    }
+
     match node.value() {
         Node::Text(text) => push_escaped_text(text, out),
         Node::Element(el) => {
@@ -1234,7 +1603,13 @@ fn serialize_pruned_html(node: NodeRef<'_, Node>, in_interactive: bool, out: &mu
                     return;
                 }
                 if is_nested_layout_table(node) {
-                    emit_unwrapped_layout_table(node, in_interactive, out);
+                    emit_unwrapped_layout_table(
+                        node,
+                        in_interactive,
+                        rescued,
+                        math_only_nodes,
+                        out,
+                    );
                     return;
                 }
             }
@@ -1254,9 +1629,29 @@ fn serialize_pruned_html(node: NodeRef<'_, Node>, in_interactive: bool, out: &mu
                 return;
             }
 
+            if let Some(meta) = rescued.get(&node.id()) {
+                if should_emit_rescued_heading(node, meta) {
+                    let lvl = meta.heading_level.clamp(2, 6);
+                    let prefix = match meta.kind {
+                        RescuedPanelKind::Tab => "Tab",
+                        RescuedPanelKind::Disclosure => "Disclosure",
+                    };
+                    out.push_str(&format!("<h{lvl}>{prefix}: "));
+                    push_escaped_text(&meta.label, out);
+                    out.push_str(&format!("</h{lvl}>"));
+                }
+            }
+
             let child_interactive = in_interactive || is_svg_chrome_ancestor(el);
             for_each_ordered_child(node, tag, |child| {
-                serialize_pruned_html(child, child_interactive, out);
+                serialize_pruned_html(
+                    child,
+                    child_interactive,
+                    false,
+                    rescued,
+                    math_only_nodes,
+                    out,
+                );
             });
 
             out.push_str("</");
@@ -1265,7 +1660,7 @@ fn serialize_pruned_html(node: NodeRef<'_, Node>, in_interactive: bool, out: &mu
         }
         _ => {
             for child in node.children() {
-                serialize_pruned_html(child, in_interactive, out);
+                serialize_pruned_html(child, in_interactive, false, rescued, math_only_nodes, out);
             }
         }
     }
@@ -1903,17 +2298,32 @@ fn is_nested_layout_table(table: NodeRef<'_, Node>) -> bool {
     has_nested_table
 }
 
-fn emit_unwrapped_layout_table(node: NodeRef<'_, Node>, in_interactive: bool, out: &mut String) {
+fn emit_unwrapped_layout_table(
+    node: NodeRef<'_, Node>,
+    in_interactive: bool,
+    rescued: &HashMap<NodeId, RescuedPanelMeta>,
+    math_only_nodes: &HashSet<NodeId>,
+    out: &mut String,
+) {
     for child in node.children() {
         let Some(tag) = child.value().as_element().map(|e| e.name()) else {
             continue;
         };
         match tag {
-            "tbody" | "tr" => emit_unwrapped_layout_table(child, in_interactive, out),
+            "tbody" | "tr" => {
+                emit_unwrapped_layout_table(child, in_interactive, rescued, math_only_nodes, out)
+            }
             "td" => {
                 let mut inner = String::new();
                 for cell_child in child.children() {
-                    serialize_pruned_html(cell_child, in_interactive, &mut inner);
+                    serialize_pruned_html(
+                        cell_child,
+                        in_interactive,
+                        false,
+                        rescued,
+                        math_only_nodes,
+                        &mut inner,
+                    );
                 }
                 if !inner.trim().is_empty() {
                     out.push_str("<div>");
@@ -1922,7 +2332,7 @@ fn emit_unwrapped_layout_table(node: NodeRef<'_, Node>, in_interactive: bool, ou
                 }
             }
             "colgroup" | "col" => {}
-            _ => serialize_pruned_html(child, in_interactive, out),
+            _ => serialize_pruned_html(child, in_interactive, false, rescued, math_only_nodes, out),
         }
     }
 }
@@ -2043,8 +2453,74 @@ fn collect_plain_text(
     node: NodeRef<'_, Node>,
     in_pre: bool,
     in_interactive: bool,
+    in_math_only: bool,
+    rescued: &HashMap<NodeId, RescuedPanelMeta>,
+    math_only_nodes: &HashSet<NodeId>,
     out: &mut String,
 ) {
+    if in_math_only {
+        match node.value() {
+            Node::Text(_) => return,
+            Node::Element(el) => {
+                if is_inert_tag(el.name()) {
+                    return;
+                }
+                if el.name() == "math" {
+                    if let Some(tex) = find_tex_annotation(node) {
+                        if !out.is_empty() && !out.ends_with([' ', '\n']) {
+                            out.push(' ');
+                        }
+                        out.push('$');
+                        out.push_str(&tex);
+                        out.push('$');
+                    }
+                    return;
+                }
+                for child in node.children() {
+                    collect_plain_text(
+                        child,
+                        in_pre,
+                        in_interactive,
+                        true,
+                        rescued,
+                        math_only_nodes,
+                        out,
+                    );
+                }
+                return;
+            }
+            _ => {
+                for child in node.children() {
+                    collect_plain_text(
+                        child,
+                        in_pre,
+                        in_interactive,
+                        true,
+                        rescued,
+                        math_only_nodes,
+                        out,
+                    );
+                }
+                return;
+            }
+        }
+    }
+
+    if math_only_nodes.contains(&node.id()) {
+        for child in node.children() {
+            collect_plain_text(
+                child,
+                in_pre,
+                in_interactive,
+                true,
+                rescued,
+                math_only_nodes,
+                out,
+            );
+        }
+        return;
+    }
+
     match node.value() {
         Node::Text(text) => {
             if in_pre {
@@ -2132,10 +2608,38 @@ fn collect_plain_text(
                 out.push('\n');
             }
 
+            if let Some(meta) = rescued.get(&node.id()) {
+                if should_emit_rescued_heading(node, meta) {
+                    if !out.is_empty() && !out.ends_with('\n') {
+                        trim_trailing_spaces(out);
+                        out.push('\n');
+                    }
+                    if !out.is_empty() && !out.ends_with("\n\n") {
+                        out.push('\n');
+                    }
+                    let prefix = match meta.kind {
+                        RescuedPanelKind::Tab => "Tab",
+                        RescuedPanelKind::Disclosure => "Disclosure",
+                    };
+                    out.push_str(prefix);
+                    out.push_str(": ");
+                    out.push_str(&meta.label);
+                    out.push_str("\n\n");
+                }
+            }
+
             let child_pre = in_pre || tag == "pre";
             let child_interactive = in_interactive || is_svg_chrome_ancestor(el);
             for_each_ordered_child(node, tag, |child| {
-                collect_plain_text(child, child_pre, child_interactive, out);
+                collect_plain_text(
+                    child,
+                    child_pre,
+                    child_interactive,
+                    false,
+                    rescued,
+                    math_only_nodes,
+                    out,
+                );
             });
 
             if is_cell && !out.is_empty() && !out.ends_with([' ', '\n']) {
@@ -2147,7 +2651,15 @@ fn collect_plain_text(
         }
         _ => {
             for child in node.children() {
-                collect_plain_text(child, in_pre, in_interactive, out);
+                collect_plain_text(
+                    child,
+                    in_pre,
+                    in_interactive,
+                    false,
+                    rescued,
+                    math_only_nodes,
+                    out,
+                );
             }
         }
     }
