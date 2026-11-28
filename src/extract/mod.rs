@@ -7,6 +7,7 @@ pub mod markdown;
 pub mod native_markdown;
 pub mod resources;
 pub mod transcript;
+pub mod ui_gates;
 pub mod url;
 pub mod webmcp;
 pub mod youtube;
@@ -19,9 +20,14 @@ pub use resources::{
     format_resource_manifest_markdown, resource_identifier, ResourceDescriptor, ResourceKind,
     ResourceSalience,
 };
+pub use ui_gates::{
+    format_ui_gates_cue, format_ui_gates_cue_with_hint, ui_gate_identifier, UiGateDescriptor,
+    UiGateKind, UiGatePresence,
+};
 pub use webmcp::{
-    format_webmcp_cue, format_webmcp_manifest_markdown, merge_webmcp_tools, sanitize_webmcp_tool,
-    WebMcpToolAnnotations, WebMcpToolDescriptor, WebMcpToolSource,
+    format_webmcp_cue, format_webmcp_cue_with_hint, format_webmcp_manifest_markdown,
+    merge_webmcp_tools, sanitize_webmcp_tool, WebMcpToolAnnotations, WebMcpToolDescriptor,
+    WebMcpToolSource,
 };
 
 use anyhow::{bail, Result};
@@ -49,10 +55,23 @@ pub enum ExtractMode {
     Full,
 }
 
+/// Policy for rescuing paired in-landmark ARIA disclosures already present in the DOM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ExpandPolicy {
+    /// Preserve existing pruning of all hidden/collapsed panels (default).
+    #[default]
+    None,
+    /// Rescue uniquely paired in-landmark ARIA `[role="tabpanel"]` elements under `Tab: <label>` headings.
+    Tabs,
+    /// Rescue paired tabpanels plus uniquely paired in-landmark `[aria-expanded="false"][aria-controls]` disclosures.
+    All,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExtractOptions {
     pub format: OutputFormat,
     pub mode: ExtractMode,
+    pub expand: ExpandPolicy,
     pub include_images: bool,
     pub include_links: bool,
     pub max_bytes: Option<usize>,
@@ -66,6 +85,7 @@ impl Default for ExtractOptions {
         Self {
             format: OutputFormat::Markdown,
             mode: ExtractMode::Clean,
+            expand: ExpandPolicy::None,
             include_images: true,
             include_links: true,
             max_bytes: None,
@@ -85,6 +105,7 @@ pub struct ExtractedDocument {
     pub warning: Option<String>,
     pub resources: Vec<ResourceDescriptor>,
     pub tools: Vec<WebMcpToolDescriptor>,
+    pub ui_gates: Vec<UiGateDescriptor>,
 }
 
 pub fn format_page_section(
@@ -124,6 +145,7 @@ pub fn wrap_raw_code_document(
         warning: proj.warning,
         resources: Vec::new(),
         tools: Vec::new(),
+        ui_gates: Vec::new(),
     }
 }
 
@@ -299,6 +321,7 @@ fn extract_document_parsed_inner(
             warning: None,
             resources: Vec::new(),
             tools: Vec::new(),
+            ui_gates: Vec::new(),
         });
     }
 
@@ -346,12 +369,69 @@ fn extract_document_parsed_inner(
         warning: None,
         resources,
         tools,
+        ui_gates: Vec::new(),
     })
 }
 
-/// Detect binary payloads by MIME type or leading magic/NUL bytes (for missing/octet-stream MIMEs).
+/// Finalize an extracted document by appending optional resource/tool manifests before running
+/// `--focus`, `--section`, `--offset`, and `--max-bytes` projection or slicing.
+pub fn finalize_extracted_document(
+    doc: &mut ExtractedDocument,
+    options: &ExtractOptions,
+    append_resources_manifest: bool,
+    append_tools_manifest: bool,
+) {
+    if append_resources_manifest && !doc.resources.is_empty() {
+        let manifest = resources::format_resource_manifest_markdown(&doc.resources);
+        if !manifest.trim().is_empty() {
+            if !doc.content.trim().is_empty() {
+                doc.content.push_str("\n\n");
+            }
+            doc.content.push_str(manifest.trim());
+        }
+    }
+    if append_tools_manifest && !doc.tools.is_empty() {
+        let manifest = webmcp::format_webmcp_manifest_markdown(&doc.tools);
+        if !manifest.trim().is_empty() {
+            if !doc.content.trim().is_empty() {
+                doc.content.push_str("\n\n");
+            }
+            doc.content.push_str(manifest.trim());
+        }
+    }
+    let has_slice_or_projection = options.max_bytes.is_some()
+        || options.focus.is_some()
+        || options.section.is_some()
+        || options.offset > 0;
+    if has_slice_or_projection {
+        let proj = apply_projection_or_slice(&doc.content, options);
+        doc.content = proj.content;
+        doc.truncated |= proj.truncated;
+        doc.next_offset = proj.next_offset;
+        if let Some(w) = proj.warning {
+            doc.warning = Some(match doc.warning.take() {
+                Some(prev) => format!("{prev}; {w}"),
+                None => w,
+            });
+        }
+    }
+}
+
+/// Detect binary payloads by MIME type or leading magic/NUL bytes (for missing/octet-stream MIMEs,
+/// or always sniffing magic headers when `sniff_magic_always` is true).
 /// Returns `Some(detected_mime)` when the payload is binary and unsafe for text extraction.
 pub fn detect_binary_content(content_type: Option<&str>, body: &[u8]) -> Option<Option<String>> {
+    detect_binary_content_with_magic_sniff(content_type, body, false)
+}
+
+/// Detect binary payloads with explicit precedence:
+/// 1) declared binary MIME, 2) magic headers (always when `sniff_magic_always` is true),
+/// 3) UTF-16 BOM / declared UTF-16 charset exemption, 4) generic NUL-byte sniffing.
+pub fn detect_binary_content_with_magic_sniff(
+    content_type: Option<&str>,
+    body: &[u8],
+    sniff_magic_always: bool,
+) -> Option<Option<String>> {
     let mime = extract_mime(content_type);
 
     if let Some(ref m) = mime {
@@ -379,15 +459,35 @@ pub fn detect_binary_content(content_type: Option<&str>, body: &[u8]) -> Option<
         }
     }
 
-    let sniff_allowed = mime.is_none() || mime.as_deref() == Some("application/octet-stream");
-    if sniff_allowed && looks_like_binary_bytes(body) {
+    let sniff_allowed =
+        sniff_magic_always || mime.is_none() || mime.as_deref() == Some("application/octet-stream");
+    if !sniff_allowed {
+        return None;
+    }
+
+    if has_binary_magic_header(body) {
+        return Some(if mime.as_deref() == Some("application/octet-stream") {
+            mime
+        } else if sniff_magic_always && mime.is_some() {
+            None
+        } else {
+            mime
+        });
+    }
+
+    if is_declared_or_bom_utf16(content_type, body) {
+        return None;
+    }
+
+    let inspect = &body[..body.len().min(8192)];
+    if inspect.contains(&0) {
         return Some(mime);
     }
 
     None
 }
 
-fn looks_like_binary_bytes(body: &[u8]) -> bool {
+fn has_binary_magic_header(body: &[u8]) -> bool {
     const MAGICS: &[&[u8]] = &[
         b"%PDF-",
         b"\x89PNG\r\n\x1a\n",
@@ -398,11 +498,17 @@ fn looks_like_binary_bytes(body: &[u8]) -> bool {
         b"\x1F\x8B",
         b"\x00asm",
     ];
-    if MAGICS.iter().any(|magic| body.starts_with(magic)) {
+    MAGICS.iter().any(|magic| body.starts_with(magic))
+}
+
+fn is_declared_or_bom_utf16(content_type: Option<&str>, body: &[u8]) -> bool {
+    if body.starts_with(&[0xFF, 0xFE]) || body.starts_with(&[0xFE, 0xFF]) {
         return true;
     }
-    let inspect = &body[..body.len().min(8192)];
-    inspect.contains(&0)
+    matches!(
+        charset::extract_charset_from_content_type(content_type).as_deref(),
+        Some("utf-16" | "utf-16le" | "utf-16be")
+    )
 }
 
 pub(crate) fn apply_utf8_limit(text: &str, max_bytes: Option<usize>) -> (String, bool) {

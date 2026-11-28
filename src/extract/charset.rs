@@ -99,7 +99,7 @@ fn decode_utf16(bytes: &[u8], from_bytes: fn([u8; 2]) -> u16) -> String {
     out
 }
 
-fn extract_charset_from_content_type(content_type: Option<&str>) -> Option<String> {
+pub(crate) fn extract_charset_from_content_type(content_type: Option<&str>) -> Option<String> {
     let ct = content_type?;
     for param in ct.split(';').skip(1) {
         let Some((key, val)) = param.split_once('=') else {

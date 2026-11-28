@@ -32,6 +32,7 @@ pub fn extract_transcript(body: &str, options: &ExtractOptions) -> Result<Extrac
             warning: None,
             resources: Vec::new(),
             tools: Vec::new(),
+            ui_gates: Vec::new(),
         });
     }
 
@@ -46,6 +47,7 @@ pub fn extract_transcript(body: &str, options: &ExtractOptions) -> Result<Extrac
         warning: None,
         resources: Vec::new(),
         tools: Vec::new(),
+        ui_gates: Vec::new(),
     })
 }
 

@@ -41,6 +41,7 @@ pub(crate) fn extract_native_markdown_with_bases(
             warning: None,
             resources: Vec::new(),
             tools: Vec::new(),
+            ui_gates: Vec::new(),
         });
     }
 
@@ -111,6 +112,7 @@ pub(crate) fn extract_native_markdown_with_bases(
                 warning: None,
                 resources: Vec::new(),
                 tools: Vec::new(),
+                ui_gates: Vec::new(),
             })
         }
         OutputFormat::Text => {
@@ -134,6 +136,7 @@ pub(crate) fn extract_native_markdown_with_bases(
                 warning: None,
                 resources: Vec::new(),
                 tools: Vec::new(),
+                ui_gates: Vec::new(),
             })
         }
         OutputFormat::Html | OutputFormat::Raw | OutputFormat::Axtree => unreachable!(),

@@ -436,6 +436,8 @@ struct FetchMetadataOutput<'a> {
     resources: Vec<pleb::extract::ResourceDescriptor>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tools: Vec<pleb::extract::WebMcpToolDescriptor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ui_gates: Vec<pleb::extract::UiGateDescriptor>,
 }
 
 impl<'a> From<&'a FetchOutput> for FetchMetadataOutput<'a> {
@@ -458,6 +460,7 @@ impl<'a> From<&'a FetchOutput> for FetchMetadataOutput<'a> {
             warning: res.warning.as_deref(),
             resources: res.resources.clone(),
             tools: res.tools.clone(),
+            ui_gates: res.ui_gates.clone(),
         }
     }
 }
@@ -1010,6 +1013,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 extract: pleb::extract::ExtractOptions {
                     format,
                     mode: extract,
+                    expand: pleb::extract::ExpandPolicy::None,
                     include_images: !no_images,
                     include_links: !no_links,
                     max_bytes,

@@ -136,6 +136,7 @@ pub fn extract_youtube_watch(
         warning: None,
         resources,
         tools: Vec::new(),
+        ui_gates: Vec::new(),
     })
 }
 

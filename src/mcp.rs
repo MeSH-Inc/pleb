@@ -393,6 +393,7 @@ async fn call_fetch(
             focus,
             section,
             offset,
+            ..Default::default()
         },
         render,
         source,

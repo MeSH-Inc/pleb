@@ -208,6 +208,8 @@ pub struct FetchOutput {
     pub resources: Vec<crate::extract::ResourceDescriptor>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<crate::extract::WebMcpToolDescriptor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ui_gates: Vec<crate::extract::UiGateDescriptor>,
 }
 
 pub struct FetchHtmlResult {
@@ -258,11 +260,40 @@ struct AcquiredPage {
     imperative_tools: Vec<crate::extract::WebMcpToolDescriptor>,
 }
 
+/// Target for `fetch_target`: either a normal URL navigation or a passive loopback CDP attach.
+#[derive(Debug, Clone)]
+pub enum FetchTarget {
+    /// Standard network/rendered fetch of an `http://` or `https://` URL.
+    Navigate(String),
+    /// Passive read-only snapshot of an already-loaded loopback `/devtools/page/<id>` tab.
+    AttachCdp {
+        /// Optional origin assertion (`http://` or `https://`); fails if attached tab origin differs.
+        expected_origin: Option<String>,
+    },
+}
+
 pub async fn fetch_document(
     ctx: &RuntimeContext,
     url: &str,
     options: &FetchOptions,
 ) -> std::result::Result<FetchOutput, FetchError> {
+    fetch_target(ctx, FetchTarget::Navigate(url.to_string()), options).await
+}
+
+pub async fn fetch_target(
+    ctx: &RuntimeContext,
+    target: FetchTarget,
+    options: &FetchOptions,
+) -> std::result::Result<FetchOutput, FetchError> {
+    let url_owned = match target {
+        FetchTarget::Navigate(u) => u,
+        FetchTarget::AttachCdp { .. } => {
+            return Err(FetchError::CdpUnavailable(
+                "passive CDP attach not yet implemented".to_string(),
+            ));
+        }
+    };
+    let url = url_owned.as_str();
     let start = Instant::now();
     if options.extract.format == OutputFormat::Raw {
         return Err(FetchError::Transport(anyhow::anyhow!(
@@ -449,6 +480,7 @@ pub async fn fetch_document(
         warning,
         resources: extracted.resources,
         tools: extracted.tools,
+        ui_gates: extracted.ui_gates,
     })
 }
 
@@ -1122,6 +1154,7 @@ async fn try_fetch_raw_source(
         warning: extracted.warning,
         resources: extracted.resources,
         tools: extracted.tools,
+        ui_gates: extracted.ui_gates,
     }))
 }
 
@@ -2277,7 +2310,7 @@ fn is_acceptable_cef_render(res: &CefRenderResult) -> bool {
     !res.html.trim().is_empty() && res.status_code != 0
 }
 
-fn parse_http_url(url: &str) -> std::result::Result<url::Url, FetchError> {
+pub fn parse_http_url(url: &str) -> std::result::Result<url::Url, FetchError> {
     let parsed = url::Url::parse(url).map_err(|e| FetchError::InvalidUrl(e.to_string()))?;
     match parsed.scheme() {
         "http" | "https" => Ok(parsed),
@@ -2324,6 +2357,8 @@ pub struct BatchItemSuccess {
     pub resources: Vec<crate::extract::ResourceDescriptor>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<crate::extract::WebMcpToolDescriptor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ui_gates: Vec<crate::extract::UiGateDescriptor>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2371,6 +2406,7 @@ impl BatchItemResult {
                 content: (!metadata_only).then_some(out.content),
                 resources: out.resources,
                 tools: out.tools,
+                ui_gates: out.ui_gates,
             })),
             Err(err) => Self::Failure(BatchItemFailure {
                 url: url.to_string(),

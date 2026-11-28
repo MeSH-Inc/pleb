@@ -55,6 +55,7 @@ pub fn extract_feed(
             warning: None,
             resources: Vec::new(),
             tools: Vec::new(),
+            ui_gates: Vec::new(),
         });
     }
 
@@ -74,6 +75,7 @@ pub fn extract_feed(
             warning: None,
             resources: Vec::new(),
             tools: Vec::new(),
+            ui_gates: Vec::new(),
         });
     };
 
@@ -94,6 +96,7 @@ pub fn extract_feed(
                 warning: None,
                 resources: Vec::new(),
                 tools: Vec::new(),
+                ui_gates: Vec::new(),
             })
         }
         OutputFormat::Text => {
@@ -107,6 +110,7 @@ pub fn extract_feed(
                 warning: None,
                 resources: Vec::new(),
                 tools: Vec::new(),
+                ui_gates: Vec::new(),
             })
         }
         OutputFormat::Html | OutputFormat::Raw | OutputFormat::Axtree => unreachable!(),
