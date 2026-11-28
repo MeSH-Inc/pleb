@@ -51,6 +51,8 @@ pub fn extract_feed(
             title: None,
             content,
             truncated,
+            next_offset: None,
+            warning: None,
             resources: Vec::new(),
             tools: Vec::new(),
         });
@@ -68,6 +70,8 @@ pub fn extract_feed(
             title: None,
             content,
             truncated,
+            next_offset: None,
+            warning: None,
             resources: Vec::new(),
             tools: Vec::new(),
         });
@@ -86,6 +90,8 @@ pub fn extract_feed(
                 title,
                 content,
                 truncated,
+                next_offset: None,
+                warning: None,
                 resources: Vec::new(),
                 tools: Vec::new(),
             })
@@ -97,6 +103,8 @@ pub fn extract_feed(
                 title,
                 content,
                 truncated,
+                next_offset: None,
+                warning: None,
                 resources: Vec::new(),
                 tools: Vec::new(),
             })

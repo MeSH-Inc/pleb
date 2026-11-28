@@ -13,6 +13,110 @@ struct SectionBlock<'a> {
     body: String,
 }
 
+/// Result of extracting exact Markdown sections matching a heading selector.
+pub struct SectionExtractResult {
+    pub content: String,
+    pub matched: bool,
+    pub warning: Option<String>,
+}
+
+/// Extract exact Markdown section(s) matching `selector` (exact -> prefix -> substring,
+/// case-insensitive after link/backslash/whitespace normalization), including nested subsections.
+pub fn extract_section(markdown: &str, selector: &str) -> SectionExtractResult {
+    let (_, sections) = split_sections(markdown);
+    let query_lower = normalize_heading_label(selector).to_ascii_lowercase();
+    let labels: Vec<String> = sections
+        .iter()
+        .map(|s| normalize_heading_label(s.heading))
+        .collect();
+    let lowers: Vec<String> = labels.iter().map(|l| l.to_ascii_lowercase()).collect();
+
+    let matched_roots: Vec<usize> = if query_lower.is_empty() || sections.is_empty() {
+        Vec::new()
+    } else {
+        let exact: Vec<usize> = lowers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| (l == &query_lower).then_some(i))
+            .collect();
+        if !exact.is_empty() {
+            exact
+        } else {
+            let prefix: Vec<usize> = lowers
+                .iter()
+                .enumerate()
+                .filter_map(|(i, l)| l.starts_with(&query_lower).then_some(i))
+                .collect();
+            if !prefix.is_empty() {
+                prefix
+            } else {
+                lowers
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, l)| l.contains(&query_lower).then_some(i))
+                    .collect()
+            }
+        }
+    };
+
+    if matched_roots.is_empty() {
+        if labels.is_empty() {
+            return SectionExtractResult {
+                content: format!(
+                    "<!-- Section {selector:?} not found (document has no headings). -->"
+                ),
+                matched: false,
+                warning: Some(format!(
+                    "requested section {selector:?} not found; document has no headings"
+                )),
+            };
+        }
+        let avail = format_bounded_label_list(&labels, 560, "sections");
+        return SectionExtractResult {
+            content: format!(
+                "<!-- Section {selector:?} not found. Available sections: {avail} -->"
+            ),
+            matched: false,
+            warning: Some(format!(
+                "requested section {selector:?} not found; available sections: {avail}"
+            )),
+        };
+    }
+
+    let mut included = vec![false; sections.len()];
+    for root_idx in matched_roots {
+        if included[root_idx] {
+            continue;
+        }
+        let root_level = sections[root_idx].level;
+        included[root_idx] = true;
+        for (j, sec) in sections.iter().enumerate().skip(root_idx + 1) {
+            if sec.level <= root_level {
+                break;
+            }
+            included[j] = true;
+        }
+    }
+
+    let mut parts = Vec::new();
+    for (idx, sec) in sections.iter().enumerate() {
+        if !included[idx] {
+            continue;
+        }
+        if sec.body.is_empty() {
+            parts.push(sec.heading.to_string());
+        } else {
+            parts.push(format!("{}\n\n{}", sec.heading, sec.body));
+        }
+    }
+
+    SectionExtractResult {
+        content: parts.join("\n\n"),
+        matched: true,
+        warning: None,
+    }
+}
+
 /// Project a Markdown or plain-text document onto the query-relevant sections within `max_bytes`,
 /// preserving intact headings, code blocks, tables, and a bounded collapsed-sections map.
 ///
@@ -179,31 +283,22 @@ fn render_selected(
     parts.join("\n\n")
 }
 
-fn format_bounded_toc(
-    sections: &[SectionBlock<'_>],
-    selected: &HashSet<usize>,
-    toc_budget: usize,
-) -> String {
-    let collapsed: Vec<String> = sections
-        .iter()
-        .enumerate()
-        .filter(|(idx, _)| !selected.contains(idx))
-        .filter_map(|(_, s)| {
-            let label = strip_inline_markdown_links(s.heading)
-                .trim_start_matches('#')
-                .trim()
-                .replace("\\_", "_")
-                .replace("\\*", "*");
-            let norm = label.split_whitespace().collect::<Vec<_>>().join(" ");
-            (!norm.is_empty()).then_some(norm)
-        })
-        .collect();
-    if collapsed.is_empty() {
+fn normalize_heading_label(raw_heading: &str) -> String {
+    let label = strip_inline_markdown_links(raw_heading)
+        .trim_start_matches('#')
+        .trim()
+        .replace("\\_", "_")
+        .replace("\\*", "*");
+    label.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn format_bounded_label_list(labels: &[String], budget: usize, fallback_noun: &str) -> String {
+    if labels.is_empty() {
         return String::new();
     }
     let mut kept: Vec<&str> = Vec::new();
-    for (idx, item) in collapsed.iter().enumerate() {
-        let rem = collapsed.len() - idx - 1;
+    for (idx, item) in labels.iter().enumerate() {
+        let rem = labels.len() - idx - 1;
         let suffix = if rem > 0 {
             format!(" | ... (+{rem} more)")
         } else {
@@ -215,20 +310,39 @@ fn format_bounded_toc(
             .chain(std::iter::once(item.as_str()))
             .collect::<Vec<_>>()
             .join(" | ");
-        if format!("<!-- Collapsed sections: {joined}{suffix} -->").len() > toc_budget {
-            let rem_all = collapsed.len() - kept.len();
+        if joined.len() + suffix.len() > budget {
+            let rem_all = labels.len() - kept.len();
             return if kept.is_empty() {
-                format!("<!-- Collapsed sections: {rem_all} omitted -->")
+                format!("{rem_all} {fallback_noun}")
             } else {
-                format!(
-                    "<!-- Collapsed sections: {} | ... (+{rem_all} more) -->",
-                    kept.join(" | ")
-                )
+                format!("{} | ... (+{rem_all} more)", kept.join(" | "))
             };
         }
         kept.push(item.as_str());
     }
-    format!("<!-- Collapsed sections: {} -->", kept.join(" | "))
+    kept.join(" | ")
+}
+
+fn format_bounded_toc(
+    sections: &[SectionBlock<'_>],
+    selected: &HashSet<usize>,
+    toc_budget: usize,
+) -> String {
+    let collapsed: Vec<String> = sections
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| !selected.contains(idx))
+        .filter_map(|(_, s)| {
+            let norm = normalize_heading_label(s.heading);
+            (!norm.is_empty()).then_some(norm)
+        })
+        .collect();
+    if collapsed.is_empty() {
+        return String::new();
+    }
+    let inner_budget = toc_budget.saturating_sub("<!-- Collapsed sections:  -->".len());
+    let summary = format_bounded_label_list(&collapsed, inner_budget, "omitted");
+    format!("<!-- Collapsed sections: {summary} -->")
 }
 
 fn compress_blocks(

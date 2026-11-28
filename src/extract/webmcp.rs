@@ -721,7 +721,7 @@ pub fn format_webmcp_manifest_markdown(tools: &[WebMcpToolDescriptor]) -> String
     out.trim_end_matches('\n').to_string()
 }
 
-pub fn format_webmcp_cue(tools: &[WebMcpToolDescriptor]) -> Option<String> {
+pub fn format_webmcp_cue_with_hint(tools: &[WebMcpToolDescriptor], hint: &str) -> Option<String> {
     if tools.is_empty() {
         return None;
     }
@@ -735,8 +735,12 @@ pub fn format_webmcp_cue(tools: &[WebMcpToolDescriptor]) -> Option<String> {
         names.push(format!("+{} more", tools.len() - MAX_CUE_TOOL_NAMES));
     }
     Some(format!(
-        "Tools: {} WebMCP {noun} ({}) — pass --tools manifest or --json",
+        "Tools: {} WebMCP {noun} ({}) — {hint}",
         tools.len(),
         names.join(", ")
     ))
+}
+
+pub fn format_webmcp_cue(tools: &[WebMcpToolDescriptor]) -> Option<String> {
+    format_webmcp_cue_with_hint(tools, "pass --tools manifest or --json")
 }

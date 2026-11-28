@@ -152,6 +152,12 @@ enum Command {
         /// Project long markdown/text output onto query-relevant sections (BM25 + bounded collapsed-section map; default 16000-byte budget or --max-bytes)
         #[arg(long)]
         focus: Option<String>,
+        /// Extract exact Markdown section(s) matching a heading selector (exact, prefix, or substring match; includes subsections)
+        #[arg(long)]
+        section: Option<String>,
+        /// Start byte offset within the extracted content for fence-safe sequential continuation (requires --format md, text, html, or axtree)
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
         /// Maximum concurrent requests in batch mode (1-16)
         #[arg(long, default_value = "4")]
         concurrency: usize,
@@ -420,6 +426,8 @@ struct FetchMetadataOutput<'a> {
     acquired_sha256: &'a str,
     escalated: bool,
     truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_offset: Option<usize>,
     timing_ms: u64,
     content_bytes: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -444,6 +452,7 @@ impl<'a> From<&'a FetchOutput> for FetchMetadataOutput<'a> {
             acquired_sha256: &res.acquired_sha256,
             escalated: res.escalated,
             truncated: res.truncated,
+            next_offset: res.next_offset,
             timing_ms: res.timing_ms,
             content_bytes: res.content_bytes,
             warning: res.warning.as_deref(),
@@ -829,6 +838,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             no_links,
             max_bytes,
             focus,
+            section,
+            offset,
             concurrency,
             jsonl,
             metadata_only,
@@ -887,11 +898,34 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             let focus = focus
                 .map(|q| q.trim().to_string())
                 .filter(|q| !q.is_empty());
+            let section = section
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
             if focus.is_some()
                 && (stage || !matches!(format, OutputFormat::Markdown | OutputFormat::Text))
             {
                 return Err(CliError::invalid_input(
                     "--focus is only supported with --format markdown or --format text (cannot be combined with --stage, --format html, --format raw, or --format axtree)",
+                ));
+            }
+            if section.is_some() && focus.is_some() {
+                return Err(CliError::invalid_input(
+                    "--section cannot be combined with --focus",
+                ));
+            }
+            if offset > 0 && focus.is_some() {
+                return Err(CliError::invalid_input(
+                    "--offset cannot be combined with --focus",
+                ));
+            }
+            if section.is_some() && (stage || format != OutputFormat::Markdown) {
+                return Err(CliError::invalid_input(
+                    "--section is only supported with --format markdown (cannot be combined with --stage, --format text, --format html, --format raw, or --format axtree)",
+                ));
+            }
+            if offset > 0 && (stage || format == OutputFormat::Raw) {
+                return Err(CliError::invalid_input(
+                    "--offset cannot be combined with --stage or --format raw",
                 ));
             }
             if batch_mode && output.is_some() {
@@ -980,6 +1014,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     include_links: !no_links,
                     max_bytes,
                     focus,
+                    section,
+                    offset,
                 },
                 render,
                 source,
@@ -1039,6 +1075,9 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                         }
                         if let Some(warning) = &res.warning {
                             eprintln!("Warning: {}", warning);
+                        }
+                        if let Some(next_offset) = res.next_offset {
+                            eprintln!("Next-Offset: {}", next_offset);
                         }
                         eprintln!(
                             "Status: {} | Strategy: {} | Time: {}ms\n",

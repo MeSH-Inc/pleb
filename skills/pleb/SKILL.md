@@ -101,7 +101,7 @@ Genuine `pleb` installations report `"version"`, `"cef_renderer": { "expected_pr
   Batch mode (`2+` URLs or `-` stdin) enforces a per-host `Semaphore(2)` cap; `--json` emits an ordered array, `--jsonl` streams per completion, and `--metadata-only` omits `content` while keeping `resources`, `tools`, and optional `warning`.
 - **Flags reference:**
   - **Global flags** (accepted before or after subcommands): `--proxy <URL>`, `--timeout <SECS>`, `--cef-timeout <SECS>`, `--cdp-url <URL>`, `--cdp-timeout <SECS>`, `--prefer-cdp`, `--no-web-bot-auth`, `--max-response-bytes <BYTES>`, `--state-dir <DIR>`, `--no-daemon`, `--daemon-idle-timeout <SECS>`, `-q`/`--quiet`, `-v`/`--verbose`, `--json`.
-  - **`pleb fetch` flags:** `--format <markdown|html|text|axtree|raw>`, `--extract <clean|article|full>`, `--render <auto|cef|cdp|cronet>`, `--source <auto|negotiate|none>`, `--resources <none|manifest|transcripts|diagrams|all>`, `--tools <none|manifest>`, `--stage-resources <ids>`, `--referer <url>`, `--stage`, `--wait-for-selector <css>`, `--respect-robots`, `--no-rewrite`, `--no-images`, `--no-links`, `--max-bytes <N>`, `--focus <query>`, `--concurrency <1..=16>`, `--jsonl`, `--metadata-only`, `-o <path>` (written only on success).
+  - **`pleb fetch` flags:** `--format <markdown|html|text|axtree|raw>`, `--extract <clean|article|full>`, `--render <auto|cef|cdp|cronet>`, `--source <auto|negotiate|none>`, `--resources <none|manifest|transcripts|diagrams|all>`, `--tools <none|manifest>`, `--stage-resources <ids>`, `--referer <url>`, `--stage`, `--wait-for-selector <css>`, `--respect-robots`, `--no-rewrite`, `--no-images`, `--no-links`, `--max-bytes <N>`, `--focus <query>`, `--section <selector>`, `--offset <bytes>`, `--concurrency <1..=16>`, `--jsonl`, `--metadata-only`, `-o <path>` (written only on success).
 - **Site crawl and map (`robots.txt` enforced by default; pass `--no-robots` to override):**
   ```bash
   pleb crawl <url> --depth 2 --max-pages 10 [--extract clean|article|full] [--path-filter <prefix>] [--no-robots]
@@ -124,7 +124,7 @@ Genuine `pleb` installations report `"version"`, `"cef_renderer": { "expected_pr
 | `130` | Interactive TTY credential prompt interrupted (`SIGINT`/`SIGTERM`) |
 
 Key `--json` / `--jsonl` outputs:
-- **`FetchOutput`**: `{ url, final_url, representation_url?, status_code, content_type, title, content, content_bytes, strategy, content_outcome, acquired_sha256, escalated, truncated, timing_ms, warning?, resources?, tools? }` (`--metadata-only` omits `content`; `content_outcome` is `complete` or `incomplete_shell`).
+- **`FetchOutput`**: `{ url, final_url, representation_url?, status_code, content_type, title, content, content_bytes, strategy, content_outcome, acquired_sha256, escalated, truncated, next_offset?, timing_ms, warning?, resources?, tools? }` (`--metadata-only` omits `content`; `content_outcome` is `complete` or `incomplete_shell`).
 - **`BatchItemResult`**: untagged on `ok` (`true` -> `FetchOutput` fields with `content?`; `false` -> `{ url, ok, error, kind, block_reason?, exit_code }`).
 - **`StagedAssetOutput`**: `{ url, final_url, status_code, content_type, byte_count, staged_path, timing_ms }`.
 - **`SearchResponse`**: `{ provider, providers_used?, results: [{ title, url, snippet, extra_snippets? }] }`.

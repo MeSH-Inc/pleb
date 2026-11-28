@@ -199,6 +199,8 @@ pub struct FetchOutput {
     pub acquired_sha256: String,
     pub escalated: bool,
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
     pub timing_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
@@ -342,19 +344,25 @@ pub async fn fetch_document(
     let needs_enrichment = options.resources != ResourcePolicy::None
         || !options.stage_resources.is_empty()
         || options.tools == ToolPolicy::Manifest;
+    let has_slice_or_projection = options.extract.max_bytes.is_some()
+        || options.extract.focus.is_some()
+        || options.extract.section.is_some()
+        || options.extract.offset > 0;
     let initial_extract_opts = if is_axtree {
         ExtractOptions {
             format: OutputFormat::Html,
             max_bytes: None,
             focus: None,
+            section: None,
+            offset: 0,
             ..options.extract.clone()
         }
-    } else if needs_enrichment
-        && (options.extract.max_bytes.is_some() || options.extract.focus.is_some())
-    {
+    } else if needs_enrichment && has_slice_or_projection {
         ExtractOptions {
             max_bytes: None,
             focus: None,
+            section: None,
+            offset: 0,
             ..options.extract.clone()
         }
     } else {
@@ -385,6 +393,7 @@ pub async fn fetch_document(
     }
 
     let mut warning = page.warning;
+    merge_warning(&mut warning, extracted.warning.take());
     if needs_enrichment {
         let missing_resources = enrich_document_resources(
             ctx,
@@ -399,10 +408,7 @@ pub async fn fetch_document(
                 "requested resource(s) not found in acquired representation: {}",
                 missing_resources.join(", ")
             );
-            warning = Some(match warning {
-                Some(existing) => format!("{existing}; {drift_warning}"),
-                None => drift_warning,
-            });
+            merge_warning(&mut warning, Some(drift_warning));
         }
         if options.tools == ToolPolicy::Manifest && !extracted.tools.is_empty() {
             let manifest = extract::webmcp::format_webmcp_manifest_markdown(&extracted.tools);
@@ -415,20 +421,12 @@ pub async fn fetch_document(
         }
     }
 
-    if (needs_enrichment
-        && (options.extract.focus.is_some() || options.extract.max_bytes.is_some()))
-        || (is_axtree && options.extract.max_bytes.is_some())
-    {
-        let (projected, did_truncate) = extract::apply_focus_or_limit(
-            &extracted.content,
-            options.extract.format,
-            needs_enrichment
-                .then_some(options.extract.focus.as_deref())
-                .flatten(),
-            options.extract.max_bytes,
-        );
-        extracted.content = projected;
-        extracted.truncated |= did_truncate;
+    if (needs_enrichment && has_slice_or_projection) || (is_axtree && has_slice_or_projection) {
+        let proj = extract::apply_projection_or_slice(&extracted.content, &options.extract);
+        extracted.content = proj.content;
+        extracted.truncated |= proj.truncated;
+        extracted.next_offset = proj.next_offset;
+        merge_warning(&mut warning, proj.warning);
     }
 
     let content_bytes = extracted.content.len();
@@ -446,11 +444,22 @@ pub async fn fetch_document(
         acquired_sha256,
         escalated: page.escalated,
         truncated: extracted.truncated,
+        next_offset: extracted.next_offset,
         timing_ms: start.elapsed().as_millis() as u64,
         warning,
         resources: extracted.resources,
         tools: extracted.tools,
     })
+}
+
+fn merge_warning(dst: &mut Option<String>, src: Option<String>) {
+    let Some(msg) = src else {
+        return;
+    };
+    *dst = Some(match dst.take() {
+        Some(existing) => format!("{existing}; {msg}"),
+        None => msg,
+    });
 }
 
 pub async fn fetch_html(
@@ -927,8 +936,7 @@ async fn enrich_document_resources(
         mode: ExtractMode::Clean,
         include_images: false,
         include_links: false,
-        max_bytes: None,
-        focus: None,
+        ..Default::default()
     };
 
     for entry in fetched.into_iter().flatten() {
@@ -1109,8 +1117,9 @@ async fn try_fetch_raw_source(
         acquired_sha256,
         escalated: false,
         truncated: extracted.truncated,
+        next_offset: extracted.next_offset,
         timing_ms,
-        warning: None,
+        warning: extracted.warning,
         resources: extracted.resources,
         tools: extracted.tools,
     }))
@@ -2156,6 +2165,8 @@ pub struct BatchItemSuccess {
     pub acquired_sha256: String,
     pub escalated: bool,
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
     pub timing_ms: u64,
     pub content_bytes: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2206,6 +2217,7 @@ impl BatchItemResult {
                 acquired_sha256: out.acquired_sha256,
                 escalated: out.escalated,
                 truncated: out.truncated,
+                next_offset: out.next_offset,
                 timing_ms: out.timing_ms,
                 content_bytes: out.content_bytes,
                 warning: out.warning,

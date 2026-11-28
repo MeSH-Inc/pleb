@@ -559,8 +559,10 @@ pleb search --urls-only "rust async runtime" | pleb fetch -
 | `--respect-robots` | flag | Enforce `robots.txt` on `fetch` (skipped by default). |
 | `--no-rewrite` | flag | Disable host rewrites from `site-rules.json` and forge raw-source rewrites. |
 | `--no-images` / `--no-links` | flags | Omit images or unwrap links in Markdown output. |
-| `--max-bytes <N>` | integer | UTF-8 byte cap with fence-safe Markdown truncation. |
+| `--max-bytes <N>` | integer | UTF-8 byte cap with fence-safe Markdown truncation (emits `Next-Offset:` / `next_offset` when more content remains). |
 | `--focus <QUERY>` | string | Query-focused BM25 section projection over Markdown/text with a bounded collapsed-section map (uses `--max-bytes` or default `16,000` bytes; rejects `--stage`, `--format html`, `--format raw`, and `--format axtree`). |
+| `--section <SELECTOR>` | string | Extract exact Markdown section(s) matching a heading selector (exact, prefix, or substring match; includes subsections; requires `--format markdown`; rejects `--focus` and `--stage`). |
+| `--offset <BYTES>` | `usize` *(default `0`)* | Start byte offset within extracted content for fence-safe continuation (typically from a prior `Next-Offset` / `next_offset`; rejects `--focus`, `--stage`, and `--format raw`). |
 | `--concurrency <N>` | `1..=16` *(default `4`)* | Batch mode concurrency (hard cap of `2` concurrent fetches per host). |
 | `--jsonl` | flag | Stream one JSON result object per completed URL (conflicts with `--json`). |
 | `--metadata-only` | flag | Omit `content` while retaining metadata, `warning`, `resources`, and `tools` (requires `--json` or `--jsonl`; conflicts with `-o`). |
@@ -712,8 +714,9 @@ All `--json` and `--jsonl` payloads serialize directly from `pleb`'s Rust output
 | `acquired_sha256` | `string` | Lowercase SHA-256 hex digest of the acquired source body prior to extraction/truncation |
 | `escalated` | `boolean` | `true` when transport escalated from primary HTTP to CEF or CDP |
 | `truncated` | `boolean` | `true` when `--max-bytes` truncated output |
+| `next_offset` | `number` | Next continuation byte offset for `--offset` when `--max-bytes` stops before the end of the extracted document (**omitted** when complete or absent) |
 | `timing_ms` | `number` | End-to-end fetch duration in milliseconds |
-| `warning` | `string` | Advisory warning when an unrendered or post-render `JavaScriptShell` returns partial HTML, or when a requested `--stage-resources` selector is absent (**omitted** when absent) |
+| `warning` | `string` | Advisory warning when an unrendered or post-render `JavaScriptShell` returns partial HTML, a requested `--stage-resources` selector is absent, or a requested `--section` / `--offset` does not match (**omitted** when absent) |
 | `resources` | `ResourceDescriptor[]` | Indexed linked resources (**omitted** when empty) |
 | `tools` | `WebMcpToolDescriptor[]` | Indexed WebMCP page tools (**omitted** when empty; `untrusted_content: true`) |
 
@@ -721,7 +724,7 @@ All `--json` and `--jsonl` payloads serialize directly from `pleb`'s Rust output
 
 Multi-URL and `stdin` (`-`) fetches emit an array (`--json`) or newline-delimited stream (`--jsonl`) of untagged `BatchItemResult` objects discriminated by `ok`:
 
-- **Success (`ok: true`)**: `url`, `ok`, `final_url`, `representation_url` (omitted when identical to `final_url`), `status_code`, `content_type`, `title`, `strategy`, `content_outcome`, `acquired_sha256`, `escalated`, `truncated`, `timing_ms`, `content_bytes`, plus `warning` (omitted when absent), `content` (omitted with `--metadata-only`), `resources` (omitted when empty), and `tools` (omitted when empty).
+- **Success (`ok: true`)**: `url`, `ok`, `final_url`, `representation_url` (omitted when identical to `final_url`), `status_code`, `content_type`, `title`, `strategy`, `content_outcome`, `acquired_sha256`, `escalated`, `truncated`, `timing_ms`, `content_bytes`, plus `next_offset` (omitted when absent), `warning` (omitted when absent), `content` (omitted with `--metadata-only`), `resources` (omitted when empty), and `tools` (omitted when empty).
 - **Failure (`ok: false`)**: `url`, `ok`, `error`, `kind`, `block_reason` (optional `BlockReason`), `exit_code`.
 
 ### `StagedAssetOutput` (`pleb fetch --stage --json`)

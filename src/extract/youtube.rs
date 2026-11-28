@@ -132,6 +132,8 @@ pub fn extract_youtube_watch(
         title: Some(title),
         content,
         truncated,
+        next_offset: None,
+        warning: None,
         resources,
         tools: Vec::new(),
     })

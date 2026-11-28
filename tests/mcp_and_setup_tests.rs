@@ -211,6 +211,15 @@ async fn mcp_initialize_list_fetch_block_diagnostics_and_status() {
         "source",
         "resources",
         "stage_resources",
+        "focus",
+        "section",
+        "offset",
+        "max_bytes",
+        "no_images",
+        "no_links",
+        "no_rewrite",
+        "metadata_only",
+        "tools",
     ] {
         assert!(
             fetch_props[param]["description"]
@@ -964,4 +973,236 @@ async fn setup_claude_webfetch_hooks_preserve_settings_switch_modes_and_run_prot
     assert_eq!(dry_hooks_json["hook"]["mode"], "redirect");
 
     let _ = std::fs::remove_dir_all(&work);
+}
+
+#[tokio::test]
+async fn mcp_fetch_supports_section_offset_and_flag_parity() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+
+    tokio::spawn(async move {
+        let html = concat!(
+            "<!doctype html><html><head><title>MCP Parity</title></head><body><main>",
+            "<h1>MCP Parity</h1>",
+            "<h2>Intro</h2><p>Opening notes for MCP parity verification.</p>",
+            "<h2>Examples</h2>",
+            "<p>See the <a href=\"/ref\">reference guide</a> and <img src=\"/fig.png\" alt=\"Fig\"> diagram.</p>",
+            "<pre><code class=\"language-rust\">fn one() {}\nfn two() {}\nfn three() {}\nfn four() {}\n</code></pre>",
+            "<form toolname=\"search_docs\" tooldescription=\"Search local docs\" action=\"/search\">",
+            "<input type=\"text\" name=\"q\" required></form>",
+            "<h2>Outro</h2><p>Closing notes here.</p>",
+            "</main></body></html>"
+        );
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    html.len()
+                );
+                let _ = socket.write_all(hdr.as_bytes()).await;
+                let _ = socket.write_all(html.as_bytes()).await;
+            });
+        }
+    });
+
+    let state_dir = hermetic_dir("mcp-parity");
+    let ctx = Arc::new(
+        RuntimeContext::new(RuntimeConfig {
+            state_dir: state_dir.clone(),
+            timeout: Duration::from_secs(5),
+            cef_timeout: Duration::from_secs(5),
+            use_daemon: false,
+            no_web_bot_auth: true,
+            cef_renderer_executable: Some(state_dir.join("missing-cef")),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+
+    let (client_out, server_in) = tokio::io::duplex(64 * 1024);
+    let (server_out, client_in) = tokio::io::duplex(64 * 1024);
+    let ctx_server = Arc::clone(&ctx);
+    let server_task = tokio::spawn(async move {
+        serve_io(ctx_server, BufReader::new(server_in), server_out)
+            .await
+            .unwrap();
+    });
+
+    let mut writer = client_out;
+    let mut reader = BufReader::new(client_in);
+
+    let _ = send_rpc(
+        &mut writer,
+        &mut reader,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-03-26" }
+        }),
+    )
+    .await;
+
+    // 1. Parameter conflict checks return JSON-RPC -32602.
+    for (idx, bad_args) in [
+        json!({ "url": format!("{base}/"), "section": "Examples", "focus": "q" }),
+        json!({ "url": format!("{base}/"), "offset": 10, "focus": "q" }),
+        json!({ "url": format!("{base}/"), "section": "Examples", "format": "html" }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let err = send_rpc(
+            &mut writer,
+            &mut reader,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 100 + idx,
+                "method": "tools/call",
+                "params": { "name": "pleb_fetch", "arguments": bad_args }
+            }),
+        )
+        .await;
+        assert_eq!(err["error"]["code"], -32602, "expected -32602: {err:?}");
+    }
+
+    // 2. section + no_images + no_links + no_rewrite + default Tools cue.
+    let sec_resp = send_rpc(
+        &mut writer,
+        &mut reader,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "pleb_fetch",
+                "arguments": {
+                    "url": format!("{base}/"),
+                    "render": "cronet",
+                    "section": "Examples",
+                    "no_images": true,
+                    "no_links": true,
+                    "no_rewrite": true
+                }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(sec_resp["result"]["isError"], false);
+    let sec_text = sec_resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(sec_text.contains("## Examples"), "text={sec_text}");
+    assert!(sec_text.contains("Bytes:"), "text={sec_text}");
+    assert!(sec_text.contains("tools=\"manifest\""), "text={sec_text}");
+    assert!(!sec_text.contains("Opening notes for MCP parity verification."));
+    assert!(!sec_text.contains("Closing notes here."));
+    assert!(!sec_text.contains("/fig.png"));
+    assert!(!sec_text.contains("](/ref"));
+
+    // 3. tools="manifest" appends ## Page Tools (WebMCP).
+    let tools_resp = send_rpc(
+        &mut writer,
+        &mut reader,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "pleb_fetch",
+                "arguments": {
+                    "url": format!("{base}/"),
+                    "render": "cronet",
+                    "tools": "manifest"
+                }
+            }
+        }),
+    )
+    .await;
+    let tools_text = tools_resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        tools_text.contains("## Page Tools (WebMCP)"),
+        "text={tools_text}"
+    );
+    assert!(tools_text.contains("search_docs"), "text={tools_text}");
+
+    // 4. metadata_only omits document body while preserving status/bytes headers.
+    let meta_resp = send_rpc(
+        &mut writer,
+        &mut reader,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "pleb_fetch",
+                "arguments": {
+                    "url": format!("{base}/"),
+                    "render": "cronet",
+                    "metadata_only": true
+                }
+            }
+        }),
+    )
+    .await;
+    let meta_text = meta_resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(meta_text.contains("Title: MCP Parity"), "text={meta_text}");
+    assert!(meta_text.contains("Bytes:"), "text={meta_text}");
+    assert!(!meta_text.contains("Opening notes for MCP parity verification."));
+
+    // 5. offset continuation using Next-Offset header recovers the entire page.
+    let mut offset = 0usize;
+    let mut all_pages = String::new();
+    for step in 0..10 {
+        let mut args = json!({
+            "url": format!("{base}/"),
+            "render": "cronet",
+            "max_bytes": 140
+        });
+        if offset > 0 {
+            args["offset"] = json!(offset);
+        }
+        let page = send_rpc(
+            &mut writer,
+            &mut reader,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 200 + step,
+                "method": "tools/call",
+                "params": { "name": "pleb_fetch", "arguments": args }
+            }),
+        )
+        .await;
+        let text = page["result"]["content"][0]["text"].as_str().unwrap();
+        all_pages.push_str(text);
+        all_pages.push('\n');
+        let next_line = text.lines().find(|l| l.starts_with("Next-Offset: "));
+        match next_line {
+            Some(line) => {
+                let next_val: usize = line
+                    .trim_start_matches("Next-Offset: ")
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert!(next_val > offset);
+                offset = next_val;
+            }
+            None => break,
+        }
+    }
+    assert!(all_pages.contains("fn one()"));
+    assert!(all_pages.contains("fn four()"));
+    assert!(all_pages.contains("Closing notes here."));
+
+    drop(writer);
+    server_task.await.unwrap();
+    let _ = std::fs::remove_dir_all(&state_dir);
 }

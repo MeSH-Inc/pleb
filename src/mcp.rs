@@ -240,8 +240,19 @@ fn tool_definitions() -> Value {
                         "type": "string",
                         "description": "Comma-separated stable resource IDs from a prior Resources cue or resources='manifest' (e.g., \"r_a1b2c3d4\") or exact resource URLs to download locally (returns local file paths in a Staged header; transcripts are also inlined). Re-fetches the page on each call."
                     },
-                    "focus": { "type": "string", "description": "Optional query for BM25 section projection" },
+                    "focus": { "type": "string", "description": "Optional query for BM25 section projection (markdown/text only; cannot be combined with section or offset)" },
+                    "section": { "type": "string", "description": "Optional Markdown heading selector (exact, prefix, or substring match) to return intact section(s) including subsections (cannot be combined with focus)" },
+                    "offset": { "type": "integer", "minimum": 0, "description": "Optional byte offset within the extracted output for fence-safe continuation (pass Next-Offset from a prior truncated response; cannot be combined with focus)" },
                     "max_bytes": { "type": "integer", "minimum": 1, "description": "Maximum UTF-8 bytes of returned content" },
+                    "no_images": { "type": "boolean", "description": "Omit images in Markdown output (default false)" },
+                    "no_links": { "type": "boolean", "description": "Unwrap hyperlink URLs in Markdown output (default false)" },
+                    "no_rewrite": { "type": "boolean", "description": "Disable URL rewriting rules (default false)" },
+                    "metadata_only": { "type": "boolean", "description": "Return header metadata only and omit document body (default false)" },
+                    "tools": {
+                        "type": "string",
+                        "enum": ["none", "manifest"],
+                        "description": "WebMCP tool indexing: none (default) surfaces a zero-cost Tools cue when tools exist; manifest appends a ## Page Tools (WebMCP) table"
+                    },
                     "wait_for_selector": { "type": "string", "description": "CSS selector to wait for when CEF/CDP renders" },
                     "respect_robots": { "type": "boolean", "description": "Enforce robots.txt rules (default false for single-URL fetch)" }
                 },
@@ -336,28 +347,61 @@ async fn call_fetch(
     let render = parse_opt_enum::<RenderMode>(args, "render")?.unwrap_or(RenderMode::Auto);
     let source = parse_opt_enum::<SourceMode>(args, "source")?.unwrap_or(SourceMode::Auto);
     let resources = parse_opt_enum::<ResourcePolicy>(args, "resources")?.unwrap_or_default();
+    let tools = parse_opt_enum::<crate::policy::ToolPolicy>(args, "tools")?.unwrap_or_default();
     let stage_resources = opt_string_list(args, "stage_resources")?;
     let focus = opt_nonempty_str(args, "focus")?;
+    let section = opt_nonempty_str(args, "section")?;
+    let offset = opt_nonneg_usize(args, "offset")?.unwrap_or(0);
     let max_bytes = opt_positive_usize(args, "max_bytes")?;
+    let no_images = opt_bool(args, "no_images")?.unwrap_or(false);
+    let no_links = opt_bool(args, "no_links")?.unwrap_or(false);
+    let no_rewrite = opt_bool(args, "no_rewrite")?.unwrap_or(false);
+    let metadata_only = opt_bool(args, "metadata_only")?.unwrap_or(false);
     let wait_for_selector = opt_nonempty_str(args, "wait_for_selector")?;
     let respect_robots = opt_bool(args, "respect_robots")?.unwrap_or(false);
+
+    if focus.is_some() && !matches!(format, OutputFormat::Markdown | OutputFormat::Text) {
+        return Err(RpcError::invalid_params(
+            "'focus' is only supported with format 'markdown' or 'text'",
+        ));
+    }
+    if section.is_some() && focus.is_some() {
+        return Err(RpcError::invalid_params(
+            "'section' cannot be combined with 'focus'",
+        ));
+    }
+    if offset > 0 && focus.is_some() {
+        return Err(RpcError::invalid_params(
+            "'offset' cannot be combined with 'focus'",
+        ));
+    }
+    if section.is_some() && format != OutputFormat::Markdown {
+        return Err(RpcError::invalid_params(
+            "'section' is only supported with format 'markdown'",
+        ));
+    }
+
     let has_stage_request = !stage_resources.is_empty();
 
     let opts = FetchOptions {
         extract: ExtractOptions {
             format,
             mode,
-            include_images: true,
-            include_links: true,
+            include_images: !no_images,
+            include_links: !no_links,
             max_bytes,
             focus,
+            section,
+            offset,
         },
         render,
         source,
         resources,
+        tools,
         stage_resources,
         wait_for_selector,
         respect_robots,
+        apply_rewrites: !no_rewrite,
         ..Default::default()
     };
 
@@ -369,13 +413,21 @@ async fn call_fetch(
             }
             lines.push(format!("URL: {}", res.final_url));
             lines.push(format!(
-                "Status: {} | Strategy: {} | Time: {}ms",
-                res.status_code, res.strategy, res.timing_ms
+                "Status: {} | Strategy: {} | Bytes: {} | Time: {}ms",
+                res.status_code, res.strategy, res.content_bytes, res.timing_ms
             ));
             if resources == ResourcePolicy::None && !has_stage_request {
                 if let Some(cue) = fetch::format_resource_cue_with_hint(
                     &res.resources,
                     "pass resources=\"manifest\" or stage_resources=\"<ids>\" to pleb_fetch",
+                ) {
+                    lines.push(cue);
+                }
+            }
+            if tools == crate::policy::ToolPolicy::None {
+                if let Some(cue) = crate::extract::webmcp::format_webmcp_cue_with_hint(
+                    &res.tools,
+                    "pass tools=\"manifest\" to pleb_fetch",
                 ) {
                     lines.push(cue);
                 }
@@ -386,7 +438,16 @@ async fn call_fetch(
             if let Some(ref warning) = res.warning {
                 lines.push(format!("Warning: {warning}"));
             }
-            let text = format!("{}\n\n{}", lines.join("\n"), res.content);
+            if let Some(next_offset) = res.next_offset {
+                lines.push(format!(
+                    "Next-Offset: {next_offset} (pass offset={next_offset} to pleb_fetch for continuation)"
+                ));
+            }
+            let text = if metadata_only {
+                lines.join("\n")
+            } else {
+                format!("{}\n\n{}", lines.join("\n"), res.content)
+            };
             Ok(tool_ok(text))
         }
         Err(err) => Ok(tool_error_from_fetch(&err)),
@@ -577,6 +638,21 @@ fn opt_bool(
         Some(_) => Err(RpcError::invalid_params(format!(
             "'{key}' must be a boolean"
         ))),
+    }
+}
+
+fn opt_nonneg_usize(
+    args: &serde_json::Map<String, Value>,
+    key: &str,
+) -> std::result::Result<Option<usize>, RpcError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => {
+            let n = v.as_u64().ok_or_else(|| {
+                RpcError::invalid_params(format!("'{key}' must be an integer >= 0"))
+            })?;
+            Ok(Some(n.min(usize::MAX as u64) as usize))
+        }
     }
 }
 

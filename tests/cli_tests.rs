@@ -800,6 +800,9 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "representation_url",
         "failed_pages",
         "--focus",
+        "--section",
+        "--offset",
+        "next_offset",
         "pleb mcp",
         "pleb setup",
         "--hooks",
@@ -833,6 +836,9 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "acquired_sha256",
         "representation_url",
         "--focus",
+        "--section",
+        "--offset",
+        "next_offset",
         "pleb mcp",
         "pleb setup",
         "--hooks",
@@ -935,6 +941,9 @@ async fn adversarial_status_json_defaults_and_readme_contract_parity() {
         "content_outcome",
         "acquired_sha256",
         "--focus",
+        "--section",
+        "--offset",
+        "next_offset",
         "pleb mcp",
         "pleb setup",
         "--hooks",
@@ -2074,4 +2083,248 @@ async fn cli_stage_resources_with_max_bytes_prints_staged_paths_on_stderr() {
         "staged path missing on disk: {}",
         staged_path.display()
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_section_offset_pagination_and_conflict_validation() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+
+    tokio::spawn(async move {
+        let html = concat!(
+            "<!doctype html><html><head><title>CLI Slicing</title></head><body><main>",
+            "<h1>CLI Slicing</h1>",
+            "<h2>Install</h2><p>Run cargo install pleb to begin setup quickly.</p>",
+            "<h2>Usage Guide</h2>",
+            "<pre><code class=\"language-python\">print('alpha line')\nprint('beta line')\nprint('gamma line')\nprint('delta line')\n</code></pre>",
+            "<h2>Appendix</h2><p>Extra trailing appendix notes.</p>",
+            "</main></body></html>"
+        );
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    html.len()
+                );
+                let _ = socket.write_all(hdr.as_bytes()).await;
+                let _ = socket.write_all(html.as_bytes()).await;
+            });
+        }
+    });
+
+    let pleb_bin = env!("CARGO_BIN_EXE_pleb");
+    let state_dir =
+        std::path::PathBuf::from(format!("/tmp/pleb-t-{}-cli-slice", std::process::id()));
+    let _ = fs::remove_dir_all(&state_dir);
+    fs::create_dir_all(&state_dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    for bad_args in [
+        vec![
+            "fetch",
+            "--section",
+            "Install",
+            "--focus",
+            "q",
+            &format!("{base}/"),
+        ],
+        vec![
+            "fetch",
+            "--offset",
+            "10",
+            "--focus",
+            "q",
+            &format!("{base}/"),
+        ],
+        vec![
+            "fetch",
+            "--section",
+            "Install",
+            "--format",
+            "text",
+            &format!("{base}/"),
+        ],
+        vec![
+            "fetch",
+            "--section",
+            "Install",
+            "--format",
+            "html",
+            &format!("{base}/"),
+        ],
+        vec![
+            "fetch",
+            "--section",
+            "Install",
+            "--stage",
+            &format!("{base}/"),
+        ],
+        vec!["fetch", "--offset", "10", "--stage", &format!("{base}/")],
+        vec![
+            "fetch",
+            "--offset",
+            "10",
+            "--format",
+            "raw",
+            "-o",
+            "/tmp/unused.bin",
+            &format!("{base}/"),
+        ],
+    ] {
+        let out = Command::new(pleb_bin)
+            .env("PLEB_NO_HOME_CEF", "1")
+            .env("PLEB_NO_KEYCHAIN", "1")
+            .args(["--state-dir"])
+            .arg(&state_dir)
+            .args(["--no-daemon"])
+            .args(&bad_args)
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "expected exit 1 for {bad_args:?}, stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // `--section` returns exact section without truncation or next_offset.
+    let sec_out = Command::new(pleb_bin)
+        .env("PLEB_NO_HOME_CEF", "1")
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args([
+            "--no-daemon",
+            "--json",
+            "fetch",
+            "--render",
+            "cronet",
+            "--section",
+            "Install",
+            &format!("{base}/"),
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(sec_out.status.code(), Some(0));
+    let sec_json: serde_json::Value = serde_json::from_slice(&sec_out.stdout).unwrap();
+    assert_eq!(sec_json["truncated"], false);
+    assert!(sec_json["next_offset"].is_null());
+    let sec_content = sec_json["content"].as_str().unwrap();
+    assert!(sec_content.contains("cargo install pleb"));
+    assert!(!sec_content.contains("Appendix"));
+
+    // Plain stderr emits `Next-Offset:` when truncated by `--max-bytes`.
+    let plain_trunc = Command::new(pleb_bin)
+        .env("PLEB_NO_HOME_CEF", "1")
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args([
+            "--no-daemon",
+            "fetch",
+            "--render",
+            "cronet",
+            "--max-bytes",
+            "110",
+            &format!("{base}/"),
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(plain_trunc.status.code(), Some(0));
+    assert!(plain_trunc.stdout.len() <= 110);
+    let plain_err = String::from_utf8_lossy(&plain_trunc.stderr);
+    assert!(
+        plain_err.lines().any(|l| l.starts_with("Next-Offset: ")),
+        "expected Next-Offset header on stderr, got:\n{plain_err}"
+    );
+
+    // `--metadata-only` retains `next_offset` and omits `content`.
+    let meta_out = Command::new(pleb_bin)
+        .env("PLEB_NO_HOME_CEF", "1")
+        .env("PLEB_NO_KEYCHAIN", "1")
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args([
+            "--no-daemon",
+            "--json",
+            "fetch",
+            "--render",
+            "cronet",
+            "--max-bytes",
+            "110",
+            "--metadata-only",
+            &format!("{base}/"),
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(meta_out.status.code(), Some(0));
+    let meta_json: serde_json::Value = serde_json::from_slice(&meta_out.stdout).unwrap();
+    assert!(meta_json["content"].is_null());
+    assert!(meta_json["next_offset"].as_u64().is_some());
+
+    // JSON sequential pagination via `--offset` converges cleanly and preserves fences.
+    let mut offset = 0u64;
+    let mut combined = String::new();
+    for _ in 0..12 {
+        let offset_str = offset.to_string();
+        let page_out = Command::new(pleb_bin)
+            .env("PLEB_NO_HOME_CEF", "1")
+            .env("PLEB_NO_KEYCHAIN", "1")
+            .args(["--state-dir"])
+            .arg(&state_dir)
+            .args([
+                "--no-daemon",
+                "--json",
+                "fetch",
+                "--render",
+                "cronet",
+                "--max-bytes",
+                "120",
+                "--offset",
+                &offset_str,
+                &format!("{base}/"),
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(page_out.status.code(), Some(0));
+        let page_json: serde_json::Value = serde_json::from_slice(&page_out.stdout).unwrap();
+        let chunk = page_json["content"].as_str().unwrap();
+        assert!(chunk.len() <= 120);
+        assert!(pleb::extract::markdown::open_fence_at(chunk, chunk.len()).is_none());
+        combined.push_str(chunk);
+        combined.push('\n');
+        match page_json["next_offset"].as_u64() {
+            Some(next) => {
+                assert!(next > offset);
+                offset = next;
+            }
+            None => break,
+        }
+    }
+    assert!(combined.contains("alpha line"));
+    assert!(combined.contains("delta line"));
+    assert!(combined.contains("Extra trailing appendix notes."));
+
+    let _ = fs::remove_dir_all(&state_dir);
 }

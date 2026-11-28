@@ -57,6 +57,8 @@ pub struct ExtractOptions {
     pub include_links: bool,
     pub max_bytes: Option<usize>,
     pub focus: Option<String>,
+    pub section: Option<String>,
+    pub offset: usize,
 }
 
 impl Default for ExtractOptions {
@@ -68,6 +70,8 @@ impl Default for ExtractOptions {
             include_links: true,
             max_bytes: None,
             focus: None,
+            section: None,
+            offset: 0,
         }
     }
 }
@@ -77,6 +81,8 @@ pub struct ExtractedDocument {
     pub title: Option<String>,
     pub content: String,
     pub truncated: bool,
+    pub next_offset: Option<usize>,
+    pub warning: Option<String>,
     pub resources: Vec<ResourceDescriptor>,
     pub tools: Vec<WebMcpToolDescriptor>,
 }
@@ -109,11 +115,13 @@ pub fn wrap_raw_code_document(
     } else {
         code.to_string()
     };
-    let (content, truncated) = apply_format_limit(&raw, options.format, options.max_bytes);
+    let proj = apply_projection_or_slice(&raw, options);
     ExtractedDocument {
         title: Some(filename.to_string()),
-        content,
-        truncated,
+        content: proj.content,
+        truncated: proj.truncated,
+        next_offset: proj.next_offset,
+        warning: proj.warning,
         resources: Vec::new(),
         tools: Vec::new(),
     }
@@ -195,12 +203,16 @@ fn extract_document_core(
     content_type: Option<&str>,
     options: &ExtractOptions,
 ) -> Result<ExtractedDocument> {
-    let defer_limit = options.focus.is_some()
-        && matches!(options.format, OutputFormat::Markdown | OutputFormat::Text);
-    let inner_opts = if defer_limit {
+    let defer_slice = options.focus.is_some()
+        || options.section.is_some()
+        || options.offset > 0
+        || options.max_bytes.is_some();
+    let inner_opts = if defer_slice {
         ExtractOptions {
             max_bytes: None,
             focus: None,
+            section: None,
+            offset: 0,
             ..options.clone()
         }
     } else {
@@ -223,15 +235,17 @@ fn extract_document_core(
             strip_concealed_unicode(title);
         }
     }
-    if defer_limit {
-        let (projected, did_truncate) = apply_focus_or_limit(
-            &doc.content,
-            options.format,
-            options.focus.as_deref(),
-            options.max_bytes,
-        );
-        doc.content = projected;
-        doc.truncated |= did_truncate;
+    if defer_slice {
+        let proj = apply_projection_or_slice(&doc.content, options);
+        doc.content = proj.content;
+        doc.truncated |= proj.truncated;
+        doc.next_offset = proj.next_offset;
+        if let Some(w) = proj.warning {
+            doc.warning = Some(match doc.warning.take() {
+                Some(prev) => format!("{prev}; {w}"),
+                None => w,
+            });
+        }
     }
     Ok(doc)
 }
@@ -281,6 +295,8 @@ fn extract_document_parsed_inner(
             title: None,
             content,
             truncated,
+            next_offset: None,
+            warning: None,
             resources: Vec::new(),
             tools: Vec::new(),
         });
@@ -326,6 +342,8 @@ fn extract_document_parsed_inner(
         title,
         content,
         truncated,
+        next_offset: None,
+        warning: None,
         resources,
         tools,
     })
@@ -394,23 +412,151 @@ pub(crate) fn apply_utf8_limit(text: &str, max_bytes: Option<usize>) -> (String,
     }
 }
 
-pub(crate) fn apply_focus_or_limit(
+#[derive(Debug, Clone)]
+pub(crate) struct ProjectionResult {
+    pub content: String,
+    pub truncated: bool,
+    pub next_offset: Option<usize>,
+    pub warning: Option<String>,
+}
+
+pub(crate) fn apply_projection_or_slice(
     content: &str,
-    format: OutputFormat,
-    focus: Option<&str>,
-    max_bytes: Option<usize>,
-) -> (String, bool) {
-    if let Some(query) = focus {
-        if matches!(format, OutputFormat::Markdown | OutputFormat::Text) {
-            return focus::focus_document(
+    options: &ExtractOptions,
+) -> ProjectionResult {
+    if let Some(query) = options.focus.as_deref() {
+        if matches!(options.format, OutputFormat::Markdown | OutputFormat::Text) {
+            let (projected, truncated) = focus::focus_document(
                 content,
                 query,
-                max_bytes.unwrap_or(focus::DEFAULT_FOCUS_MAX_BYTES),
-                format == OutputFormat::Markdown,
+                options.max_bytes.unwrap_or(focus::DEFAULT_FOCUS_MAX_BYTES),
+                options.format == OutputFormat::Markdown,
             );
+            return ProjectionResult {
+                content: projected,
+                truncated,
+                next_offset: None,
+                warning: None,
+            };
         }
     }
-    apply_format_limit(content, format, max_bytes)
+
+    let mut working: std::borrow::Cow<'_, str> = std::borrow::Cow::Borrowed(content);
+    if let Some(selector) = options.section.as_deref() {
+        if options.format == OutputFormat::Markdown {
+            let sec = focus::extract_section(working.as_ref(), selector);
+            if !sec.matched {
+                return ProjectionResult {
+                    content: sec.content,
+                    truncated: false,
+                    next_offset: None,
+                    warning: sec.warning,
+                };
+            }
+            working = std::borrow::Cow::Owned(sec.content);
+        }
+    }
+
+    let working_str = working.as_ref();
+    let mut start = options.offset;
+    if start >= working_str.len() {
+        let warning = (start > 0 && !working_str.is_empty()).then(|| {
+            format!(
+                "offset {start} exceeds extracted content length ({} bytes)",
+                working_str.len()
+            )
+        });
+        return ProjectionResult {
+            content: String::new(),
+            truncated: false,
+            next_offset: None,
+            warning,
+        };
+    }
+    while start < working_str.len() && !working_str.is_char_boundary(start) {
+        start += 1;
+    }
+    if start >= working_str.len() {
+        return ProjectionResult {
+            content: String::new(),
+            truncated: false,
+            next_offset: None,
+            warning: Some(format!(
+                "offset {} exceeds extracted content length ({} bytes)",
+                options.offset,
+                working_str.len()
+            )),
+        };
+    }
+
+    let mut fence_prefix: Option<&str> = None;
+    if start > 0 && options.format == OutputFormat::Markdown {
+        if let Some((_, _, open_start, open_line_end)) =
+            markdown::open_fence_at(&working_str[..start], start)
+        {
+            if open_line_end < working_str.len() {
+                if start < open_line_end {
+                    start = open_line_end;
+                }
+                fence_prefix = Some(&working_str[open_start..open_line_end]);
+            }
+        }
+    }
+
+    let rem = &working_str[start..];
+    match options.max_bytes {
+        None => {
+            let out = match fence_prefix {
+                Some(fp) => format!("{fp}{rem}"),
+                None => rem.to_string(),
+            };
+            ProjectionResult {
+                content: out,
+                truncated: false,
+                next_offset: None,
+                warning: None,
+            }
+        }
+        Some(max) if options.format == OutputFormat::Markdown => {
+            if let Some(fp) = fence_prefix {
+                if max > fp.len() + 1 {
+                    let prefixed = format!("{fp}{rem}");
+                    let (out, trunc, consumed_prefixed) =
+                        markdown::truncate_markdown_with_offset(&prefixed, max);
+                    let consumed_orig = consumed_prefixed.saturating_sub(fp.len());
+                    let next_offset =
+                        (trunc && consumed_orig > 0 && start + consumed_orig < working_str.len())
+                            .then_some(start + consumed_orig);
+                    return ProjectionResult {
+                        content: out,
+                        truncated: trunc,
+                        next_offset,
+                        warning: None,
+                    };
+                }
+            }
+            let (out, trunc, consumed) = markdown::truncate_markdown_with_offset(rem, max);
+            let next_offset = (trunc && consumed > 0 && start + consumed < working_str.len())
+                .then_some(start + consumed);
+            ProjectionResult {
+                content: out,
+                truncated: trunc,
+                next_offset,
+                warning: None,
+            }
+        }
+        Some(max) => {
+            let (out, trunc, consumed) = truncate_utf8_with_offset(rem, max);
+            let next_offset = (trunc && consumed > 0 && start + consumed < working_str.len())
+                .then_some(start + consumed);
+            ProjectionResult {
+                content: out,
+                truncated: trunc,
+                next_offset,
+                warning: None,
+            }
+        }
+    }
 }
 
 pub(crate) fn apply_format_limit(
@@ -426,16 +572,25 @@ pub(crate) fn apply_format_limit(
 }
 
 pub fn truncate_utf8(text: &str, max_bytes: usize) -> (String, bool) {
+    let (out, truncated, _) = truncate_utf8_with_offset(text, max_bytes);
+    (out, truncated)
+}
+
+pub(crate) fn truncate_utf8_with_offset(text: &str, max_bytes: usize) -> (String, bool, usize) {
     if text.len() <= max_bytes {
-        return (text.to_string(), false);
+        return (text.to_string(), false, text.len());
     }
     if max_bytes == 0 {
-        return (String::new(), !text.is_empty());
+        return (String::new(), !text.is_empty(), 0);
     }
 
     if max_bytes <= TRUNCATED_SUFFIX.len() {
         let end = floor_char_boundary(text, max_bytes);
-        return (text[..end].to_string(), true);
+        return (
+            text[..end].to_string(),
+            true,
+            markdown::advance_past_newline(text, end),
+        );
     }
 
     let limit = max_bytes - TRUNCATED_SUFFIX.len();
@@ -443,7 +598,7 @@ pub fn truncate_utf8(text: &str, max_bytes: usize) -> (String, bool) {
     let mut out = String::with_capacity(end + TRUNCATED_SUFFIX.len());
     out.push_str(&text[..end]);
     out.push_str(TRUNCATED_SUFFIX);
-    (out, true)
+    (out, true, markdown::advance_past_newline(text, end))
 }
 
 pub(crate) fn choose_boundary_cut(text: &str, limit: usize) -> usize {

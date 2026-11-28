@@ -270,11 +270,24 @@ fn clean_alt_text(raw: &str) -> String {
 /// Truncate Markdown cleanly within `max_bytes`, closing any open fenced code block
 /// (or rewinding past its opening fence if no code line fits inside the budget).
 pub fn truncate_markdown(md: &str, max_bytes: usize) -> (String, bool) {
+    let (out, truncated, _) = truncate_markdown_with_offset(md, max_bytes);
+    (out, truncated)
+}
+
+pub(crate) fn advance_past_newline(text: &str, idx: usize) -> usize {
+    if text.as_bytes().get(idx) == Some(&b'\n') {
+        idx + 1
+    } else {
+        idx
+    }
+}
+
+pub(crate) fn truncate_markdown_with_offset(md: &str, max_bytes: usize) -> (String, bool, usize) {
     if md.len() <= max_bytes {
-        return (md.to_string(), false);
+        return (md.to_string(), false, md.len());
     }
     if max_bytes == 0 {
-        return (String::new(), !md.is_empty());
+        return (String::new(), !md.is_empty(), 0);
     }
 
     let suffix = if max_bytes <= TRUNCATED_SUFFIX.len() {
@@ -295,7 +308,8 @@ pub fn truncate_markdown(md: &str, max_bytes: usize) -> (String, bool) {
         let reserve = 1 + fl + suffix.len();
         let fence_budget = max_bytes.saturating_sub(reserve);
         if candidate_cut <= open_line_end || fence_budget <= open_line_end {
-            return rewind_before_fence(md, open_start, max_bytes, suffix);
+            let (out, trunc) = rewind_before_fence(md, open_start, max_bytes, suffix);
+            return (out, trunc, open_start);
         }
 
         let inner_cut = if suffix.is_empty() {
@@ -310,7 +324,8 @@ pub fn truncate_markdown(md: &str, max_bytes: usize) -> (String, bool) {
         };
         let prefix = md[..inner_cut].trim_end_matches('\n');
         if prefix.len() < open_line_end.saturating_sub(1) || prefix.len() <= open_start {
-            return rewind_before_fence(md, open_start, max_bytes, suffix);
+            let (out, trunc) = rewind_before_fence(md, open_start, max_bytes, suffix);
+            return (out, trunc, open_start);
         }
 
         let mut out = String::with_capacity(prefix.len() + 1 + fl + suffix.len());
@@ -324,7 +339,7 @@ pub fn truncate_markdown(md: &str, max_bytes: usize) -> (String, bool) {
         out.push_str(suffix);
         debug_assert!(out.len() <= max_bytes);
         debug_assert!(open_fence_at(&out, out.len()).is_none());
-        return (out, true);
+        return (out, true, advance_past_newline(md, inner_cut));
     }
 
     let prefix = &md[..candidate_cut];
@@ -333,7 +348,7 @@ pub fn truncate_markdown(md: &str, max_bytes: usize) -> (String, bool) {
     out.push_str(suffix);
     debug_assert!(out.len() <= max_bytes);
     debug_assert!(open_fence_at(&out, out.len()).is_none());
-    (out, true)
+    (out, true, advance_past_newline(md, candidate_cut))
 }
 
 fn rewind_before_fence(

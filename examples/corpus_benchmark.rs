@@ -253,7 +253,7 @@ fn run_benchmark(config: &Config) -> Result<BenchmarkReport, String> {
         include_images: true,
         include_links: true,
         max_bytes: None,
-        focus: None,
+        ..Default::default()
     };
 
     let mut fixtures = Vec::new();

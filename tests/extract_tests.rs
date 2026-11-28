@@ -187,8 +187,7 @@ fn no_images_no_links_data_uri_and_utf8_max_bytes() {
             mode: ExtractMode::Clean,
             include_images: false,
             include_links: false,
-            max_bytes: None,
-            focus: None,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -3124,4 +3123,314 @@ fn block_anchor_dedups_repeated_permalink_while_preserving_first_and_inline_link
     assert!(res
         .content
         .contains("[second inline](https://example.com/r/rust/posts/inline)"));
+}
+
+#[test]
+fn section_selector_matches_exact_prefix_substring_and_subsections() {
+    let html = r##"<!doctype html>
+<html><head><title>Reference Docs</title></head>
+<body><main>
+  <h1>Reference Docs</h1>
+  <h2>Overview</h2>
+  <p>Introductory paragraph.</p>
+  <h2>API Reference</h2>
+  <p>Top-level API notes.</p>
+  <h3><a href="#auth">Auth_Setup</a></h3>
+  <p>Configure bearer tokens.</p>
+  <h4>Token Scopes</h4>
+  <p>Read and write scopes.</p>
+  <h2>Changelog</h2>
+  <p>Release history details.</p>
+</main></body></html>"##;
+    let url = Url::parse("https://example.com/docs").unwrap();
+
+    // Exact match includes nested subsections and excludes sibling sections.
+    let exact = extract_document(
+        html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions {
+            section: Some("API Reference".to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(!exact.truncated);
+    assert!(exact.next_offset.is_none());
+    assert!(exact.warning.is_none());
+    assert!(exact.content.contains("## API Reference"));
+    assert!(exact.content.contains("Top-level API notes."));
+    assert!(exact.content.contains("Auth"));
+    assert!(exact.content.contains("Read and write scopes."));
+    assert!(!exact.content.contains("Introductory paragraph."));
+    assert!(!exact.content.contains("Release history details."));
+
+    // Prefix and substring matching work case-insensitively.
+    let prefix = extract_document(
+        html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions {
+            section: Some("api".to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(prefix.content.contains("## API Reference"));
+
+    let substr = extract_document(
+        html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions {
+            section: Some("Setup".to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(substr.content.contains("Configure bearer tokens."));
+    assert!(!substr.content.contains("## API Reference"));
+
+    // Unknown or punctuation-only selector returns available headings and a warning.
+    for missing_sel in ["Nonexistent Section", "###"] {
+        let missing = extract_document(
+            html,
+            &url,
+            Some("text/html"),
+            &ExtractOptions {
+                section: Some(missing_sel.to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!missing.truncated);
+        assert!(missing.next_offset.is_none());
+        assert!(missing.warning.is_some());
+        assert!(missing.content.contains("not found"));
+        assert!(missing.content.contains("Available sections:"));
+        assert!(missing.content.contains("API Reference"));
+    }
+}
+
+#[test]
+fn offset_pagination_preserves_fences_and_completes_monotonically() {
+    let html = r#"<!doctype html>
+<html><head><title>Async Guide</title></head>
+<body><main>
+  <h1>Async Guide</h1>
+  <p>Walkthrough introduction covering task scheduling fundamentals cleanly.</p>
+  <h2>Example Pipeline</h2>
+  <pre><code class="language-rust">fn step_one() -> u32 { 1 }
+fn step_two() -> u32 { 2 }
+fn step_three() -> u32 { 3 }
+fn step_four() -> u32 { 4 }
+fn step_five() -> u32 { 5 }
+fn step_six() -> u32 { 6 }
+fn step_seven() -> u32 { 7 }
+fn step_eight() -> u32 { 8 }
+</code></pre>
+  <h2>Closing Notes</h2>
+  <p>Final summary paragraph after code fence.</p>
+</main></body></html>"#;
+    let url = Url::parse("https://example.com/async").unwrap();
+    let full = extract_document(html, &url, Some("text/html"), &ExtractOptions::default()).unwrap();
+    assert!(full.content.len() > 240);
+
+    let mut offset = 0usize;
+    let mut chunks = Vec::new();
+    for _ in 0..24 {
+        let page = extract_document(
+            html,
+            &url,
+            Some("text/html"),
+            &ExtractOptions {
+                max_bytes: Some(120),
+                offset,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            page.content.len() <= 120,
+            "chunk exceeded max_bytes: {}",
+            page.content.len()
+        );
+        assert!(
+            pleb::extract::markdown::open_fence_at(&page.content, page.content.len()).is_none(),
+            "chunk ended with unclosed fence:\n{}",
+            page.content
+        );
+        chunks.push(page.content);
+        match page.next_offset {
+            Some(next) => {
+                assert!(
+                    next > offset,
+                    "offset must strictly increase: {offset} -> {next}"
+                );
+                offset = next;
+            }
+            None => break,
+        }
+    }
+
+    let joined = chunks.join("\n");
+    assert!(
+        chunks.iter().filter(|c| c.contains("```rust")).count() >= 2,
+        "expected resumed chunk inside code fence to reopen ```rust fence:\n{joined}"
+    );
+    assert!(joined.contains("fn step_one()"));
+    assert!(joined.contains("fn step_eight()"));
+    assert!(joined.contains("Final summary paragraph after code fence."));
+}
+
+#[test]
+fn tiny_fence_budget_stops_and_oob_offset_warns() {
+    let html = r#"<!doctype html>
+<html><head><title>Code</title></head>
+<body><main>
+  <pre><code class="language-rust">let alpha = 100;
+let beta = 200;
+let gamma = 300;
+</code></pre>
+</main></body></html>"#;
+    let url = Url::parse("https://example.com/code").unwrap();
+    let first = extract_document(
+        html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions {
+            max_bytes: Some(50),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mid_offset = first
+        .next_offset
+        .expect("expected first page to have next_offset");
+
+    // `fence_prefix` (`"```rust\n"`, 8 bytes) + closing (`"\n```"`, 4 bytes) + `TRUNCATED_SUFFIX` (17 bytes)
+    // leaves zero room inside 20 bytes, so pagination must not emit a looping `next_offset`.
+    let tiny = extract_document(
+        html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions {
+            max_bytes: Some(20),
+            offset: mid_offset,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(tiny.next_offset.is_none());
+
+    // Even when `max_bytes` <= `fp.len() + 1`, offset strictly advances or terminates cleanly.
+    let sub_prefix = extract_document(
+        html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions {
+            max_bytes: Some(9),
+            offset: mid_offset,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    if let Some(next) = sub_prefix.next_offset {
+        assert!(next > mid_offset);
+    }
+
+    let oob = extract_document(
+        html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions {
+            offset: 99_999,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(oob.content.is_empty());
+    assert!(!oob.truncated);
+    assert!(oob.next_offset.is_none());
+    assert!(oob
+        .warning
+        .as_deref()
+        .is_some_and(|w| w.contains("exceeds extracted content length")));
+}
+
+#[test]
+fn section_with_offset_paginates_within_section_and_text_paginates() {
+    let html = r#"<!doctype html>
+<html><head><title>Handbook</title></head>
+<body><main>
+  <h2>Target Section</h2>
+  <p>Sentence one of target section with details. Sentence two of target section continues.</p>
+  <p>Sentence three of target section concludes nicely here.</p>
+  <h2>Excluded Trailing</h2>
+  <p>Should never be emitted inside section slice.</p>
+</main></body></html>"#;
+    let url = Url::parse("https://example.com/handbook").unwrap();
+
+    let mut offset = 0usize;
+    let mut collected = String::new();
+    for _ in 0..10 {
+        let slice = extract_document(
+            html,
+            &url,
+            Some("text/html"),
+            &ExtractOptions {
+                section: Some("Target Section".to_string()),
+                max_bytes: Some(90),
+                offset,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!slice.content.contains("Excluded Trailing"));
+        assert!(!slice.content.contains("Should never be emitted"));
+        collected.push_str(&slice.content);
+        collected.push('\n');
+        match slice.next_offset {
+            Some(next) => {
+                assert!(next > offset);
+                offset = next;
+            }
+            None => break,
+        }
+    }
+    assert!(collected.contains("Sentence one"));
+    assert!(collected.contains("Sentence three"));
+
+    // Plain-text pagination uses byte boundaries cleanly without Markdown truncation markers/fences.
+    let mut txt_offset = 0usize;
+    let mut txt_all = String::new();
+    for _ in 0..10 {
+        let slice = extract_document(
+            html,
+            &url,
+            Some("text/html"),
+            &ExtractOptions {
+                format: OutputFormat::Text,
+                max_bytes: Some(80),
+                offset: txt_offset,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(slice.content.len() <= 80);
+        let raw_piece = slice
+            .content
+            .strip_suffix("\n\n[... truncated]")
+            .unwrap_or(&slice.content);
+        txt_all.push_str(raw_piece);
+        match slice.next_offset {
+            Some(next) => {
+                assert!(next > txt_offset);
+                txt_offset = next;
+            }
+            None => break,
+        }
+    }
+    assert!(txt_all.contains("Target Section"));
+    assert!(txt_all.contains("Should never be emitted"));
 }

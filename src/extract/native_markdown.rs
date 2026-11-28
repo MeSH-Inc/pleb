@@ -37,6 +37,8 @@ pub(crate) fn extract_native_markdown_with_bases(
             title: None,
             content,
             truncated,
+            next_offset: None,
+            warning: None,
             resources: Vec::new(),
             tools: Vec::new(),
         });
@@ -105,6 +107,8 @@ pub(crate) fn extract_native_markdown_with_bases(
                 title,
                 content,
                 truncated,
+                next_offset: None,
+                warning: None,
                 resources: Vec::new(),
                 tools: Vec::new(),
             })
@@ -126,6 +130,8 @@ pub(crate) fn extract_native_markdown_with_bases(
                 title,
                 content,
                 truncated,
+                next_offset: None,
+                warning: None,
                 resources: Vec::new(),
                 tools: Vec::new(),
             })
