@@ -441,6 +441,9 @@ pub fn compact_markdown(md: &str) -> String {
             }
             continue;
         }
+        if is_empty_atx_heading(trimmed_end) {
+            continue;
+        }
         let allow_setext = !last_was_hr && out_lines.last().is_some_and(|p| !p.is_empty());
         if is_thematic_break(trimmed_end, allow_setext) {
             if out_lines.is_empty() || last_was_hr {
@@ -467,6 +470,12 @@ pub fn compact_markdown(md: &str) -> String {
     }
 
     out_lines.join("\n")
+}
+
+fn is_empty_atx_heading(line: &str) -> bool {
+    let t = line.trim();
+    let hashes = t.bytes().take_while(|&b| b == b'#').count();
+    (1..=6).contains(&hashes) && t[hashes..].trim().is_empty()
 }
 
 fn is_thematic_break(line: &str, allow_setext_dash: bool) -> bool {

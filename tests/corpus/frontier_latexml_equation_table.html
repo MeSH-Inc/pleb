@@ -1,0 +1,28 @@
+<!-- pleb-fixture: {"tier":"ratchet","url":"https://arxiv.example.org/html/2402.03300v1","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"Policy Optimization Note","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["The policy objective is defined below.","$$\nP(O|q) = \\frac{1}{|o|} \\sum_t A_t \\tag{1}\n$$","Summary metrics follow in the table.","| Metric | Formula |"],"forbidden_substrings":["&#124;","| $$"],"minimum_output_bytes":100,"expected_structure":{"minimum_headings":1,"minimum_tables":1}}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Policy Optimization Note</title></head>
+<body>
+  <main>
+    <article>
+      <h1>Policy Optimization Note</h1>
+      <p>The policy objective is defined below.</p>
+      <table id="S4.E1" class="ltx_equation ltx_eqn_table">
+        <tbody>
+          <tr class="ltx_equation ltx_eqn_row ltx_align_baseline">
+            <td class="ltx_eqn_cell ltx_eqn_center_padleft"></td>
+            <td class="ltx_eqn_cell ltx_align_center"><math id="S4.E1.m1" class="ltx_Math" alttext="P(O|q) = \frac{1}{|o|} \sum_t A_t" display="block"><semantics><mrow><mi>P</mi></mrow><annotation encoding="application/x-tex">P(O|q) = \frac{1}{|o|} \sum_t A_t</annotation></semantics></math></td>
+            <td class="ltx_eqn_cell ltx_eqn_center_padright"></td>
+            <td class="ltx_eqn_cell ltx_eqn_eqno"><span class="ltx_tag">(1)</span></td>
+          </tr>
+        </tbody>
+      </table>
+      <p>Summary metrics follow in the table.</p>
+      <table>
+        <thead><tr><th>Metric</th><th>Formula</th></tr></thead>
+        <tbody><tr><td>Entropy</td><td><math alttext="\sum_t x_t"><semantics><annotation encoding="application/x-tex">\sum_t x_t</annotation></semantics></math></td></tr></tbody>
+      </table>
+    </article>
+  </main>
+</body>
+</html>

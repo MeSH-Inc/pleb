@@ -90,7 +90,8 @@ static ARIA_BOILERPLATE_SEL: LazyLock<Selector> = LazyLock::new(|| {
         "[role=\"menubar\"],",
         "[role=\"tooltip\"],",
         "[aria-hidden=\"true\"],",
-        "[hidden]"
+        "[hidden],",
+        "dialog:not([open])"
     ))
     .unwrap()
 });
@@ -688,6 +689,7 @@ fn collect_link_density_prune_ids(
 
 pub(crate) fn is_element_hidden_or_inert(el: &scraper::node::Element) -> bool {
     matches!(el.name(), "template" | "noscript" | "script" | "style")
+        || (el.name() == "dialog" && el.attr("open").is_none())
         || el.attr("hidden").is_some()
         || el
             .attr("aria-hidden")
@@ -1147,12 +1149,15 @@ fn serialize_pruned_html(node: NodeRef<'_, Node>, in_interactive: bool, out: &mu
                 return;
             }
 
-            if tag == "pre" && !has_descendant_tag(node, "code") {
+            if tag == "pre" {
                 let mut code = String::new();
                 collect_raw_text(node, &mut code);
                 if !code.trim().is_empty() {
-                    let lang = std::iter::once(node)
-                        .chain(node.ancestors().take(2))
+                    let lang = node
+                        .descendants()
+                        .filter(|n| matches!(n.value(), Node::Element(e) if e.name() == "code"))
+                        .chain(std::iter::once(node))
+                        .chain(node.ancestors().take(3))
                         .find_map(|n| match n.value() {
                             Node::Element(e) => extract_lang_from_element(e),
                             _ => None,
@@ -1165,6 +1170,25 @@ fn serialize_pruned_html(node: NodeRef<'_, Node>, in_interactive: bool, out: &mu
             if tag == "table" {
                 if let Some((lang, code)) = try_extract_code_gutter_table(node) {
                     emit_code_block(lang.as_deref(), &code, out);
+                    return;
+                }
+                if let Some(equations) = try_extract_equation_layout_table(node) {
+                    for (tex, eqno) in equations {
+                        let tagged = match eqno.as_deref() {
+                            Some(raw_eq) if !tex.contains("\\tag") => {
+                                let (_, inner) = extract_eqno_tag_inner(raw_eq);
+                                if is_valid_eqno_inner(inner) {
+                                    std::borrow::Cow::Owned(format!("{tex} \\tag{{{inner}}}"))
+                                } else {
+                                    std::borrow::Cow::Borrowed(tex.as_str())
+                                }
+                            }
+                            _ => std::borrow::Cow::Borrowed(tex.as_str()),
+                        };
+                        out.push_str("<math data-tex=\"");
+                        push_escaped_attr(tagged.as_ref(), out);
+                        out.push_str("\" data-display=\"1\"></math>");
+                    }
                     return;
                 }
             }
@@ -1257,12 +1281,6 @@ fn emit_code_block(lang: Option<&str>, code: &str, out: &mut String) {
     out.push('>');
     push_escaped_text(code, out);
     out.push_str("</code></pre>");
-}
-
-fn has_descendant_tag(node: NodeRef<'_, Node>, target: &str) -> bool {
-    node.descendants()
-        .skip(1)
-        .any(|d| matches!(d.value(), Node::Element(el) if el.name() == target))
 }
 
 fn emit_img_tag(src: &str, alt: Option<&str>, title: Option<&str>, out: &mut String) {
@@ -1787,15 +1805,201 @@ fn detect_code_language(
         })
 }
 
+fn try_extract_equation_layout_table(
+    table: NodeRef<'_, Node>,
+) -> Option<Vec<(String, Option<String>)>> {
+    for desc in table.descendants().skip(1) {
+        if let Node::Element(el) = desc.value() {
+            if matches!(el.name(), "thead" | "th" | "caption" | "table") {
+                return None;
+            }
+        }
+    }
+
+    let mut rows = Vec::new();
+    collect_equation_rows(table, &mut rows)?;
+    if rows.is_empty() {
+        return None;
+    }
+
+    let mut equations = Vec::with_capacity(rows.len());
+    for tds in rows {
+        let mut row_math = Vec::new();
+        let mut row_eqno: Option<String> = None;
+
+        for td in tds {
+            let has_math = td
+                .descendants()
+                .any(|d| matches!(d.value(), Node::Element(e) if e.name() == "math"));
+            if has_math {
+                if !collect_td_math_cell(td, &mut row_math) {
+                    return None;
+                }
+                continue;
+            }
+
+            if td.descendants().any(|d| {
+                matches!(d.value(), Node::Element(e) if matches!(e.name(), "img" | "svg" | "input"))
+            }) {
+                return None;
+            }
+
+            let mut cell_text = String::new();
+            collect_raw_text(td, &mut cell_text);
+            let trimmed = cell_text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if row_eqno.is_some() || !(1..=24).contains(&trimmed.len()) {
+                return None;
+            }
+            let (enclosed, inner) = extract_eqno_tag_inner(trimmed);
+            if !has_eqno_marker(td) && !(enclosed && is_valid_eqno_inner(inner)) {
+                return None;
+            }
+            row_eqno = Some(trimmed.to_string());
+        }
+
+        if row_math.is_empty() {
+            if row_eqno.is_some() {
+                return None;
+            }
+            continue;
+        }
+        equations.push((row_math.join(" "), row_eqno));
+    }
+
+    (!equations.is_empty()).then_some(equations)
+}
+
+fn collect_equation_rows<'a>(
+    node: NodeRef<'a, Node>,
+    rows: &mut Vec<Vec<NodeRef<'a, Node>>>,
+) -> Option<()> {
+    for child in node.children() {
+        let Node::Element(el) = child.value() else {
+            continue;
+        };
+        match el.name() {
+            "tbody" => collect_equation_rows(child, rows)?,
+            "tr" => {
+                let mut tds = Vec::new();
+                for cell in child.children() {
+                    if let Node::Element(ce) = cell.value() {
+                        if ce.name() == "td" {
+                            tds.push(cell);
+                        } else {
+                            return None;
+                        }
+                    }
+                }
+                rows.push(tds);
+            }
+            "colgroup" | "col" => {}
+            _ => return None,
+        }
+    }
+    Some(())
+}
+
+fn collect_td_math_cell(node: NodeRef<'_, Node>, out: &mut Vec<String>) -> bool {
+    match node.value() {
+        Node::Text(text) => text
+            .chars()
+            .all(|c| c.is_whitespace() || matches!(c, ',' | '.' | ';' | ':')),
+        Node::Element(el) => {
+            if matches!(el.name(), "script" | "style" | "noscript" | "template") {
+                return true;
+            }
+            if el.name() == "math" {
+                let Some(tex) = find_tex_annotation(node) else {
+                    return false;
+                };
+                out.push(tex);
+                return true;
+            }
+            if matches!(el.name(), "img" | "svg" | "input") {
+                return false;
+            }
+            node.children()
+                .all(|child| collect_td_math_cell(child, out))
+        }
+        _ => node
+            .children()
+            .all(|child| collect_td_math_cell(child, out)),
+    }
+}
+
+fn has_eqno_marker(td: NodeRef<'_, Node>) -> bool {
+    td.descendants().any(|d| {
+        matches!(
+            d.value(),
+            Node::Element(el)
+                if (d == td || el.name() == "span")
+                    && el.attr("class").is_some_and(|c| {
+                        c.as_bytes()
+                            .windows(4)
+                            .any(|w| w.eq_ignore_ascii_case(b"eqno"))
+                    })
+        )
+    })
+}
+
+fn extract_eqno_tag_inner(trimmed: &str) -> (bool, &str) {
+    let enclosed = (trimmed.starts_with('(') && trimmed.ends_with(')') && trimmed.len() >= 2)
+        || (trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2);
+    let core = if enclosed {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    (enclosed, core.trim())
+}
+
+fn is_valid_eqno_inner(inner: &str) -> bool {
+    !inner.is_empty()
+        && inner
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '\'' | ' '))
+}
+
+fn is_valid_lang_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '+' | '#' | '-' | '_')
+}
+
+fn normalize_lang_token(raw: &str) -> Option<String> {
+    let cleaned = raw.trim_matches(|c: char| !is_valid_lang_char(c));
+    if cleaned.is_empty()
+        || !cleaned
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        || !cleaned.chars().all(is_valid_lang_char)
+    {
+        return None;
+    }
+    Some(cleaned.to_ascii_lowercase())
+}
+
 fn extract_lang_from_element(el: &scraper::node::Element) -> Option<String> {
     let cls = el.attr("class")?;
-    for tok in cls.split_whitespace() {
+    let mut tokens = cls.split_whitespace().peekable();
+    while let Some(tok) = tokens.next() {
         for prefix in ["language-", "lang-", "highlight-source-"] {
             if let Some(rest) = tok.strip_prefix(prefix) {
-                let cleaned = rest.trim();
-                if !cleaned.is_empty() {
-                    return Some(cleaned.to_ascii_lowercase());
+                if let Some(lang) = normalize_lang_token(rest) {
+                    return Some(lang);
                 }
+            }
+        }
+        if tok.len() >= 6 && tok[..6].eq_ignore_ascii_case("brush:") {
+            let candidate = if !tok[6..].is_empty() {
+                &tok[6..]
+            } else {
+                tokens.peek().copied().unwrap_or("")
+            };
+            if let Some(lang) = normalize_lang_token(candidate) {
+                return Some(lang);
             }
         }
     }
@@ -1805,6 +2009,7 @@ fn extract_lang_from_element(el: &scraper::node::Element) -> Option<String> {
 pub(crate) fn collect_raw_text(node: NodeRef<'_, Node>, out: &mut String) {
     match node.value() {
         Node::Text(text) => out.push_str(text),
+        Node::Element(el) if matches!(el.name(), "script" | "style" | "noscript" | "template") => {}
         _ => {
             for child in node.children() {
                 collect_raw_text(child, out);

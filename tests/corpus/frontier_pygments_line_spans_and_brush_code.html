@@ -1,0 +1,24 @@
+<!-- pleb-fixture: {"tier":"ratchet","url":"https://docs.example.dev/tutorial/first-steps/","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"First Steps Guide","variants":[{"name":"clean_md","format":"markdown","mode":"clean","require_balanced_fences":true,"expected_substrings":["First Steps","Create a minimal app file and inspect fetch usage."],"expected_code_blocks":[{"language":"python","snippet":"from fastapi import FastAPI\napp = FastAPI()\n@app.get(\"/\")\nasync def root():\n    return {\"message\": \"Hello\"}"},{"language":"js","snippet":"const a = 1;\nconst b = 2;"}],"forbidden_substrings":["FastAPIapp = FastAPI()"],"minimum_output_bytes":120,"expected_structure":{"minimum_headings":2,"minimum_code_blocks":2}}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>First Steps Guide</title></head>
+<body>
+  <main>
+    <article>
+      <h1>First Steps</h1>
+      <p>Create a minimal app file and inspect fetch usage.</p>
+      <h2>Python App</h2>
+      <div class="language-python highlight"><pre><span></span><code><span id="__span-0-1"><span class="kn">from</span><span class="w"> </span><span class="nn">fastapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">FastAPI</span>
+</span><span id="__span-0-2"><span class="n">app</span> <span class="o">=</span> <span class="n">FastAPI</span><span class="p">()</span>
+</span><span id="__span-0-3"><span class="nd">@app.get</span><span class="p">(</span><span class="s2">"/"</span><span class="p">)</span>
+</span><span id="__span-0-4"><span class="k">async</span> <span class="k">def</span> <span class="nf">root</span><span class="p">():</span>
+</span><span id="__span-0-5">    <span class="k">return</span> <span class="p">{</span><span class="s2">"message"</span><span class="p">:</span> <span class="s2">"Hello"</span><span class="p">}</span>
+</span></code></pre></div>
+      <h2>Browser Fetch</h2>
+      <pre class="brush: js notranslate"><code>const a = 1;
+const b = 2;
+</code></pre>
+    </article>
+  </main>
+</body>
+</html>

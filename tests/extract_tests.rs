@@ -3434,3 +3434,129 @@ fn section_with_offset_paginates_within_section_and_text_paginates() {
     assert!(txt_all.contains("Target Section"));
     assert!(txt_all.contains("Should never be emitted"));
 }
+
+#[test]
+fn milestone2_inverse_false_positives_preserve_valid_content() {
+    let url = Url::parse("https://example.com/inverse").unwrap();
+
+    // 1. `<pre><code class="language-rust">` preserves `rust`; `paintbrush: red` is ignored; `brush:cpp;` extracts `cpp`.
+    let code_html = r#"<!doctype html>
+<html><head><title>Code</title></head>
+<body><main>
+  <pre><code class="language-rust">fn main() { println!("hi"); }
+</code></pre>
+  <pre class="paintbrush: red"><code>plain text block
+</code></pre>
+  <pre class="brush:cpp; notranslate"><code>int x = 1;
+int y = 2;
+</code></pre>
+</main></body></html>"#;
+    let code_doc = extract_document(
+        code_html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert!(code_doc.content.contains("```rust\nfn main()"));
+    assert!(!code_doc.content.contains("```red"));
+    assert!(code_doc
+        .content
+        .contains("```cpp\nint x = 1;\nint y = 2;\n```"));
+
+    // 2. `<dialog open>` preserved in Clean mode; closed `<dialog>` stripped in Clean and preserved in Full.
+    let dialog_html = r#"<!doctype html>
+<html><head><title>Dialogs</title></head>
+<body>
+  <dialog id="closed-modal"><p>Secret modal prompt.</p></dialog>
+  <main>
+    <h1>Dialogs</h1>
+    <dialog open><p>Visible notice dialog.</p></dialog>
+    <p>Main article body.</p>
+  </main>
+</body></html>"#;
+    let clean_dialog = extract_document(
+        dialog_html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert!(clean_dialog.content.contains("Visible notice dialog."));
+    assert!(!clean_dialog.content.contains("Secret modal prompt."));
+    let full_dialog = extract_document(
+        dialog_html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions {
+            mode: ExtractMode::Full,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(full_dialog.content.contains("Secret modal prompt."));
+
+    // 3. Headerless 2-column math table with prose cell and `<thead>` math table remain Markdown pipe tables.
+    let table_html = r#"<!doctype html>
+<html><head><title>Tables</title></head>
+<body><main>
+  <h1>Tables</h1>
+  <table>
+    <tbody>
+      <tr><td>Cross-entropy</td><td><math alttext="H(p,q)"><semantics><annotation encoding="application/x-tex">-\sum y \log p</annotation></semantics></math></td></tr>
+    </tbody>
+  </table>
+  <table>
+    <thead><tr><th>Metric</th><th>Expr</th></tr></thead>
+    <tbody><tr><td>KL</td><td><math alttext="D_{KL}"><semantics><annotation encoding="application/x-tex">D_{KL}</annotation></semantics></math></td></tr></tbody>
+  </table>
+</main></body></html>"#;
+    let table_doc = extract_document(
+        table_html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert!(table_doc.content.contains("| Cross-entropy |"));
+    assert!(table_doc.content.contains("| Metric | Expr |"));
+
+    // 4. Empty ATX heading pruning preserves `## Real Title`, `#######`, and bare `#` / `##` inside code fences,
+    // while removing bare `##` / `###` outside fences without creating double blank lines.
+    let heading_html = r#"<!doctype html>
+<html><head><title>Headings</title></head>
+<body><main>
+  <h2><a href="" rel="bookmark"></a></h2>
+  <h1>Headings</h1>
+  <p>First paragraph.</p>
+  <h3>   </h3>
+  <p>Second paragraph.</p>
+  <h2>Real Title</h2>
+  <p>#######</p>
+  <pre><code class="language-bash">#
+##
+echo still here
+</code></pre>
+</main></body></html>"#;
+    let heading_doc = extract_document(
+        heading_html,
+        &url,
+        Some("text/html"),
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert!(heading_doc.content.starts_with("# Headings\n"));
+    let outside_fence = heading_doc
+        .content
+        .split_once("```")
+        .map_or(heading_doc.content.as_str(), |(before, _)| before);
+    assert!(!outside_fence
+        .lines()
+        .any(|l| l.trim() == "##" || l.trim() == "###"));
+    assert!(heading_doc.content.contains("## Real Title"));
+    assert!(heading_doc.content.contains("#######"));
+    assert!(heading_doc
+        .content
+        .contains("```bash\n#\n##\necho still here\n```"));
+    assert!(!heading_doc.content.contains("\n\n\n"));
+}

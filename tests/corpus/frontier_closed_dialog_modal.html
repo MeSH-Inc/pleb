@@ -1,0 +1,31 @@
+<!-- pleb-fixture: {"tier":"ratchet","url":"https://pkg.example.dev/net/http","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"HTTP Client Documentation","variants":[{"name":"clean_md","format":"markdown","mode":"clean","expected_substrings":["Package http provides HTTP client and server implementations.","Active announcement banner"],"forbidden_substrings":["Keyboard shortcuts","Hidden modal body","Report GitHub Issue"],"minimum_output_bytes":80},{"name":"full_md","format":"markdown","mode":"full","expected_substrings":["Hidden modal body","HTTP Client Documentation","Keyboard shortcuts"],"minimum_output_bytes":80}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>HTTP Client Documentation</title></head>
+<body>
+  <dialog id="modal-form" aria-labelledby="modal-title" closedby="any">
+    <form id="modal-form-content" method="dialog">
+      <header class="modal-header">
+        <h5 id="modal-title" class="modal-title">Report GitHub Issue</h5>
+        <button type="submit" aria-label="Close">×</button>
+      </header>
+      <div class="modal-body">
+        <p>Hidden modal body</p>
+      </div>
+    </form>
+  </dialog>
+  <main>
+    <article>
+      <h1>HTTP Client Documentation</h1>
+      <p>Package http provides HTTP client and server implementations.</p>
+      <dialog open>
+        <p>Active announcement banner</p>
+      </dialog>
+    </article>
+  </main>
+  <dialog id="shortcuts-modal" class="ShortcutsDialog">
+    <h2>Keyboard shortcuts</h2>
+    <p>Press / to focus search.</p>
+  </dialog>
+</body>
+</html>

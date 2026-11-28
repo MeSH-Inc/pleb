@@ -1,0 +1,18 @@
+<!-- pleb-fixture: {"tier":"ratchet","url":"https://agency.example.gov/edgar/about","status_code":200,"content_type":"text/html; charset=utf-8","expected_exit_code":0,"expected_response_classification":"ok","expected_title":"SEC Filing Guide","variants":[{"name":"clean_md","format":"markdown","mode":"clean","require_balanced_fences":true,"expected_substrings":["# About EDGAR","Public company filings are indexed in full text for research access."],"expected_code_blocks":[{"language":"bash","snippet":"#\necho ok"}],"forbidden_substrings":["##"],"minimum_output_bytes":80,"expected_structure":{"minimum_headings":1,"minimum_code_blocks":1}}]} -->
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>SEC Filing Guide</title></head>
+<body>
+  <main>
+    <article>
+      <h2><a href="" rel="bookmark"></a></h2>
+      <h1>About EDGAR</h1>
+      <h2>  </h2>
+      <p>Public company filings are indexed in full text for research access.</p>
+      <pre><code class="language-bash">#
+echo ok
+</code></pre>
+    </article>
+  </main>
+</body>
+</html>
