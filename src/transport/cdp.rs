@@ -19,10 +19,20 @@ use url::Url;
 
 use super::{ResponseTooLargeError, TransportError, TransportErrorKind};
 use crate::auth::{resolve_credentials, CredentialProvider};
+use crate::extract::is_html_content_type;
 use crate::extract::webmcp::sanitize_webmcp_tool;
 use crate::extract::{WebMcpToolAnnotations, WebMcpToolDescriptor, WebMcpToolSource};
 use crate::policy::source::canonical_url_host;
-use crate::policy::{is_local_or_private_host, is_loopback_host, is_safe_redirect_url};
+use crate::policy::{
+    classify_response_with_headers, detect_interstitial_challenge, is_local_or_private_host,
+    is_loopback_host, is_safe_redirect_url, ResponseClassification,
+};
+use crate::transport::reveal::{
+    build_cdp_reveal_eval_js, is_indexable_json_mime, BrowserCaptureMetadata, CapturedDataset,
+    RevealPolicy, RevealedPanelSnapshot, MAX_RAW_CAPTURED_DATASETS, MAX_REVEALED_PANEL_HTML_BYTES,
+    MAX_TOTAL_REVEAL_META_BYTES,
+};
+use crate::transport::DiagnosticHeaders;
 
 pub const MAX_HTML_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_UNSOLICITED_EVENTS: usize = 16_384;
@@ -35,8 +45,6 @@ const PAGE_STATE_MAX_WAIT: Duration = Duration::from_millis(1000);
 const PAGE_STATE_FALLBACK_SETTLE: Duration = Duration::from_millis(250);
 const CDP_ERR_METHOD_NOT_FOUND: i64 = -32601;
 const CDP_ERR_SERVER_ERROR: i64 = -32000;
-
-use crate::transport::reveal::{BrowserCaptureMetadata, RevealPolicy};
 
 #[derive(Debug, Clone, Default)]
 pub struct CdpRenderOptions {
@@ -272,7 +280,10 @@ impl CdpRenderer {
 
         let deadline = Instant::now() + timeout;
         let is_page_endpoint = cdp_url.path().starts_with("/devtools/page/");
-        let ws_url = prepare_cdp_ws_url(&cdp_url, options.capture_axtree, is_page_endpoint);
+        let needs_layout = options.capture_axtree
+            || options.reveal != RevealPolicy::None
+            || options.scroll_steps > 0;
+        let ws_url = prepare_cdp_ws_url(&cdp_url, needs_layout, is_page_endpoint);
 
         let (ws_stream, peer_ip, port) = self
             .connect_cdp_ws(&ws_url, Some(&target_url), url, deadline)
@@ -440,15 +451,28 @@ fn is_loopback_ip(ip: IpAddr) -> bool {
     }
 }
 
-fn prepare_cdp_ws_url(cdp_url: &Url, capture_axtree: bool, is_page_endpoint: bool) -> Url {
+fn prepare_cdp_ws_url(cdp_url: &Url, needs_layout: bool, is_page_endpoint: bool) -> Url {
     let mut ws_url = cdp_url.clone();
-    if !capture_axtree && !is_page_endpoint {
+    if !needs_layout && !is_page_endpoint {
         let has_layout = ws_url.query_pairs().any(|(k, _)| k == "layout");
         if !has_layout {
             ws_url.query_pairs_mut().append_pair("layout", "off");
         }
     }
     ws_url
+}
+
+fn origin_and_path_changed(before: &str, after: &str) -> bool {
+    let Ok(b) = Url::parse(before) else {
+        return before != after;
+    };
+    let Ok(a) = Url::parse(after) else {
+        return true;
+    };
+    b.scheme() != a.scheme()
+        || b.host_str() != a.host_str()
+        || b.port_or_known_default() != a.port_or_known_default()
+        || b.path() != a.path()
 }
 
 fn resolve_cdp_access_headers(state_dir: &Path, cdp_url: &Url) -> Result<Option<(String, String)>> {
@@ -859,6 +883,8 @@ struct SessionEventState {
     terminal_error: Option<TransportError>,
     cdp_tools: Vec<WebMcpToolDescriptor>,
     blocked_interception_ids: HashSet<String>,
+    xhr_get_requests: HashSet<String>,
+    captured_datasets: Vec<CapturedDataset>,
 }
 
 #[derive(Serialize)]
@@ -987,6 +1013,40 @@ struct OuterHtmlReply {
 }
 
 #[derive(Deserialize)]
+struct RuntimeEvaluateReply {
+    result: RuntimeRemoteObject,
+    #[serde(rename = "exceptionDetails")]
+    exception_details: Option<RuntimeExceptionDetails>,
+}
+
+#[derive(Deserialize)]
+struct RuntimeRemoteObject {
+    value: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct RuntimeExceptionDetails {
+    #[serde(default)]
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct RevealScriptOutcome {
+    #[serde(default)]
+    revealed_panels: Vec<RevealedPanelSnapshot>,
+    #[serde(default)]
+    reveal_capped: bool,
+    #[serde(default)]
+    scroll_steps_performed: usize,
+    #[serde(default)]
+    navigated: bool,
+    #[serde(default)]
+    challenge_detected: bool,
+    #[serde(default)]
+    warning: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct FetchRequestPausedParams {
     #[serde(rename = "requestId")]
     request_id: String,
@@ -1018,6 +1078,8 @@ struct RequestWillBeSentParams {
 #[derive(Deserialize)]
 struct RequestInfo {
     url: String,
+    #[serde(default)]
+    method: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1044,6 +1106,8 @@ struct NetworkResponsePayload {
     headers: HashMap<String, String>,
     #[serde(rename = "mimeType", default)]
     mime_type: String,
+    #[serde(rename = "encodedDataLength", default)]
+    encoded_data_length: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -1501,6 +1565,19 @@ impl CdpSession {
                 let Some(params) = parse_event_params::<RequestWillBeSentParams>(raw) else {
                     return Ok(());
                 };
+                if params
+                    .resource_type
+                    .as_deref()
+                    .is_some_and(|rt| rt == "XHR" || rt == "Fetch")
+                    && params
+                        .request
+                        .method
+                        .as_deref()
+                        .unwrap_or("GET")
+                        .eq_ignore_ascii_case("GET")
+                {
+                    self.state.xhr_get_requests.insert(params.request_id.clone());
+                }
                 let matches_main = self.state.main_frame_id.as_deref().is_some_and(|mf| {
                     params.frame_id.as_deref() == Some(mf)
                         && params.resource_type.as_deref() == Some("Document")
@@ -1527,6 +1604,7 @@ impl CdpSession {
                 let Some(params) = parse_event_params::<ResponseReceivedParams>(raw) else {
                     return Ok(());
                 };
+                let is_xhr_get = self.state.xhr_get_requests.remove(&params.request_id);
                 let matches_main = self.state.main_frame_id.as_deref().is_some_and(|mf| {
                     params.frame_id.as_deref() == Some(mf)
                         && params.resource_type.as_deref() == Some("Document")
@@ -1534,6 +1612,38 @@ impl CdpSession {
                     == Some(params.request_id.as_str())
                     && params.resource_type.as_deref() == Some("Document"));
                 if !matches_main {
+                    if is_xhr_get
+                        && (200..300).contains(&params.response.status)
+                        && self.state.captured_datasets.len() < MAX_RAW_CAPTURED_DATASETS
+                    {
+                        let mime_type =
+                            header_case_insensitive(&params.response.headers, "content-type")
+                                .filter(|s| !s.is_empty())
+                                .or_else(|| {
+                                    (!params.response.mime_type.trim().is_empty())
+                                        .then(|| params.response.mime_type.trim().to_string())
+                                });
+                        if mime_type
+                            .as_deref()
+                            .is_some_and(is_indexable_json_mime)
+                        {
+                            let byte_count =
+                                header_case_insensitive(&params.response.headers, "content-length")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                                    .or_else(|| {
+                                        params
+                                            .response
+                                            .encoded_data_length
+                                            .filter(|v| *v > 0.0 && v.is_finite())
+                                            .map(|v| v as usize)
+                                    });
+                            self.state.captured_datasets.push(CapturedDataset {
+                                url: params.response.url,
+                                mime_type,
+                                byte_count,
+                            });
+                        }
+                    }
                     return Ok(());
                 }
 
@@ -1609,6 +1719,7 @@ impl CdpSession {
                 let Some(params) = parse_event_params::<LoadingFailedParams>(raw) else {
                     return Ok(());
                 };
+                self.state.xhr_get_requests.remove(&params.request_id);
                 if self.state.main_request_id.as_deref() == Some(params.request_id.as_str())
                     && self.state.terminal_error.is_none()
                 {
@@ -1654,6 +1765,9 @@ impl CdpSession {
     }
 
     async fn execute(&mut self, options: &CdpRenderOptions) -> Result<CdpRenderResult> {
+        let needs_layout = options.capture_axtree
+            || options.reveal != RevealPolicy::None
+            || options.scroll_steps > 0;
         if !self.is_page_endpoint {
             let created: CreateTargetReply = self
                 .call_required(
@@ -1676,7 +1790,7 @@ impl CdpSession {
                 )
                 .await?;
             self.session_id = Some(attached.session_id);
-        } else if !options.capture_axtree {
+        } else if !needs_layout {
             let _ = self
                 .call_best_effort(
                     "Kitesurf.setLayoutMode",
@@ -1767,7 +1881,7 @@ impl CdpSession {
 
         self.settle_page().await?;
 
-        let outer_html = self.read_outer_html().await?;
+        let mut outer_html = self.read_outer_html().await?;
         let max_bytes = if options.max_response_bytes > 0 {
             options.max_response_bytes
         } else {
@@ -1778,6 +1892,154 @@ impl CdpSession {
                 limit_bytes: max_bytes,
             }));
         }
+
+        let mut capture_meta = BrowserCaptureMetadata::default();
+        let needs_reveal_or_scroll =
+            options.reveal != RevealPolicy::None || options.scroll_steps > 0;
+        if needs_reveal_or_scroll {
+            let pre_state_final_url = self.state.final_url.clone();
+            let pre_url = pre_state_final_url
+                .as_deref()
+                .unwrap_or_else(|| self.initial_target_url.as_str())
+                .to_string();
+            let pre_status = if self.state.status_code == 0 {
+                200
+            } else {
+                self.state.status_code
+            };
+            let pre_is_html = self
+                .state
+                .content_type
+                .as_deref()
+                .is_none_or(|c| is_html_content_type(Some(c)));
+            let mut pre_parsed = None;
+            let empty_headers = DiagnosticHeaders::default();
+            let pre_class = classify_response_with_headers(
+                pre_status,
+                pre_is_html,
+                Some(self.initial_target_url.as_str()),
+                Some(&pre_url),
+                &outer_html,
+                &empty_headers,
+                &mut pre_parsed,
+            );
+            let skip_for_gate = detect_interstitial_challenge(&outer_html).is_some()
+                || matches!(
+                    pre_class,
+                    ResponseClassification::Challenge { .. }
+                        | ResponseClassification::Blocked { .. }
+                );
+            if !skip_for_gate {
+                let remaining_ms = self
+                    .deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis() as u64;
+                let eval_js = build_cdp_reveal_eval_js(
+                    options.reveal,
+                    options.scroll_steps,
+                    remaining_ms.clamp(200, 15_000),
+                );
+                let reply = self
+                    .call_typed::<_, RuntimeEvaluateReply>(
+                        "Runtime.evaluate",
+                        serde_json::json!({
+                            "expression": eval_js,
+                            "returnByValue": true,
+                            "awaitPromise": true
+                        }),
+                        true,
+                    )
+                    .await?;
+                match reply {
+                    RpcCallOutcome::Ok(eval_ok) => {
+                        if let Some(ex) = eval_ok.exception_details {
+                            capture_meta.reveal_warning =
+                                Some(format!("reveal script exception: {}", ex.text));
+                        } else if let Some(val) = eval_ok.result.value {
+                            match serde_json::from_value::<RevealScriptOutcome>(val) {
+                                Ok(outcome) => {
+                                    let event_navigated = self
+                                        .state
+                                        .final_url
+                                        .as_deref()
+                                        .is_some_and(|u| origin_and_path_changed(&pre_url, u));
+                                    if outcome.navigated || event_navigated {
+                                        self.state.final_url = pre_state_final_url;
+                                        capture_meta.reveal_warning =
+                                            Some(outcome.warning.unwrap_or_else(|| {
+                                                "aborted --reveal because a control triggered page navigation".to_string()
+                                            }));
+                                    } else if outcome.challenge_detected {
+                                        capture_meta.scroll_steps_performed =
+                                            outcome.scroll_steps_performed;
+                                        capture_meta.reveal_warning = outcome.warning;
+                                        let post_html = self.read_outer_html().await?;
+                                        if post_html.len() > max_bytes {
+                                            return Err(anyhow::Error::new(
+                                                ResponseTooLargeError {
+                                                    limit_bytes: max_bytes,
+                                                },
+                                            ));
+                                        }
+                                        outer_html = post_html;
+                                    } else {
+                                        let mut total_meta_bytes = 0usize;
+                                        for mut snap in outcome.revealed_panels {
+                                            if snap.html.len() > MAX_REVEALED_PANEL_HTML_BYTES {
+                                                snap.html.truncate(snap.html.floor_char_boundary(
+                                                    MAX_REVEALED_PANEL_HTML_BYTES,
+                                                ));
+                                                capture_meta.reveal_capped = true;
+                                            }
+                                            let next_total =
+                                                total_meta_bytes.saturating_add(snap.html.len());
+                                            if next_total > MAX_TOTAL_REVEAL_META_BYTES {
+                                                capture_meta.reveal_capped = true;
+                                                break;
+                                            }
+                                            total_meta_bytes = next_total;
+                                            capture_meta.revealed_panels.push(snap);
+                                        }
+                                        capture_meta.reveal_capped |= outcome.reveal_capped;
+                                        capture_meta.scroll_steps_performed =
+                                            outcome.scroll_steps_performed;
+                                        capture_meta.reveal_warning = outcome.warning;
+                                        let post_html = self.read_outer_html().await?;
+                                        if post_html.len() > max_bytes {
+                                            return Err(anyhow::Error::new(
+                                                ResponseTooLargeError {
+                                                    limit_bytes: max_bytes,
+                                                },
+                                            ));
+                                        }
+                                        outer_html = post_html;
+                                    }
+                                }
+                                Err(err) => {
+                                    capture_meta.reveal_warning = Some(format!(
+                                        "invalid reveal script payload: {err}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    RpcCallOutcome::RpcErr(err) => {
+                        if err.code == CDP_ERR_METHOD_NOT_FOUND {
+                            return Err(rpc_failure_err(
+                                "CDP Runtime.evaluate",
+                                &err,
+                                TransportErrorKind::ProtocolMismatch,
+                            ));
+                        }
+                        capture_meta.reveal_warning = Some(format!(
+                            "Runtime.evaluate failed ({}): {}",
+                            err.code, err.message
+                        ));
+                    }
+                }
+            }
+        }
+        capture_meta.datasets = std::mem::take(&mut self.state.captured_datasets);
 
         let axtree_text = if options.capture_axtree {
             Some(self.read_axtree(max_bytes).await?)
@@ -1806,7 +2068,7 @@ impl CdpSession {
             link_header: self.state.link_header.clone(),
             axtree_text,
             imperative_tools,
-            capture_meta: BrowserCaptureMetadata::default(),
+            capture_meta,
         })
     }
 
