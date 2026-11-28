@@ -1272,7 +1272,11 @@ async fn mcp_fetch_supports_expand_no_navigate_optional_url_and_ui_gated_headers
                         }
                     };
                     let reply = json!({ "id": id, "result": result });
-                    if ws.send(Message::Text(reply.to_string().into())).await.is_err() {
+                    if ws
+                        .send(Message::Text(reply.to_string().into()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -1380,7 +1384,9 @@ async fn mcp_fetch_supports_expand_no_navigate_optional_url_and_ui_gated_headers
         let (c_out, s_in) = tokio::io::duplex(16 * 1024);
         let (s_out, c_in) = tokio::io::duplex(16 * 1024);
         let t = tokio::spawn(async move {
-            serve_io(bad_ctx, BufReader::new(s_in), s_out).await.unwrap();
+            serve_io(bad_ctx, BufReader::new(s_in), s_out)
+                .await
+                .unwrap();
         });
         let mut bw = c_out;
         let mut br = BufReader::new(c_in);
@@ -1426,8 +1432,14 @@ async fn mcp_fetch_supports_expand_no_navigate_optional_url_and_ui_gated_headers
     )
     .await;
     assert_eq!(attach_none["result"]["isError"], false);
-    let attach_text = attach_none["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(attach_text.contains("UI-Gated: 1 tab in DOM (pass --expand tabs) | untrusted labels: \"Rust\""), "text={attach_text}");
+    let attach_text = attach_none["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(
+        attach_text
+            .contains("UI-Gated: 1 tab in DOM (pass --expand tabs) | untrusted labels: \"Rust\""),
+        "text={attach_text}"
+    );
     assert!(attach_text.contains("npm install sdk"));
     assert!(!attach_text.contains("cargo add sdk"));
     assert!(!attach_text.contains("LEAK_MCP_HIDDEN"));
@@ -1447,7 +1459,9 @@ async fn mcp_fetch_supports_expand_no_navigate_optional_url_and_ui_gated_headers
         }),
     )
     .await;
-    let tabs_text = attach_tabs["result"]["content"][0]["text"].as_str().unwrap();
+    let tabs_text = attach_tabs["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
     assert!(tabs_text.contains("## Tab: Rust"), "tabs={tabs_text}");
     assert!(tabs_text.contains("cargo add sdk"));
     assert!(!tabs_text.contains("LEAK_MCP_HIDDEN"));
@@ -1467,8 +1481,14 @@ async fn mcp_fetch_supports_expand_no_navigate_optional_url_and_ui_gated_headers
         }),
     )
     .await;
-    let meta_text = attach_meta["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(meta_text.contains("UI-Gated: 1 tab in DOM (pass --expand tabs) | untrusted labels: \"Rust\""), "meta={meta_text}");
+    let meta_text = attach_meta["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(
+        meta_text
+            .contains("UI-Gated: 1 tab in DOM (pass --expand tabs) | untrusted labels: \"Rust\""),
+        "meta={meta_text}"
+    );
     assert!(!meta_text.contains("npm install sdk"));
     assert!(!meta_text.contains("cargo add sdk"));
     assert!(!meta_text.contains("LEAK_MCP_HIDDEN"));

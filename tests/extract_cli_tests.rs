@@ -93,10 +93,14 @@ fn extract_stdin_file_expand_section_offset_and_zero_home_touch() {
     assert_eq!(stdin_none.status.code(), Some(0));
     let out_none = String::from_utf8_lossy(&stdin_none.stdout);
     let err_none = String::from_utf8_lossy(&stdin_none.stderr);
-    assert!(out_none.contains("Run npm install sdk."), "stdout={out_none}");
+    assert!(
+        out_none.contains("Run npm install sdk."),
+        "stdout={out_none}"
+    );
     assert!(!out_none.contains("cargo add sdk"), "stdout={out_none}");
     assert!(
-        err_none.contains("UI-Gated: 1 tab in DOM (pass --expand tabs) | untrusted labels: \"Rust\""),
+        err_none
+            .contains("UI-Gated: 1 tab in DOM (pass --expand tabs) | untrusted labels: \"Rust\""),
         "stderr={err_none}"
     );
     assert!(!dir.path().join("daemon.sock").exists());
@@ -120,9 +124,18 @@ fn extract_stdin_file_expand_section_offset_and_zero_home_touch() {
     assert_eq!(sec_full.status.code(), Some(0));
     let full_json: serde_json::Value = serde_json::from_slice(&sec_full.stdout).unwrap();
     let full_content = full_json["content"].as_str().unwrap();
-    assert!(full_content.contains("### Tab: Rust"), "content={full_content}");
-    assert!(full_content.contains("cargo add sdk"), "content={full_content}");
-    assert!(!full_content.contains("npm install"), "content={full_content}");
+    assert!(
+        full_content.contains("### Tab: Rust"),
+        "content={full_content}"
+    );
+    assert!(
+        full_content.contains("cargo add sdk"),
+        "content={full_content}"
+    );
+    assert!(
+        !full_content.contains("npm install"),
+        "content={full_content}"
+    );
     assert!(full_json.get("ui_gates").is_none());
 
     let sec_head = pleb_extract_cmd(unwritable_home)
@@ -236,9 +249,15 @@ fn extract_manifests_paginate_and_atomic_output_preserves_existing_file_on_error
             break;
         }
     }
-    assert!(combined.contains("## Linked Resources"), "combined={combined}");
+    assert!(
+        combined.contains("## Linked Resources"),
+        "combined={combined}"
+    );
     assert!(combined.contains("/diagram.png"), "combined={combined}");
-    assert!(combined.contains("## Page Tools (WebMCP)"), "combined={combined}");
+    assert!(
+        combined.contains("## Page Tools (WebMCP)"),
+        "combined={combined}"
+    );
     assert!(combined.contains("search_docs"), "combined={combined}");
 
     // 2. `--json -o <path>` writes valid JSON to `-o` with empty stdout.
@@ -419,12 +438,7 @@ fn extract_flag_rejections_input_limits_binary_guard_and_utf16_success() {
             "invalid_input",
         ),
         (
-            vec![
-                "--json",
-                "extract",
-                "--url",
-                "ftp://docs.example.com/file",
-            ],
+            vec!["--json", "extract", "--url", "ftp://docs.example.com/file"],
             "invalid_url",
         ),
     ] {
@@ -475,8 +489,14 @@ fn extract_flag_rejections_input_limits_binary_guard_and_utf16_success() {
     // 3. Binary guard exit 5 with empty stdout and no `-o` file created.
     for (ct, payload) in [
         (None, b"%PDF-1.7\n%binary\n".as_slice()),
-        (Some("text/html"), b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR".as_slice()),
-        (Some("text/html; charset=utf-8"), b"abc\x00def\x00ghi".as_slice()),
+        (
+            Some("text/html"),
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR".as_slice(),
+        ),
+        (
+            Some("text/html; charset=utf-8"),
+            b"abc\x00def\x00ghi".as_slice(),
+        ),
     ] {
         let mut args = vec![
             "--json",

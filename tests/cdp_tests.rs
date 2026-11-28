@@ -1415,7 +1415,9 @@ async fn passive_attach_enforces_outbound_rpc_allowlist_and_ignores_fetch_pause_
         .iter()
         .map(|r| r.method.clone())
         .collect();
-    assert!(!drop_methods.iter().any(|m| m.starts_with("Target.") || m.starts_with("Fetch.") || m == "Browser.close"));
+    assert!(!drop_methods
+        .iter()
+        .any(|m| m.starts_with("Target.") || m.starts_with("Fetch.") || m == "Browser.close"));
 }
 
 #[tokio::test]
@@ -1425,48 +1427,55 @@ async fn passive_attach_aborts_on_all_three_toctou_document_swaps() {
     // Case A: `Page.frameNavigated` arrives during `--wait-for-selector` polling.
     let selector_polls = Arc::new(AtomicU64::new(0));
     let polls_a = Arc::clone(&selector_polls);
-    let handler_a: RpcHandler = Arc::new(move |id, method, session_id, _params, _log| match method {
-        "Page.enable" | "DOM.enable" | "WebMCP.enable" => vec![rpc_ok(id, session_id, json!({}))],
-        "Page.getFrameTree" => vec![rpc_ok(
-            id,
-            session_id,
-            json!({
-                "frameTree": {
-                    "frame": {
-                        "id": "main-a",
-                        "loaderId": "ldr-a1",
-                        "url": "https://portal.example.com/step1",
-                        "securityOrigin": "https://portal.example.com"
-                    }
-                }
-            }),
-        )],
-        "DOM.getDocument" => vec![rpc_ok(id, session_id, json!({ "root": { "nodeId": 1 } }))],
-        "DOM.getOuterHTML" => {
-            vec![rpc_ok(id, session_id, json!({ "outerHTML": "<html><body>Initial</body></html>" }))]
-        }
-        "DOM.querySelector" => {
-            if polls_a.fetch_add(1, Ordering::Relaxed) == 0 {
-                vec![
-                    rpc_event(
-                        session_id.as_deref(),
-                        "Page.frameNavigated",
-                        json!({
-                            "frame": {
-                                "id": "main-a",
-                                "loaderId": "ldr-a2",
-                                "url": "https://portal.example.com/step2"
-                            }
-                        }),
-                    ),
-                    rpc_ok(id, session_id, json!({ "nodeId": 0 })),
-                ]
-            } else {
-                vec![rpc_ok(id, session_id, json!({ "nodeId": 22 }))]
+    let handler_a: RpcHandler =
+        Arc::new(move |id, method, session_id, _params, _log| match method {
+            "Page.enable" | "DOM.enable" | "WebMCP.enable" => {
+                vec![rpc_ok(id, session_id, json!({}))]
             }
-        }
-        _ => vec![rpc_err(id, session_id, -32601, "Method not found")],
-    });
+            "Page.getFrameTree" => vec![rpc_ok(
+                id,
+                session_id,
+                json!({
+                    "frameTree": {
+                        "frame": {
+                            "id": "main-a",
+                            "loaderId": "ldr-a1",
+                            "url": "https://portal.example.com/step1",
+                            "securityOrigin": "https://portal.example.com"
+                        }
+                    }
+                }),
+            )],
+            "DOM.getDocument" => vec![rpc_ok(id, session_id, json!({ "root": { "nodeId": 1 } }))],
+            "DOM.getOuterHTML" => {
+                vec![rpc_ok(
+                    id,
+                    session_id,
+                    json!({ "outerHTML": "<html><body>Initial</body></html>" }),
+                )]
+            }
+            "DOM.querySelector" => {
+                if polls_a.fetch_add(1, Ordering::Relaxed) == 0 {
+                    vec![
+                        rpc_event(
+                            session_id.as_deref(),
+                            "Page.frameNavigated",
+                            json!({
+                                "frame": {
+                                    "id": "main-a",
+                                    "loaderId": "ldr-a2",
+                                    "url": "https://portal.example.com/step2"
+                                }
+                            }),
+                        ),
+                        rpc_ok(id, session_id, json!({ "nodeId": 0 })),
+                    ]
+                } else {
+                    vec![rpc_ok(id, session_id, json!({ "nodeId": 22 }))]
+                }
+            }
+            _ => vec![rpc_err(id, session_id, -32601, "Method not found")],
+        });
     let (ws_a, _p, _l) = spawn_mock_cdp_server(handler_a).await;
     let err_a = CdpRenderer::new(
         format!("{ws_a}/devtools/page/a"),
@@ -1483,46 +1492,57 @@ async fn passive_attach_aborts_on_all_three_toctou_document_swaps() {
     )
     .await
     .unwrap_err();
-    assert_eq!(transport_error_kind(&err_a), Some(TransportErrorKind::LoadError));
+    assert_eq!(
+        transport_error_kind(&err_a),
+        Some(TransportErrorKind::LoadError)
+    );
 
     // Case B: `loaderId` swaps between `DOM.getOuterHTML` and `Accessibility.getFullAXTree`.
     let tree_calls_b = Arc::new(AtomicU64::new(0));
     let tree_b = Arc::clone(&tree_calls_b);
-    let handler_b: RpcHandler = Arc::new(move |id, method, session_id, _params, _log| match method {
-        "Page.enable" | "DOM.enable" | "WebMCP.enable" => vec![rpc_ok(id, session_id, json!({}))],
-        "Page.getFrameTree" => {
-            let n = tree_b.fetch_add(1, Ordering::Relaxed);
-            let loader = if n < 2 { "ldr-b1" } else { "ldr-b2" };
-            vec![rpc_ok(
+    let handler_b: RpcHandler = Arc::new(
+        move |id, method, session_id, _params, _log| match method {
+            "Page.enable" | "DOM.enable" | "WebMCP.enable" => {
+                vec![rpc_ok(id, session_id, json!({}))]
+            }
+            "Page.getFrameTree" => {
+                let n = tree_b.fetch_add(1, Ordering::Relaxed);
+                let loader = if n < 2 { "ldr-b1" } else { "ldr-b2" };
+                vec![rpc_ok(
+                    id,
+                    session_id,
+                    json!({
+                        "frameTree": {
+                            "frame": {
+                                "id": "main-b",
+                                "loaderId": loader,
+                                "url": "https://portal.example.com/doc",
+                                "securityOrigin": "https://portal.example.com"
+                            }
+                        }
+                    }),
+                )]
+            }
+            "DOM.getDocument" => vec![rpc_ok(id, session_id, json!({ "root": { "nodeId": 1 } }))],
+            "DOM.getOuterHTML" => {
+                vec![rpc_ok(
+                    id,
+                    session_id,
+                    json!({ "outerHTML": "<html><body>Snap B</body></html>" }),
+                )]
+            }
+            "Accessibility.getFullAXTree" => vec![rpc_ok(
                 id,
                 session_id,
                 json!({
-                    "frameTree": {
-                        "frame": {
-                            "id": "main-b",
-                            "loaderId": loader,
-                            "url": "https://portal.example.com/doc",
-                            "securityOrigin": "https://portal.example.com"
-                        }
-                    }
+                    "nodes": [
+                        { "nodeId": "1", "role": { "value": "RootWebArea" }, "name": { "value": "Doc" }, "childIds": [] }
+                    ]
                 }),
-            )]
-        }
-        "DOM.getDocument" => vec![rpc_ok(id, session_id, json!({ "root": { "nodeId": 1 } }))],
-        "DOM.getOuterHTML" => {
-            vec![rpc_ok(id, session_id, json!({ "outerHTML": "<html><body>Snap B</body></html>" }))]
-        }
-        "Accessibility.getFullAXTree" => vec![rpc_ok(
-            id,
-            session_id,
-            json!({
-                "nodes": [
-                    { "nodeId": "1", "role": { "value": "RootWebArea" }, "name": { "value": "Doc" }, "childIds": [] }
-                ]
-            }),
-        )],
-        _ => vec![rpc_err(id, session_id, -32601, "Method not found")],
-    });
+            )],
+            _ => vec![rpc_err(id, session_id, -32601, "Method not found")],
+        },
+    );
     let (ws_b, _p, _l) = spawn_mock_cdp_server(handler_b).await;
     let err_b = CdpRenderer::new(
         format!("{ws_b}/devtools/page/b"),
@@ -1539,37 +1559,51 @@ async fn passive_attach_aborts_on_all_three_toctou_document_swaps() {
     )
     .await
     .unwrap_err();
-    assert_eq!(transport_error_kind(&err_b), Some(TransportErrorKind::LoadError));
+    assert_eq!(
+        transport_error_kind(&err_b),
+        Some(TransportErrorKind::LoadError)
+    );
 
     // Case C: Tab navigates away and back to the exact same URL (new `loaderId`) before final `Page.getFrameTree`.
     let tree_calls_c = Arc::new(AtomicU64::new(0));
     let tree_c = Arc::clone(&tree_calls_c);
-    let handler_c: RpcHandler = Arc::new(move |id, method, session_id, _params, _log| match method {
-        "Page.enable" | "DOM.enable" | "WebMCP.enable" => vec![rpc_ok(id, session_id, json!({}))],
-        "Page.getFrameTree" => {
-            let n = tree_calls_c_step(&tree_c);
-            let loader = if n == 0 || n == 1 { "ldr-c1" } else { "ldr-c-reloaded" };
-            vec![rpc_ok(
-                id,
-                session_id,
-                json!({
-                    "frameTree": {
-                        "frame": {
-                            "id": "main-c",
-                            "loaderId": loader,
-                            "url": "https://portal.example.com/same",
-                            "securityOrigin": "https://portal.example.com"
+    let handler_c: RpcHandler =
+        Arc::new(move |id, method, session_id, _params, _log| match method {
+            "Page.enable" | "DOM.enable" | "WebMCP.enable" => {
+                vec![rpc_ok(id, session_id, json!({}))]
+            }
+            "Page.getFrameTree" => {
+                let n = tree_calls_c_step(&tree_c);
+                let loader = if n == 0 || n == 1 {
+                    "ldr-c1"
+                } else {
+                    "ldr-c-reloaded"
+                };
+                vec![rpc_ok(
+                    id,
+                    session_id,
+                    json!({
+                        "frameTree": {
+                            "frame": {
+                                "id": "main-c",
+                                "loaderId": loader,
+                                "url": "https://portal.example.com/same",
+                                "securityOrigin": "https://portal.example.com"
+                            }
                         }
-                    }
-                }),
-            )]
-        }
-        "DOM.getDocument" => vec![rpc_ok(id, session_id, json!({ "root": { "nodeId": 1 } }))],
-        "DOM.getOuterHTML" => {
-            vec![rpc_ok(id, session_id, json!({ "outerHTML": "<html><body>Round trip</body></html>" }))]
-        }
-        _ => vec![rpc_err(id, session_id, -32601, "Method not found")],
-    });
+                    }),
+                )]
+            }
+            "DOM.getDocument" => vec![rpc_ok(id, session_id, json!({ "root": { "nodeId": 1 } }))],
+            "DOM.getOuterHTML" => {
+                vec![rpc_ok(
+                    id,
+                    session_id,
+                    json!({ "outerHTML": "<html><body>Round trip</body></html>" }),
+                )]
+            }
+            _ => vec![rpc_err(id, session_id, -32601, "Method not found")],
+        });
     let (ws_c, _p, _l) = spawn_mock_cdp_server(handler_c).await;
     let err_c = CdpRenderer::new(
         format!("{ws_c}/devtools/page/c"),
@@ -1583,7 +1617,10 @@ async fn passive_attach_aborts_on_all_three_toctou_document_swaps() {
     )
     .await
     .unwrap_err();
-    assert_eq!(transport_error_kind(&err_c), Some(TransportErrorKind::LoadError));
+    assert_eq!(
+        transport_error_kind(&err_c),
+        Some(TransportErrorKind::LoadError)
+    );
 }
 
 fn tree_calls_c_step(counter: &Arc<AtomicU64>) -> u64 {
@@ -1647,11 +1684,19 @@ async fn passive_attach_guards_endpoints_frame_binding_axtree_size_and_child_web
         ],
         "Page.getFrameTree" => {
             let f = f_bg.lock().unwrap().clone();
-            vec![rpc_ok(id, session_id, json!({ "frameTree": { "frame": f } }))]
+            vec![rpc_ok(
+                id,
+                session_id,
+                json!({ "frameTree": { "frame": f } }),
+            )]
         }
         "DOM.getDocument" => vec![rpc_ok(id, session_id, json!({ "root": { "nodeId": 1 } }))],
         "DOM.getOuterHTML" => {
-            vec![rpc_ok(id, session_id, json!({ "outerHTML": "<html><body><main><p>Bound OK</p></main></body></html>" }))]
+            vec![rpc_ok(
+                id,
+                session_id,
+                json!({ "outerHTML": "<html><body><main><p>Bound OK</p></main></body></html>" }),
+            )]
         }
         "Accessibility.getFullAXTree" => {
             let nodes = ax_bg.lock().unwrap().clone();
@@ -1681,7 +1726,10 @@ async fn passive_attach_guards_endpoints_frame_binding_axtree_size_and_child_web
         .unwrap();
     assert_eq!(ok.imperative_tools.len(), 1);
     assert_eq!(ok.imperative_tools[0].name, "main_safe_tool");
-    assert!(ok.axtree_text.as_deref().is_some_and(|t| t.contains("RootWebArea")));
+    assert!(ok
+        .axtree_text
+        .as_deref()
+        .is_some_and(|t| t.contains("RootWebArea")));
     {
         let guard = log.lock().unwrap();
         let ax_rpc = guard
@@ -1725,7 +1773,10 @@ async fn passive_attach_guards_endpoints_frame_binding_axtree_size_and_child_web
         .render_attached(None, &CdpRenderOptions::default(), Duration::from_secs(5))
         .await
         .unwrap_err();
-    assert_eq!(transport_error_kind(&no_ldr), Some(TransportErrorKind::ProtocolMismatch));
+    assert_eq!(
+        transport_error_kind(&no_ldr),
+        Some(TransportErrorKind::ProtocolMismatch)
+    );
 
     // Non-empty unreachableUrl -> LoadError.
     *frame_override.lock().unwrap() = json!({
@@ -1738,7 +1789,10 @@ async fn passive_attach_guards_endpoints_frame_binding_axtree_size_and_child_web
         .render_attached(None, &CdpRenderOptions::default(), Duration::from_secs(5))
         .await
         .unwrap_err();
-    assert_eq!(transport_error_kind(&unreach), Some(TransportErrorKind::LoadError));
+    assert_eq!(
+        transport_error_kind(&unreach),
+        Some(TransportErrorKind::LoadError)
+    );
 
     // Non-HTTP URLs (`chrome://settings`, `about:blank`) rejected.
     for non_http in ["chrome://settings", "about:blank"] {
@@ -1773,7 +1827,10 @@ async fn passive_attach_guards_endpoints_frame_binding_axtree_size_and_child_web
         )
         .await
         .unwrap_err();
-    assert_eq!(transport_error_kind(&origin_err), Some(TransportErrorKind::RedirectBlocked));
+    assert_eq!(
+        transport_error_kind(&origin_err),
+        Some(TransportErrorKind::RedirectBlocked)
+    );
 
     // Opaque `"null"` securityOrigin -> RedirectBlocked.
     *frame_override.lock().unwrap() = json!({
@@ -1790,7 +1847,10 @@ async fn passive_attach_guards_endpoints_frame_binding_axtree_size_and_child_web
         )
         .await
         .unwrap_err();
-    assert_eq!(transport_error_kind(&opaque_err), Some(TransportErrorKind::RedirectBlocked));
+    assert_eq!(
+        transport_error_kind(&opaque_err),
+        Some(TransportErrorKind::RedirectBlocked)
+    );
 }
 
 #[tokio::test]
@@ -1885,7 +1945,10 @@ async fn passive_attach_classification_site_cache_isolation_and_cli_envelopes() 
     assert!(!ok.escalated);
     assert_eq!(ok.url, "https://portal.example.com/dashboard");
     assert_eq!(ok.ui_gates.len(), 1);
-    assert_eq!(std::fs::read(&site_cache_path).unwrap(), initial_cache_bytes);
+    assert_eq!(
+        std::fs::read(&site_cache_path).unwrap(),
+        initial_cache_bytes
+    );
 
     // 2. Challenge interstitial fails fast BEFORE any `--wait-for-selector` polling expires!
     *mode.lock().unwrap() = "cloudflare";
@@ -1903,13 +1966,19 @@ async fn passive_attach_classification_site_cache_isolation_and_cli_envelopes() 
     )
     .await
     .unwrap_err();
-    assert!(t0.elapsed() < Duration::from_secs(2), "challenge waited on selector timeout");
+    assert!(
+        t0.elapsed() < Duration::from_secs(2),
+        "challenge waited on selector timeout"
+    );
     assert_eq!(query_calls.load(Ordering::Relaxed), 0);
     assert!(
         matches!(ch_err, FetchError::Challenge { status: 0, .. }),
         "expected Challenge(status=0), got {ch_err:?}"
     );
-    assert_eq!(std::fs::read(&site_cache_path).unwrap(), initial_cache_bytes);
+    assert_eq!(
+        std::fs::read(&site_cache_path).unwrap(),
+        initial_cache_bytes
+    );
 
     // 3. Login wall classifies cleanly as LoginWall without touching site-cache.
     *mode.lock().unwrap() = "login";
@@ -1934,7 +2003,10 @@ async fn passive_attach_classification_site_cache_isolation_and_cli_envelopes() 
         ),
         "expected Blocked LoginWall, got {login_err:?}"
     );
-    assert_eq!(std::fs::read(&site_cache_path).unwrap(), initial_cache_bytes);
+    assert_eq!(
+        std::fs::read(&site_cache_path).unwrap(),
+        initial_cache_bytes
+    );
 
     // 4. Selector timeout and origin mismatch both leave site-cache untouched.
     *mode.lock().unwrap() = "ok";
@@ -1966,9 +2038,18 @@ async fn passive_attach_classification_site_cache_isolation_and_cli_envelopes() 
     )
     .await
     .unwrap_err();
-    assert!(matches!(timeout_err, FetchError::Timeout { .. }), "got {timeout_err:?}");
-    assert_eq!(std::fs::read(&timeout_cache_path).unwrap(), initial_cache_bytes);
-    assert_eq!(std::fs::read(&site_cache_path).unwrap(), initial_cache_bytes);
+    assert!(
+        matches!(timeout_err, FetchError::Timeout { .. }),
+        "got {timeout_err:?}"
+    );
+    assert_eq!(
+        std::fs::read(&timeout_cache_path).unwrap(),
+        initial_cache_bytes
+    );
+    assert_eq!(
+        std::fs::read(&site_cache_path).unwrap(),
+        initial_cache_bytes
+    );
 
     *frame_url.lock().unwrap() = "https://other.example.com/dashboard";
     let mismatch = fetch_target(
@@ -1980,8 +2061,14 @@ async fn passive_attach_classification_site_cache_isolation_and_cli_envelopes() 
     )
     .await
     .unwrap_err();
-    assert!(matches!(mismatch, FetchError::Transport(_)), "got {mismatch:?}");
-    assert_eq!(std::fs::read(&site_cache_path).unwrap(), initial_cache_bytes);
+    assert!(
+        matches!(mismatch, FetchError::Transport(_)),
+        "got {mismatch:?}"
+    );
+    assert_eq!(
+        std::fs::read(&site_cache_path).unwrap(),
+        initial_cache_bytes
+    );
 
     // 5. CLI integration: single-item `--json`, `--jsonl`, `--metadata-only`, and invalid flag rejections.
     *frame_url.lock().unwrap() = "https://portal.example.com/dashboard";
@@ -2131,4 +2218,3 @@ async fn passive_attach_classification_site_cache_isolation_and_cli_envelopes() 
     }
     let _ = ResourcePolicy::Manifest;
 }
-
