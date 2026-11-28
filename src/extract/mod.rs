@@ -402,10 +402,7 @@ pub fn merge_revealed_panels(
         expand: ExpandPolicy::None,
         include_images: extract_opts.include_images,
         include_links: extract_opts.include_links,
-        max_bytes: None,
-        focus: None,
-        section: None,
-        offset: 0,
+        ..ExtractOptions::default()
     };
 
     let norm_ws = |s: &str| -> String { s.split_whitespace().collect::<Vec<_>>().join(" ") };
@@ -420,9 +417,11 @@ pub fn merge_revealed_panels(
         let Some(clean_label) = ui_gates::sanitize_cue_label_pub(&snap.label) else {
             continue;
         };
-        let gate_kind = match snap.kind {
-            crate::transport::RevealedPanelKind::Tab => UiGateKind::Tablist,
-            crate::transport::RevealedPanelKind::Disclosure => UiGateKind::Disclosure,
+        let (gate_kind, kind_prefix) = match snap.kind {
+            crate::transport::RevealedPanelKind::Tab => (UiGateKind::Tablist, "Tab"),
+            crate::transport::RevealedPanelKind::Disclosure => {
+                (UiGateKind::Disclosure, "Disclosure")
+            }
         };
         revealed_gate_labels.push((gate_kind, clean_label.clone()));
 
@@ -456,10 +455,6 @@ pub fn merge_revealed_panels(
             continue;
         }
 
-        let kind_prefix = match snap.kind {
-            crate::transport::RevealedPanelKind::Tab => "Tab",
-            crate::transport::RevealedPanelKind::Disclosure => "Disclosure",
-        };
         let heading = format!("{kind_prefix}: {clean_label}");
         let level = usize::from(snap.heading_level.clamp(2, 6));
         match format {

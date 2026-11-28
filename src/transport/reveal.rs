@@ -201,19 +201,27 @@ fn is_noise_dataset_url(url: &Url) -> bool {
     let Some(segments) = url.path_segments() else {
         return false;
     };
-    let lower_segments: Vec<String> = segments
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_ascii_lowercase())
-        .collect();
-    if lower_segments
-        .last()
-        .is_some_and(|last| NOISE_DATASET_FILENAMES.contains(&last.as_str()))
-    {
+    let mut non_empty = segments.filter(|s| !s.is_empty());
+    let mut last = "";
+    if non_empty.any(|seg| {
+        last = seg;
+        NOISE_DATASET_SEGMENTS
+            .iter()
+            .any(|p| seg.eq_ignore_ascii_case(p))
+    }) {
         return true;
     }
-    lower_segments
+    NOISE_DATASET_FILENAMES
         .iter()
-        .any(|seg| NOISE_DATASET_SEGMENTS.contains(&seg.as_str()))
+        .any(|f| last.eq_ignore_ascii_case(f))
+}
+
+fn url_origin_key(url: &Url) -> Option<(String, String, Option<u16>)> {
+    Some((
+        url.scheme().to_ascii_lowercase(),
+        canonical_url_host(url)?,
+        url.port_or_known_default(),
+    ))
 }
 
 /// Filter passively captured XHR/Fetch JSON responses into `ResourceKind::Dataset` entries.
@@ -222,14 +230,9 @@ pub fn filter_and_index_xhr_datasets(
     captured: &[CapturedDataset],
     resources: &mut Vec<ResourceDescriptor>,
 ) {
-    let Some(page_host) = canonical_url_host(page_url) else {
+    let Some(page_origin) = url_origin_key(page_url) else {
         return;
     };
-    let page_origin = (
-        page_url.scheme().to_ascii_lowercase(),
-        page_host,
-        page_url.port_or_known_default(),
-    );
 
     let mut seen_ids: HashSet<String> = resources.iter().map(|r| r.identifier.clone()).collect();
     let mut added = 0usize;
@@ -241,30 +244,21 @@ pub fn filter_and_index_xhr_datasets(
         if item.byte_count.is_some_and(|b| b <= 2) {
             continue;
         }
-        let mime_clean = item.mime_type.as_deref().and_then(|m| {
+        let Some(mime_hint) = item.mime_type.as_deref().and_then(|m| {
             let b = m.split(';').next()?.trim().to_ascii_lowercase();
             is_indexable_json_mime(&b).then_some(b)
-        });
-        let Some(mime_hint) = mime_clean else {
+        }) else {
             continue;
         };
 
         let Ok(raw_parsed) = Url::parse(item.url.trim()) else {
             continue;
         };
-        if has_sensitive_query_param(&raw_parsed) || !is_safe_subresource_url(page_url, &raw_parsed)
+        if has_sensitive_query_param(&raw_parsed)
+            || !is_safe_subresource_url(page_url, &raw_parsed)
+            || url_origin_key(&raw_parsed).as_ref() != Some(&page_origin)
+            || is_noise_dataset_url(&raw_parsed)
         {
-            continue;
-        }
-        let Some(cand_host) = canonical_url_host(&raw_parsed) else {
-            continue;
-        };
-        let cand_origin = (
-            raw_parsed.scheme().to_ascii_lowercase(),
-            cand_host,
-            raw_parsed.port_or_known_default(),
-        );
-        if cand_origin != page_origin || is_noise_dataset_url(&raw_parsed) {
             continue;
         }
 

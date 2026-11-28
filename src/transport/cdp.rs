@@ -1879,17 +1879,12 @@ impl CdpSession {
 
         self.settle_page().await?;
 
-        let mut outer_html = self.read_outer_html().await?;
         let max_bytes = if options.max_response_bytes > 0 {
             options.max_response_bytes
         } else {
             MAX_HTML_BYTES
         };
-        if outer_html.len() > max_bytes {
-            return Err(anyhow::Error::new(ResponseTooLargeError {
-                limit_bytes: max_bytes,
-            }));
-        }
+        let mut outer_html = self.read_bounded_outer_html(max_bytes).await?;
 
         let mut capture_meta = BrowserCaptureMetadata::default();
         let needs_reveal_or_scroll =
@@ -1967,35 +1962,17 @@ impl CdpSession {
                                             Some(outcome.warning.unwrap_or_else(|| {
                                                 "aborted --reveal because a control triggered page navigation".to_string()
                                             }));
-                                    } else if outcome.challenge_detected {
-                                        capture_meta.scroll_steps_performed =
-                                            outcome.scroll_steps_performed;
-                                        capture_meta.reveal_warning = outcome.warning;
-                                        let post_html = self.read_outer_html().await?;
-                                        if post_html.len() > max_bytes {
-                                            return Err(anyhow::Error::new(
-                                                ResponseTooLargeError {
-                                                    limit_bytes: max_bytes,
-                                                },
-                                            ));
-                                        }
-                                        outer_html = post_html;
                                     } else {
-                                        capture_meta.revealed_panels = outcome.revealed_panels;
-                                        capture_meta.reveal_capped |= outcome.reveal_capped;
-                                        capture_meta.enforce_bounds();
+                                        if !outcome.challenge_detected {
+                                            capture_meta.revealed_panels = outcome.revealed_panels;
+                                            capture_meta.reveal_capped |= outcome.reveal_capped;
+                                            capture_meta.enforce_bounds();
+                                        }
                                         capture_meta.scroll_steps_performed =
                                             outcome.scroll_steps_performed;
                                         capture_meta.reveal_warning = outcome.warning;
-                                        let post_html = self.read_outer_html().await?;
-                                        if post_html.len() > max_bytes {
-                                            return Err(anyhow::Error::new(
-                                                ResponseTooLargeError {
-                                                    limit_bytes: max_bytes,
-                                                },
-                                            ));
-                                        }
-                                        outer_html = post_html;
+                                        outer_html =
+                                            self.read_bounded_outer_html(max_bytes).await?;
                                     }
                                 }
                                 Err(err) => {
@@ -2206,6 +2183,16 @@ impl CdpSession {
             }
         }
         Ok(())
+    }
+
+    async fn read_bounded_outer_html(&mut self, max_bytes: usize) -> Result<String> {
+        let html = self.read_outer_html().await?;
+        if html.len() > max_bytes {
+            return Err(anyhow::Error::new(ResponseTooLargeError {
+                limit_bytes: max_bytes,
+            }));
+        }
+        Ok(html)
     }
 
     async fn read_outer_html(&mut self) -> Result<String> {
