@@ -1175,7 +1175,6 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 wait_for_selector,
                 respect_robots,
                 apply_rewrites: !no_rewrite,
-                ..Default::default()
             };
 
             if !batch_mode {
