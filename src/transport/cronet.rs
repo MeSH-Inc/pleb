@@ -196,41 +196,72 @@ impl Engine {
         max_body_bytes: usize,
         disable_redirects: bool,
     ) -> Result<CronetResponse> {
-        let (tx, rx) = oneshot::channel();
-        let active_request = Arc::new((Mutex::new(ActiveRequestInner::default()), Condvar::new()));
-        let guard = CancelGuard {
-            active_request: Arc::clone(&active_request),
-        };
-
-        self.start_request(
-            url,
-            headers,
-            max_body_bytes,
-            disable_redirects,
-            tx,
-            active_request,
-        )?;
-
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(result)) => {
-                drop(guard);
-                result
-            }
-            Ok(Err(_)) => {
-                drop(guard);
-                Err(anyhow::Error::new(TransportError::new(
-                    TransportErrorKind::Canceled,
-                    "Cronet request canceled",
-                )))
-            }
-            Err(_) => {
-                drop(guard);
-                Err(anyhow::Error::new(TransportError::new(
+        let deadline = tokio::time::Instant::now() + timeout;
+        for attempt in 0..=1 {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow::Error::new(TransportError::new(
                     TransportErrorKind::Timeout,
                     format!("Cronet request timed out after {:?}", timeout),
-                )))
+                )));
+            }
+
+            let (tx, rx) = oneshot::channel();
+            let active_request =
+                Arc::new((Mutex::new(ActiveRequestInner::default()), Condvar::new()));
+            let guard = CancelGuard {
+                active_request: Arc::clone(&active_request),
+            };
+
+            self.start_request(
+                url,
+                headers,
+                max_body_bytes,
+                disable_redirects,
+                tx,
+                active_request,
+            )?;
+
+            match tokio::time::timeout(remaining, rx).await {
+                Ok(Ok(Ok(resp))) => {
+                    drop(guard);
+                    return Ok(resp);
+                }
+                Ok(Ok(Err(failure))) => {
+                    drop(guard);
+                    let remaining_after =
+                        deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if attempt == 0
+                        && failure.retryable
+                        && remaining_after >= Duration::from_millis(250)
+                    {
+                        tracing::debug!(
+                            url,
+                            error = %failure.err,
+                            "retrying transient Cronet error once"
+                        );
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                    return Err(failure.err);
+                }
+                Ok(Err(_)) => {
+                    drop(guard);
+                    return Err(anyhow::Error::new(TransportError::new(
+                        TransportErrorKind::Canceled,
+                        "Cronet request canceled",
+                    )));
+                }
+                Err(_) => {
+                    drop(guard);
+                    return Err(anyhow::Error::new(TransportError::new(
+                        TransportErrorKind::Timeout,
+                        format!("Cronet request timed out after {:?}", timeout),
+                    )));
+                }
             }
         }
+        unreachable!("attempt loop always returns within two attempts")
     }
 
     fn start_request(
@@ -239,7 +270,7 @@ impl Engine {
         headers: &[(&str, String)],
         max_body_bytes: usize,
         disable_redirects: bool,
-        tx: oneshot::Sender<Result<CronetResponse>>,
+        tx: oneshot::Sender<std::result::Result<CronetResponse, CronetAttemptError>>,
         active_request: Arc<(Mutex<ActiveRequestInner>, Condvar)>,
     ) -> Result<()> {
         let c_url = CString::new(url)?;
@@ -376,6 +407,11 @@ struct InterceptedRedirect {
     diagnostics: super::DiagnosticHeaders,
 }
 
+struct CronetAttemptError {
+    err: anyhow::Error,
+    retryable: bool,
+}
+
 struct RequestState {
     body: Mutex<Vec<u8>>,
     max_body_bytes: usize,
@@ -390,7 +426,7 @@ struct RequestState {
     link_header: Mutex<Option<String>>,
     location_header: Mutex<Option<String>>,
     diagnostics: Mutex<super::DiagnosticHeaders>,
-    sender: Mutex<Option<oneshot::Sender<Result<CronetResponse>>>>,
+    sender: Mutex<Option<oneshot::Sender<std::result::Result<CronetResponse, CronetAttemptError>>>>,
     request: Mutex<ffi::Cronet_UrlRequestPtr>,
     callback: Mutex<ffi::Cronet_UrlRequestCallbackPtr>,
     active_request: Arc<(Mutex<ActiveRequestInner>, Condvar)>,
@@ -464,7 +500,7 @@ fn get_state(callback: ffi::Cronet_UrlRequestCallbackPtr) -> &'static RequestSta
     }
 }
 
-fn complete(state: &RequestState, result: Result<CronetResponse>) {
+fn complete(state: &RequestState, result: std::result::Result<CronetResponse, CronetAttemptError>) {
     if let Some(tx) = lock_unpoisoned(&state.sender).take() {
         let _ = tx.send(result);
     }
@@ -699,29 +735,116 @@ unsafe extern "C" fn on_succeeded(
     );
 }
 
+fn sanitize_cronet_error_detail(raw: &str) -> String {
+    let mut out = String::new();
+    let mut last_space = false;
+    for ch in raw.chars() {
+        if ch.is_control() || ch.is_whitespace() {
+            if !out.is_empty() && !last_space {
+                out.push(' ');
+                last_space = true;
+            }
+        } else {
+            out.push(ch);
+            last_space = false;
+        }
+        if out.len() >= 256 {
+            while out.len() > 256 {
+                out.pop();
+            }
+            break;
+        }
+    }
+    out.trim_end().to_string()
+}
+
+fn format_cronet_error_message(
+    code_name: &str,
+    internal_code: i32,
+    quic_code: i32,
+    raw_message: Option<&str>,
+    retryable: bool,
+) -> String {
+    let mut out = format!("cronet request failed [{code_name}]");
+    let mut meta = Vec::new();
+    if internal_code != 0 {
+        meta.push(format!("net_error={internal_code}"));
+    }
+    if quic_code != 0 {
+        meta.push(format!("quic_error={quic_code}"));
+    }
+    if retryable {
+        meta.push("retryable=true".to_string());
+    }
+    if !meta.is_empty() {
+        out.push_str(" (");
+        out.push_str(&meta.join(", "));
+        out.push(')');
+    }
+    if let Some(raw) = raw_message {
+        let detail = sanitize_cronet_error_detail(raw);
+        if !detail.is_empty() {
+            out.push_str(": ");
+            out.push_str(&detail);
+        }
+    }
+    out
+}
+
+fn is_retryable_cronet_error(
+    code: std::os::raw::c_int,
+    internal_code: i32,
+    immediately_retryable: bool,
+) -> bool {
+    immediately_retryable
+        || matches!(code, 5 | 8 | 10)
+        || matches!(internal_code, -337 | -324 | -103)
+}
+
 unsafe extern "C" fn on_failed(
     callback: ffi::Cronet_UrlRequestCallbackPtr,
     _request: ffi::Cronet_UrlRequestPtr,
     _info: ffi::Cronet_UrlResponseInfoPtr,
     error: ffi::Cronet_ErrorPtr,
 ) {
-    let (code_name, kind) = if error.is_null() {
-        ("ERROR_OTHER", TransportErrorKind::Network)
+    let (msg, kind, retryable_err) = if error.is_null() {
+        (
+            format_cronet_error_message("ERROR_OTHER", 0, 0, None, false),
+            TransportErrorKind::Network,
+            false,
+        )
     } else {
         let code = ffi::Cronet_Error_error_code_get(error);
+        let internal_code = ffi::Cronet_Error_internal_error_code_get(error);
+        let quic_code = ffi::Cronet_Error_quic_detailed_error_code_get(error);
+        let immediately_retryable = ffi::Cronet_Error_immediately_retryable_get(error);
+        let msg_ptr = ffi::Cronet_Error_message_get(error);
+        let raw_message =
+            (!msg_ptr.is_null()).then(|| CStr::from_ptr(msg_ptr).to_string_lossy().into_owned());
         let kind = match code {
             4 | 6 => TransportErrorKind::Timeout,
             _ => TransportErrorKind::Network,
         };
-        (net_error_name(code), kind)
+        let is_retryable = is_retryable_cronet_error(code, internal_code, immediately_retryable);
+        (
+            format_cronet_error_message(
+                net_error_name(code),
+                internal_code,
+                quic_code,
+                raw_message.as_deref(),
+                immediately_retryable,
+            ),
+            kind,
+            is_retryable,
+        )
     };
     let boxed = finish_request(callback);
     complete(
         &boxed,
-        Err(anyhow::Error::new(TransportError::new(
-            kind,
-            format!("cronet request failed [{}]", code_name),
-        ))),
+        Err(CronetAttemptError {
+            err: anyhow::Error::new(TransportError::new(kind, msg)),
+            retryable: retryable_err,
+        }),
     );
 }
 
@@ -759,19 +882,28 @@ unsafe extern "C" fn on_canceled(
             body: Vec::new(),
         })
     } else if let Some(target) = lock_unpoisoned(&boxed.blocked_redirect).take() {
-        Err(anyhow::Error::new(TransportError::new(
-            TransportErrorKind::RedirectBlocked,
-            format!("blocked unsafe redirect to {target}"),
-        )))
+        Err(CronetAttemptError {
+            err: anyhow::Error::new(TransportError::new(
+                TransportErrorKind::RedirectBlocked,
+                format!("blocked unsafe redirect to {target}"),
+            )),
+            retryable: false,
+        })
     } else if boxed.overflowed.load(Ordering::SeqCst) {
-        Err(anyhow::Error::new(super::ResponseTooLargeError {
-            limit_bytes: boxed.max_body_bytes,
-        }))
+        Err(CronetAttemptError {
+            err: anyhow::Error::new(super::ResponseTooLargeError {
+                limit_bytes: boxed.max_body_bytes,
+            }),
+            retryable: false,
+        })
     } else {
-        Err(anyhow::Error::new(TransportError::new(
-            TransportErrorKind::Canceled,
-            "cronet request canceled",
-        )))
+        Err(CronetAttemptError {
+            err: anyhow::Error::new(TransportError::new(
+                TransportErrorKind::Canceled,
+                "cronet request canceled",
+            )),
+            retryable: false,
+        })
     };
     complete(&boxed, result);
 }
@@ -801,12 +933,14 @@ mod tests {
     async fn spawn_edge_server() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let drop_once_seen = Arc::new(AtomicBool::new(false));
 
         tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     break;
                 };
+                let drop_once_seen = Arc::clone(&drop_once_seen);
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];
                     let n = socket.read(&mut buf).await.unwrap_or(0);
@@ -841,6 +975,22 @@ mod tests {
                             );
                             let _ = socket.write_all(hdr.as_bytes()).await;
                             let _ = socket.write_all(body).await;
+                        }
+                        "/drop-once" => {
+                            if !drop_once_seen.swap(true, Ordering::SeqCst) {
+                                drop(socket);
+                                return;
+                            }
+                            let body = b"recovered after drop";
+                            let hdr = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = socket.write_all(hdr.as_bytes()).await;
+                            let _ = socket.write_all(body).await;
+                        }
+                        "/drop-always" => {
+                            drop(socket);
                         }
                         "/redir-ok" => {
                             let _ = socket
@@ -926,7 +1076,60 @@ mod tests {
             assert_eq!(te.kind, TransportErrorKind::RedirectBlocked);
         }
 
+        let recovered = engine
+            .get(
+                &format!("{base}/drop-once"),
+                &[],
+                Duration::from_secs(5),
+                65536,
+            )
+            .await
+            .expect("transient connection drop should recover on 1x retry");
+        assert_eq!(recovered.status_code, 200);
+        assert_eq!(recovered.body, b"recovered after drop");
+
+        let err_drop = engine
+            .get(
+                &format!("{base}/drop-always"),
+                &[],
+                Duration::from_secs(5),
+                65536,
+            )
+            .await
+            .err()
+            .expect("persistent drop should fail with TransportError");
+        let drop_te = err_drop
+            .downcast_ref::<TransportError>()
+            .expect("persistent drop must return TransportError");
+        assert_eq!(drop_te.kind, TransportErrorKind::Network);
+        assert!(
+            drop_te.message.contains("cronet request failed [")
+                && drop_te.message.contains("net_error=-"),
+            "expected enriched Cronet error details, got: {}",
+            drop_te.message
+        );
+
         drop(engine);
         let _ = std::fs::remove_dir_all(&storage);
+    }
+
+    #[test]
+    fn cronet_error_formatting_and_retry_classification() {
+        assert!(is_retryable_cronet_error(11, -337, false));
+        assert!(is_retryable_cronet_error(5, 0, false));
+        assert!(is_retryable_cronet_error(11, 0, true));
+        assert!(!is_retryable_cronet_error(1, -105, false));
+
+        let msg = format_cronet_error_message(
+            "ERROR_OTHER",
+            -337,
+            0,
+            Some("net::ERR_HTTP2_PROTOCOL_ERROR\n\textra"),
+            false,
+        );
+        assert_eq!(
+            msg,
+            "cronet request failed [ERROR_OTHER] (net_error=-337): net::ERR_HTTP2_PROTOCOL_ERROR extra"
+        );
     }
 }

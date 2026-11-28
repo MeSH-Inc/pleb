@@ -150,4 +150,8 @@ extern "C" {
     ) -> Cronet_HttpHeaderPtr;
 
     pub fn Cronet_Error_error_code_get(error: Cronet_ErrorPtr) -> c_int;
+    pub fn Cronet_Error_message_get(error: Cronet_ErrorPtr) -> Cronet_String;
+    pub fn Cronet_Error_internal_error_code_get(error: Cronet_ErrorPtr) -> i32;
+    pub fn Cronet_Error_immediately_retryable_get(error: Cronet_ErrorPtr) -> bool;
+    pub fn Cronet_Error_quic_detailed_error_code_get(error: Cronet_ErrorPtr) -> i32;
 }
